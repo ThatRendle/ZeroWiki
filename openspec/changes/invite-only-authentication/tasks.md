@@ -1,9 +1,9 @@
 ## 1. Identity store
 
-- [ ] 1.1 Provision a SQLite identity database file on the mounted volume (accounts, git emails, hashed tokens, invitations), separate from the content git repo
-- [ ] 1.2 Define the account schema: username (unique), password hash, display name, associated git emails
-- [ ] 1.3 Define the invitation schema: token, issuer, expiry, redeemed/revoked state
-- [ ] 1.4 Define the git-token schema: owning account, token hash, created/revoked state
+- [x] 1.1 Provision a SQLite identity database file on the mounted volume (accounts, git emails, hashed tokens, invitations), separate from the content git repo
+- [x] 1.2 Define the account schema: username (unique), password hash, display name, associated git emails
+- [x] 1.3 Define the invitation schema: token, issuer, expiry, redeemed/revoked state
+- [x] 1.4 Define the git-token schema: owning account, token hash, created/revoked state
 
 ## 2. Password & token hashing
 

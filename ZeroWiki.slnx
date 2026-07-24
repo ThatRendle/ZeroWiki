@@ -1,0 +1,8 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/ZeroWiki/ZeroWiki.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/ZeroWiki.Tests/ZeroWiki.Tests.csproj" />
+  </Folder>
+</Solution>
