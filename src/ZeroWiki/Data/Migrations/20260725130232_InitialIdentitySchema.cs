@@ -20,7 +20,7 @@ namespace ZeroWiki.Data.Migrations
                     PasswordHash = table.Column<string>(type: "TEXT", nullable: false),
                     DisplayName = table.Column<string>(type: "TEXT", maxLength: 128, nullable: false),
                     IsAdministrator = table.Column<bool>(type: "INTEGER", nullable: false),
-                    CreatedAt = table.Column<DateTimeOffset>(type: "TEXT", nullable: false)
+                    CreatedAt = table.Column<string>(type: "TEXT", maxLength: 28, nullable: false)
                 },
                 constraints: table =>
                 {
@@ -53,8 +53,8 @@ namespace ZeroWiki.Data.Migrations
                     Id = table.Column<Guid>(type: "TEXT", nullable: false),
                     AccountId = table.Column<Guid>(type: "TEXT", nullable: false),
                     TokenHash = table.Column<string>(type: "TEXT", nullable: false),
-                    CreatedAt = table.Column<DateTimeOffset>(type: "TEXT", nullable: false),
-                    RevokedAt = table.Column<DateTimeOffset>(type: "TEXT", nullable: true)
+                    CreatedAt = table.Column<string>(type: "TEXT", maxLength: 28, nullable: false),
+                    RevokedAt = table.Column<string>(type: "TEXT", maxLength: 28, nullable: true)
                 },
                 constraints: table =>
                 {
@@ -74,10 +74,10 @@ namespace ZeroWiki.Data.Migrations
                     Id = table.Column<Guid>(type: "TEXT", nullable: false),
                     TokenHash = table.Column<string>(type: "TEXT", nullable: false),
                     IssuerAccountId = table.Column<Guid>(type: "TEXT", nullable: false),
-                    CreatedAt = table.Column<DateTimeOffset>(type: "TEXT", nullable: false),
-                    ExpiresAt = table.Column<DateTimeOffset>(type: "TEXT", nullable: false),
-                    RedeemedAt = table.Column<DateTimeOffset>(type: "TEXT", nullable: true),
-                    RevokedAt = table.Column<DateTimeOffset>(type: "TEXT", nullable: true)
+                    CreatedAt = table.Column<string>(type: "TEXT", maxLength: 28, nullable: false),
+                    ExpiresAt = table.Column<string>(type: "TEXT", maxLength: 28, nullable: false),
+                    RedeemedAt = table.Column<string>(type: "TEXT", maxLength: 28, nullable: true),
+                    RevokedAt = table.Column<string>(type: "TEXT", maxLength: 28, nullable: true)
                 },
                 constraints: table =>
                 {

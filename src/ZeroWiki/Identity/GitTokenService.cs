@@ -64,22 +64,15 @@ public sealed class GitTokenService(
     /// Lists an account's git tokens, newest first, including revoked ones so the owner can
     /// see the full history.
     /// </summary>
-    /// <remarks>
-    /// The ordering is applied client-side: SQLite cannot ORDER BY a <see cref="DateTimeOffset"/>,
-    /// and an account holds a handful of tokens at most.
-    /// </remarks>
     public async Task<IReadOnlyList<GitTokenSummary>> ListAsync(
         Guid accountId,
-        CancellationToken cancellationToken = default)
-    {
-        var tokens = await db.GitTokens
+        CancellationToken cancellationToken = default) =>
+        await db.GitTokens
             .AsNoTracking()
             .Where(t => t.AccountId == accountId)
+            .OrderByDescending(t => t.CreatedAt)
             .Select(t => new GitTokenSummary(t.Id, t.CreatedAt, t.RevokedAt))
             .ToListAsync(cancellationToken);
-
-        return [.. tokens.OrderByDescending(t => t.CreatedAt)];
-    }
 
     /// <summary>
     /// Revokes one of the account's own tokens. Idempotent — revoking an already-revoked

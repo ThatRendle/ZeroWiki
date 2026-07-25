@@ -1,5 +1,6 @@
 using Microsoft.EntityFrameworkCore;
 using ZeroWiki.Data.Configurations;
+using ZeroWiki.Data.Converters;
 
 namespace ZeroWiki.Data;
 
@@ -17,6 +18,18 @@ public sealed class IdentityDbContext(DbContextOptions<IdentityDbContext> option
     public DbSet<Invitation> Invitations => Set<Invitation>();
 
     public DbSet<GitToken> GitTokens => Set<GitToken>();
+
+    /// <summary>
+    /// Applied as a convention rather than per property on purpose: it covers
+    /// <see cref="DateTimeOffset"/>? as well, and a timestamp column added later cannot be
+    /// left out of it by omission.
+    /// </summary>
+    protected override void ConfigureConventions(ModelConfigurationBuilder configurationBuilder)
+    {
+        configurationBuilder.Properties<DateTimeOffset>()
+            .HaveConversion<Iso8601UtcDateTimeOffsetConverter>()
+            .HaveMaxLength(Iso8601UtcDateTimeOffsetConverter.FormattedLength);
+    }
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {

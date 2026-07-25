@@ -11,7 +11,7 @@ using ZeroWiki.Data;
 namespace ZeroWiki.Data.Migrations
 {
     [DbContext(typeof(IdentityDbContext))]
-    [Migration("20260724174030_InitialIdentitySchema")]
+    [Migration("20260725130232_InitialIdentitySchema")]
     partial class InitialIdentitySchema
     {
         /// <inheritdoc />
@@ -26,7 +26,9 @@ namespace ZeroWiki.Data.Migrations
                         .ValueGeneratedOnAdd()
                         .HasColumnType("TEXT");
 
-                    b.Property<DateTimeOffset>("CreatedAt")
+                    b.Property<string>("CreatedAt")
+                        .IsRequired()
+                        .HasMaxLength(28)
                         .HasColumnType("TEXT");
 
                     b.Property<string>("DisplayName")
@@ -89,10 +91,13 @@ namespace ZeroWiki.Data.Migrations
                     b.Property<Guid>("AccountId")
                         .HasColumnType("TEXT");
 
-                    b.Property<DateTimeOffset>("CreatedAt")
+                    b.Property<string>("CreatedAt")
+                        .IsRequired()
+                        .HasMaxLength(28)
                         .HasColumnType("TEXT");
 
-                    b.Property<DateTimeOffset?>("RevokedAt")
+                    b.Property<string>("RevokedAt")
+                        .HasMaxLength(28)
                         .HasColumnType("TEXT");
 
                     b.Property<string>("TokenHash")
@@ -115,19 +120,25 @@ namespace ZeroWiki.Data.Migrations
                         .ValueGeneratedOnAdd()
                         .HasColumnType("TEXT");
 
-                    b.Property<DateTimeOffset>("CreatedAt")
+                    b.Property<string>("CreatedAt")
+                        .IsRequired()
+                        .HasMaxLength(28)
                         .HasColumnType("TEXT");
 
-                    b.Property<DateTimeOffset>("ExpiresAt")
+                    b.Property<string>("ExpiresAt")
+                        .IsRequired()
+                        .HasMaxLength(28)
                         .HasColumnType("TEXT");
 
                     b.Property<Guid>("IssuerAccountId")
                         .HasColumnType("TEXT");
 
-                    b.Property<DateTimeOffset?>("RedeemedAt")
+                    b.Property<string>("RedeemedAt")
+                        .HasMaxLength(28)
                         .HasColumnType("TEXT");
 
-                    b.Property<DateTimeOffset?>("RevokedAt")
+                    b.Property<string>("RevokedAt")
+                        .HasMaxLength(28)
                         .HasColumnType("TEXT");
 
                     b.Property<string>("TokenHash")

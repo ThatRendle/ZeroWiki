@@ -168,6 +168,363 @@ Gates re-run independently: `dotnet build` **0 warn / 0 err**, `dotnet test` **7
 
 **✅ SIGN-OFF — Block 1 (§1.1–1.4 + scaffolding) APPROVED.** Clear to tick 1.1–1.4 and commit.
 
+---
+
+_[architect] → @worker — **§1 amendment unit: AD7, the `DateTimeOffset` storage representation.**
+Reopening §1 after sign-off, deliberately. No new tasks — 1.1–1.4 stay ticked; this corrects **how** the
+schema they defined stores timestamps. Landing it **before Block 3** rather than just before Block 4, so
+§3's bootstrap (which writes `Account.CreatedAt`) is built against the final schema instead of being
+churned by a regenerated migration afterwards._
+
+**Why this is happening at all.** Block 2 discovered that `OrderByDescending(t => t.CreatedAt)` throws on
+SQLite, and worked around it client-side. The reviewer then verified the whole picture empirically, and
+two of the three findings are the reason for this unit:
+
+1. `ORDER BY`, `Max`/`Min`, and `Where(x => x.ExpiresAt > now)` on a `DateTimeOffset` **all throw
+   loudly** — EF Core has errored rather than silently client-evaluating a `Where` since 3.0. (This
+   killed my original justification, which was a fear of silent client-side evaluation. It was wrong.)
+2. **Equality *does* translate, and is offset-sensitive.** Stored form is TEXT
+   `'2026-07-25 11:00:00+00:00'`. The same instant written with a different offset does not compare
+   equal, and TEXT ordering across mixed offsets is chronologically wrong. Every write goes through
+   `TimeProvider.GetUtcNow()` today, so we are correct **by habit, not by schema**.
+3. **The obvious fix is the wrong one and fails silently.** EF's built-in
+   `DateTimeOffsetToBinaryConverter` restores server-side `>` and `ORDER BY` — and compares *wrongly*,
+   because it packs the offset into the value instead of normalising it. Measured, with `now = 12:00Z`, a
+   `Where(ExpiresAt > now)` returned a row expiring at `16:00+05:00` (= `11:00Z`) as **unexpired**. That
+   is a silent fail-open in the invitation-expiry filter, reachable via
+   `HasConversion<DateTimeOffsetToBinaryConverter>()` — the first thing a reasonable implementer tries.
+   **Do not use it.**
+
+**The decision (binding).** Store every `DateTimeOffset` as a **fixed-width ISO-8601 UTC string**:
+
+- Format **exactly** `yyyy-MM-ddTHH:mm:ss.fffffffZ` — 7 fixed fractional digits, literal `Z`. **Never**
+  the `"o"` round-trip form, which carries a variable offset and breaks fixed-width ordering.
+- `HasMaxLength(28)`. No `NOCASE` on these columns.
+- Apply via **`ConfigureConventions`** — `configurationBuilder.Properties<DateTimeOffset>().HaveConversion<…>()`
+  — **not** per-property `HasConversion`. This is binding: it covers `DateTimeOffset?` too, and it makes
+  the invariant impossible to forget on a column added in §4 or later. Per-property configuration
+  certainly would be forgotten.
+- Round-trip must **normalise** a non-UTC input (a `+05:00` value stores as the correct instant) and keep
+  NULL as NULL.
+
+*Why ISO-8601 text over the conventional `long` UTC ticks* — ticks is unambiguous and I considered it. The
+deciding argument is the operator: this project sells zero-config self-hosting, so the person debugging
+"why was my invite rejected" is in a `sqlite3` shell. `2026-07-25T13:00:00.0000000Z` answers that;
+`639205812000000000` does not. More importantly, SQLite's own `datetime()`/`julianday()`/`strftime()`
+parse ISO-8601 with `T` and `Z`, so an operator's hand-written `WHERE ExpiresAt > datetime('now')` is
+**correct by default** — whereas against ticks the same query needs arithmetic they will get silently
+wrong. Designing out a silent-comparison bug class and then leaving the operator's own query inside it
+would be incoherent. Ordering correctness is structural, not incidental: fixed width + always-`Z` +
+SQLite's default BINARY collation ⇒ lexicographic order **is** chronological order. That is as strong as
+ticks, not weaker. The one real cost is a format string to get wrong — and `ParseExact` throws loudly on a
+malformed value, which is the right failure direction.
+
+**Tasks**
+
+1. Add the converter and wire it through `ConfigureConventions` on `IdentityDbContext`.
+2. **Regenerate** the single `InitialIdentitySchema` migration (delete + `dotnet ef migrations add`, as
+   you did for the NOCASE fix) — do **not** stack a second migration. Nothing has shipped, so one clean
+   migration is the honest representation; a follow-up migration would be fiction. Confirm exactly one
+   migration exists afterwards and that the snapshot agrees.
+3. **Remove `GitTokenService.ListAsync`'s materialise-then-sort workaround and its `<remarks>`** — order
+   server-side now. This is the one Block 2 file this unit touches, and the reason to do it here: left in
+   place, the workaround calcifies into a pattern the rest of the change copies.
+4. **Tests that lock the invariant in** — this is the part that makes it worth anything:
+   - Server-side ordering works (`OrderByDescending(CreatedAt)` reaches SQL and returns the right order).
+   - **A server-side `Where(i => i.ExpiresAt > now)` excludes an expired invitation** — the §4-critical
+     one. It must prove the predicate reached SQL, not that a client-side filter got the right answer.
+   - A non-UTC input (`+05:00`) round-trips to the correct instant and compares correctly against it —
+     i.e. the exact case `DateTimeOffsetToBinaryConverter` got wrong.
+   - Ordering is correct across a wide range (year 1 → 9999) and NULL stays NULL (`RevokedAt == null`
+     still translates).
+   - Existing tests stay green: the whole suite currently runs the real migration, so a bad converter
+     shows up immediately.
+
+**Out of scope:** no new entity, no new column, no §3/§4 behaviour, no `tasks.md` changes (1.1–1.4 remain
+ticked — this is a correction within them, not new work).
+
+**Gates:** the usual four. Then → @reviewer. This commits as its own commit against §1, with the
+amend-a-signed-off-migration reason in the body.
+
+[worker] AD7 implemented. Summary:
+
+- **`Data/Converters/Iso8601UtcDateTimeOffsetConverter.cs`** — `ValueConverter<DateTimeOffset, string>`.
+  Writes `value.UtcDateTime.ToString(Format, InvariantCulture)`, reads
+  `DateTimeOffset.ParseExact(…, AssumeUniversal | AdjustToUniversal)`. `FormattedLength = 28` is public so
+  the max length can't drift from the format.
+- **Wired via `ConfigureConventions`** on `IdentityDbContext`:
+  `Properties<DateTimeOffset>().HaveConversion<Iso8601UtcDateTimeOffsetConverter>()
+  .HaveMaxLength(FormattedLength)`. Confirmed it reaches `DateTimeOffset?` too — the regenerated migration
+  gives **all seven** timestamp columns across four tables `TEXT`/`maxLength: 28` (`Account.CreatedAt`,
+  `GitToken.CreatedAt`/`RevokedAt`, `Invitation.CreatedAt`/`ExpiresAt`/`RedeemedAt`/`RevokedAt`), and
+  there's a test for the nullable case specifically. No `NOCASE` on any of them.
+- **Migration regenerated, not stacked.** Deleted `20260724174030_InitialIdentitySchema` + snapshot,
+  re-added → exactly one migration, `20260725130232_InitialIdentitySchema`. Verified the NOCASE collations
+  from the Block 1 fix survived (`Username`, `GitEmail.Email` both still `collation: "NOCASE"`) and that
+  the snapshot agrees.
+- **`GitTokenService.ListAsync`** — workaround gone. Now `Where` → `OrderByDescending(t => t.CreatedAt)` →
+  `Select(… new GitTokenSummary …)` → `ToListAsync`, all server-side; the `<remarks>` explaining the
+  client-side sort is deleted. N3's projection kept.
+- **Tests: 6 new (60 total), `Data/DateTimeOffsetStorageTests.cs`.** Where a query has to reach SQL I
+  assert on `ToQueryString()` — it only succeeds for a fully translated query, so a client-side filter
+  can't pass these by luck:
+  - stored form is exactly `2026-07-25T13:00:00.0000000Z`, 28 chars (raw `SELECT`, not through EF);
+  - `18:00+05:00` stores as `13:00Z` and reloads as the same instant with a zero offset;
+  - **the §4-critical one** — an invitation expiring `16:00+05:00` (= `11:00Z`) is excluded by
+    `Where(i => i.ExpiresAt > now)` at `now = 12:00Z`, with `"ExpiresAt" > ` asserted present in the
+    generated SQL. This is the exact row the built-in binary converter admitted;
+  - ordering is chronological in SQL across `DateTimeOffset.MinValue` → year 9999, with a mixed-offset
+    pair (`12:00Z` before `18:00+05:00` = `13:00Z`) in the middle, `ORDER BY` asserted in the SQL;
+  - NULL stays NULL — raw `WHERE RevokedAt IS NULL` counts 1, `Where(t => t.RevokedAt == null)`
+    translates to `IS NULL` and returns the unrevoked token;
+  - nullable `RevokedAt` written as `16:00+05:00` stores as `11:00Z`.
+
+**Negative control (worth knowing, with its caveat).** I temporarily swapped
+`HaveConversion<DateTimeOffsetToBinaryConverter>()` in and ran the new file: **all 6 fail**, then restored
+and re-verified the wiring. Caveat, stated plainly rather than overclaimed: because the migration was
+regenerated for the TEXT representation, some of those failures are representation mismatch rather than
+the comparison semantics specifically, so this proves the suite is *coupled to the AD7 representation* —
+it is not an independent reproduction of the reviewer's measured fail-open. The reviewer's own measurement
+stands as that.
+
+**Judgement calls:**
+
+- **Format literals are quoted** — `yyyy-MM-dd'T'HH:mm:ss.fffffff'Z'`, not the brief's literal
+  `yyyy-MM-ddTHH:mm:ssZ` spelling. Output is byte-identical (asserted against the raw column), but
+  unquoted `T`/`Z` rely on "unrecognised characters are copied through", and an unquoted `Z` in a *parse*
+  format is the kind of thing that has surprising interactions with `DateTimeStyles`. Quoting makes it
+  impossible to read either as a specifier. Say the word if you want the unquoted spelling.
+- **`ParseExact` deliberately left to throw** on a malformed column, per the brief's "fails loudly" —
+  no `TryParseExact` fallback. Note this is the *opposite* of `Argon2idPasswordHasher.Verify`'s
+  absorb-corruption stance, and I think correctly so: a corrupt password hash must not become a
+  distinguishable error, whereas a corrupt timestamp is a data-integrity fault with nothing to hide.
+  Flagging because the inconsistency is deliberate and might otherwise look accidental.
+- **Converter lives in `Data/Converters/`**, mirroring `Data/Configurations/`.
+- **No `Max`/`Min` test** — the brief's list didn't ask for one and nothing calls them yet; the reviewer
+  verified they work. Happy to add if wanted.
+
+**Nothing awkward turned up.** Specifically: `Properties<DateTimeOffset>()` covering the nullable form
+needed no extra call; `HaveMaxLength` composes on the same builder; comparison and ordering translate
+without a single hint or raw-SQL escape hatch; and no existing test needed changing — all 54 prior tests
+passed unmodified against the regenerated migration, including `GitTokenServiceTests`' round-tripped
+`RevokedAt` equality assertions.
+
+**Gates:** `dotnet build` — 0 Warnings, 0 Errors. `dotnet test` — **60/60 passed** (54 + 6 new).
+`openspec validate invite-only-authentication --strict` — valid. `dotnet format --verify-no-changes` —
+clean (exit 0). No new entity, no new column, no §3/§4 behaviour, `tasks.md` untouched.
+
+→ @reviewer
+
+[worker] AD7 nits N1/N2 + the optional companion applied. Both reviewer findings were right, and my
+original T4 was weaker than I thought — the pair I chose (`12:00Z` vs `18:00+05:00`) sorts correctly even
+with the offset preserved, so it proved less than it looked like it did.
+
+- **N1 — the mixed-offset pair is now adversarial.** `13:00Z` vs `09:00−05:00` (= `14:00Z`). A *negative*
+  offset is the point: preserving it makes `"T09"` sort before `"T13"`, inverting a pair whose true order
+  is the other way round.
+- **N2 — added a pair differing only in fractional digits.** `13:00:00.0000000Z` vs `13:00:00.5000000Z`.
+  `.` (0x2E) sorts before `Z` (0x5A), so any representation that drops trailing fractional digits inverts
+  them. T4 now carries both pairs, so one test covers both mutation classes.
+- **Companion taken** — `Live_invitation_written_with_a_negative_offset_survives_the_sql_predicate`: an
+  invitation expiring `09:00−05:00` (= `14:00Z`) must survive `Where(i => i.ExpiresAt > now)` at
+  `now = 12:00Z`. The fail-*closed* mirror of the existing fail-open test, same `ToQueryString()` proof.
+
+**Confirmed empirically, not assumed** — built both mutants in turn, ran the file, restored, re-verified:
+
+| Converter | Result for `DateTimeOffsetStorageTests` |
+|---|---|
+| real (ISO-8601 UTC, fixed width) | **7/7 pass** |
+| M1 — offset-preserving (`…fffffffzzz`, still valid ISO-8601 TEXT) | **6 of 7 fail** |
+| M3 — variable width (`.FFFFFFF`, UTC-normalised) | **4 of 7 fail** |
+
+The failures are the semantic ones, with the diffs to show it:
+- **Under M1**, ordering fails at **pos 1** — the negative-offset row (true position 3) sorts straight
+  after `MinValue`; and the new companion returns **0 rows instead of 1**, reproducing the fail-closed
+  drop the reviewer measured. The fail-open test also fails. (The NULL test passes, correctly — null
+  handling is orthogonal to the representation.)
+- **Under M3**, ordering fails at **pos 1** — the sub-second row sorts *before* the whole-second row, the
+  `.`-before-`Z` inversion exactly. Both expiry tests **pass** under M3, since M3 does normalise to UTC —
+  which is precisely why N2 was needed: T4 is the only test that catches a variable-width representation.
+
+`ParseExact`-throws and the quoted format literals left as they are per the ruling. Noting the reviewer's
+lowercase-`z` finding for the record, since it's the sharpest argument for the quoting and I hadn't found
+it: unquoted, `Z` is read as the case-insensitive UTC designator, so `…0000000z` would parse fine on read
+while sorting after every uppercase-`Z` value in SQL. No converter change, no migration regeneration.
+
+**Gates re-run:** `dotnet build` — 0 Warnings, 0 Errors. `dotnet test` — **61/61 passed** (was 60; +1
+companion). `openspec validate invite-only-authentication --strict` — valid.
+`dotnet format --verify-no-changes` — clean (exit 0). Still exactly one migration.
+
+[reviewer] AD7 audited. Verdict: **Approve** — no blocking findings. The representation is correct, the
+regeneration is clean, the convention reaches everything, and — the part I was asked to close — **the test
+suite does independently catch a plausible-but-wrong converter**, verified by mutation rather than
+argument. Gates re-run independently: `dotnet build` **0 warn / 0 err**, `dotnet test` **60/60**,
+`openspec validate invite-only-authentication --strict` **valid**, `dotnet format --verify-no-changes`
+**exit 0**.
+
+**Scope confirmed.** Tracked diff is `IdentityDbContext.cs` (+13), the migration pair (old deleted, new
+added), the snapshot (+25/−12), and `GitTokenService.cs` (−13/+6). `git status` over `Account.cs`,
+`GitToken.cs`, `GitEmail.cs`, `Invitation.cs` and `Data/Configurations/` is **empty** — no entity, no
+column, no configuration change. `tasks.md` and `openspec/specs/` untouched. Exactly the amendment
+described.
+
+**Item 2 — migration regeneration is clean, and Block 1's collations survived.**
+- `src/ZeroWiki/Data/Migrations/` holds **exactly three files**: `20260725130232_InitialIdentitySchema.cs`,
+  its `.Designer.cs`, and the snapshot. The old `20260724174030_*` pair is deleted, not orphaned — one
+  migration, no stack, no stray second.
+- **The invariant I blocked Block 1 over is intact.** `…InitialIdentitySchema.cs:19` carries
+  `collation: "NOCASE"` on `Accounts.Username`, `:36` on `GitEmails.Email`, and the snapshot agrees at
+  `IdentityDbContextModelSnapshot.cs:47` and `:70` (`.UseCollation("NOCASE")`). That was the real
+  regression risk in regenerating rather than stacking, and it didn't bite.
+- Snapshot diff is exactly the seven property retypings (`DateTimeOffset`/`DateTimeOffset?` → `string`
+  with `HasMaxLength(28)`, `IsRequired()` only on the non-nullable ones) and nothing else. No index, key,
+  FK or delete-behaviour drift.
+
+**Item 3 — the convention reaches every column, including nullables.**
+- All **seven** timestamp columns are `TEXT`/`maxLength: 28` in the migration: `Accounts.CreatedAt` (`:23`),
+  `GitTokens.CreatedAt`/`RevokedAt` (`:56-57`), `Invitations.CreatedAt`/`ExpiresAt`/`RedeemedAt`/`RevokedAt`
+  (`:77-80`). Three of those are `DateTimeOffset?`, so `Properties<DateTimeOffset>()` is confirmed to cover
+  the nullable form.
+- **No `NOCASE` on any of them** — the only two collation lines in the migration are the two intended ones.
+  Correct: BINARY is what makes lexicographic order chronological.
+- **Nothing left per-property.** `grep -rn 'HasConversion' src/ tests/` finds no hand-written call anywhere
+  outside the generated migration/snapshot; the only wiring is
+  `IdentityDbContext.cs:27-32`. `HaveMaxLength(Iso8601UtcDateTimeOffsetConverter.FormattedLength)` chaining
+  off the same builder is the right touch — the max length cannot drift from the format, and the
+  `<summary>` at `:22-26` records *why* it's a convention. That's the binding detail honoured properly.
+- `GitTokenService.ListAsync` (`:64-76`) — workaround and `<remarks>` gone, `OrderByDescending` now sits
+  before the projection so both reach SQL. Good that this landed with AD7 rather than being left to rot.
+
+**Item 1 — I reproduced my own fail-open case against this converter, and the gap is closed. Verified by
+mutation, not inspection.**
+
+The worker was right to be honest that swapping in `DateTimeOffsetToBinaryConverter` changes the
+*representation* (TEXT → INTEGER), so those 6 failures don't prove the suite catches wrong *semantics*. So
+I built three mutant converters that all store plausible ISO-8601 **TEXT** and ran every one of the 6
+shipped assertions against each:
+
+- **M1 — `"o"` round-trip format: valid ISO-8601 text, offset preserved.** This is the same *class* of bug
+  as the built-in binary converter, in the representation AD7 actually uses — the most realistic way a
+  future hand would get this wrong.
+- **M2 — fixed-width, always-`Z`, canonical-*looking*, but every instant shifted +5h.**
+- **M3 — ISO-8601 UTC but variable width** (`FFFFFFF` drops trailing zero fractions).
+
+| shipped test | M1 offset kept | M2 shifted | M3 variable width |
+|---|---|---|---|
+| T1 stored form is fixed-width ISO-8601 UTC | **FAIL** | **FAIL** | **FAIL** |
+| T2 non-UTC input normalised | **FAIL** | **FAIL** | **FAIL** |
+| **T3 expired invitation excluded by an SQL predicate** | **FAIL (semantic)** | pass | pass |
+| T4 ordering across the range | pass | *(setup error)* | pass |
+| T5 NULL stays NULL | pass | pass | pass |
+| T6 nullable also fixed-width | **FAIL** | **FAIL** | **FAIL** |
+
+**The answer to the question: yes.** `Expired_invitation_is_excluded_by_a_predicate_evaluated_in_sql`
+(`DateTimeOffsetStorageTests.cs:63-89`) fails under M1 **for the semantic reason, not a representation
+mismatch** — it returns **2 rows instead of 1, admitting the expired `16:00+05:00` invitation against a
+`12:00Z` now**. That is my measured fail-open, independently reproduced against a converter that stores
+perfectly legitimate-looking ISO-8601 text in the AD7 column type. The `ToQueryString()` assertion is what
+makes it airtight: the predicate demonstrably reached SQL, so it cannot pass on a lucky client-side
+filter. T3 is the load-bearing test of this unit and it earns that position. (M2 illustrates the
+complement: a *uniform* shift is order- and comparison-preserving, so no semantic test can catch it — it's
+caught only by the exact-string assertions T1/T2/T6. Both kinds of assertion are needed and both are
+present.)
+
+**Two residual weaknesses in the ordering test — nits, not blockers, since the class of bug is already
+caught by T3 and T1/T2/T6:**
+- **N1 — T4's mixed-offset pair is not adversarial.** `12:00Z` vs `18:00+05:00` (= `13:00Z`) sorts
+  correctly *even when the offset is preserved*, because `"T12"` < `"T18"` as text. Verified: **T4 passes
+  under M1.** A **negative** offset inverts: `13:00Z` vs `09:00−05:00` (= `14:00Z`) — the text reads
+  `"T09"` < `"T13"` while the instant is *later*.
+- **N2 — no two values differ only in fractional digits**, so variable-width formatting slips past every
+  semantic test (verified: T3 *and* T4 both pass under M3; only the exact-string assertions catch it).
+  A sub-second pair in the same second closes it: `15:00:00.0000000Z` vs `15:00:00.5000000Z` — under
+  variable width the `.` (0x2E) sorts *before* the `Z` (0x5A) and they invert.
+
+I wrote and ran the strengthened version so the recommendation isn't theoretical. Ordering over
+`[13:00Z, 09:00−05:00, 15:00:00.000Z, 15:00:00.500Z]` **passes on the real converter and fails under both
+M1 and M3.** Folding those two pairs into `Timestamps_order_chronologically_in_sql_across_the_whole_range`
+(`:91-113`) is a two-line change that makes the ordering test carry its own weight instead of relying on
+T1. Optional companion: a **negative-offset expiry** case — an invitation expiring `09:00−05:00` (=
+`14:00Z`) must still be live at `12:00Z`. That's the fail-**closed** mirror of T3 (a live invitation
+silently dropped rather than an expired one admitted); verified it returns 0 rows instead of 1 under M1.
+T3 covers fail-open; this would cover the other direction.
+
+**The quoted format literals — confirmed strictly more correct, and for a concrete reason.**
+`'T'`/`'Z'` vs the brief's unquoted spelling (`Iso8601UtcDateTimeOffsetConverter.cs:31`):
+- **Formatting is byte-identical** — both produce `2026-07-25T13:00:00.0000000Z`, 28 chars. Confirmed.
+- **Parsing differs on exactly one input**, and it matters: `2026-07-25T13:00:00.0000000z` (**lowercase
+  z**) is **rejected** by the quoted format and **accepted** by the unquoted one — because an unquoted `Z`
+  is read as the UTC designator, which is case-insensitive, rather than as a literal. Everything else I
+  threw at both (offset instead of `Z`, space separator, missing fractional digits, no designator, trailing
+  junk) is rejected by both.
+- That one difference is a genuine silent-corruption path, not tidiness: a lowercase-`z` value would parse
+  *fine* on read while sorting **after every** uppercase-`Z` value in SQL (`z` = 0x7A > `Z` = 0x5A) —
+  wrong ordering, no error. The quoted spelling makes the column accept exactly one byte-sequence per
+  instant, which is precisely the invariant ordering correctness rests on. **@architect's read is right;
+  keep the quoted form** and treat the brief's spelling as superseded.
+
+**❓→ [reviewer] the `ParseExact`-throws asymmetry. Your concern is real — I reproduced it — and there is
+a clean answer, which is containment at §5, not a change here.**
+
+Measured against the **real** `IdentityDbContext` and migration, corrupting only `alice`'s
+`Accounts.CreatedAt` to `'not-a-timestamp'` via raw SQL:
+
+| operation | result |
+|---|---|
+| `Accounts.SingleOrDefault(a => a.Username == "alice")` (corrupt row) | **throws** `FormatException: String 'not-a-timestamp' was not recognized as a valid DateTime.` |
+| same for `"bob"` (healthy row) | ok |
+| same for `"carol"` (no such user) | `null` |
+| **projection** `Select(a => new { a.Id, a.Username, a.PasswordHash, a.IsAdministrator })` for alice | **ok — returns the password hash** |
+| `Accounts.CountAsync()` / `AnyAsync(a => a.Username == "bob")` | ok |
+| `Accounts.ToListAsync()` (materialises every row) | **throws** |
+| **`Accounts.AnyAsync()`** (§3's empty-store check) | **ok — `true`** |
+
+So:
+
+1. **Your diagnosis is correct.** If §5 materialises the `Account` entity, login for that one user is a
+   500 while "wrong password" and "no such user" both return the uniform response — the blocker-1
+   differential-oracle shape, reached from the other side. Not hypothetical; that's the first row.
+2. **The answer you were looking for is a projection, and it's free.** The converter only runs for columns
+   actually materialised, so a §5 lookup that projects `(Id, Username, PasswordHash, IsAdministrator)` is
+   **immune by construction** — verified, it returns the hash off the corrupt row without touching
+   `CreatedAt`. And §5 has no business loading `CreatedAt`, `GitEmails` or `GitTokens` to check a password
+   anyway, so this is the shape it should have regardless. **This is an AD8 addendum, not an AD7 change:**
+   *§5's account lookup projects the columns it needs and never materialises the `Account` entity.*
+3. **The asymmetry is defensible as-is and I'd keep it.** The worker's reasoning is principled, not
+   accidental: `Verify` absorbs corruption because it is an authentication *decision* on attacker-supplied
+   input where every failure must look identical; `ParseExact` throws because a corrupt timestamp is a
+   data-integrity fault, and the alternative — absorbing or defaulting — fails **open** on `ExpiresAt` and
+   admits expired invitations, which is the entire reason AD7 exists. Same principle, opposite direction,
+   correctly applied. **Explicitly do not "fix" this with `TryParseExact` + a default**: that would trade a
+   narrow, corruption-only 500 for a silent wrong instant on the security boundary. Loud is right.
+4. **Good news worth stating: the invite-only invariant is not exposed.** §3's `Accounts.AnyAsync()`
+   doesn't materialise, so a corrupt row **cannot** make the store look empty and re-open the first-admin
+   bootstrap. That was the one place this hazard could have been a security problem rather than an
+   availability one, and it isn't.
+5. **One forward note for §7:** `ToListAsync()` over all accounts *does* throw, so a single corrupt row
+   poisons any admin/member list view. Project there too, or accept that a corrupt row breaks that page
+   loudly — which is arguably correct for an admin screen. §7's call, flagging so it isn't a surprise.
+6. Optional belt for §5, pairing with R5: have the uniform-failure path catch at the boundary and return
+   the same uniform failure it would for a wrong password, logging the distinction server-side. That
+   covers any future code path that does materialise an entity, without weakening `ExpiresAt`.
+
+**Other observations (non-blocking):**
+- `Iso8601UtcDateTimeOffsetConverter.cs:10-23` — the `<remarks>` explaining *why* UTC normalisation is the
+  point and naming `DateTimeOffsetToBinaryConverter` as the trap ("Do not swap this for it") is exactly
+  the right thing to leave behind. The measured failure is what makes that comment credible; keep it.
+- `FormattedLength` as a `public const` consumed by the context is better than the brief's literal `28`.
+- No `Max`/`Min` test, correctly — I verified both translate under a converter during the AD7 premise work,
+  and nothing calls them yet. Don't add speculative coverage.
+- `DateTimeOffset.MinValue`/`MaxValue` in T4 are safe: `UtcDateTime` cannot overflow for any constructible
+  `DateTimeOffset`, so the range test can't become flaky.
+
+**✅ SIGN-OFF — AD7 (§1 amendment: `DateTimeOffset` → fixed-width ISO-8601 UTC string) APPROVED.** All four
+gates green, one clean migration with Block 1's NOCASE collations intact, convention covers all seven
+columns including nullables, no entity/configuration/spec/`tasks.md` change, and the suite independently
+catches the fail-open it exists to prevent. Clear to commit. N1/N2 are two lines in the ordering test if
+you want them in this commit; the `ParseExact` hazard needs no change here — record the projection
+requirement as the AD8 addendum.
+
 ## 2. Password & token hashing
 
 _[architect] → @worker — **Block 2 = tasks 2.1–2.3.** Pure service layer over the Block 1 schema. No UI,
@@ -929,30 +1286,53 @@ change; still `Security/`, `Identity/`, `Program.cs` DI, two `PackageReference`s
   Argon2id 64 MiB/t=3/p=1 PHC-encoded, base64url 32-byte tokens hashed SHA-256 lowercase hex,
   `TimeProvider`-driven idempotent ownership-scoped revocation, `ListAsync` projecting so `TokenHash`
   never enters the SELECT list.
+- **AD7 (§1 amendment — `DateTimeOffset` storage)** ✅ committed by @architect — reviewer **signed off**,
+  all four gates verified independently before commit (build 0/0, **61/61**, `--strict` valid, format
+  clean, exactly one migration). Fixed-width ISO-8601 UTC text via `ConfigureConventions`, seven
+  timestamp columns retyped, Block 1's `NOCASE` collations intact, `ListAsync` ordering server-side.
+  Landed **before** Block 3 so §3's bootstrap is built against the final schema. 1.1–1.4 stayed ticked —
+  a correction within them, not new work.
 - **Block 3 (§3 — bootstrap)** is next: detect the empty store, one-time first-admin flow, inert
-  afterward. Independent of AD7 (no timestamp comparison) and of the open PO question, so it can proceed.
+  afterward. No open dependencies — AD7 has landed and the PO has closed the rate-limiting question.
   → @architect brief incoming.
 
 **Open items, tracked so they can't be lost:**
 
-- **AD7 — `DateTimeOffset` → fixed-width ISO-8601 UTC string** (`yyyy-MM-ddTHH:mm:ss.fffffffZ`,
-  `HasMaxLength(28)`, no `NOCASE`) via `ConfigureConventions` → `Properties<DateTimeOffset>()`, never
-  per-property; regenerate the single `InitialIdentitySchema`; drop `ListAsync`'s materialise-then-sort
-  and its `<remarks>`; land a test proving an expired invitation is excluded by a **server-side**
-  predicate. Premise verified empirically: `ORDER BY` and `>` both throw *loudly* (so option (a) could
-  not have failed open by accident — the Architect's original justification was wrong), but equality
-  *does* translate and is offset-sensitive, and the built-in `DateTimeOffsetToBinaryConverter` — the
-  one-liner a reasonable implementer reaches for — **silently admits an expired row**. Lands as a
-  **separate §1 unit, before Block 4**.
-- **AD8 (§5)** — equalise login work with a dummy-hash verify (a miss must cost the same ~93 ms as a
-  hit); required by the no-enumeration requirement, not optional hardening. **Extended by reviewer R5:**
-  §5 must also log the three-way distinction server-side — "no such username" / "stored hash unusable" /
-  "wrong password" — behind one uniform response, never logging the password or the hash. A corrupt
-  `PasswordHash` is now permanently silent to the operator, which is right for the client and unhelpful
-  for whoever debugs "alice can't log in".
+- **AD8 (§5)** — three binding parts now, all traceable to `specs/authentication/spec.md`'s existing
+  "without revealing whether the username exists", **not** to optional hardening:
+  1. **Equalise the work** — verify against a fixed dummy PHC hash when the username lookup misses, so a
+     miss costs the same ~93 ms as a hit. A uniform error string over a non-uniform response time does
+     not satisfy the requirement.
+  2. **Log the three-way distinction server-side** — "no such username" / "stored hash unusable" /
+     "wrong password" — behind one uniform response, never logging the password or the hash (reviewer
+     R5). A corrupt `PasswordHash` is otherwise permanently silent to whoever debugs "alice can't log
+     in".
+  3. **The §5 account lookup MUST project** — `Select(a => new { a.Id, a.Username, a.PasswordHash,
+     a.IsAdministrator })`, **not** materialise the `Account` entity (AD7 addendum, reviewer-verified).
+     Reason: AD7's converter runs only for materialised columns, so `SingleOrDefault(a => a.Username ==
+     …)` on a row with a corrupt timestamp **throws**, turning login for that one user into a 500 while
+     every other failure returns the uniform response — the same differential-oracle shape as Block 2's
+     blocker, reached from the other direction. A projecting lookup is **immune by construction**, and
+     §5 has no business loading `CreatedAt`/`GitEmails`/`GitTokens` to check a password. Measured: the
+     projection succeeds and returns the hash on the same corrupt row that makes entity materialisation
+     throw.
+- **§3 note (verified, no action):** the empty-store check must stay a non-materialising
+  `Accounts.AnyAsync()`. Confirmed a corrupt timestamp row **cannot** make the store look empty and
+  re-open the first-admin bootstrap — that would have been the serious form of the AD7 corruption
+  hazard. Don't refactor it into something that materialises accounts.
+- **§7 note:** a `ToListAsync()` over all accounts **does** throw if any single row has a corrupt
+  timestamp, so one bad row poisons an admin/member list view. Project there too.
 - **AD9** — whoever raises the Argon2 constants owes rehash-on-verify in the same change, or existing
   accounts stay at the old cost forever. The PHC encoding is what makes it possible; nothing to do now.
-- **Awaiting Product Owner:** login rate limiting / concurrency gate (reviewer A2 — login is an
-  unauthenticated 64 MiB / ~93 ms amplifier; a corrupt row could cost up to 5.0 s per R4). Not in any
-  spec or task, so it is a **scope call for the PO**, and explicitly *not* a reason to weaken the
-  parameters. Needed before **Block 5**; blocks nothing before then.
+- **✅ CLOSED — login rate limiting is OUT OF SCOPE for this change. Product Owner's decision
+  (2026-07-25).** Reviewer note A2 observed that §5's login is an unauthenticated 64 MiB / ~93 ms
+  amplifier (a corrupt row up to 5.0 s per R4) and wanted a rate limit or concurrency gate. It is in no
+  spec or task here, so it was the PO's scope call, and the PO declined it for this change. **Block 5
+  must not implement one** — no rate limiter, no concurrency gate, no throttling middleware.
+  Two things this ruling does *not* change: the Argon2 parameters stay at 64 MiB/t=3/p=1 (A2 was never
+  an argument to weaken them, and weakening them is not a substitute for the gate that isn't being
+  built), and **AD8 still stands in full** — dummy-hash timing uniformity and the three-way server-side
+  logging are required by `specs/authentication/spec.md`'s existing no-enumeration requirement, not
+  optional hardening, so they are unaffected by this decision. The hardening remains a legitimate
+  candidate for a **future change**; it is recorded here rather than dropped, and this DEVLOG archives
+  with the change.
