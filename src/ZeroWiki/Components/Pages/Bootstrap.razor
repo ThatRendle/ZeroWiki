@@ -1,0 +1,79 @@
+@page "/bootstrap"
+@using ZeroWiki.Identity
+@inject BootstrapService BootstrapService
+@inject NavigationManager Navigation
+
+<PageTitle>Create the first administrator</PageTitle>
+
+<h1>Create the first administrator</h1>
+
+<p>
+    This wiki is invite-only and has no accounts yet. Create the first administrator account;
+    everyone else joins by invitation from an existing member.
+</p>
+
+<EditForm Model="Input" FormName="bootstrap" OnValidSubmit="SubmitAsync">
+    <DataAnnotationsValidator />
+
+    <p>
+        <label>
+            Username
+            <InputText @bind-Value="Input.Username" autocomplete="username" />
+        </label>
+        <ValidationMessage For="() => Input.Username" />
+    </p>
+
+    <p>
+        <label>
+            Password
+            <InputText @bind-Value="Input.Password" type="password" autocomplete="new-password" />
+        </label>
+        <ValidationMessage For="() => Input.Password" />
+    </p>
+
+    <p>
+        <label>
+            Confirm password
+            <InputText @bind-Value="Input.ConfirmPassword" type="password" autocomplete="new-password" />
+        </label>
+        <ValidationMessage For="() => Input.ConfirmPassword" />
+    </p>
+
+    <button type="submit">Create administrator</button>
+</EditForm>
+
+@code {
+    // Two things are load-bearing here. No property initializer, because an initializer on a
+    // [SupplyParameterFromForm] property can be overwritten with null by a post (BL0008). And an
+    // explicit Name, because the posted field names are rendered from the expressions below
+    // ("Input.Username"), whereas the binder's prefix otherwise comes from the attributed
+    // property's own name — "PostedInput" — and nothing would bind at all.
+    [SupplyParameterFromForm(Name = nameof(Input))]
+    private BootstrapInput? PostedInput { get; set; }
+
+    /// <summary>Non-null view of the form state — a fresh instance on the first GET.</summary>
+    private BootstrapInput Input => PostedInput ??= new();
+
+    /// <summary>
+    /// Closes the page to anyone arriving once an account exists. A courtesy only — the guard
+    /// that counts is in <see cref="SubmitAsync"/>, since a hand-crafted POST never does this GET.
+    /// </summary>
+    protected override async Task OnInitializedAsync()
+    {
+        if (!await BootstrapService.IsAvailableAsync())
+        {
+            Navigation.NavigateTo("/", replace: true);
+        }
+    }
+
+    private async Task SubmitAsync()
+    {
+        // Independently re-checked inside the service, under the store's write lock, so this
+        // decision cannot be raced or reached by skipping the GET above.
+        var outcome = await BootstrapService.CreateFirstAdministratorAsync(Input.Username, Input.Password);
+
+        Navigation.NavigateTo(
+            outcome == BootstrapOutcome.Created ? "/bootstrap/complete" : "/",
+            replace: true);
+    }
+}

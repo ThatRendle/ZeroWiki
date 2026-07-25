@@ -13,9 +13,9 @@
 
 ## 3. Bootstrap
 
-- [ ] 3.1 Detect the empty-store condition (no accounts) on startup
+- [x] 3.1 Detect the empty-store condition (no accounts) on startup
 - [ ] 3.2 Present a one-time bootstrap flow to create the first administrator account
-- [ ] 3.3 Make the bootstrap path inert once any account exists
+- [x] 3.3 Make the bootstrap path inert once any account exists
 
 ## 4. Invitations
 

@@ -12,10 +12,12 @@ builder.Services.AddSingleton(TimeProvider.System);
 builder.Services.AddSingleton<IPasswordHasher, Argon2idPasswordHasher>();
 builder.Services.AddSingleton<ISecretTokenGenerator, SecretTokenGenerator>();
 builder.Services.AddScoped<GitTokenService>();
+builder.Services.AddScoped<BootstrapService>();
 
 var app = builder.Build();
 
 await app.MigrateIdentityDbAsync();
+await app.LogBootstrapStateAsync();
 
 // Configure the HTTP request pipeline.
 if (!app.Environment.IsDevelopment())
@@ -33,3 +35,10 @@ app.MapStaticAssets();
 app.MapRazorComponents<App>();
 
 app.Run();
+
+/// <summary>
+/// Named so the integration tests can boot this application through
+/// <c>WebApplicationFactory&lt;Program&gt;</c>. Top-level statements otherwise generate an
+/// internal entry-point class the test project cannot name.
+/// </summary>
+public partial class Program;

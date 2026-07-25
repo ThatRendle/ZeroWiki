@@ -1275,6 +1275,1360 @@ R6 theory cases). `openspec validate invite-only-authentication --strict` — va
 `dotnet format --verify-no-changes` — clean (exit 0). No schema, entity, configuration, or migration
 change; still `Security/`, `Identity/`, `Program.cs` DI, two `PackageReference`s, and the three test files.
 
+## 3. Bootstrap
+
+_[architect] → @worker — **Block 3 = tasks 3.1–3.3.** The first UI in this change: a Static SSR page with
+a form POST. Built against the AD7 schema, which has landed (`71fb453`)._
+
+**Tasks in scope**
+
+- `3.1` Detect the empty-store condition (no accounts) on startup.
+- `3.2` Present a one-time bootstrap flow to create the first administrator account.
+- `3.3` Make the bootstrap path inert once any account exists.
+
+**Binding spec (verbatim, `specs/user-accounts/spec.md`)**
+
+> ### Requirement: First-administrator bootstrap
+> The system SHALL provide a way to create the first administrator account when no accounts exist, so
+> that the initial member can invite others. Once any account exists, the bootstrap path SHALL NOT create
+> additional accounts.
+>
+> #### Scenario: Bootstrap on empty deployment
+> - **WHEN** the system starts with no accounts and the bootstrap step is completed
+> - **THEN** exactly one administrator account exists
+>
+> #### Scenario: Bootstrap disabled once populated
+> - **WHEN** at least one account already exists
+> - **THEN** the bootstrap path does not create a new account
+
+Design **D2**: the one-time bootstrap resolves the chicken-and-egg (invites require an inviter) "without
+leaving a permanent privileged backdoor". **AD6**: administrator = `IsAdministrator = true`.
+
+**Binding decisions**
+
+- **B1 — "exactly one" is a concurrency requirement, and it is the hard part of this block.** Two
+  simultaneous POSTs to the bootstrap form must not both create an administrator. A read-then-write
+  (`AnyAsync` → `Add` → `SaveChanges`) is **not** sufficient: SQLite's default deferred transaction takes
+  no write lock on the read, so both requests can observe an empty store and both inserts then succeed —
+  two admins, spec violated. **Do the check and the insert inside a single transaction that takes the
+  write lock before the check** (`BEGIN IMMEDIATE` semantics — on Microsoft.Data.Sqlite,
+  `BeginTransaction(deferred: false)`; verify how to reach that through EF Core rather than assuming
+  `BeginTransactionAsync()` gives it to you). **Prove it with a test that runs concurrent bootstrap
+  attempts and asserts exactly one account exists** — not a test that runs the happy path twice in
+  sequence. If you conclude this genuinely cannot be done without a schema change (e.g. a single-row gate
+  table), **stop and tell me** — that would be another §1 unit and my call, not yours to absorb.
+- **B2 — the gate is a live check, never the startup result.** 3.1 says "on startup", and that is for
+  first-run signalling/logging only. The **inertness gate in 3.3 must re-evaluate per request**: an
+  account created at 10:00 must make the bootstrap path inert immediately, with no restart. Caching the
+  startup answer in a singleton and gating on it would leave a **permanent privileged backdoor open for
+  the life of the process** — exactly what D2 forbids. This is the most dangerous mistake available in
+  this block.
+- **B3 — inert means inert on both verbs.** The GET must not render the form when any account exists
+  (redirect away), **and** the POST must independently refuse. The POST check is the one that matters,
+  since the GET check is only a UX nicety and a hand-crafted POST skips it. Don't let the redirect stand
+  in for the guard.
+- **B4 — keep `AnyAsync()` non-materialising** (§3 note from the AD7 audit, reviewer-verified). A corrupt
+  timestamp column must not be able to make the store look empty and re-open the bootstrap. Do not
+  refactor the emptiness check into anything that materialises `Account` entities.
+- **B5 — the bootstrap page must be reachable anonymously.** No account exists, so nobody can log in.
+  §6 adds the global anonymous denial; note in your handoff that bootstrap needs exemption there, so §6
+  doesn't lock the first run out.
+- **B6 — Static SSR, form POST, antiforgery.** No interactive render mode (AD1) — `Program.cs` registers
+  none and it stays that way. `app.UseAntiforgery()` is already wired (`Program.cs:30`); use the framework
+  form handling so the antiforgery token is validated. No JS.
+- **B7 — input validation stays minimal and deliberate.** Require a non-empty username, a non-empty
+  password, and a confirm-password match; trim the username; apply sane max lengths. **Do not invent a
+  password complexity policy** — none is specified and inventing one is a product decision. If you think
+  one is needed, say so in your handoff and I'll put it to the Product Owner.
+- **B8 — the password goes through `IPasswordHasher.Hash`** (Block 2). Never store or log the plaintext,
+  and don't reimplement hashing. Note `Hash` throws on an empty password by design — B7's validation is
+  what keeps that unreachable from the UI.
+- **B9 — after success, redirect to a confirmation state** ("administrator account created, you can now
+  sign in"). Do **not** redirect to `/login` — §5 hasn't built it and a 404 on success is a bad first-run
+  experience. §5 will retarget this. Do **not** auto-login; sessions are §5's job.
+
+**Out of scope:** login, sessions, cookie auth (§5); the anonymous home page and global access control
+(§6); invitations (§4); the git-token UI (§7). Don't stub them.
+
+**Tests:** both spec scenarios, plus the concurrency proof from B1 and a per-request-gate proof for B2
+(bootstrap inert *without a restart* once an account appears). Reuse the in-memory SQLite +
+real-`Migrate()` pattern. §9's scenario tests come later; this is the unit/integration layer.
+
+**Human-in-the-loop — this block cannot fully self-verify.** Checking the first-run bootstrap UX in a real
+browser is explicitly a Product-Owner verification step in this repo's workflow, so **3.2 will not be
+ticked on automated gates alone.** Implement and self-test as far as you can, then include in your handoff
+a **precise, copy-pasteable verification script for the Product Owner**: the exact commands to start from
+an empty store, the URL to visit, what to enter, what they should see on success, and how to confirm the
+path is then inert (including what a second visit does). Assume they will paste it verbatim.
+
+**Gates:** the usual four. Then → @reviewer.
+
+[worker] Block 3.1–3.3 implemented. Summary:
+
+- **`Identity/BootstrapService.cs`** — `IsAvailableAsync` (the live gate) and
+  `CreateFirstAdministratorAsync` → `BootstrapOutcome.Created` / `AlreadyBootstrapped`
+  (`Identity/BootstrapOutcome.cs`). Password via `IPasswordHasher.Hash` (B8), `CreatedAt` from
+  `TimeProvider`, `IsAdministrator = true` (AD6), username trimmed (B7).
+- **B1 — write lock taken before the check.** Verified the API rather than assuming it:
+  `SqliteConnection` on Microsoft.Data.Sqlite 10.0.10 exposes `BeginTransaction(bool deferred)` and
+  `BeginTransaction(IsolationLevel, bool deferred)` — **no async overload takes `deferred`**, so EF's
+  `BeginTransactionAsync()` cannot give us `BEGIN IMMEDIATE`. Implementation opens the context's own
+  connection, `BeginTransaction(deferred: false)`, enlists via `Database.UseTransactionAsync`, then does
+  `AnyAsync` → `Add` → `SaveChangesAsync` → commit inside it.
+- **Hashing happens *before* the lock is taken.** Argon2id is ~100 ms; holding the store's single write
+  lock across that would serialise every other writer behind a CPU burn. Costs a wasted hash on the
+  refusal path, which is fine (and incidentally uniform in time).
+- **B2 — gate is a live per-call check.** `IsAvailableAsync` is `!await db.Accounts.AnyAsync(ct)` with no
+  field, no memo, no static. Startup detection (3.1) lives in `Identity/BootstrapStartupExtensions.cs`
+  and **logs the answer and discards it** — the doc comment says so explicitly, so nobody later "optimises"
+  it into a cached gate.
+- **B4** — the check stays `AnyAsync` (`SELECT EXISTS(SELECT 1 …)`, no column materialised).
+- **B3 — inert on both verbs.** GET redirects to `/` via `OnInitializedAsync`; the POST is guarded
+  independently inside the service under the write lock. Verified against a real hand-crafted POST (below).
+- **B6 — Static SSR, framework form handling.** `Components/Pages/Bootstrap.razor` (`EditForm` +
+  `FormName="bootstrap"` + `[SupplyParameterFromForm]` + `DataAnnotationsValidator`), no interactive render
+  mode, no JS; antiforgery validated by the existing `app.UseAntiforgery()`. Confirmed the rendered form
+  carries `__RequestVerificationToken` and `_handler`.
+- **B9** — success redirects to `/bootstrap/complete` (`Components/Pages/BootstrapComplete.razor`), which
+  says the account exists and that signing in comes later. No auto-login. Refusal redirects to `/`.
+- **B7** — `Components/Pages/BootstrapInput.cs`: required username (≤64, matching the column),
+  required password (≤256), `[Compare]` confirmation. **No complexity policy invented** — see the question
+  at the end.
+
+**Proof for B1 — measured against three implementations, not argued.** Ran
+`Concurrent_bootstrap_attempts_create_exactly_one_administrator` (8 attempts, each with its **own
+`DbContext` and connection**, released together off a `TaskCompletionSource`, on a **file-backed** temp
+database — the shared in-memory pattern is a single connection and cannot show this race at all):
+
+| Implementation | Result |
+|---|---|
+| no transaction (`AnyAsync` → `Add` → `SaveChanges`) | **8 of 8 `Created` — eight administrators.** Reproduced on 3 of 3 runs |
+| `BeginTransaction(deferred: true)` | **`SQLite Error 5: 'database is locked'`** after the 30 s busy timeout, on 3 of 3 runs |
+| `BeginTransaction(deferred: false)` (shipped) | **exactly 1 `Created`, 7 `AlreadyBootstrapped`**, one row, `IsAdministrator = 1` |
+
+Two notes on that table. The naive version is exactly as bad as B1 predicted — silently, eight times over.
+The *deferred* version does **not** produce two admins on this platform: each deferred transaction holds a
+shared read lock from its `AnyAsync`, so neither can upgrade to a write lock and they deadlock until the
+busy timeout. So B1's conclusion is confirmed while its stated mechanism differs slightly — deferred fails
+loudly (a 30 s hang then a 500) rather than over-creating. Either way it is unusable, and
+`BEGIN IMMEDIATE` is the fix. Flagging because the brief's wording implies deferred over-creates.
+
+**Proof for B2** — `Gate_closes_the_moment_an_account_appears_without_a_restart` asserts one *service
+instance* answers `true`, then `false` after an account appears, then `true` again after it is deleted.
+Mutation-checked: adding `_cached ??=` to `IsAvailableAsync` fails **exactly that test** and nothing else,
+so it is the test that carries B2.
+
+**Live smoke test — and it caught a bug no unit test could.** Ran the real app on an empty store and drove
+the form with `curl`:
+- startup logged `The identity store has no accounts. Visit /bootstrap …` (3.1 ✅);
+- POST → **302 → `/bootstrap/complete`**, one row: `admin` (trimmed from `"  admin  "`),
+  `IsAdministrator = 1`, `CreatedAt = 2026-07-25T15:23:07.0226560Z` (AD7 form),
+  `PasswordHash` starting `$argon2id$v=19$m=65536,t=3,p=1$` (Block 2 parameters);
+- **GET `/bootstrap` with no restart → 302 → `/`** (B2 + B3 GET);
+- **hand-crafted POST reusing an earlier antiforgery token, skipping the GET entirely → 302 → `/`, and the
+  store still holds exactly one account** (B3 POST, the guard that counts).
+
+The bug: my first attempt satisfied analyzer BL0008 by renaming the markup-facing accessor to `Model`,
+which silently broke binding — Blazor renders field names from the `@bind-Value` **expression**
+(`Model.Username`) while the binder's prefix comes from the **attributed property's name**. The POST
+arrived with every field empty and re-rendered the form with "Enter a username." Fixed with
+`[SupplyParameterFromForm(Name = "Input")]` on a `PostedInput` backing property plus an `Input` accessor,
+so rendered names and binder prefix agree; commented in place. **Unit tests could never have caught this**
+— they call the service directly. Worth remembering for §4/§5's forms.
+
+**Judgement calls:**
+
+- **`DisplayName` defaults to the trimmed username.** The form asks only for username/password/confirm per
+  B7, but `Account.DisplayName` is required. Adding a fourth field is a product decision I didn't want to
+  make; there is no page in this change for editing it afterwards (§7.2 is git emails only). Say if the
+  bootstrap form should collect it.
+- **Refusal redirects to `/`, same as the GET.** No error page: telling an attacker "bootstrap already
+  used" is information they can have, but a bare redirect is simpler and §5 will retarget both.
+- **The concurrency test uses a stub `IPasswordHasher`.** Deliberate: real Argon2id would add ~100 ms of
+  CPU before the lock on each of 8 tasks (and ~512 MiB), *widening* the window and making the race
+  looser. The stub makes all 8 hit `BEGIN IMMEDIATE` at effectively the same instant, which is the
+  sharper test. Argon2id is covered by `Created_administrator_can_be_verified_with_the_submitted_password`
+  in the other file, and end-to-end by the live smoke test above.
+- **`?? throw` on `UseTransactionAsync`.** It returns `IDbContextTransaction?` and is only null when null
+  is passed, so this is an assertion rather than a reachable branch. The alternative was `!`.
+- **Committing through EF's wrapper, not the raw `SqliteTransaction`.** Found by test: committing the raw
+  transaction leaves the context still associated with it, and the *next* query on that context throws
+  "The transaction object is not associated with the same connection object as this command."
+
+**Two things for §6, so the first run doesn't get locked out:**
+1. **B5 — `/bootstrap` and `/bootstrap/complete` must be exempt** from §6's global anonymous denial. Nobody
+   can log in before an account exists, so gating them would make first run impossible.
+2. **Non-blocking observation:** because the template sets `BlazorDisableThrowNavigationException=true`
+   (`ZeroWiki.csproj:7`), `NavigateTo` does not abort rendering, so the inert GET still renders the form
+   into the body of its own 302. Browsers never show it and it contains nothing secret (labels plus the
+   visitor's own antiforgery token), so I have not changed it — flipping that property is a template-wide
+   behaviour change beyond this block. Flagging in case §6 would rather have redirects abort rendering.
+
+**Gates:** `dotnet build` — 0 Warnings, 0 Errors. `dotnet test` — **73/73 passed** (61 + 12 new).
+`openspec validate invite-only-authentication --strict` — valid. `dotnet format --verify-no-changes` —
+clean (exit 0). Smoke-test artifacts (`src/ZeroWiki/App_Data/`) removed; it is gitignored regardless.
+
+❓ **@architect — password policy.** B7 says don't invent one and I haven't. My recommendation: **still
+don't**, but not because it doesn't matter — because the useful control here is a *minimum length*, and
+picking the number is a product call. Concretely, nothing today stops the first administrator's password
+being `a`: Argon2id at 64 MiB makes offline cracking expensive, but a one-character password is guessable
+online in a handful of requests, and the PO has ruled login rate limiting out of scope for this change, so
+there is no compensating control. That combination is worth one sentence from the Product Owner — a single
+`[MinLength(n)]` on `BootstrapInput.Password` (and later on invitation redemption) is a one-line change if
+they want it. I'd propose 12 characters if they have no preference. Not blocking; the block is complete
+either way.
+
+**3.2 needs human confirmation — Product Owner verification recipe.** Everything above is automated or
+`curl`-driven; the brief requires a real browser for the first-run UX. Copy-pasteable:
+
+```bash
+# 1. Start from a genuinely empty store (the file is gitignored; deleting it loses nothing else)
+cd /Users/rendle/github/emmz/ZeroWiki
+rm -rf src/ZeroWiki/App_Data
+
+# 2. Run the app
+dotnet run --project src/ZeroWiki
+```
+
+Then, in a browser:
+
+1. **Watch the console as it starts.** It must log, as a warning:
+   `The identity store has no accounts. Visit /bootstrap to create the first administrator account.`
+2. Open **<https://localhost:7070/bootstrap>** (or <http://localhost:5171/bootstrap> if you'd rather skip
+   the dev certificate). You should see the heading **"Create the first administrator"**, the explanation
+   that the wiki is invite-only with no accounts yet, and three fields: Username, Password, Confirm
+   password.
+3. **Check the validation first:** press **Create administrator** with everything blank. The page should
+   come back with *Enter a username.*, *Enter a password.*, *Confirm the password.* — and no account is
+   created. Then type mismatched passwords and submit: *The passwords do not match.*
+4. Now enter a username (e.g. `admin`) and the same password in both fields, and press **Create
+   administrator**. The URL should become **`/bootstrap/complete`** and the page should read
+   **"Administrator account created"**, noting that revisiting `/bootstrap` will not create another
+   account and that signing in does not exist yet.
+5. **Confirm it is now inert — without restarting the app.** In the same browser, go back to
+   **`/bootstrap`**. You should be redirected to the home page (`/`) and **must not** see the form again.
+   Press the browser's back button and try to re-submit as well; still no second account.
+6. **Confirm exactly one account exists:**
+   ```bash
+   sqlite3 src/ZeroWiki/App_Data/identity.db \
+     "SELECT COUNT(*) AS accounts, group_concat(Username) AS usernames, group_concat(IsAdministrator) FROM Accounts;"
+   ```
+   Expected: `1|admin|1` — one account, your username, administrator. The `PasswordHash` column should
+   start `$argon2id$v=19$m=65536,t=3,p=1$` and contain nothing resembling your password:
+   ```bash
+   sqlite3 src/ZeroWiki/App_Data/identity.db "SELECT substr(PasswordHash,1,34) FROM Accounts;"
+   ```
+7. **Optional — confirm restart doesn't reopen it.** Stop the app (Ctrl+C) and `dotnet run` again. The
+   startup log should now say `…already has at least one account; the first-administrator bootstrap path
+   is inert.` and `/bootstrap` should still redirect to `/`.
+
+If step 5 ever shows the form again, or step 6 shows more than one account, that is a failure — stop and
+say so rather than working around it.
+
+→ @reviewer
+
+[reviewer] Block 3.1–3.3 audited. Verdict: **Request changes** — **one** blocking finding, and it is not
+about any of B1/B2/B3, all three of which I reproduced by mutation and confirmed correct. Gates re-run
+independently: `dotnet build` **0 warn / 0 err**, `dotnet test` **73/73**, `openspec validate
+invite-only-authentication --strict` **valid**, `dotnet format --verify-no-changes` **exit 0**.
+
+**Scope confirmed.** Tracked diff vs `71fb453` is `Program.cs` (+2: the `BootstrapService` registration
+and the startup log call) plus the six new source/test files and this DEVLOG. `tasks.md` and
+`openspec/specs/` are untouched. No login, no session, no cookie auth, no invitation, no git-token UI,
+no anonymous-denial middleware — not even a stub. Nothing reaches outside §3.
+
+---
+
+**BLOCKING**
+
+**BL1 — the refusal path burns a full 64 MiB Argon2id hash on an anonymous, permanently-reachable
+endpoint. `BootstrapService.cs:58` vs `:68`/`:79`.**
+
+Hashing outside the write lock is right, and I'd have blocked the reverse. But "outside the lock" got
+conflated with "before the check": the *only* emptiness check is the one at `:79`, inside the lock, so a
+POST to `/bootstrap` on a fully-bootstrapped deployment derives a 64 MiB / t=3 Argon2id hash and then
+throws it away.
+
+Measured against the real app on a populated store (5 sequential refused POSTs vs 5 control `GET /`):
+
+| request | wall time |
+|---|---|
+| refused `POST /bootstrap` | **0.25, 0.25, 0.25, 0.26, 0.24 s** |
+| control `GET /` | 0.00 s ×5 |
+
+That is ~4 requests/second to saturate a core and 64 MiB of allocation per concurrent request, from an
+unauthenticated route — and **B5 requires §6 to keep `/bootstrap` exempt from the global anonymous
+denial**, so this endpoint stays anonymous for the life of every deployment, long after bootstrap is
+over. This is not the A2/rate-limiting bucket the PO closed: nothing is being *added*. Login has to hash
+to do its job; the bootstrap refusal path has to hash to do nothing.
+
+Fix is a cheap advisory pre-filter, with the authoritative check unmoved:
+
+```csharp
+// Cheap pre-filter. The authoritative check is the one under the write lock below; this only
+// avoids deriving a 64 MiB hash for a request already known to be refused.
+if (await db.Accounts.AnyAsync(cancellationToken)) { return BootstrapOutcome.AlreadyBootstrapped; }
+
+var passwordHash = passwordHasher.Hash(password);
+// … BeginTransaction(deferred: false) → AnyAsync → Add → SaveChanges → Commit, unchanged
+```
+
+I verified this does not weaken B1: mutant **B** below moves the check before the lock *instead of*
+keeping it under the lock, and the concurrency test catches that immediately (8 admins). Adding the
+check while keeping the one at `:79` leaves that test green — all 8 attempts pass the pre-filter on an
+empty store and still serialise on `BEGIN IMMEDIATE`.
+
+On the "incidentally uniform in time" justification in your handoff: it buys nothing here. Whether
+bootstrap is open is already public — the GET answers `302 →/` vs `200`, and the POST answers
+`302 →/` vs `302 →/bootstrap/complete`. There is no oracle to protect, so the uniformity is paying
+250 ms for nothing.
+
+@architect — if you read this as the same bucket as the closed A2 ruling, overrule me and I'll re-audit
+as a nit. I don't think it is, and I'd rather not ship a permanent anonymous amplifier that §4 and §5
+can then copy.
+
+---
+
+**The three priority hazards — all verified by mutation, not by reading**
+
+I rebuilt the tree in a scratch copy and ran seven mutants through the full suite and, where a unit test
+could not see the difference, through real HTTP against the running app.
+
+### B1 — "exactly one administrator" ✅ correct, and the ordering is load-bearing *and* tested
+
+Your API claim is right, verified by reflection on `Microsoft.Data.Sqlite` 10.0.10 rather than taken on
+trust. `SqliteConnection` exposes `BeginTransaction(bool deferred)` and
+`BeginTransaction(IsolationLevel, bool deferred)`; the only async forms are
+`BeginTransactionAsync(CancellationToken)` and `BeginTransactionAsync(IsolationLevel, CancellationToken)`
+— **no `Begin*Async` overload takes a `bool` at all**, and `DatabaseFacade` exposes only
+`BeginTransactionAsync(CancellationToken)`. So `BEGIN IMMEDIATE` genuinely is unreachable through the
+async surface, and dropping to the raw `SqliteConnection` is not a shortcut, it is the only route.
+
+I also probed the lock semantics directly, two connections, file-backed, 1 s busy timeout: with
+`deferred: true`, a read inside A's transaction leaves a second writer free to proceed; with
+`deferred: false`, the second writer is refused with `SQLite Error 5: 'database is locked'`. The write
+lock is taken up front, as claimed.
+
+**The shipped code takes the lock before the check** — `BeginTransaction(deferred: false)` at `:68`,
+`AnyAsync` at `:79` — and the test suite proves that ordering is not incidental:
+
+| mutant | `Concurrent_bootstrap_attempts_create_exactly_one_administrator` |
+|---|---|
+| shipped (`deferred: false`, check under the lock) | **pass** |
+| **B — check moved *before* `BeginTransaction`** (lock still taken) | **FAIL — expected 1, actual 8** |
+| C — no transaction at all | **FAIL — expected 1, actual 8** |
+| D — `deferred: true` | **FAIL — `SqliteException: SQLite Error 5: 'database is locked'` after 30 s** |
+
+Your table reproduces exactly, and mutant **B** is the one that matters most: it is the plausible
+"tidy-up" a future hand makes (hoist the check out of the transaction), it keeps the transaction, and the
+test still catches it. That is the strongest result in this block.
+
+Your correction to B1's stated mechanism is right and my probe explains why both are true: with **no**
+transaction each insert is its own autocommit unit, reads and writes never overlap, and you get eight
+admins; with a **deferred** transaction spanning read+write, every attempt holds SHARED and none can
+upgrade to EXCLUSIVE, so it deadlocks to `SQLITE_BUSY` instead. Different failure, same verdict.
+
+**Refusal under contention is a refusal, not an exception** — confirmed: 1 `Created`, 7
+`AlreadyBootstrapped`, no exception escapes. And the rollback path is safe to reuse the context after:
+`Second_bootstrap_attempt_after_a_successful_one_is_refused` and `Bootstrap_creates_no_account_once_one
+_already_exists` both query the same context *after* a refusal has disposed (and thus rolled back) the
+transaction, which is exactly the disposed-transaction trap your judgement call describes. Double
+disposal (EF wrapper then the outer `await using var writeLock`) is idempotent and covered by those
+tests.
+
+### B2 — the gate is live, and nothing anywhere reintroduces staleness ✅
+
+Your mutation claim reproduces **exactly**: `_cached ??=` in `IsAvailableAsync` fails
+`Gate_closes_the_moment_an_account_appears_without_a_restart` and **nothing else** — 1 failed, 72 passed.
+That test carries B2 on its own.
+
+I then swept the whole path for the staleness vectors the brief named, because the unit test only covers
+the service:
+
+- `BootstrapService` is registered **`AddScoped`** (`Program.cs:15`), not singleton — a singleton would
+  in any case fail at startup on the scoped `IdentityDbContext` capture.
+- `BootstrapService.cs:31-32` — no field, no memo, no static, no `Lazy`, no captured `bool`.
+- `BootstrapStartupExtensions.cs:16-33` — static, no state; the answer is logged and dropped, and the
+  `<remarks>` at `:9-14` says so. Nothing reads it.
+- `Bootstrap.razor:61-67` — the component is instantiated per request under Static SSR; it holds form
+  state only, never an availability snapshot.
+- No output-caching or response-caching middleware is registered, so no cached 200 of the form page.
+  A browser could still heuristically cache its own earlier GET — harmless precisely because the POST
+  guard is authoritative, which is the point of B3.
+
+Live confirmation, no restart: create the admin, then `GET /bootstrap` → **302 → `/`** on the same
+running process.
+
+### B3 — the POST guard holds with the GET check deleted ✅
+
+The decisive test, since in the shipped code `OnInitializedAsync` runs on the POST request too, so your
+hand-crafted-POST evidence cannot by itself separate the two guards. I deleted `OnInitializedAsync`
+entirely (mutant **E**) and drove the real app:
+
+| | shipped | mutant E (no GET check) |
+|---|---|---|
+| `GET /bootstrap`, store populated | 302 → `/` | 200, form rendered |
+| `POST /bootstrap`, store populated | 302 → `/`, **1 account** | 302 → `/`, **1 account, still `admin`** |
+
+The POST refuses on the service guard alone. B3 satisfied: the redirect is a courtesy, exactly as the
+comment at `Bootstrap.razor:57-60` claims.
+
+---
+
+**The other binding decisions**
+
+- **B4 ✅** — `BootstrapService.cs:32` and `:79` are both `AnyAsync`, no materialisation, and the
+  `<remarks>` at `:25-30` records why. This is the §3 note from the AD7 audit honoured properly: a
+  corrupt timestamp row cannot make the store look empty and re-open bootstrap.
+- **B6 ✅, and antiforgery is genuinely *validated*, not merely rendered.** `grep` for
+  `InteractiveServer|InteractiveWebAssembly|InteractiveAuto|AddInteractive|@rendermode|RenderMode`
+  across `src/` and `tests/` returns **nothing at all** — not even the template `@using static` line.
+  `Program.cs:9` is a bare `AddRazorComponents()` and `:35` a bare `MapRazorComponents<App>()`. Your
+  handoff confirmed the token is *present in the markup*, which is not the same claim, so I tested the
+  negative: **`POST /bootstrap` with all three fields and `_handler`, but no `__RequestVerificationToken`
+  → `400`, 0 accounts.** No JS anywhere.
+- **B7 ✅** — `BootstrapInput.cs:13-23`. `StringLength(64)` matches `AccountConfiguration`'s
+  `HasMaxLength(64)` on `Username`; `DisplayName`'s column is 128 so the defaulted value always fits.
+  Your comment at `:12` is accurate — `RequiredAttribute` does `Trim()` before the emptiness test, so
+  `"   "` fails, which the `[InlineData("   ")]` case also pins at the service layer. And the password
+  is correctly **not** trimmed anywhere; only the username is.
+- **B8 ✅** — measured on the live row: `PasswordHash` starts `$argon2id$v=19$m=65536,t=3,p=1$` (Block 2
+  parameters), `SELECT … WHERE (Id||Username||DisplayName||PasswordHash||CreatedAt) LIKE '%passphrase%'`
+  returns **0**, and the plaintext appears **0** times in the whole server log. `IsAdministrator = 1`
+  (AD6), `CreatedAt = 2026-07-25T15:34:03.6519750Z` — AD7's fixed-width form.
+- **B9 ✅** — 302 → `/bootstrap/complete`, no auth cookie in the response, no session code anywhere.
+- **B5** — handoff note present and correct; recorded for §6 below.
+
+---
+
+**The form-binding item — (a) the fix, (b) the guard**
+
+**(a) The fix is correct, and the shape is justified — I checked the "simpler" alternative rather than
+assuming.** BL0008 is real on this SDK and fires exactly as you describe: rebuilding the page in the
+official ASP.NET Core Identity shape (`[SupplyParameterFromForm] private BootstrapInput Input { get; set;
+} = new();`) produces
+
+> `warning BL0008: Property 'ZeroWiki.Components.Pages.Bootstrap.Input' has [SupplyParameterFromForm] and
+> a property initializer. This can be overwritten with null during form posts.`
+
+— 1 warning, against a 0-warning gate. So the two-member shape is not over-engineering, it is the price
+of the analyzer. (For the record that shape *works*, because there the attributed property is itself
+named `Input`; the bug only appears once the two names diverge.)
+
+I reproduced the actual bug to confirm the diagnosis is the right one (mutant **F**, `Name` removed):
+rendered field names stay `Input.Username` / `Input.Password` / `Input.ConfirmPassword` in **both**
+variants, and the POST comes back **200 with "Enter a username. / Enter a password. / Confirm the
+password."** and **0 accounts**. Render names from the expression, binder prefix from the attributed
+property — exactly your account of it.
+
+**No residual mismatch for this form.** The one soft spot is that `Name = "Input"` and the accessor
+`Input` are coupled by a string the compiler does not check. Two shapes that would bite differently:
+a page with two `[SupplyParameterFromForm]` models needs a distinct `Name` per accessor, and any rename
+of `Input` silently desynchronises. Cheap fix, nit N2 below: **`Name = nameof(Input)`**.
+
+**(b) Yes — a test-level guard is worth adding, and here is the measurement that settles it.** Under
+mutant F the form is completely non-functional over HTTP and **the unit suite passes 73/73**. A silently
+empty post returning 200 is invisible to every test in this repo, and §4, §5 and §7 each add more Static
+SSR forms to the same trap.
+
+The guard is one `WebApplicationFactory<Program>` test: GET the page, scrape `__RequestVerificationToken`
+and `_handler` out of the markup, POST the form, assert `302 → /bootstrap/complete` and one account. That
+single test kills mutant F, kills the missing-antiforgery case, kills a `FormName`/`_handler` regression,
+and kills an accidental interactive render mode — and the scraping harness is reusable by §4/§5/§7
+verbatim. It needs `Microsoft.AspNetCore.Mvc.Testing` and `Program` made visible to the test project.
+
+**@architect — this is your call, not the worker's.** It is arguably §9's scenario layer, but §9 lands
+*after* three more forms have been written against the trap, so a small harness unit now (the way AD7 was
+slotted in ahead of §3) buys more than the same work later. I am not blocking on it.
+
+---
+
+**Nits (non-blocking)**
+
+- **N1 — `[SupplyParameterFromForm(Name = "Input")]` → `Name = nameof(Input)`** (`Bootstrap.razor:51`).
+  Same value, but a rename of the accessor now updates it, so the binder prefix cannot silently drift
+  from the rendered field names again. One token; the explanatory comment above it stays worth keeping.
+- **N2 — `/bootstrap/complete` states something untrue before bootstrap** (`BootstrapComplete.razor:8`).
+  Measured: it returns **200 to anyone at any time**, including on an empty store, asserting "The first
+  administrator account now exists". Harmless, but it is a page §6 must exempt (B5) that renders
+  unconditionally. Consider redirecting to `/bootstrap` when `IsAvailableAsync()` is still true, so the
+  exempted pair is self-consistent.
+- **N3 — open the connection through EF** (`BootstrapService.cs:60-64`). `connection.OpenAsync()` on the
+  raw `DbConnection` bypasses `RelationalConnection`'s open-count bookkeeping;
+  `db.Database.OpenConnectionAsync(cancellationToken)` is the supported form and keeps EF's accounting
+  straight. No observable defect today — the context owns and disposes the connection at end of scope —
+  but the cast at `:60` plus the manual open is the kind of thing that stops being harmless the moment a
+  connection is shared.
+- **N4 — password minimum length (your ❓, as a nit per @architect).** I agree with your recommendation
+  and would push for it: with rate limiting ruled out, the *first administrator* — the highest-privilege
+  account in the system, and the only one created before any policy exists — can currently have a
+  one-character password. **12 is a reasonable floor**; 8 is the NIST SP 800-63B minimum and I would not
+  go below it. A single `[MinLength(12)]` on `BootstrapInput.Password`, mirrored on §4's redemption form.
+  Product Owner's number, not mine.
+- **N5 — the concurrency test's stub hasher is sound, confirmed.** Real Argon2id would put ~100 ms and
+  64 MiB *ahead* of the lock on each of 8 tasks, spreading their arrival at `BEGIN IMMEDIATE` and making
+  the race looser, not tighter — plus ~512 MiB peak in a test process. The stub is the sharper test and
+  the real hasher is covered by `Created_administrator_can_be_verified_with_the_submitted_password` and
+  by the live run. Keep it. (It is also what keeps mutants B/C failing in under a second rather than
+  minutes.)
+- **N6 — your other judgement calls, all accepted.** `DisplayName` defaulting to the trimmed username is
+  right for this block — a fourth field is a product decision and there is no edit page until §7 anyway;
+  say so to the PO and move on. Refusal redirecting to `/` is fine and §5 retargets both. `?? throw` on
+  `UseTransactionAsync` is the correct choice over `!` — it is an assertion with a message rather than a
+  silent suppression, and this repo's bar is no null-forgiving to dodge a real null. Committing through
+  EF's wrapper is not merely a preference, it is required, and the test that found it is the reason to
+  trust it.
+
+---
+
+**Answer to the `BlazorDisableThrowNavigationException` observation**
+
+Agreed it is harmless as *disclosure* — the 3,525-byte body carries labels and the visitor's own
+antiforgery token, nothing else, and no client ever renders it — **but it is not inert**: it is precisely
+why `SubmitAsync` still executes after `OnInitializedAsync` has already redirected on a populated store,
+which is what makes BL1's wasted Argon2 hash reachable at all. Fix BL1 in the service (defence where it
+belongs) rather than by flipping a template-wide property, and the observation goes back to being purely
+cosmetic for §6.
+
+---
+
+**Architectural notes (not blocking this block)**
+
+- **Username charset is unconstrained, and the bootstrap account is the one that can't be fixed later.**
+  `BootstrapInput.Username` validates length only, so `:`, whitespace and control characters are all
+  accepted. §8 makes the username the Basic-auth username on the Smart HTTP remote (where `:` is
+  structurally illegal in `user:pass`), and §7 will put it in URLs and UI. B7 said minimal validation and
+  I am not asking for more here — but every *other* account is created via §4's redemption, which can
+  adopt a charset rule later, whereas the first administrator is created **before any rule exists** and
+  there is no rename page anywhere in this change. Worth deciding the rule at §4 and applying it here in
+  the same breath.
+- **B5 is now load-bearing in two directions.** §6 must exempt `/bootstrap` *and* `/bootstrap/complete`,
+  and BL1 is what that exemption costs if left unfixed. Recording it so §6 inherits both halves.
+
+---
+
+**3.2 — needs human confirmation, not complete.** The verification recipe is precise, copy-pasteable and
+covers the right things (empty store → startup warning → validation → success → inert without restart →
+one row → restart). I have exercised every step of it over HTTP except the browser rendering itself, and
+all of it behaved as written. It still must not be ticked until the Product Owner confirms in a real
+browser.
+
+→ @worker — **BL1 only** (`BootstrapService.cs:58`): pre-filter the emptiness check before the hash,
+leaving the authoritative check under the write lock exactly where it is; confirm the concurrency test
+stays green and re-post. N1–N6 are yours to take or leave with a line of reasoning. Everything else in
+this block is clean and the B1/B2/B3 work is the strongest evidence I've audited in this change.
+
+[architect] Ruling on the Block 3 audit.
+
+**BL1 upheld as blocking.** And it is explicitly **not** the A2 bucket the Product Owner closed: nothing
+is being added, no rate limiter, no gate, no throttle. The fix is *not doing 64 MiB of expensive work on a
+request we have already decided to refuse* — a cheap `AnyAsync` pre-filter before the hash, with the
+authoritative under-lock check staying exactly where it is. Reading the PO's scope ruling as "therefore
+leave a 0.25 s / 64 MiB anonymous amplifier in place" would be a misuse of it. B5 makes `/bootstrap`
+permanently anonymous, so this never ages out on its own. Keep both checks; the reviewer already
+confirmed that leaves the concurrency proof green, and mutant B (check hoisted above the lock) is what
+catches a fix that goes too far.
+
+**Integration test harness — approved, build it now. My call, per the reviewer's referral.** The
+measurement decides it: under mutant F the form is **entirely non-functional over HTTP while 73/73 unit
+tests pass**. A suite that stays green while the only user-facing path in the block is dead is not
+telling us what we think it is. One `WebApplicationFactory<Program>` test (GET → scrape the antiforgery
+token → POST → assert 302 and exactly one account) kills that mutant plus the missing-token case, a
+`FormName` regression, and an accidental render mode. Scope-wise this belongs to §3, not §9: it is the
+evidence that 3.2/3.3 actually work, and §9's scenario tests are a later layer over the same harness.
+Build it **minimal and reusable** — §4, §5 and §7 each add a Static SSR form and will hit the identical
+trap; discovering it three more times by hand is the alternative I'm rejecting.
+
+**AD10 — apply the Product Owner's 12-character password minimum in this round** (see `## NEXT`). Minimum
+length only: no composition rules, no strength meter, no extra UI — those were explicitly not chosen. §4's
+redemption form must carry the same minimum so the two paths cannot diverge.
+
+**AD11 — username charset, decided now rather than at §4.** The reviewer is right that the bootstrap admin
+is the only account created before any policy exists and there is no rename page anywhere in this change,
+so "decide it later" means "the first admin is permanently outside whatever we decide". Binding rule:
+**1–64 characters, ASCII letters, digits, `.`, `-`, `_`, and at least one alphanumeric.** Apply it to
+bootstrap now and to §4 redemption when it lands.
+
+I'm treating this as an Architect call rather than a Product Owner one because the load-bearing part is a
+**technical constraint, not a preference**: §8 uses the username as the Basic-auth userid, where a colon
+is structurally illegal (RFC 7617 forbids it in the userid), and whitespace/control characters in a
+credential are a correctness hazard rather than a style choice. The rule is deliberately the *minimum*
+that satisfies that constraint — I have not invented a vanity-name policy on top. If the Product Owner
+later wants something stricter, tightening a charset is backward-compatible in a way that loosening a
+username people already hold is not.
+
+**Nits: take N1, N2, N3.** `nameof(Input)` (an uncompiled string naming a property is exactly the failure
+that just cost a live smoke test to find); `/bootstrap/complete` must not return 200 claiming an
+administrator exists when the store is empty; and `db.Database.OpenConnectionAsync` over the raw
+connection call. N4–N6 are already answered or accepted.
+
+→ @worker — BL1, the integration harness, AD10, AD11, and N1–N3.
+
+[worker] Round 1 fixes applied — BL1, the integration harness, AD10, AD11, N1–N3. No disagreements.
+
+**BL1 — fixed, and the fix is measured.** Added a cheap `AnyAsync` pre-filter *before* the hash
+(`BootstrapService.cs:55-63`); the authoritative check under the write lock is untouched. The comment
+says explicitly that moving the under-lock check up here *instead of* adding this one would reopen the
+race, so the next reader can't "tidy" it into mutant B. Measured against the real app on a populated
+store, same method as the reviewer's:
+
+| request | before | after |
+|---|---|---|
+| refused `POST /bootstrap` | 0.24–0.26 s | **0.0017–0.0064 s** |
+| control `GET /` | 0.0008–0.0014 s | 0.0008–0.0014 s |
+
+~100× down, and now within noise of a request that does nothing. Conceded on the "incidentally uniform
+in time" line in my last handoff — the reviewer is right that there is no oracle to protect here (the GET
+already answers 200 vs 302), so it was paying 250 ms for nothing.
+
+**I re-ran your mutant B to be sure the fix didn't go too far** — deleted the *under-lock* check, keeping
+only the new pre-filter: `Concurrent_bootstrap_attempts_create_exactly_one_administrator` fails
+**expected 1, actual 8**. So the pre-filter is provably advisory and the under-lock check is provably
+load-bearing. With both in place the concurrency test is green.
+
+**Integration harness — built, minimal, and it kills mutant F.** Three files under
+`tests/ZeroWiki.Tests/Web/`:
+- `ZeroWikiAppFactory` — `WebApplicationFactory<Program>` over a throwaway SQLite file
+  (`UseSetting("ConnectionStrings:IdentityDb", …)`, temp file deleted on dispose), a
+  redirect-surfacing `CreateHttpClient()`, and `GetAccountsAsync()`. `Program.cs` gained
+  `public partial class Program;` so the factory can name it.
+- `StaticSsrForm` — fetch a page, carry back its hidden fields (`_handler`, antiforgery token), post.
+  **It reads the field names out of the rendered markup rather than restating them**, which is the
+  whole point: a form whose rendered names have drifted from its binder prefix fails here.
+- `BootstrapPageTests` — 6 facts + 7 theory cases over real HTTP.
+
+Verified it earns its place by re-applying **mutant F** (`Name` removed): previously 73/73 green with the
+form completely dead; now **6 integration tests fail**. It also covers the missing-antiforgery case
+(400, 0 accounts), which I'd only checked by hand before.
+
+**AD10 — 12-character minimum** on `BootstrapInput.Password`. Length only; no composition rules, no
+meter, no extra UI. **AD11 — username charset** as ruled: `^[A-Za-z0-9._-]*[A-Za-z0-9][A-Za-z0-9._-]*$`
+with the existing `StringLength(64)` supplying the length bound. Both constants live in
+`Identity/CredentialPolicy.cs` so §4's redemption form references the same values rather than restating
+them — that's the "natural" factoring AD10 allowed, not a new abstraction layer: one static class, four
+consts and a message, no behaviour. The XML doc records that AD11's reason is RFC 7617's illegal colon in
+the Basic-auth userid, not taste. Covered by theory cases both ways — `has space`, `colon:name`, `___`
+(no alphanumeric) and `café` rejected; `admin`, `a.b-c_1`, `_x_` accepted.
+
+Two notes on AD11 you may want to sanity-check: I set `MatchTimeoutInMilliseconds = 250` on the
+`[RegularExpression]`, because length and pattern validation run independently so the pattern can still
+be handed a very long string; and I put the rule **only** on the form, not in `BootstrapService`, because
+Blazor runs DataAnnotations validation *server-side* — `OnValidSubmit` never fires for an invalid model,
+so a hand-crafted POST is validated too. The service keeps its blank-username/blank-password guards.
+Say the word if you'd rather see the charset re-asserted at the service boundary as well.
+
+**N1** `Name = nameof(Input)`. **N2** `/bootstrap/complete` now redirects to `/bootstrap` while the store
+is empty, so the exempted pair is self-consistent; new test asserts both directions. **N3**
+`db.Database.OpenConnectionAsync(cancellationToken)`; the raw `SqliteConnection` is still fetched
+afterwards because only the non-async overload takes `deferred`, and the comment says so.
+
+**Gates:** `dotnet build` — 0 Warnings, 0 Errors. `dotnet test` — **84/84 passed** (73 + 11 new: 6 facts
++ 7 theory cases, less none removed). `openspec validate invite-only-authentication --strict` — valid.
+`dotnet format --verify-no-changes` — clean (exit 0). `BlazorDisableThrowNavigationException` untouched.
+Smoke-test `App_Data/` removed.
+
+---
+
+**3.2 — Product Owner verification recipe (REISSUED; supersedes the one in my previous post).** Updated
+for AD10 (12-character minimum) and AD11 (username charset). Stands alone; paste verbatim.
+
+```bash
+# 1. Start from a genuinely empty store (the file is gitignored; deleting it loses nothing else)
+cd /Users/rendle/github/emmz/ZeroWiki
+rm -rf src/ZeroWiki/App_Data
+
+# 2. Run the app
+dotnet run --project src/ZeroWiki
+```
+
+Then, in a browser:
+
+1. **Watch the console as it starts.** It must log, as a warning:
+   `The identity store has no accounts. Visit /bootstrap to create the first administrator account.`
+2. Open **<https://localhost:7070/bootstrap>** (or <http://localhost:5171/bootstrap> if you'd rather skip
+   the dev certificate). You should see the heading **"Create the first administrator"**, the explanation
+   that the wiki is invite-only with no accounts yet, and three fields: Username, Password, Confirm
+   password.
+3. **Empty submit.** Press **Create administrator** with all three fields blank. The page comes back with
+   *Enter a username.*, *Enter a password.* and *Confirm the password.* No account is created.
+4. **Short password.** Username `admin`, and `secret123` in both password fields. You should get
+   **"A password must be at least 12 characters."** and no account. *(This is the new 12-character
+   minimum — AD10.)*
+5. **Bad username.** Username `admin user` (with a space), and a password of at least 12 characters in
+   both fields. You should get **"A username can use letters, digits, dots, hyphens and underscores, and
+   must contain at least one letter or digit."** and no account. `admin:user` and `café` are rejected the
+   same way; `admin`, `a.b-c_1` and `_x_` are all accepted. *(This is the new charset rule — AD11.)*
+6. **Mismatched passwords.** Username `admin`, then two *different* passwords of at least 12 characters.
+   You should get **"The passwords do not match."** and no account.
+7. **Now create it for real.** Username `admin`, and the same password of **at least 12 characters** in
+   both fields — e.g. `correct horse battery staple`. Press **Create administrator**. The URL should
+   become **`/bootstrap/complete`** and the page should read **"Administrator account created"**, noting
+   that revisiting `/bootstrap` will not create another account and that signing in does not exist yet.
+8. **Confirm it is now inert — without restarting the app.** In the same browser, go back to
+   **`/bootstrap`**. You should be redirected to the home page (`/`) and **must not** see the form again.
+   Press the browser's back button and try to re-submit as well; still no second account.
+9. **Confirm exactly one account exists:**
+   ```bash
+   sqlite3 src/ZeroWiki/App_Data/identity.db \
+     "SELECT COUNT(*), group_concat(Username), group_concat(IsAdministrator) FROM Accounts;"
+   ```
+   Expected: `1|admin|1` — one account, your username, administrator. And confirm the password was
+   hashed, not stored:
+   ```bash
+   sqlite3 src/ZeroWiki/App_Data/identity.db "SELECT substr(PasswordHash,1,34) FROM Accounts;"
+   ```
+   Expected: it starts `$argon2id$v=19$m=65536,t=3,p=1$` and contains nothing resembling what you typed.
+10. **Optional — confirm a restart doesn't reopen it.** Stop the app (Ctrl+C) and `dotnet run
+    --project src/ZeroWiki` again. The startup log should now say `…already has at least one account;
+    the first-administrator bootstrap path is inert.`, `/bootstrap` should still redirect to `/`, and
+    `/bootstrap/complete` should still show the confirmation.
+
+If step 8 ever shows the form again, or step 9 shows more than one account, that is a failure — stop and
+say so rather than working around it.
+
+→ @reviewer
+
+[reviewer] Round-1 delta re-audited. Verdict: **Request changes** — **one** blocker, and it is in the new
+AD11 work, not in anything from the last round. **BL1 is genuinely fixed, B1/B2/B3 all survive the change,
+and the harness earns its place** — all verified by mutation. Gates re-run independently: `dotnet build`
+**0 warn / 0 err**, `dotnet test` **84/84**, `openspec validate invite-only-authentication --strict`
+**valid**, `dotnet format --verify-no-changes` **exit 0**.
+
+**Scope still clean.** Tracked diff adds only `CredentialPolicy.cs`, `tests/…/Web/`, the
+`Microsoft.AspNetCore.Mvc.Testing` reference and `public partial class Program;`. `grep` for
+`signin|login|CookieAuth|AddAuthentication|UseAuthorization|Invitation(Service|Page)|GitTokenPage` across
+`src/` returns **nothing**; `tasks.md` and `openspec/specs/` untouched; no render mode anywhere.
+
+---
+
+**BLOCKING — BL2: the AD11 username regex is quadratic, and it is reachable anonymously. It reinstates
+BL1's amplifier through the validation path, and adds a 500.** `CredentialPolicy.cs:33`, consumed at
+`BootstrapInput.cs:17-20`.
+
+`^[A-Za-z0-9._-]*[A-Za-z0-9][A-Za-z0-9._-]*$` puts two overlapping `*` quantifiers either side of a single
+required character. On input that is valid-charset-then-invalid, every split point has to be tried.
+Measured, clean 4× per doubling:
+
+| input length | match time |
+|---|---|
+| 1,000 | 3.0 ms |
+| 4,000 | 9.2 ms |
+| 16,000 | 142 ms |
+| 64,000 | **2,288 ms** |
+
+`MatchTimeoutInMilliseconds = 250` does not fix this, it *bounds* it — at exactly the figure we just spent
+a blocker removing. And `RegularExpressionAttribute` does not catch `RegexMatchTimeoutException`, so it
+propagates. Over real HTTP, 200,000-character username:
+
+| store state | result |
+|---|---|
+| empty | `status=500`, **0.260 s** |
+| **already bootstrapped** | `status=500`, **0.253 s** |
+
+That second row is the point. DataAnnotations validation runs **before** `OnValidSubmit` calls the
+service, so BL1's pre-filter — which does work, measured below — is simply never reached. `/bootstrap`
+is permanently anonymous under B5, `FormOptions.ValueLengthLimit` allows 4 MB per field, and the result
+is 250 ms of CPU plus an unhandled exception per request, from an unauthenticated endpoint. Same
+amplifier, same route, one round later, through a different door.
+
+**The fix is to bound the pattern's work, not to time-box it.** I measured three candidates through the
+attribute, and one is clearly right:
+
+| pattern | 50 K chars | 1 M chars | decisions changed vs shipped |
+|---|---|---|---|
+| shipped | 253 ms **TIMEOUT-THROW** | 250 ms **TIMEOUT-THROW** | — |
+| `^(?=.{1,64}\z)…` | 0.3 ms reject | 0.0 ms reject | rejects at 65 → doubles up with `StringLength`'s message |
+| **`^[A-Za-z0-9._-]{0,63}[A-Za-z0-9][A-Za-z0-9._-]{0,63}\z`** | **0.0 ms reject** | **0.0 ms reject** | **none within the length `StringLength(64)` admits** |
+| `^(?=.*[A-Za-z0-9])[A-Za-z0-9._-]+\z` | 0.1 ms | 1.1 ms | none (linear, not constant) |
+
+I ran all 31 inputs — every AD11 case, both charset directions, control characters, homoglyphs, 64/65/200
+chars — through each. The bounded-quantifier form differs from the shipped pattern on exactly one input
+(200 chars), which `StringLength(64)` already rejects. So it is behaviour-preserving where it matters and
+constant-time everywhere. Keep the 250 ms timeout as a belt once it can no longer be handed unbounded
+work. One wart to expect: `[RegularExpression]` needs a compile-time constant, and `{0,63}` cannot be
+composed from `MaximumUsernameLength` in a `const string`, so the `63` has to be a literal with a comment
+tying it to the constant.
+
+**Use `\z`, not `$`, while you are in there — and this is not cosmetic.** `$` matches before a trailing
+newline, so `Regex.IsMatch("admin\n", UsernamePattern)` is **true**. Today that is inert, and I want to be
+precise about why: `RegularExpressionAttribute.IsValid` additionally requires `m.Length ==
+stringValue.Length`, so the *attribute* rejects it (confirmed both by direct measurement —
+`Regex.IsMatch=True, match.Length=5/6, attribute.IsValid=False` — and end-to-end over HTTP, where
+`admin\n` came back with the charset message and created nothing). But `UsernamePattern` is a **public
+shared constant whose entire purpose is reuse by §4** — and by the service-boundary guard discussed below,
+which would naturally be written as `Regex.IsMatch(...)` and **would** admit `admin\n`. A credential
+validator that is safe only because one particular consumer happens to add a length check is the exact
+shape this thread has now rejected twice. `\z` makes it correct under either call style; verified.
+
+---
+
+**BL1 — fixed, and I confirmed both halves of your claim independently**
+
+- The pre-filter sits at `BootstrapService.cs:60-63`, **before** the hash at `:68`; the authoritative
+  check is untouched at `:88`. Measured on the real app, populated store: refused POST **0.0016 s /
+  0.0018 s** against 0.24–0.26 s last round. ~150×, and within noise of the control GET.
+- **Your mutant-B re-run reproduces exactly.** I deleted the under-lock check while keeping the
+  pre-filter: `Concurrent_bootstrap_attempts_create_exactly_one_administrator` fails **expected 1, actual
+  8**. The pre-filter is provably advisory and the under-lock check provably load-bearing, which is the
+  thing that had to stay true. The comment at `:55-59` naming that trap explicitly is the right artefact
+  to leave behind.
+
+**B1 / B2 / B3 — still intact after the change.** Re-ran the whole battery against the new service:
+
+| mutant | result | reading |
+|---|---|---|
+| cached gate (`_cached ??=`) | **1 failure**, `Gate_closes_the_moment_an_account_appears_without_a_restart` | B2 intact, still carried by exactly that test |
+| pre-filter only, under-lock check deleted | **1 failure**, concurrency, expected 1 actual 8 | B1 intact |
+| GET redirect deleted | **1 failure**, and no second account created | B3 intact — the POST guard still refuses alone |
+| `[SupplyParameterFromForm]` with no `Name` | **6 failures** | see below |
+
+`Bootstrap.razor` now also has two independent refusals in front of a POST (pre-filter and under-lock
+check), so B3 is strictly stronger than last round, not weaker.
+
+---
+
+**The integration harness — approved, and it does what it was built for**
+
+Mutant F (the `Name` removed) previously left **73/73 green with the form entirely dead**. It now fails
+**6 integration tests**. That is the whole justification, discharged.
+
+**Reusability: yes, and it is not over-built.** Three files, ~140 lines, no fixtures, no base classes, no
+DI gymnastics. `StaticSsrForm` is the load-bearing piece and it generalises cleanly — taking the field
+names *out of the rendered markup* (`StaticSsrForm.cs:30-37`) is what makes it a drift detector rather
+than a restatement, and §4/§5/§7 can use it verbatim. `CreateClient` carries cookies by default, which
+§5's session tests will need. `ZeroWikiAppFactory.GetAccountsAsync()` is the only bootstrap-flavoured
+part; when §4 wants invitations it will want a general `WithDbAsync(...)` instead — a two-line
+generalisation then, not a design flaw now.
+
+---
+
+**Your two sanity-checks, answered**
+
+**(a) The timeout is the wrong answer; length must gate the pattern.** Fully covered by BL2 above — the
+timeout converts an unbounded hang into a bounded 250 ms burn plus a 500, which is a *worse* failure than
+the one it prevents and the exact resource profile BL1 was upheld to remove. Your instinct that the
+pattern can be handed a very long string is right; the conclusion drawn from it was the wrong one.
+
+**(b) The charset is correct — 25 of 26 cases, and the 26th is the `$` finding above.** Verified against
+the real attribute, not by eye:
+
+- **Accepted, correctly:** `admin`, `a.b-c_1`, `_x_`, `A1`, `x`, `1`.
+- **Rejected, correctly:** `has space`, `___`/`...`/`-.-` (no alphanumeric), `café`, `adımin` (dotless-i
+  homoglyph), embedded NUL, tab, newline, leading newline, trailing/leading space, `admin/../x`,
+  `admin@host`, `admin%20x`, zero-width space, empty.
+- **The colon requirement holds in every position** — `colon:name`, `:`, `admin:`, `:admin` all rejected.
+  RFC 7617 satisfied, which is the one rule with a hard technical requirement behind it.
+- The single hole is `admin\n` at the raw-`Regex` level, inert via the attribute, live for any other
+  consumer — see BL2's `\z` note.
+
+---
+
+**My answer on the service boundary: I agree with you, and I'd go further — the argument is now
+concrete rather than hypothetical.**
+
+The worker's reasoning is correct as far as it goes: Blazor does run DataAnnotations server-side, and I
+confirmed it over HTTP (`has space`, `admin:user`, `café`, a 9-character password and a mismatch are all
+refused with their messages and zero accounts, with no hand-crafted POST able to skip it). So this is not
+a live hole in the web path.
+
+But that is a statement about **today's only caller**, and the contract belongs to the service:
+
+1. **`BootstrapService` already half-asserts it.** `ArgumentException.ThrowIfNullOrWhiteSpace(username)`
+   at `:50` says blank is a caller error. It is incoherent for `""` to throw while `"a:b"` — the value
+   with an actual RFC 7617 consequence in §8 — is silently persisted. Adding the rest is *completing* an
+   existing guard, not adding ceremony.
+2. **The duplication objection does not apply here, because `CredentialPolicy` already exists.** Both
+   sites reference the same constants; they cannot drift. That class was created for precisely this.
+3. **The store is what needs protecting, not the form.** There is no rename page anywhere in this change,
+   §4 creates accounts through a different path, and §9 calls services directly. "Valid because of how it
+   is reached" is what we rejected in Block 2 and again in BL1.
+4. **BL2 makes this non-theoretical**: the natural way to write that guard is
+   `Regex.IsMatch(username, CredentialPolicy.UsernamePattern)`, which today would admit `admin\n`. Fix the
+   pattern first, then add the guard.
+
+**Throw, don't return an outcome.** `BootstrapOutcome` answers a *domain* question — "was the store
+empty?" — and folding a caller-error signal into it would force every caller to distinguish "someone else
+got there first" from "you passed garbage", change the page's refusal redirect semantics, and duplicate
+what the form already reports far more helpfully. `ArgumentException` matches the guards already at
+`:50-51` and the existing `Blank_username_is_rejected_before_anything_is_written` test shape.
+
+Two implementation details that matter: **validate the trimmed value** (so `Username_is_trimmed` stays
+green and `"  alice  "` remains acceptable), and **put the guard before the hash at `:68`**, or it
+reintroduces BL1 for that path.
+
+---
+
+**Nits (non-blocking)**
+
+- **N1 — the charset theory is vacuous against a broken form.**
+  `BootstrapPageTests.cs:81-94` asserts only `200` + no accounts, both of which a *completely dead* form
+  satisfies. Proof: it is **not** among mutant F's 6 failures — it passes while the form posts nothing.
+  Assert the AD11 message text, exactly as `A_password_below_the_minimum_length_is_rejected_and_creates
+  _nothing` (`:74-77`) already does. Then the four cases test the charset instead of testing 200.
+- **N2 — AD10's message is a magic string; AD11's isn't.** `BootstrapInput.cs:26` hard-codes `"at least
+  12"` beside `CredentialPolicy.MinimumPasswordLength`, and `:16` hard-codes `"at most 64"` beside
+  `MaximumUsernameLength` — while AD11 correctly keeps its wording in `UsernameRuleDescription`
+  (`CredentialPolicy.cs:41`). Raise the minimum and the message lies. Move both next to their numbers, for
+  the same reason the charset message already lives there.
+- **N3 — the form now rejects what the service trims.** `Username = "admin "` fails AD11 (space), yet
+  `BootstrapService.cs:53` still trims. Trailing whitespace is what a paste produces, and the user gets a
+  charset message that never mentions spaces. The service's `Trim()` is now unreachable from the web path.
+  Either trim before validating, or accept it and know the trim is now only a service-boundary courtesy —
+  worth one deliberate line either way, especially since §4's form will inherit the same shape.
+- **N4 — the harness doesn't pin the environment**, so it tests whatever `WebApplicationFactory`
+  defaults to. Fine today; §6 will care, because the `Development` branch skips `UseExceptionHandler`
+  and HSTS. A note for when §6 lands, not a change now.
+
+---
+
+**Product Owner recipe — one step is wrong and would strand them at the first click. Everything else I
+drove verbatim and it is accurate.**
+
+**Step 2 is incorrect.** It offers `https://localhost:7070/bootstrap` as the primary URL. But
+`dotnet run --project src/ZeroWiki` — the command in step 2's own code block — selects the **first**
+launch profile, which is `http`, and binds **only** `http://localhost:5171`:
+
+```
+Now listening on: http://localhost:5171
+https://localhost:7070/bootstrap -> CONNECTION REFUSED (curl exit 7)
+http://localhost:5171/bootstrap  -> 200
+```
+
+The Product Owner will paste the primary URL, get a browser connection error, and have no way to know the
+recipe is at fault rather than the app. Fix by either making `http://localhost:5171/bootstrap` the stated
+URL (it is also the one the console prints, so it self-corrects), or changing step 2's command to
+`dotnet run --project src/ZeroWiki --launch-profile https`. Do not leave both URLs with the wrong one
+first.
+
+**Everything else verified verbatim against a real run:**
+
+| step | claim | result |
+|---|---|---|
+| 1 | startup warning text | exact match |
+| 3 | blank → three messages | `Enter a username.` / `Enter a password.` / `Confirm the password.`, 0 accounts |
+| 4 | `secret123` → 12-char message | exact match, and **only** that message |
+| 5 | `admin user` → charset message | exact match; `admin:user` and `café` identical, 0 accounts |
+| 6 | mismatch → `The passwords do not match.` | exact match |
+| 7 | `correct horse battery staple` → `/bootstrap/complete` | 302 → `/bootstrap/complete` |
+| 8 | inert without restart | `GET /bootstrap` → 302 → `/` |
+| 9 | `1\|admin\|1`, hash prefix | exact match; password appears nowhere in the row |
+| 10 | restart → inert log line | exact match: *"The identity store already has at least one account; the first-administrator bootstrap path is inert."*, `/bootstrap` → 302 → `/`, `/bootstrap/complete` → 200 |
+
+(One caution for whoever re-runs this: a stale app still holding port 5171 makes a *new* `dotnet run`
+fail to bind while the browser keeps talking to the old one, which looks exactly like a bootstrap bug. It
+cost me a false alarm. Worth a line in step 2 — "if the console does not say `Now listening on`, an older
+instance is still running".)
+
+**3.2 still needs the Product Owner's browser confirmation** — unchanged, and it must not be ticked until
+they have run the corrected recipe.
+
+→ @worker — **BL2 only**: bound the pattern's work (the measured bounded-quantifier form) and switch `$`
+to `\z`; plus the step-2 URL in the recipe. N1–N4 are yours to take or leave with a line of reasoning, and
+the service-boundary guard is @architect's ruling to make — my view is above. Everything else in this
+delta is clean, and the BL1 fix plus the harness are exactly what was asked for.
+
+[architect] Ruling on the re-audit. **BL2 upheld — and it is my mistake, not the worker's.** AD11 is my
+decision; I specified a charset and a shape and left the pattern to implementation, and the natural
+reading of it is quadratic. The result is that the rule I introduced to close a §8 correctness hazard
+reinstated the very amplifier BL1 had just removed, one round later and through an earlier door —
+DataAnnotations runs *before* `OnValidSubmit`, so BL1's pre-filter never even executes. Worth stating
+plainly because it generalises: **a validation rule is attacker-reachable code**, and on a permanently
+anonymous route its cost is part of its specification. Any future credential rule in this change gets
+costed the same way.
+
+- **Take the measured bounded form** `^[A-Za-z0-9._-]{0,63}[A-Za-z0-9][A-Za-z0-9._-]{0,63}\z` (0.0 ms at
+  1 MB, and no decision changes within the length `StringLength(64)` admits). **Keep the timeout as a
+  belt, not as the fix** — the reviewer is right that a timeout converts an unbounded hang into a bounded
+  burn *plus* a 500, which is worse than what it prevents. Length gates the pattern; the timeout is what's
+  left over.
+- **`\z`, not `$`** — non-negotiable, and the reason is the one that matters: `$` matches before a
+  trailing newline, so `admin\n` passes a bare `Regex.IsMatch`. The attribute happens to reject it today
+  only because it also requires a full-length match. `UsernamePattern` is a public constant whose entire
+  purpose is reuse by §4 and by the service guard below — a validator that is safe only because one
+  particular caller adds a length check is the exact shape this thread has now rejected twice.
+
+**Service-boundary guard — confirmed, implement it.** The reviewer attacked my lean and agreed with it for
+a better reason than I had: `BootstrapService` *already* half-asserts this (`ThrowIfNullOrWhiteSpace`), so
+it is incoherent for `""` to throw while `"a:b"` — the value with an actual RFC 7617 consequence in §8 —
+is silently persisted. **Throw `ArgumentException`, not a new `BootstrapOutcome`**: the outcome type
+answers a domain question ("did someone beat you to it"), and folding caller-error into it would force
+every caller to distinguish garbage input from a lost race. Validate the **trimmed** value, and place the
+guard **before the hash** — otherwise it reintroduces BL1 for that path, which is the whole lesson of this
+round.
+
+**Nits — take all four.** N1 (assert the charset messages' text, as the password test does; a theory that
+passes against a dead form proves nothing — it wasn't among mutant F's six failures). N2 (AD10's messages
+hard-code "12"/"64" while AD11's correctly reads from `CredentialPolicy` — make them consistent). N3
+(**resolve the trim disagreement rather than papering over it**: the form now rejects `"admin "` while the
+service trims it. Bind: **trim first, then validate**, in both places, so the two paths cannot disagree
+about what a username *is*). N4 (pin the environment in the harness — cheap now, and §6's access-control
+tests will depend on it).
+
+**The recipe URL is a genuine save.** `dotnet run` binds only `http://localhost:5171`, so the recipe's
+primary `https://localhost:7070` is connection-refused — it would have stranded the Product Owner at the
+first click, on the one step where they cannot tell a bad instruction from a broken feature. Fix step 2,
+and add the stale-instance caution the reviewer hit.
+
+→ @worker — BL2, the service-boundary guard, N1–N4, and the recipe fix.
+
+[worker] Round 2 fixes applied — BL2, the service guard, N1–N4, recipe. No disagreements; two findings
+of my own came out of the work, both below.
+
+**BL2 — bounded pattern + `\z`.** `UsernamePattern` is now
+`@"^[A-Za-z0-9._-]{0,63}[A-Za-z0-9][A-Za-z0-9._-]{0,63}\z"` (verbatim literal, because `\z` is not a
+valid C# escape). Timeout kept at 250 ms and its doc comment now says it is a belt, not the fix. The
+`63` carries a comment tying it to `MaximumUsernameLength` **and** a test —
+`Username_pattern_admits_exactly_the_maximum_length` — so raising the constant without widening the
+quantifiers fails rather than silently rejecting legal usernames.
+
+**Confirmation you asked for: the bounded form changes no decision inside 64 characters.** Ran both
+patterns over a 3,636-input corpus (every 1-, 2- and 3-character string over an alphabet covering each
+equivalence class the rule cares about — `a Z 9 . - _ : space \n \t NUL é / @ %` — plus boundary lengths
+60–64 in three shapes, plus the realistic cases):
+
+| comparison | differences |
+|---|---|
+| through `RegularExpressionAttribute` (the only pre-existing consumer) | **0 of 3,636** |
+| raw `Regex.IsMatch` | **31** — *every one* a trailing-newline input, old=`True` new=`False` |
+
+So the bounded form is exactly behaviour-preserving where it was already used, and the only raw-level
+changes are the `$`→`\z` fix itself. A 65-character control is accepted by *both* patterns' raw form and
+rejected by `StringLength(64)`, so the length message still isn't doubled up. `CredentialPolicyTests` now
+pins the timing too: a 1,000,001-character hostile input must match in under 100 ms (measures 0 ms).
+
+**Service-boundary guard — implemented as ruled.** `ArgumentException`, not a new `BootstrapOutcome`;
+validates the **trimmed** value; sits **before the hash**, so it cannot become another way to spend
+64 MiB refusing a request. Rather than have callers hand-roll a `Regex` over the public constant, I added
+`CredentialPolicy.UsernameMatcher()` (`[GeneratedRegex]`, compiled, same pattern and timeout) and used
+that — it removes the "natural way to write the guard is `Regex.IsMatch`" hazard you named, for §4 too.
+Covered by 5 rejection cases, an over-length case, and 5 acceptance cases at the service level.
+
+**One thing I did *not* do, deliberately:** the service does not enforce AD10's 12-character password
+minimum. The coherence argument that carried the username guard is structural — §8 parses the username
+as a Basic-auth userid, so `a:b` has a downstream consequence — whereas password length is a product
+policy with no structural consequence (only the hash is persisted, and any length hashes fine). Putting a
+Product-Owner number inside the service would also make §4 and §3 able to disagree with it silently. Say
+the word and it's two lines, but I didn't want to expand the ruling on my own.
+
+**N1** — the charset theory now asserts `CredentialPolicy.UsernameRuleDescription` appears in the
+response, exactly as the password test does, so it can no longer pass against a dead form. **N2** — both
+AD10 messages moved into `CredentialPolicy` beside their numbers, and a test asserts each message
+actually contains the number it quotes, which turns "raise the minimum and the message lies" into a
+failing build rather than a code-review hope. **N3** — resolved as ruled, trim-then-validate:
+`BootstrapInput.Username` trims in its setter, so validation and the store now agree on what a username
+*is*; the service still trims (harmless, and it is the boundary). **N4** — harness pins
+`Environments.Production`, with a comment saying why (it is the shape the container ships in, and §6 will
+branch on it).
+
+**Finding that fell out of N3, worth flagging because it changed two test expectations.** With
+trim-first, `"admin\n"` now trims to `admin` and is **accepted** by both the form and the service — it is
+the same class as `"  admin  "`, which N3 explicitly wants accepted. So `admin\n` moved from my
+rejection theories into the accepted-and-trimmed ones. The `\z` fix is still exactly right and still
+tested: `CredentialPolicyTests` asserts the **raw pattern** rejects `"admin\n"`, which is the level where
+`$` would have been wrong and where a future caller that doesn't trim would be exposed. Net: pattern
+rejects it, call paths trim it away before it gets there. Both true, and now both pinned.
+
+**Recipe URL — confirmed independently before fixing.** Ran `dotnet run --project src/ZeroWiki`:
+`Now listening on: http://localhost:5171` only; `https://localhost:7070/bootstrap` gives curl exit 7
+(connection refused), `http://localhost:5171/bootstrap` gives 200. Corrected recipe below states 5171 as
+the sole URL — the one the console itself prints, so it self-corrects — and carries the stale-instance
+caution.
+
+**Gates:** `dotnet build` — 0 Warnings, 0 Errors. `dotnet test` — **121/121 passed** (84 + 37).
+`openspec validate invite-only-authentication --strict` — valid. `dotnet format --verify-no-changes` —
+clean (exit 0).
+
+---
+
+**3.2 — Product Owner verification recipe (REISSUED; supersedes both earlier versions).** Corrected for
+the URL, AD10 and AD11. Stands alone; paste verbatim.
+
+```bash
+# 1. Start from a genuinely empty store (the file is gitignored; deleting it loses nothing else)
+cd /Users/rendle/github/emmz/ZeroWiki
+rm -rf src/ZeroWiki/App_Data
+
+# 2. Run the app
+dotnet run --project src/ZeroWiki
+```
+
+**Before going further, check the console actually says `Now listening on: http://localhost:5171`.** If
+it doesn't, an older copy of the app is still running and holding the port — the new one will fail to
+bind while your browser keeps talking to the old one, which looks exactly like a bootstrap bug. Stop it
+(`pkill -f ZeroWiki`) and run step 2 again.
+
+Then, in a browser:
+
+1. **Watch the console as it starts.** It must log, as a warning:
+   `The identity store has no accounts. Visit /bootstrap to create the first administrator account.`
+2. Open **<http://localhost:5171/bootstrap>**. You should see the heading **"Create the first
+   administrator"**, the explanation that the wiki is invite-only with no accounts yet, and three fields:
+   Username, Password, Confirm password.
+3. **Empty submit.** Press **Create administrator** with all three fields blank. The page comes back with
+   *Enter a username.*, *Enter a password.* and *Confirm the password.* No account is created.
+4. **Short password.** Username `admin`, and `secret123` in both password fields. You should get
+   **"A password must be at least 12 characters."** and no account.
+5. **Bad username.** Username `admin user` (with a space in the middle), and a password of at least 12
+   characters in both fields. You should get **"A username can use letters, digits, dots, hyphens and
+   underscores, and must contain at least one letter or digit."** and no account. `admin:user` and `café`
+   are rejected the same way. `admin`, `a.b-c_1` and `_x_` are all accepted, and surrounding spaces are
+   trimmed rather than rejected — ` admin ` is accepted and stored as `admin`.
+6. **Mismatched passwords.** Username `admin`, then two *different* passwords of at least 12 characters.
+   You should get **"The passwords do not match."** and no account.
+7. **Now create it for real.** Username `admin`, and the same password of **at least 12 characters** in
+   both fields — e.g. `correct horse battery staple`. Press **Create administrator**. The URL should
+   become **`/bootstrap/complete`** and the page should read **"Administrator account created"**, noting
+   that revisiting `/bootstrap` will not create another account and that signing in does not exist yet.
+8. **Confirm it is now inert — without restarting the app.** In the same browser, go back to
+   **<http://localhost:5171/bootstrap>**. You should be redirected to the home page (`/`) and **must
+   not** see the form again. Press the browser's back button and try to re-submit as well; still no
+   second account.
+9. **Confirm exactly one account exists.** In a second terminal:
+   ```bash
+   cd /Users/rendle/github/emmz/ZeroWiki
+   sqlite3 src/ZeroWiki/App_Data/identity.db \
+     "SELECT COUNT(*), group_concat(Username), group_concat(IsAdministrator) FROM Accounts;"
+   ```
+   Expected: `1|admin|1` — one account, your username, administrator. And confirm the password was
+   hashed, not stored:
+   ```bash
+   sqlite3 src/ZeroWiki/App_Data/identity.db "SELECT substr(PasswordHash,1,34) FROM Accounts;"
+   ```
+   Expected: it starts `$argon2id$v=19$m=65536,t=3,p=1$` and contains nothing resembling what you typed.
+10. **Optional — confirm a restart doesn't reopen it.** Stop the app (Ctrl+C) and `dotnet run --project
+    src/ZeroWiki` again. The startup log should now say `…already has at least one account; the
+    first-administrator bootstrap path is inert.`, <http://localhost:5171/bootstrap> should still
+    redirect to `/`, and <http://localhost:5171/bootstrap/complete> should still show the confirmation.
+
+If step 8 ever shows the form again, or step 9 shows more than one account, that is a failure — stop and
+say so rather than working around it.
+
+→ @reviewer
+
+[reviewer] Round-2 delta re-audited. Verdict: **Approve** — no blocking findings. BL2 is closed at the
+exact door where I measured the 500, B1/B2/B3 and BL1 all survive a third round of surgery on this
+service, and every new invariant has a mutation-proven test behind it. Gates re-run independently:
+`dotnet build` **0 warn / 0 err**, `dotnet test` **121/121**, `openspec validate
+invite-only-authentication --strict` **valid**, `dotnet format --verify-no-changes` **exit 0**.
+
+**Scope clean.** Tracked delta adds `CredentialPolicyTests.cs` and touches only Block 3 files. `grep`
+across `src/` for `signin|LoginPage|CookieAuth|AddAuthentication|UseAuthorization|AddAuthorization|
+InvitationService|GitTokenPage|SignInAsync` → **nothing**; render-mode grep → **nothing**; `tasks.md` and
+`openspec/specs/` untouched.
+
+---
+
+**Priority 1 — BL2 is closed over HTTP, at the same door, measured**
+
+Driven against the running app, same requests as last round:
+
+| case | before | after |
+|---|---|---|
+| 200 K-char username, **empty** store | **500**, 0.260 s | **200**, 0.021 s |
+| 200 K-char username, **already bootstrapped** | **500**, 0.253 s | **302 → `/`**, **0.0023 s** |
+| 1,000,001-char username | (would time out) | **200**, 0.0061 s |
+| `RegexMatchTimeoutException` in the log | present | **0** |
+| unhandled exceptions | present | **0** |
+
+The populated-store row is the one that mattered: a hostile POST now costs **0.0023 s**, against a control
+refusal of 0.0014 s. Indistinguishable. The amplifier is gone from the validation path as well as the
+service path.
+
+**Priority 2 — `\z` is still tested at the level where it matters. Trim-first did not weaken it.**
+
+This was the right thing to be suspicious of, and I checked it by mutation rather than by reading. I
+reverted the pattern's `\z` to `$`, changing nothing else:
+
+> **1 failed, 120 passed** — `CredentialPolicyTests.Username_pattern_rejects_disallowed_values(username:
+> "admin\n")`, and nothing else.
+
+So that single case is the only thing holding the property, and it does hold it. The reasoning behind the
+move is also sound, not a rationalisation: `$` wrongly accepts exactly one class of input — a string ending
+in a single `\n` whose prefix is otherwise legal — and `Trim()` maps precisely that class onto its legal
+prefix. So trim-first *subsumes* the bug for trimming callers, which is why `admin\n` legitimately moved
+into the accepted-and-trimmed theories, while `\z` remains load-bearing for the non-trimming caller. Both
+statements are true simultaneously, and both are now pinned. Nothing quietly went untested.
+
+Worth adding the detail that makes it concrete: `UsernameMatcher()` is itself that non-trimming caller.
+`RegularExpressionAttribute` rejected `admin\n` only because it additionally requires a full-length match;
+`Regex.IsMatch` does not. With `^…\z` the two are equivalent, verified — `"admin"` true, `"admin\n"`,
+`"ad min"`, `"xx admin xx"`, `"admin\0"` all false. The anchor choice is what makes the new public API
+safe, which is a nicer outcome than the anchor merely being tidier.
+
+**Priority 3 — B1 / B2 / B3 and BL1 all still hold.** Full battery against the round-2 service:
+
+| mutant | result |
+|---|---|
+| cached gate (`_cached ??=`) | **1 failure** — `Gate_closes_the_moment_an_account_appears_without_a_restart` (**B2**) |
+| under-lock check deleted, pre-filter kept | **1 failure** — concurrency, expected 1 actual 8 (**B1**) |
+| GET redirect deleted | **1 failure**, no second account (**B3**) |
+| `[SupplyParameterFromForm]` `Name` removed | **13 failures** (was 6 — the harness got stronger) |
+| **service guard deleted** | **6 failures** — all five charset cases plus `Overlong_username_is_rejected_by_the_service_itself` |
+| **`\z` → `$`** | **1 failure** — the `admin\n` case |
+| **bounded quantifiers → unbounded** | **1 failure** — `Username_pattern_rejects_a_very_long_input_without_doing_the_work` |
+| **`MaximumUsernameLength` 64 → 200** | **3 failures**, including `Username_pattern_admits_exactly_the_maximum_length` |
+
+Every new invariant in this round has a test that dies when the invariant does. The guard-deleted and
+unbounded-pattern mutants are the two that would have let this round's work rot silently, and both are
+caught. The raised-constant tripwire fires exactly where it should — the pattern admits up to 127, so the
+test trips at the real breakage point rather than a cosmetic one.
+
+**The equivalence claim — conclusion correct, headline slightly too strong. Worth recording precisely.**
+
+I built my own corpus rather than re-running yours, and found **5** attribute-level differences where you
+reported 0. They are not a defect, and they do not touch your conclusion — but the difference is
+instructive, so I made it exhaustive: every length 0–140 in five shapes (all-alphanumeric, all-punctuation,
+the single required alphanumeric parked first / middle / last), each with and without a trailing newline.
+
+| measure | result |
+|---|---|
+| minimum length at which *any* decision differs | **65** |
+| differences at length ≤ 64 | **0** |
+| differences where `StringLength(64)` would also pass | **0** |
+
+Your boundary shapes were `aaa…` and `___…a`, and 65 `a`s is accepted by *both* patterns because the
+required alphanumeric can sit anywhere; the divergence needs the alphanumeric pinned at an extreme, e.g.
+`'_' × 64 + 'a'`. So "0 differences over 3,636 inputs" is a property of that corpus. **The statement that
+holds shape-independently — and the one that matters — is "no decision changes for any input
+`StringLength(64)` admits", and I verified that exhaustively.** Your 65-character control conclusion is
+right for the control you chose; the general form needed checking, and it passes.
+
+One cosmetic consequence, confirmed live rather than predicted: a ≥65-character username whose only
+alphanumeric is at an extreme now shows **two** messages (length *and* charset) where it previously showed
+one. Visible in the 200 K-char POST above. It is an already-invalid input and both messages are true. Not
+worth changing; recorded so nobody re-derives it as a bug.
+
+---
+
+**`CredentialPolicy.UsernameMatcher()` — a good addition, and better than what I asked for**
+
+I flagged "the natural way to write the guard is `Regex.IsMatch` over the raw constant, which admits
+`admin\n`" as a hazard. Exposing a `[GeneratedRegex]` accessor removes the hazard rather than documenting
+it: §4 cannot pick its own options, cannot forget the timeout, and cannot hand-roll an unanchored match.
+It is source-generated rather than interpreted, and `RegexOptions.None` is correct here — every class is an
+explicit ASCII range with no case-folding, so there is nothing for a culture to change. The service uses it
+on the **trimmed** value with an explicit `Length > MaximumUsernameLength` check in front
+(`BootstrapService.cs:59-63`), which is necessary and easy to miss: the pattern alone admits up to 127
+characters, so the regex is not a length check. `Overlong_username_is_rejected_by_the_service_itself` pins
+that half specifically.
+
+**N1–N4 all verified.** N1 — the charset theory now asserts `CredentialPolicy.UsernameRuleDescription`
+appears in the response, and it is now among mutant F's failures, which is exactly the property it lacked.
+N2 — messages sit beside their numbers with `Rule_messages_state_the_numbers_they_are_paired_with` holding
+them in step; mutant J proves that test fires. N3 — resolved as ruled, and the setter is the right place
+(it is the only way to make DataAnnotations validate what the store will actually receive); the doc comment
+naming the pasted-trailing-space case is the reason a future reader won't "simplify" it away. N4 — pinning
+`Environments.Production` is the right call and better than pinning Development: it exercises
+`UseExceptionHandler`/`UseHsts`, which is the shape the container ships, and §6's access-control tests will
+be truthful by default rather than by luck.
+
+---
+
+**Password minimum at the service — @architect, you are right, but only one of your three arguments
+carries it, and the worker's distinction is real and should survive as a rule**
+
+Taking them in turn:
+
+1. **"The divergence argument is inverted" — correct, and this simply disposes of the objection.** Both
+   paths reference `CredentialPolicy.MinimumPasswordLength`; they cannot disagree. The worker's concern
+   would apply to a literal `12` in the service, not to the constant.
+2. **"A control in the presentation layer is weaker than one at the boundary" — true but overstated.** A
+   guard in `BootstrapService` protects *that service's* callers. It does not protect the store: §4's
+   redemption will still need its own, and so would any future reset/seed/import path. The boundary being
+   defended is one service, not the data.
+3. **"Same argument that carried the username guard" — this is the weak one, and the worker is right to
+   resist it.** The distinction is genuine: `a:b` *breaks* §8's Basic-auth parse — a correctness defect in
+   another component, in a record with no rename path. A 3-character password breaks nothing; the account
+   works, it is merely weak. Structural invalidity and weak data are not the same category, and flattening
+   them would licence pushing every product rule into every service.
+
+**The argument that does carry it — and neither of you has made it — is irreversibility on the most
+privileged record in the system.** `CreateFirstAdministratorAsync` mints the *only* account created with
+no invitation, no authentication and no audit trail, on a route that is anonymous for the life of the
+deployment, and AD10 exists precisely because online guessing has no rate limit in front of it. There is
+no password-reset path anywhere in this change, so a weak first-administrator password is permanent until
+someone builds one. A control on *that* record living solely in a Razor page is one refactor from absent,
+and the mistake it prevents cannot be undone afterwards. That asymmetry is worth two lines even though
+"weak data" is normally a presentation concern.
+
+**So: enforce it, `ArgumentException`, same shape and same position as the username guard — trimmed value
+not applicable, and before the hash.** And keep the worker's distinction as the general rule so this does
+not become precedent for pushing every product number into every service: *structural invariants always at
+the boundary; a policy number at the boundary only when the record is privileged and the mistake is
+irreversible.* Bootstrap is the clearest case in this codebase of both.
+
+Two implementation notes: check the raw password (it is never trimmed — `[Required]`'s own trim already
+rules out all-whitespace), and there is no form/service disagreement to create a 500, since both read the
+same constant and `MinLength` counts the same characters. I verified there is no divergence to trip over.
+
+**This is not a blocker and I have not held the block for it.** The form enforces AD10 on the only path
+that can reach the service today, verified over HTTP; the addition is two lines plus a test and disturbs
+nothing I checked above. Land it in this round or as a §4 unit alongside redemption's copy — your call.
+
+---
+
+**Product Owner recipe — re-driven end to end. Correct, and the URL fix is confirmed.**
+
+| step | verified |
+|---|---|
+| pre-flight | `Now listening on: http://localhost:5171` — the only bound URL, and the caution is accurate |
+| stale-instance remedy | `pkill -f ZeroWiki` matches **both** the apphost and `dotnet run`; listeners 2 → 0. Works exactly as written |
+| 1 | startup warning text — exact match |
+| 2 | 200, heading present, all three `Input.*` fields render |
+| 3 | blank → `Enter a username.` / `Enter a password.` / `Confirm the password.`, 0 accounts |
+| 4 | `secret123` → `A password must be at least 12 characters.` and **only** that, 0 accounts |
+| 5 | `admin user`, `admin:user`, `café` → the charset message, 0 accounts each |
+| 5 (trim claim) | `  admin  ` → **302 → `/bootstrap/complete`**, stored as `'admin'` — the new claim is true |
+| 6 | mismatch → `The passwords do not match.`, 0 accounts |
+| 7 | `correct horse battery staple` → `/bootstrap/complete` |
+| 8 | inert with no restart → 302 → `/`; replayed POST → 302 → `/`, still one account |
+| 9 | `1\|admin\|1`; hash starts `$argon2id$v=19$m=65536,t=3,p=1$`; password appears nowhere in the row |
+| 10 | restart → *"The identity store already has at least one account; the first-administrator bootstrap path is inert."*, `/bootstrap` → 302 → `/`, `/bootstrap/complete` → 200 with the confirmation text |
+
+**No defects.** Every URL resolves, every quoted message is byte-exact, every expected outcome occurs, and
+the two additions since the last version — the stale-instance caution and the trim case — are both
+independently true. It stands alone and I would hand it over as written.
+
+**3.2 still needs the Product Owner's browser confirmation** and must not be ticked until they have run
+it — that is a workflow requirement, not a gap in the work.
+
+---
+
+**✅ SIGN-OFF — Block 3 (§3.1–3.3, first-administrator bootstrap) APPROVED.** All four gates green
+(build 0/0, **121/121**, `--strict` valid, format clean), scope confined to §3, and every binding decision
+B1–B9 plus AD6/AD7/AD10/AD11 verified — most of them by mutation rather than inspection. Clear to tick
+**3.1 and 3.3** and commit; **3.2 stays unticked pending the Product Owner's browser run** of the recipe
+above. The one open item is @architect's ruling on the password minimum at the service boundary, which is
+a decision rather than a defect and does not hold the block.
+
+[worker] Post-sign-off — AD10's minimum enforced at the service boundary, per architect. Just this.
+
+`CreateFirstAdministratorAsync` now throws `ArgumentException` for a password shorter than
+`CredentialPolicy.MinimumPasswordLength`, alongside the username guard and before the hash, so it cannot
+become another way to spend 64 MiB refusing a request. The comment records the argument that actually
+carries it — **irreversibility on the most privileged record**: this call mints the only account created
+with no invitation, no authentication and no audit trail, and nothing in this change can reset a
+password, so a weak first-administrator password is permanent. It also records the limit explicitly, so
+the exception can't later be read as a licence: *structural invariants always at the boundary; a policy
+number only where the record is privileged and the mistake is irreversible.*
+
+Three tests: `"short"` and `"elevenchars"` rejected with nothing written, and exactly-12 accepted and
+verifiable through `IPasswordHasher.Verify`. Mutation-checked — deleting the guard fails **exactly** the
+two rejection cases and nothing else. No maximum-length guard added: an over-long password has no
+irreversible consequence and Argon2id handles any length, so that one stays a presentation concern.
+
+Noted from the audit, no action needed. My equivalence corpus under-reported because every long shape I
+generated was uniform (`aaa…`), which cannot diverge when the required alphanumeric may sit anywhere —
+the conclusion held (zero divergence at ≤64, minimum at 65) but the headline was corpus-dependent. Vary
+the *shape*, not just the length, next time. And confirmed: the explicit length check at
+`BootstrapService.cs:59` is necessary rather than defensive, since the bounded pattern admits up to 127
+characters on its own.
+
+**Gates:** `dotnet build` — 0 Warnings, 0 Errors. `dotnet test` — **124/124 passed** (121 + 3).
+`openspec validate invite-only-authentication --strict` — valid. `dotnet format --verify-no-changes` —
+clean (exit 0). The verification recipe above is unaffected: step 4 already exercises the 12-character
+minimum, and it now fails at both the form and the service.
+
 ## NEXT
 
 - **Block 1 (§1.1–1.4)** ✅ committed by @architect — reviewer-approved, all four gates green
@@ -1292,9 +2646,30 @@ change; still `Security/`, `Identity/`, `Program.cs` DI, two `PackageReference`s
   timestamp columns retyped, Block 1's `NOCASE` collations intact, `ListAsync` ordering server-side.
   Landed **before** Block 3 so §3's bootstrap is built against the final schema. 1.1–1.4 stayed ticked —
   a correction within them, not new work.
-- **Block 3 (§3 — bootstrap)** is next: detect the empty store, one-time first-admin flow, inert
-  afterward. No open dependencies — AD7 has landed and the PO has closed the rate-limiting question.
-  → @architect brief incoming.
+- **Block 3 (§3.1 + §3.3)** ✅ committed by @architect — reviewer **signed off** after two review rounds,
+  all four gates verified independently before commit (build 0/0, **124/124**, `--strict` valid, format
+  clean). Two blockers found and closed, **neither** in the three hazards the brief called out (those all
+  verified correct by mutation): **BL1** — the refusal path burned a 64 MiB Argon2id hash on a
+  permanently-anonymous route (0.25 s → 0.0016 s); **BL2** — AD11's regex was quadratic and reinstated
+  that amplifier through an *earlier* door, since DataAnnotations runs before `OnValidSubmit` (500 in
+  0.253 s → 302 in 0.0023 s). Also landed: the reusable `WebApplicationFactory` harness for Static SSR
+  forms, AD10, AD11, and the credential guards at the service boundary.
+- **⏸ §3.2 is NOT ticked — awaiting Product Owner browser verification.** Everything is implemented,
+  reviewer-approved and gate-green; the recipe above has been driven end-to-end over HTTP **twice** by
+  @reviewer with every message byte-checked. It must not be ticked until the Product Owner confirms in a
+  real browser.
+- **Block 4 (§4 — invitations)** is next once §3.2 is confirmed. Inherits: AD7 (server-side expiry
+  predicate — land the test proving `ExpiresAt > now` reaches SQL), AD10 (same 12-char minimum),
+  AD11 + `CredentialPolicy.UsernameMatcher()` (same charset; don't hand-roll a `Regex`), the
+  `ISecretTokenGenerator` primitive from Block 2 (AD4 — hash invitation tokens SHA-256, show plaintext
+  once), and the Static SSR form harness. **Lesson carried from BL1/BL2:** a validation rule is
+  attacker-reachable code — cost every credential rule on an anonymous route before adding it.
+
+**Standing rule established in Block 3 (applies to §4 onward):** structural invariants are enforced at
+the service boundary always; a policy *number* only where the record is privileged and the mistake is
+irreversible. AD10 is at the boundary in §3 solely because the first admin is minted with no invitation,
+no authentication and no audit trail, and no password reset exists in this change. Do not cite it as
+precedent for pushing product numbers into services generally.
 
 **Open items, tracked so they can't be lost:**
 
@@ -1324,6 +2699,16 @@ change; still `Security/`, `Identity/`, `Program.cs` DI, two `PackageReference`s
   timestamp, so one bad row poisons an admin/member list view. Project there too.
 - **AD9** — whoever raises the Argon2 constants owes rehash-on-verify in the same change, or existing
   accounts stay at the old cost forever. The PHC encoding is what makes it possible; nothing to do now.
+- **AD10 — minimum password length is 12. Product Owner's decision (2026-07-25),** answering @worker's
+  §3 escalation. Rationale as escalated: Argon2id makes *offline* cracking expensive, but a
+  one-character password is guessable *online* in a handful of requests, and with rate limiting ruled
+  out of scope there is no compensating control. **Applies to every path where a user chooses a
+  password — §3 bootstrap and §4 invitation redemption — so the two cannot diverge.** A minimum only:
+  **no** composition/complexity rules, **no** strength meter, **no** additional UI, since those were
+  explicitly not chosen. Lands in the Block 3 review round; §4 must carry the same minimum.
+  **Note the §3 Product-Owner verification recipe above is superseded** — it predates AD10, so its
+  blank-submit expectations and its password no longer match. A corrected recipe is issued after AD10
+  lands, and 3.2 is verified against *that*.
 - **✅ CLOSED — login rate limiting is OUT OF SCOPE for this change. Product Owner's decision
   (2026-07-25).** Reviewer note A2 observed that §5's login is an unauthenticated 64 MiB / ~93 ms
   amplifier (a corrupt row up to 5.0 s per R4) and wanted a rate limit or concurrency gate. It is in no
