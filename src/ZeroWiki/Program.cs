@@ -1,11 +1,17 @@
 using ZeroWiki.Components;
 using ZeroWiki.Data;
+using ZeroWiki.Identity;
+using ZeroWiki.Security;
 
 var builder = WebApplication.CreateBuilder(args);
 
 // Add services to the container.
 builder.Services.AddRazorComponents();
 builder.Services.AddIdentityDb(builder.Configuration);
+builder.Services.AddSingleton(TimeProvider.System);
+builder.Services.AddSingleton<IPasswordHasher, Argon2idPasswordHasher>();
+builder.Services.AddSingleton<ISecretTokenGenerator, SecretTokenGenerator>();
+builder.Services.AddScoped<GitTokenService>();
 
 var app = builder.Build();
 

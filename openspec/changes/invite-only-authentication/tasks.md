@@ -7,9 +7,9 @@
 
 ## 2. Password & token hashing
 
-- [ ] 2.1 Implement Argon2id password hashing (via a vetted library, tuned parameters); verify against stored hash
-- [ ] 2.2 Implement high-entropy git token generation; store hashed, return plaintext once
-- [ ] 2.3 Implement token verification and revocation
+- [x] 2.1 Implement Argon2id password hashing (via a vetted library, tuned parameters); verify against stored hash
+- [x] 2.2 Implement high-entropy git token generation; store hashed, return plaintext once
+- [x] 2.3 Implement token verification and revocation
 
 ## 3. Bootstrap
 
