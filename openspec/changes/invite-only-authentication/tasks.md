@@ -29,7 +29,7 @@
 
 - [x] 5.1 Implement username/password login using the framework's auth/session primitives
 - [x] 5.2 Reject invalid credentials with a uniform generic error (no username enumeration)
-- [ ] 5.3 Implement logout that fully invalidates the session
+- [x] 5.3 Implement logout that fully invalidates the session
 
 ## 6. Anonymous experience & access control
 

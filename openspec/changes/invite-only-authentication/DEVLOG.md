@@ -3293,17 +3293,63 @@ necessarily anonymous — the invitee has no account yet). Running §6 once all 
 them in a single deliberate pass instead of being amended three times, and makes "deny everything except
 this list" reviewable as one statement.
 
-- **Block 5 (§5.1–5.3 — login & session)** is next. Inherits **AD8 in full** (dummy-hash timing
-  uniformity; three-way server-side logging behind one uniform response; the account lookup **must
-  project**, never materialise the `Account` entity — a corrupt timestamp column otherwise turns login
-  for that one user into a 500 while everyone else gets the uniform failure). Also inherits the Static
-  SSR form harness from §3 and the BL1/BL2 lesson: **a validation rule is attacker-reachable code** —
-  cost every rule on an anonymous route before adding it. Login is the most exposed route in the change.
-- **Block 4 (§4 — invitations)** follows §5. Inherits: AD7 (land the test proving the `ExpiresAt > now`
-  expiry predicate reaches **SQL**, not a client-side filter), AD10 (same 12-char minimum on redemption),
-  AD11 + `CredentialPolicy.UsernameMatcher()` (same charset, don't hand-roll a `Regex`), the
-  `ISecretTokenGenerator` primitive from Block 2 (AD4 — hash invitation tokens SHA-256, plaintext shown
-  once), and the standing service-boundary rule below.
+- **Block 5 (§5.1–5.3 — login & session)** ✅ committed by @architect (`b8b5a3c`) — reviewer **signed
+  off**, all four gates verified independently before commit (build 0/0, **149/149**, `--strict` valid,
+  format clean). **§5.3 verified by the Product Owner in a real browser (2026-07-26)**; §5 is complete.
+  Cookie auth only (no Identity stack), custom admin claim (not `ClaimTypes.Role`), AD8 satisfied in full
+  — dummy-hash timing uniformity measured at miss 228.8 ms / wrong 222.0 ms / correct 226.3 ms, uniform
+  status+body+headers across three separately-booted apps, projecting lookup, local-only `returnUrl`,
+  POST+antiforgery logout. Two test-quality defects were found by **mutation, not by reading the code**:
+  a path-only redirect assertion that let `//evil.example` pass as "redirected home", and a hasher
+  recorder blind to the password, which let an empty-password miss path (0.0 ms vs 220 ms — a free miss
+  path, the exact oracle §5.2 closes) pass 147/147. Both fixed; the redirect helper is now the only place
+  in the test project touching `Headers.Location`.
+
+---
+
+### ▶ RESUME HERE — Block 4 (§4.1–4.5, invitations)
+
+**State:** 15/31 tasks ticked. §1, §2, §3, §5 complete; AD7 amendment landed. Working tree clean, branch
+`change/invite-only-authentication`, HEAD is the §5.3 confirmation commit. All four gates green at HEAD
+(build 0/0, 149 tests, `--strict` valid, format clean). Remaining order per **AD12**: **§4 → §6 → §7 →
+§8 → §9**.
+
+**Before briefing Block 4, read:** `proposal.md`, `design.md` (D1, D3, D6), `specs/invitations/spec.md`,
+and this DEVLOG's pinned architecture decisions (AD1–AD13) plus the standing rules at the end of `NEXT`.
+
+**Block 4 inherits, and a brief must bind all of these:**
+
+- **AD7** — land a test proving the `ExpiresAt > now` expiry predicate reaches **SQL**, not a client-side
+  filter. This is the single most important test in §4: expiry is a security boundary, and the built-in
+  `DateTimeOffsetToBinaryConverter` was measured *silently admitting an expired row*. Assert on
+  `ToQueryString()`, as `DateTimeOffsetStorageTests` does.
+- **AD10** — the same 12-character password minimum on redemption, from `CredentialPolicy`.
+- **AD11** — the same username charset via `CredentialPolicy.UsernameMatcher()`. **Do not hand-roll a
+  `Regex`** over `UsernamePattern`, and do not reintroduce an unbounded quantifier (that was BL2).
+- **AD4 / Block 2** — invitation tokens use `ISecretTokenGenerator`: high-entropy, SHA-256 hashed at
+  rest, **plaintext shown once** and never stored or logged. Do not use Argon2 for them.
+- **§3's concurrency lesson (B1)** — "single-use" is a **concurrency** requirement exactly as "exactly one
+  administrator" was. Two simultaneous redemptions of the same invitation must create **one** account.
+  A read-then-write cannot do this on SQLite: the write lock must be taken *before* the check
+  (`BeginTransaction(deferred: false)`; there is **no** async overload). Prove it with a genuinely
+  concurrent test, not the happy path run twice.
+- **§3's BL1/BL2 lesson** — a validation rule is attacker-reachable code. Redemption is **anonymous** (the
+  invitee has no account yet), so every rule on that route gets costed before it is added, and the
+  expensive Argon2id hash must sit behind the cheap validity checks, not in front of them.
+- **§5's C5 property** — redemption must not become a token-enumeration oracle: an invalid token, an
+  expired one, a revoked one and an already-redeemed one should be indistinguishable to the caller.
+  Decide deliberately whether they are, and say so.
+- **The standing service-boundary rule** (below): structural invariants at the boundary always; a policy
+  number only where the record is privileged and the mistake irreversible.
+- **The forward-notes from §5:** use `RequireClaim(…, "true")`, never the bare form; and if §4 wants
+  `IPasswordHasher`'s usable/unusable distinction, **change the shape** (tri-state `Verify`) rather than
+  copying a pattern whose safety rests on documentation.
+- **Test harness** — `tests/ZeroWiki.Tests/Web/` (`ZeroWikiAppFactory`, `StaticSsrForm`, `HttpAssertions`)
+  exists and is reusable; §4's forms must use it. `RecordingPasswordHasher` and `CapturingLoggerProvider`
+  are there too.
+
+**Expect §4.2 (redeeming an invitation in a browser) to be a Product-Owner verification step**, as §3.2
+and §5.3 were — draft the recipe and do not tick it on gates alone.
 
 - **AD13 — session expiry stays sliding, 14 days. Product Owner's decision (2026-07-26),** answering
   reviewer note A1. **Record the consequence honestly, because it is stronger than the limitation the
