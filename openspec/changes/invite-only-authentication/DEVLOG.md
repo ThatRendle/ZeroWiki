@@ -27,6 +27,49 @@ Greenfield repo — this change scaffolds the whole solution. Binding calls made
   repo** (design D6). Dev default is a local path under the app.
 - **AD6 — Admin/member distinction.** Persist a single `IsAdministrator` boolean on the account
   (design D2 + Open Question re: roles). No broader role model this change.
+- **AD14 — Invitation lifetime is 7 days. Product Owner's decision (2026-07-26).** The spec bounds
+  the lifetime ("expires after a bounded time") but never names the bound, so like AD10 the number
+  is the Product Owner's, not the Architect's. Rationale as offered and accepted: a week survives a
+  weekend and a missed message, while keeping a link that leaks into a chat backlog from staying
+  live indefinitely. **The number lives beside AD10 in `CredentialPolicy`'s sibling — an invitation
+  policy constant — not inline at a call site**, for the same reason AD10 does: the value is quoted
+  in user-facing copy ("this link expires in 7 days") and in the expiry test, and those three must
+  not drift. Expiry is computed **once at issue** (`CreatedAt + 7 days` persisted into `ExpiresAt`),
+  never re-derived at redemption from a constant that may since have changed.
+- **AD15 — An invitation is visible and revocable to its issuer, and to any administrator. Product
+  Owner's decision (2026-07-26).** The spec says a "member" issues and that an unused invitation
+  can be revoked, but is silent on by whom; this closes it. Members see and revoke their own;
+  administrators see and revoke all. Two consequences that bind the implementation: **listing is
+  scoped in the query, not filtered in the view** (`WHERE IssuerAccountId = @me` unless the caller
+  is an administrator) — a view-level filter leaks through any future JSON/partial surface; and the
+  revoke path **takes the caller's identity as a parameter and authorises inside the service**,
+  exactly as `GitTokenService.RevokeAsync(accountId, tokenId)` already does, so a route that forgets
+  to check cannot revoke someone else's invitation. **This also answers `design.md`'s open question**
+  ("whether the admin/member distinction needs any persisted role beyond 'can issue invitations'"):
+  it does not — `IsAdministrator` (AD6) carries the whole distinction §4 needs.
+- **AD16 — the four authorization additions all stay, and two of them are load-bearing. Architect's
+  ruling (2026-07-26),** closing @worker's Block 4a ❓. **Measured, twice, independently** — the
+  first measurement was wrong and is retracted in §4's thread; these numbers are the reviewer's,
+  reproduced by the worker under a `shasum` landing guard:
+  - `AddAuthorization()` — **required.** Without it every request to an `[Authorize]` page is a 500.
+  - `app.UseAuthorization()` — **required, and its position is the point.** `WebApplication`
+    auto-inserts the middleware at the *front* of the pipeline, ahead of the explicit
+    `UseAuthentication()`, where it evaluates `[Authorize]` against a not-yet-authenticated `User`
+    and 302s **every signed-in member** to `/login`. The explicit call placed *after*
+    `UseAuthentication()` is the only reason a logged-in member reaches the page.
+  - `AuthorizeRouteView` and `AddCascadingAuthenticationState()` — **inert today, kept deliberately.**
+    §6 and §7 render `AuthorizeView`, which needs the cascading state; `AuthorizeRouteView` keeps the
+    renderer and the endpoint from being able to disagree about the same `[Authorize]`. Do not delete
+    them as dead code in §6 — this is the ruling that says why they are there.
+
+  **The lesson is worth more than the ruling.** Had the two required lines been dropped as
+  "redundant", **both anonymous tests would have stayed green** while the site was broken for every
+  authenticated user: the tests assert that anonymous is denied, and the breakage denies *everyone*.
+  A suite can be green and still be describing a broken system — §5 found this in its own tests, and
+  §4 found it again in the experiment built to prevent it (a mutation script whose `\n` could not
+  match `Program.cs`'s CRLF silently mutated nothing, and a no-op mutation is indistinguishable from
+  a surviving mutant unless you check the edit landed). **Any mutation run in this repo verifies the
+  file actually changed before believing the result.**
 
 ## 1. Identity store
 
@@ -2629,6 +2672,702 @@ characters on its own.
 clean (exit 0). The verification recipe above is unaffected: step 4 already exercises the 12-character
 minimum, and it now fails at both the form and the service.
 
+## 4. Invitations
+
+_[architect] — **§4 is carved into two blocks.** The section splits cleanly along the trust boundary,
+and each task lands whole in exactly one block so nothing is ticked half-built:_
+
+- _**Block 4a = 4.1 + 4.4** — issuing and revoking. **Authenticated** surface; the caller already has
+  an account._
+- _**Block 4b = 4.2 + 4.3 + 4.5** — redemption and its rejections. **Anonymous** surface; the caller
+  has no account yet, which is what makes it the exposed half. 4.2 carries a Product-Owner browser
+  verification, as 3.2 and 5.3 did._
+
+_The split is deliberate rather than tidy: 4a and 4b have different threat models, and mixing them
+in one review would let the cheap half's reasoning stand in for the expensive half's._
+
+---
+
+_[architect] → @worker — **Block 4a = tasks 4.1 and 4.4.** Read this whole post before starting;
+everything binding is here, so you should not need to go hunting._
+
+**Tasks in scope**
+
+- `4.1` Issue a single-use, expiring invitation as an authenticated member.
+- `4.4` Revoke an unused invitation.
+
+**Explicitly NOT in scope** — redemption (`4.2`), the rejection paths (`4.3`), and the
+no-open-registration assertion (`4.5`) are Block 4b. Do not build a redemption route "while you're
+there": its validation is anonymous, attacker-reachable, and gets its own brief and its own review.
+
+**Binding spec (verbatim, `specs/invitations/spec.md`)**
+
+> ### Requirement: Issue invitations
+>
+> The system SHALL allow an existing member to issue a single-use invitation that expires after a
+> bounded time.
+>
+> #### Scenario: Member issues an invitation
+>
+> - **WHEN** an authenticated member issues an invitation
+> - **THEN** the system produces a single-use invitation with an expiry and a redemption link/token
+
+> ### Requirement: Invitation validity and revocation
+>
+> The system SHALL reject redemption of an invitation that is expired, already redeemed, or revoked,
+> and SHALL allow an unused invitation to be revoked before redemption.
+
+_(Only the revocation clause of that second requirement is 4a's. The three rejection scenarios under
+it are 4b's.)_
+
+**Binding decisions**
+
+- **AD4 — invitation tokens are `ISecretTokenGenerator`, not Argon2.** High-entropy random, SHA-256
+  at rest, **plaintext returned once and never stored, never logged**. `Invitation.TokenHash` and its
+  unique index already exist. Model the return on `IssuedGitToken` / `GitTokenService.IssueAsync` —
+  that is the shape this repo already uses for a shown-once secret, and §7 will present both.
+- **AD14 — 7 days, as a named policy constant, computed once at issue.** Persist
+  `ExpiresAt = CreatedAt + InvitationPolicy.Lifetime`. Do **not** leave the expiry implicit and
+  re-derive it at redemption: an invitation's lifetime is a property of *that invitation*, fixed when
+  it was handed out, and re-deriving it would silently re-date every outstanding invite the day
+  somebody edits the constant. The user-facing copy must quote the same constant, and a test must
+  hold copy and constant in step — `CredentialPolicy`'s
+  `MinimumPasswordLengthRuleDescription` is the established pattern for that.
+- **AD15 — issuer + any administrator, scoped in the query and authorised in the service.** `ListAsync`
+  takes the caller and scopes with `WHERE IssuerAccountId = @me` unless the caller is an
+  administrator; `RevokeAsync` takes the caller's id and its administrator flag and refuses a
+  non-owner, exactly as `GitTokenService.RevokeAsync(accountId, tokenId)` already refuses another
+  account's token. **A route that forgets to check must not be able to revoke someone else's
+  invitation** — that is the whole point of putting it in the service rather than the page.
+- **Revocation is idempotent, and only an *unused* invitation is revocable.** Follow
+  `GitTokenService.RevokeAsync`: re-revoking keeps the original `RevokedAt` and succeeds. But note the
+  spec's word — "revoked **before redemption**". Revoking an already-**redeemed** invitation is
+  meaningless (the account exists; revoking it must not un-create anything) and must not appear to
+  succeed at something it did not do. Decide the shape, state it in your handoff, and test it.
+- **Authorization: any authenticated member, NOT administrator-only.** The spec says "an existing
+  member", and AD15 says administrators get *broader visibility*, not exclusive rights to issue. So
+  the issue page is `[Authorize]` plain. **Where you do test the administrator flag** (AD15's
+  widened listing), use `RequireClaim(ZeroWikiClaims.IsAdministrator, "true")` — the **bare**
+  `RequireClaim(type)` form matches the claim's mere *presence* and would make `"false"` an
+  administrator. That is a §5 forward-note, and it is a live foot-gun here.
+- **Wire only the authorization plumbing 4.1 needs — §6 is not yours.** `Program.cs` currently calls
+  `UseAuthentication()` but there is no `AddAuthorization()`, no `UseAuthorization()`, no
+  `CascadingAuthenticationState`, and `Routes.razor` uses a bare `RouteView`, so `[Authorize]` on a
+  component would be silently inert today. Add the minimum that makes `[Authorize]` actually deny:
+  the services, the middleware, `AuthorizeRouteView`, and the cascading auth state. **Do not** add a
+  global fallback policy, a deny-anonymous default, or the login redirect for content pages — 6.1–6.3
+  own those, and pulling them forward would put §6's decisions in §4's review.
+- **Projection over materialisation (AD7 addendum / the §7 note).** The listing must project to a
+  summary record — model it on `GitTokenSummary` and `GitTokenService.ListAsync` — not
+  `ToListAsync()` over `Invitation` entities. A single row with an unreadable timestamp otherwise
+  throws and poisons the entire list for everyone. `AsNoTracking()` throughout on read paths.
+- **Static SSR, form POSTs, antiforgery.** No interactive render mode, no circuit. Follow
+  `Bootstrap.razor` for the `[SupplyParameterFromForm(Name = nameof(Input))]` + non-nullable `Input`
+  view idiom, including *why* it has no property initializer (BL0008). Follow `Logout.razor` for the
+  rule that a **state-changing action happens on POST only** — a revoke reachable by GET is
+  triggerable by any page that can make the browser fetch a URL, and an `<img>` tag is enough.
+- **The shown-once plaintext must survive exactly one render and no more.** It is returned by the
+  service, rendered into the page that handled the POST, and is then gone. Do not stash it in
+  `TempData`, a session, a query string, or the redirect target — a redemption link in a URL lands in
+  browser history, server logs and any proxy in between. The design's open question resolves to
+  "copy-a-link handoff", so render the full absolute redemption URL for copying, built from the
+  request's own base URI, not a configured host.
+
+**Test expectations** — `dotnet test` currently stands at 149 green; you are adding to that, not
+replacing it.
+
+- The harness in `tests/ZeroWiki.Tests/Web/` (`ZeroWikiAppFactory`, `StaticSsrForm`, `HttpAssertions`)
+  exists and **must** be reused for the page-level tests; `RecordingPasswordHasher` and
+  `CapturingLoggerProvider` are there too.
+- Prove the token is **hashed at rest** — the store holds no value equal to the plaintext that was
+  shown.
+- Prove `ExpiresAt` is 7 days after `CreatedAt` via a fake `TimeProvider` (the DI'd
+  `TimeProvider.System` is replaceable in tests), and that the constant and the user-facing copy
+  agree.
+- Prove **AD15 both ways**: a member cannot list or revoke another member's invitation, and an
+  administrator can do both. The negative case is the one that matters.
+- Prove the issue route **denies anonymous** — that is the "as an authenticated member" half of 4.1,
+  and without a test it is one forgotten attribute away from being false.
+
+**Two lessons from earlier blocks that cost real time here**
+
+- **§3/B1 — "single-use" is a concurrency property.** That bites in 4b, not 4a, but it starts here:
+  do not build an issue/revoke shape that a redemption cannot later make atomic. Assume 4b will need
+  `BeginTransaction(deferred: false)` around redemption (there is **no** async overload) and leave
+  room for it.
+- **§5's mutation-testing finding.** Two test-quality defects in Block 5 passed 147/147 while
+  asserting nothing — a path-only redirect check that admitted `//evil.example`, and a recorder blind
+  to the value it was recording. Before you hand off, **break your own implementation on purpose and
+  confirm the test you wrote actually goes red.** A test that cannot fail is worse than no test,
+  because it is counted.
+
+**Done-gates — all four, before anything is ticked**
+
+1. `dotnet build` clean (no errors)
+2. `dotnet test` green — your new tests **and** all 149 existing ones
+3. `openspec validate invite-only-authentication --strict`
+4. `dotnet format --verify-no-changes` clean
+
+Post progress and any `❓ @architect` questions to this section as you go, then hand off with
+`→ @reviewer`.
+
+[worker] Block 4a (4.1 + 4.4) implemented. Summary:
+
+- **`InvitationPolicy`** (AD14) — `LifetimeDays = 7`, `Lifetime = TimeSpan.FromDays(LifetimeDays)`,
+  `LifetimeRuleDescription`, and `RedemptionPath = "/invite"`. Same shape as `CredentialPolicy`, and
+  `InvitationPolicyTests` holds the copy to the number the way `CredentialPolicyTests` does.
+- **`InvitationService`** over `IdentityDbContext` + `ISecretTokenGenerator` + `TimeProvider`:
+  `IssueAsync(issuerAccountId)` → `IssuedInvitation(Id, Token, CreatedAt, ExpiresAt)` (plaintext
+  returned once, only `secret.Hash` persisted); `ListAsync(callerAccountId, callerIsAdministrator)` →
+  `IReadOnlyList<InvitationSummary>`; `RevokeAsync(callerAccountId, callerIsAdministrator,
+  invitationId)` → `InvitationRevocation`. `ExpiresAt = CreatedAt + InvitationPolicy.Lifetime`
+  computed **once at issue** and persisted.
+- **AD15 scoping is in the query, in both directions.** `ListAsync` and `RevokeAsync` each start from
+  the full set and add `Where(i => i.IssuerAccountId == callerAccountId)` unless the caller is an
+  administrator — the branch is on the `IQueryable`, so a non-administrator's SQL never selects
+  another member's row at all. Nothing is filtered in the view.
+- **`ListAsync` projects** to `InvitationSummary` (`AsNoTracking`, ordered server-side, newest first),
+  and the summary carries no token hash. The issuer's username comes from an explicit
+  `join` on `Accounts` rather than `i.IssuerAccount!.Username`, so the projection needs no
+  null-forgiving operator over an optional navigation.
+- **`Invitations.razor`** — `@page "/invitations"`, `@attribute [Authorize]`, Static SSR, no
+  interactive render mode. Two POST-only forms: `issue-invitation` (a bare button, `Logout.razor`'s
+  idiom) and `revoke-invitation`. The shown-once link is built with
+  `Navigation.ToAbsoluteUri($"{RedemptionPath}/{token}")` — the request's own base URI — rendered by
+  the response that created it, and never put in `TempData`, a session, a query string or a redirect
+  target. Claims are read with `User.HasClaim(ZeroWikiClaims.IsAdministrator, "true")`, the
+  value-matching form, never the bare presence check.
+- **Authorization plumbing, exactly the four the brief named.** `AddAuthorization()`,
+  `AddCascadingAuthenticationState()`, `app.UseAuthorization()` between `UseAuthentication()` and
+  `UseAntiforgery()`, and `RouteView` → `AuthorizeRouteView` in `Routes.razor`. **No** fallback
+  policy, no deny-anonymous default, no content-page login redirect — those are 6.1–6.3. See the
+  ❓ below: the brief's premise for these turns out to be measurably false, and I have left them in
+  rather than deciding that myself.
+- **Tests: 28 new (177 total).** `Identity/InvitationServiceTests` (14), `Identity/InvitationPolicyTests`
+  (3), `Web/InvitationsPageTests` (11) on the existing `ZeroWikiAppFactory` / `StaticSsrForm` /
+  `HttpAssertions` harness.
+
+**Judgement calls where the brief left latitude:**
+
+1. **Revoking an already-redeemed invitation → `InvitationRevocation.AlreadyRedeemed`, not `true`.**
+   The return type is a three-value enum (`Revoked` / `NotFound` / `AlreadyRedeemed`) rather than
+   `GitTokenService.RevokeAsync`'s `bool`, because a `bool` has to conflate "nothing here for you"
+   with "this one already made an account". The spec permits revocation *before redemption*, so
+   reporting success would claim to have undone something that was not undone — and `RevokedAt` stays
+   `null`, so the row does not acquire a state that says an account-creating invitation was withdrawn.
+   Idempotency is preserved for the case the brief named: re-revoking an *unused* invitation returns
+   `Revoked` and keeps the original `RevokedAt`. Administrators get the same answer (tested) —
+   "already redeemed" is a property of the invitation, not of the caller's rights.
+2. **`NotFound` covers both "no such invitation" and "not yours", deliberately indistinguishable**, so
+   an authenticated member cannot use the revoke path to discover that another member's invitation
+   exists. Same reasoning as §5's C5, applied to the authenticated surface.
+3. **`RedemptionPath = "/invite"` is a constant, not a literal** — Block 4b owns the page, this block
+   owns the link, and the two must not be spelled out separately. **@architect / @worker-4b: the link
+   this block renders 404s until 4b maps `/invite/{token}`.** Flagging rather than assuming.
+4. **`RevokeAsync` materialises the single `Invitation` row** it is about to write, rather than
+   projecting. The AD7 projection rule is about *lists* — one unreadable row poisoning everyone's
+   view; a single-row fetch for a write is bounded to the row being written and needs a tracked
+   entity. `ListAsync` does project.
+5. **One revoke form wrapping the table**, with each row's `<button type="submit"
+   name="RevokeInput.InvitationId" value="@id">`, instead of a form per row. A form per row needs a
+   distinct `FormName` per row, which makes a submission naming a row the caller cannot see land on
+   "no form has that name" — an error, and worse, it would put the authorization decision in what the
+   view happened to render. This shape puts the identifier in the POST body where it is plainly
+   attacker-supplied, and the service is what refuses it.
+6. **`StaticSsrForm.GetHiddenFieldsAsync` gained a form-scoped overload** (additive; the existing
+   one-argument overload is untouched). A page with two forms renders two `_handler` inputs, so the
+   whole-page read now throws on a genuine ambiguity instead of silently picking one.
+7. **No `NavMenu` link to `/invitations`** — the nav renders for anonymous visitors too, and §6.1 says
+   anonymous sees only "Login". §6/§7 own navigation.
+
+**Broke it on purpose — nine mutants, all caught** (per the §5 lesson; ran each against
+`--filter FullyQualifiedName~Invitation`, baseline and restored both 31/31):
+
+| mutant | failures |
+|---|---|
+| M1 `[Authorize]` removed from the page | **2** (anonymous GET no longer redirects; anonymous POST issues an invitation) |
+| M2 `ListAsync` drops the caller scope | **2** |
+| M3 `RevokeAsync` drops the caller scope | **2** |
+| M4 redeemed invitation reported as revoked | **2** |
+| M5 `ExpiresAt = CreatedAt` (lifetime not applied) | **3** |
+| M6 `LifetimeDays` → 14, copy left saying 7 | **2** |
+| M7 plaintext persisted instead of the hash | **2** |
+| M8 revocation overwrites the original `RevokedAt` | **1** |
+| M9 summary carries the at-rest token hash | **4** |
+
+M1 is the one worth stating plainly: `[Authorize]` on `/invitations` is doing real work — remove the
+attribute and an anonymous GET renders the page and an anonymous POST issues a live invitation.
+
+❓ **@architect — the brief's premise for the authorization plumbing is false, measurably. Your call
+whether to keep it.** The brief said `[Authorize]` "would be silently inert today" and asked for the
+four minimum additions. It is not inert, and none of the four is the reason it works. Measured by
+removing each in turn and re-running `InvitationsPageTests` (11 tests, including the anonymous-GET
+and anonymous-POST cases):
+
+| removed | `InvitationsPageTests` |
+|---|---|
+| `AuthorizeRouteView` → back to `RouteView` | **11/11 pass** |
+| `AddCascadingAuthenticationState()` | **11/11 pass** |
+| `app.UseAuthorization()` | **11/11 pass** |
+| `AddAuthorization()` (middleware kept) | **11/11 pass** |
+| `AddAuthorization()` **and** `app.UseAuthorization()` | **11/11 pass** |
+| the `[Authorize]` attribute itself (M1) | **2 fail** |
+
+So the deny is entirely the endpoint metadata `MapRazorComponents` lifts off the component, enforced
+through the authorization services `AddRazorComponents()` already registers and the middleware
+`WebApplication` inserts implicitly. All four additions are redundant *for today's behaviour*.
+
+**I kept all four**, because the instruction was explicit and I do not think redundant-today is the
+same as wrong, but I have rewritten the code comments so they no longer assert the false premise:
+
+- `AddAuthorization()` — §6 has to write a fallback policy against a named registration, and I would
+  rather not have it discover the site's authorization is configured by an invisible default.
+- `app.UseAuthorization()` — the implicit insertion happens *before* `UseHttpsRedirection` and
+  everything above it; stating it puts the boundary where a reader looks for it, next to
+  `UseAuthentication()` which was already explicit for the same reason.
+- `AuthorizeRouteView` + `AddCascadingAuthenticationState()` — currently inert, and §6/§7 will need
+  them the moment anything renders `AuthorizeView`. If you would rather §6 add them so this block's
+  diff carries nothing dead, say so and I will drop both — it is a two-line revert and the tests do
+  not move either way.
+
+**Not built, and deliberately so:** no redemption route, no validation of a presented token, no
+account creation — 4.2/4.3/4.5 are 4b. **AD7's "expiry predicate reaches SQL" test is 4b's**, not
+duplicated here: 4a has no expiry filter (the list shows expired invitations, marked as such), and
+`DateTimeOffsetStorageTests` already asserts exactly that predicate against `Invitations.ExpiresAt`.
+
+**Gates:** `dotnet build` — 0 Warnings, 0 Errors. `dotnet test` — **177/177 passed** (149 existing +
+28 new). `openspec validate invite-only-authentication --strict` — valid. `dotnet format
+--verify-no-changes` — clean (exit 0).
+
+**For @reviewer to look at hardest:**
+1. The `AlreadyRedeemed` shape (call 1) — it is a deviation from `GitTokenService.RevokeAsync`'s
+   `bool`, and the redeemed-invitation case does not exist yet, so it is reasoned rather than observed.
+2. The single-form-with-per-row-buttons shape (call 5) and whether the antiforgery/POST-only
+   guarantees really hold for it —
+   `Revoking_requires_a_post_carrying_an_antiforgery_token` asserts both, but it is one test.
+3. ~~The authorization-plumbing ❓ above — all four additions are redundant for today's behaviour and
+   I kept them anyway. That is exactly the kind of call I would rather have a second reading of.~~
+   — **retracted; the claim is false.** Two of the four are load-bearing. See the `[worker]`
+   retraction at the end of this section.
+4. `InvitationsPageTests.SubmitAsync` re-fetches the page to get fresh hidden fields per post — worth
+   confirming that does not paper over a form whose rendered names have drifted.
+
+→ @reviewer
+
+---
+
+_[reviewer] — **Block 4a (4.1 + 4.4). Verdict: Request changes.** Two blockers, both in prose, not in
+code: **no file under `src/` needs to change.** The implementation is the cleanest of the change so far
+— AD15 is enforced where it was asked to be, the shown-once secret is genuinely shown once, and every
+mutant you nominated is genuinely caught (I re-ran them rather than taking the table on trust). What I
+am blocking on is the **authorization-plumbing measurement**, which is materially false in the opposite
+direction from the one that would be safe, and one code comment that credits a protection that does not
+exist. Findings are numbered so you can answer each in-thread._
+
+**Re-verified gates, independently:** `dotnet build` 0 Warnings / 0 Errors · `dotnet test` **177/177** ·
+`dotnet format --verify-no-changes` exit 0 · `openspec validate invite-only-authentication --strict`
+valid. Working tree restored to your handoff state after every experiment below.
+
+### 🚫 R1 — the plumbing table is wrong, and the ❓ built on it invites a change that breaks the site
+
+Your handoff (`§4`, "the brief's premise for the authorization plumbing is false, measurably") reports
+11/11 passing with `app.UseAuthorization()` removed, with `AddAuthorization()` removed, and with both
+removed, and concludes "none of the four is the reason it works … All four additions are redundant *for
+today's behaviour*". I removed each in turn and re-ran `InvitationsPageTests`. Measured:
+
+| removed | your table | **measured** |
+|---|---|---|
+| `AuthorizeRouteView` → `RouteView` | 11/11 pass | 11/11 pass ✅ genuinely inert |
+| `AddCascadingAuthenticationState()` | 11/11 pass | 11/11 pass ✅ genuinely inert |
+| `app.UseAuthorization()` | 11/11 pass | ❌ **9 fail / 2 pass** |
+| `AddAuthorization()` (middleware kept) | 11/11 pass | ❌ **11 fail** — `InvalidOperationException: Unable to find the required services. Please add all the required services by calling 'IServiceCollection.AddAuthorization'` |
+| both | 11/11 pass | ❌ **11 fail** — `InvalidOperationException: Endpoint /invitations (/invitations) contains authorization metadata, but a middleware was not found that supports authorization` |
+| the `[Authorize]` attribute (M1) | 2 fail | 2 fail ✅ |
+
+**Two of the four are load-bearing.** And the `app.UseAuthorization()` row is the one that matters most,
+because of *which* nine fail: every failure is an **authenticated** request getting `302 Found` where it
+expected `200` — `A_member_issues_an_invitation…`, `A_member_revokes_their_own_invitation`,
+`An_administrator_can_revoke…`, and so on. The two that still pass are exactly your two anonymous tests.
+
+The mechanism: with no explicit call, `WebApplication` auto-inserts the authorization middleware at the
+**front** of the pipeline — ahead of your explicit `app.UseAuthentication()`. It therefore evaluates
+`[Authorize]` against an `HttpContext.User` that has not been authenticated yet and bounces **every
+signed-in member** to `/login`. Your explicit `app.UseAuthorization()` sitting *after*
+`UseAuthentication()` (`Program.cs:72-73`) is the only reason a logged-in member can reach the page at
+all. So the comment at `Program.cs:68-71` is not the readability argument it currently presents itself
+as — it is the functional reason, and it **understates** itself.
+
+This is blocking for two reasons. First, you asked @architect to rule on the strength of that table
+("If you would rather §6 add them … I will drop both — it is a two-line revert and the tests do not move
+either way"), and for `app.UseAuthorization()` the tests move a great deal. Second, the DEVLOG is
+committed with the block and is the durable record of *how* this was built; a wrong measurement in it
+outlives the block.
+
+Worth naming explicitly, because it is the §5 lesson in a new costume: had this shipped without
+`app.UseAuthorization()`, **both anonymous tests would still be green** while the feature was broken for
+every real user. A deny-anonymous test cannot, on its own, tell "authorization works" from
+"authorization denies everybody" — it takes the authenticated tests alongside it. Yours has both, which
+is why the mutation caught it.
+
+**Asked of you:** re-measure, correct the ❓ post and the "all four are redundant" conclusion, and keep
+`AddAuthorization()` + `app.UseAuthorization()` on the stated ground that they are required. The genuine
+question then narrows to a real one worth @architect's answer: `AuthorizeRouteView` +
+`AddCascadingAuthenticationState()` **are** inert today (confirmed), so keep-for-§6 vs. let-§6-add-them
+is a live call. Note for that call: `AuthorizeRouteView` is not free — with `AddAuthorization()` absent
+it throws `Cannot provide a value for property 'AuthorizationPolicyProvider'`, so it hard-couples the
+renderer to the authorization services being registered.
+
+### 🚫 R2 — `InvitationService.cs:56-58` claims a protection the projection does not give
+
+> `Projected rather than materialised. The timestamps are value-converted, so one unreadable column on
+> one row would otherwise throw and take the whole list down for everybody.`
+
+The projection selects `invitation.CreatedAt`, `ExpiresAt`, `RedeemedAt` and `RevokedAt` into
+`InvitationSummary` — so the converter runs on exactly the columns the comment says are covered.
+Measured, by corrupting a row and calling `ListAsync`:
+
+- corrupt `Invitations.CreatedAt` → **`FormatException: String 'not-a-timestamp' was not recognized as a
+  valid DateTime`**. Still throws. Still poisons the whole list.
+- corrupt `Accounts.CreatedAt` → **no throw.**
+
+So the projection *is* doing real work, but not the work the comment names: the value of the explicit
+`join … select issuer.Username` is that the `Account` row is **never materialised**, which is precisely
+the §7 note's hazard ("a `ToListAsync()` over all accounts does throw if any single row has a corrupt
+timestamp"). Please rewrite the remark to say what actually holds — the joined account row is never
+materialised, and the invitation's own timestamps are read and therefore still fail closed on
+corruption. §7 will build this same list shape from this same comment, and a reader trusting it as
+written would skip a check that is still needed.
+
+### Notes — not blocking, but worth an answer
+
+**N1 — `AlreadyRedeemed`: right shape, and I agree with both calls (1) and (2).** The three-value enum is
+better than `GitTokenService`'s `bool` here for the reason you gave, and the spec's "before redemption"
+makes reporting success a lie. On enumeration: collapsing "no such invitation" and "not yours" into
+`NotFound` is **correct and I want to be explicit that it is not §5's uniformity rule applied
+reflexively.** AD15 makes this an authenticated route, so the threat is a signed-in member using revoke
+as an existence oracle for another member's invitation id — collapsing closes exactly that, and it costs
+nothing, because a legitimate caller never sees `NotFound` for a row their own list rendered. Verified
+indistinguishable at both layers. Reachability: `Revoked` and `NotFound` are reachable end-to-end today;
+`AlreadyRedeemed` is not, since nothing writes `RedeemedAt` until 4b and `IsRevocable` never renders a
+button for a redeemed row. That is correct defence-in-depth, not dead code — but its end-to-end coverage
+is 4b's to add, so please hand that forward.
+
+**N2 — @architect, for 4b's brief: `RevokeAsync` is check-then-act, and 4b closes the window.**
+`InvitationService.cs:106-124` reads the row, tests `RedeemedAt is not null`, then writes — no
+transaction, no concurrency token. Nothing here **boxes in** 4b (I checked: `BeginTransaction(deferred:
+false)` around redemption is entirely available, the service takes the scoped `IdentityDbContext`, and
+`IssueAsync` is a plain insert). But once redemption exists, a redemption committing between that read
+and that write leaves a row carrying **both** `RedeemedAt` and `RevokedAt`, and tells the revoker
+`Revoked` for an invitation that did create an account — the exact confusion `AlreadyRedeemed` exists to
+prevent. 4b should either bring the revoke path inside the same transaction or make the write
+conditional (`ExecuteUpdateAsync` … `WHERE RedeemedAt IS NULL`). Flagging now so it is not lost between
+briefs.
+
+**N3 — the bare-presence claim foot-gun is unpinned.** I mutated `Invitations.razor:127` from
+`User.HasClaim(ZeroWikiClaims.IsAdministrator, "true")` to
+`User.HasClaim(c => c.Type == ZeroWikiClaims.IsAdministrator)` — **31/31 still pass.** Not a live defect:
+`Login.razor:85-88` adds the claim only when `account.IsAdministrator`, so no principal ever carries
+`"false"`, which is exactly why the mutant survives. But the guard @architect singled out as "a live
+foot-gun here" is the one thing in this block with no test behind it, and the day anything emits the
+claim unconditionally, a regression to the bare form silently promotes every member. One test — a
+principal carrying `zerowiki:is_administrator = "false"` must not see another member's invitation —
+would pin it.
+
+**N4 — the issue form has no antiforgery negative.** `Revoking_requires_a_post_carrying_an_antiforgery_token`
+covers revoke properly (I confirmed both halves: the GET with `_handler=revoke-invitation` and the id
+returns 200 with `RevokedAt` still null, and the token-stripped POST returns 400). Nothing covers issuing
+without a token. `app.UseAntiforgery()` is global so both are in fact protected — but the untested form
+is the one that **mints a credential**. A three-line addition to `Issuing_requires_a_post`.
+
+**N5 — AD14 copy-vs-constant holds in both directions** (I checked both, since a one-direction check is
+the usual way this rots): `LifetimeDays → 14` fails `The_lifetime_rule_states_the_number_it_is_paired_with`
+*and* the service expiry test; copy drifting to "14 days" with the constant at 7 fails the policy test;
+`Lifetime` drifting from `LifetimeDays` fails `The_lifetime_is_the_stated_number_of_days`. Note for
+whoever edits these next: `InvitationsPageTests` asserts `CreatedAt + InvitationPolicy.Lifetime`, which
+is self-referential, so **`InvitationServiceTests.cs:85` (`IssuedAt.AddDays(7)`) is the only line that
+pins AD14 to a literal number against the clock.** Don't "tidy" it into the constant.
+
+**N6 — `ListAsync`'s inner join drops an invitation whose issuer no longer exists.** Unreachable today
+(nothing deletes accounts). Worth remembering if §6/§7 ever adds account deletion.
+
+**N7 — `LoadAsync()` runs twice per POST** — once from `OnInitializedAsync`, once from the handler. One
+extra query, harmless; mentioning only because §7 will copy this page's shape.
+
+**N8 — `Uri.EscapeDataString(issued.Token)` is a no-op** and should stay. `SecretTokenGenerator` emits
+base64url without padding, and `EscapeDataString` escapes none of `A–Z a–z 0–9 - _`. Correctly defensive
+rather than redundant — it stops being a no-op the day the encoding changes.
+
+### Checked and clean — recorded so the audit shows it was looked at, not assumed
+
+- **AD15 is in the query, both directions, both layers.** Dropping the scope from `ListAsync` fails 2
+  (service + HTTP); dropping it from `RevokeAsync` fails 2 (service + HTTP). A route that forgot to
+  check genuinely cannot reach past the service — confirmed by
+  `A_member_cannot_revoke_another_members_invitation_by_posting_its_identifier`, which posts a foreign id
+  through the real form and gets 200 with `RevokedAt` still null.
+- **The revoke form shape (your call 5) is sound.** One form, per-row buttons, identifier in the POST
+  body where it is plainly attacker-supplied. Antiforgery validated (token-stripped POST → 400),
+  POST-only (GET with the id → 200, no revocation), and the swapped-row case refused by the service
+  rather than by what the view rendered. I agree this beats a form per row.
+- **Hashed at rest** — persisting the plaintext fails 2, and both tests assert against a dump of *every
+  column* of the row rather than the one column it was least likely to be in. Good instinct.
+- **Shown once** — asserted three ways: rendered by the POST response, absent from the next GET, absent
+  from every column of the store. `grep` for `TempData|Session|Log|Console` across the invitation files
+  returns only your comment saying not to. No secret in a URL, a redirect target or a log.
+- **Deny-anonymous asserts the right thing** — 302, `/login`, same authority, returnUrl containing the
+  page. Not "any non-success". That matters: a missing authorization middleware produces a **500**, and I
+  confirmed this test fails on it rather than passing it through.
+- **Idempotent revoke** — overwriting `RevokedAt` fails `Revoking_an_already_revoked_invitation_keeps_the_original_time`.
+- **Static SSR** — no render mode, no `AddInteractive*`, no circuit anywhere in the diff.
+  (`_Imports.razor:6`'s `@using static …RenderMode` is the pre-existing template line, untouched here,
+  and declares nothing.)
+- **Scope is exactly 4.1 + 4.4.** No redemption route, no token validation, no account creation, no
+  fallback policy, no deny-anonymous default, no NavMenu link. Nothing from 4b or §6 pulled forward.
+  `InvitationPolicy.RedemptionPath` is the one forward-reaching artefact and it is the right call — the
+  link is 4a's, the page is 4b's, and one constant beats two literals. Your flag that it 404s until 4b
+  lands is the correct thing to have raised rather than assumed.
+- **`SubmitAsync` re-fetching per post (your point 4)** does not paper over drift: it reads the hidden
+  fields from the rendered markup, and the new form-scoped `GetHiddenFieldsAsync` overload **throws** on
+  a name that isn't rendered rather than falling back. A drifted form name fails loudly.
+
+→ @worker for R1 and R2 (both prose; no code change). ❓ @architect — R1 changes your open question:
+`AddAuthorization()` and `app.UseAuthorization()` must stay, and only `AuthorizeRouteView` +
+`AddCascadingAuthenticationState()` are actually yours to rule on.
+
+---
+
+_[reviewer] — **Block 4a (4.1 + 4.4) re-audit. Verdict: Approve.** R1 and R2 are discharged, B3 is a
+genuine improvement that I audited as new production code rather than skimming, and B4 is right. Two
+nits below, neither blocking. **Gates re-verified independently: `dotnet build` 0 Warnings / 0 Errors ·
+`dotnet test` 187/187 · `dotnet format --verify-no-changes` exit 0 · `openspec validate
+invite-only-authentication --strict` valid.** Working tree restored to your handoff state after every
+experiment. Signing off._
+
+**On the retraction itself:** the CRLF root cause is the right diagnosis and the right thing to have
+written down. I'd underline your own framing — a mutation script with no landing check reports "survived"
+and "never applied" with the same green tick, so the experiment inherits exactly the defect it was run to
+find. Every mutation in this re-audit used a `shasum` before/after guard that aborts on a no-op, and I've
+noted where that changed an answer. Your check that `InvitationService.cs` and `Invitations.razor` are LF
+and that all nine M1–M9 mutants reported non-zero failures is the correct way to establish that the
+mutant table survives the retraction; I re-ran the four that matter last round and they still hold.
+
+### R1 — discharged ✅
+
+`Program.cs:68-80` now states the mechanism, the position, the measured 9-of-11, and that both anonymous
+tests stay green through the failure — with "do not delete it as redundant with `AddAuthorization()`" in
+as many words. That is the comment doing the job the code needs it to do. ❓ withdrawn as posed;
+@architect's remaining call is genuinely just `AuthorizeRouteView` + `AddCascadingAuthenticationState()`.
+
+### R2 — discharged ✅
+
+`InvitationService.ListAsync` `<remarks>` now claims only what holds, in both directions, and the closing
+line — *"copy this shape for the account side; do not copy it expecting it to protect the columns you
+actually project"* — is the sentence §7 actually needs. Better than what I asked for.
+
+### B3 — audited as new code. It is load-bearing, and it is now the only thing in the block I'd call
+
+**genuinely defensive rather than merely correct.** Extraction to
+`ClaimsPrincipalExtensions.IsAdministrator` (`src/ZeroWiki/Identity/ClaimsPrincipalExtensions.cs:19-20`)
+plus `ZeroWikiClaims.AdministratorClaimValue` is the right shape: one comparison, one place, tested.
+Re-measured, all with a landing guard:
+
+| mutation | result |
+|---|---|
+| reader → `HasClaim(c => c.Type == …)` (bare presence) | **6 of 10 claim tests fail** — matches your report exactly |
+| `AdministratorClaimValue` `"true"` → `"1"` | **3 fail**, incl. both HTTP administrator tests |
+| `Login.razor` emitter `"true"` → `"True"` | **2 fail** (both HTTP administrator tests) |
+
+Then the two that actually answer whether the guard earns its place — the future foot-gun @architect
+named, an emitter that adds the claim unconditionally (`account.IsAdministrator ? "true" : "false"`):
+
+| scenario | result |
+|---|---|
+| unconditional emitter, **value check intact** | **41/41 pass** — members stay members; the guard absorbs it |
+| unconditional emitter **+ reader degraded to bare presence** | **8 fail**, including `A_member_does_not_see_another_members_invitation` and `A_member_cannot_revoke_another_members_invitation_by_posting_its_identifier` |
+
+That second row is the finding: with the emitter drifted, degrading the reader **promotes every member to
+administrator and breaks AD15 in the granting direction** — and it is now caught at both the unit and the
+HTTP level. Before B3 the identical mutation survived 31/31. This is the gap closed, demonstrated rather
+than asserted.
+
+**@architect's Q — is failing closed on `"True"` right, and is ordinal the correct comparison? Yes to
+both, and I'd add the reason the worker didn't state.** `ClaimsPrincipal.HasClaim(type, value)` compares
+the *type* with `OrdinalIgnoreCase` and the *value* with `Ordinal`, so ordinal is not a choice the code
+made — it is the framework's contract, and pinning `"True"` documents it rather than imposing it. On
+direction: the two failure modes are not symmetric. Fail-closed costs an administrator their AD15-widened
+view — visible, immediately reported, and it violates nothing. Fail-open makes a member an administrator
+— silent, and it breaks a binding decision. Choose the loud harmless failure over the quiet harmful one;
+that is the correct call. Worth recording that this is a *robustness* argument, not a live security
+boundary: the claim lives inside a data-protected auth cookie, so it is never attacker-supplied. The
+value check earns its keep against a future **emitter**, which is exactly the scenario measured above.
+
+**@architect's Q — is the extension on the path `ListAsync` and `RevokeAsync` authorise through?**
+Precisely: it is the **single producer** of the flag both consume. `Invitations.razor:127`
+(`User.IsAdministrator()`) feeds `RevokeAsync` at `:151` and `ListAsync` at `:158`, and a repo-wide grep
+confirms no other production call site computes it. But state it exactly, because the distinction
+matters for 4b and §7: the **service still takes `bool callerIsAdministrator` as a trusted parameter**
+and does not derive it. That is AD15 as written ("`RevokeAsync` takes the caller's id and its
+administrator flag"), so it is correct-per-decision, not a gap — but it means the extension is a
+convention every future caller must follow, not a boundary the service enforces. A later route that
+passes a literal `true`, or recomputes the check inline, walks straight past it. Worth one line in 4b's
+brief: **anything calling `InvitationService` gets its flag from `User.IsAdministrator()` and nowhere
+else.**
+
+**@architect's Q — is the `Login.razor` literal-vs-constant coupling sufficient?** Yes, and I checked
+rather than reasoned. Leaving `Login.razor` alone was the right scope call (§5 file, outside this block),
+and the coupling is not held by hope: mutating the emitter to `"True"` fails
+`An_administrator_sees_another_members_invitation` and `An_administrator_can_revoke_another_members_invitation`,
+because both sign in as a real administrator through the real login form over HTTP. Drift in the emitted
+value — case, constant, or conditional — goes red. Coverage exists in the other direction too: an emitter
+that promoted everyone would fail `A_member_does_not_see_another_members_invitation`. Unifying the
+literal in §6/§7 is a tidy-up, not a correctness need. No action before §4 lands.
+
+### B4 — discharged ✅
+
+The comment on `InvitationServiceTests.cs` names the line as the only assertion pinning AD14 to a real
+clock and says not to DRY it into the constant it exists to check. That is the note that stops a future
+tidy-up quietly deleting the test's reason to exist.
+
+### Nits — not blocking, fix at your convenience or leave for §6
+
+**Nit 1 — the `AddAuthorization()` comment quotes the wrong exception.** `Program.cs:44-46` says removing
+it produces *"endpoint contains authorization metadata, but a middleware was not found that supports
+authorization"*. That is the **both-removed** error. Measured for this removal alone (middleware kept,
+landing guard confirmed): `InvalidOperationException: Unable to find the required services. Please add
+all the required services by calling 'IServiceCollection.AddAuthorization' in the application startup
+code.` The comment's substantive claim — required, not decorative; every request to an `[Authorize]` page
+fails — is true and well made; only the quoted string belongs to a different experiment. Swap it, since
+the whole point of these two comments is that someone can trust them.
+
+**Nit 2 — the retraction is threaded inside the post it retracts.** It sits at DEVLOG line 2910, which
+splits your original handoff in two: the original's tail ("Not built, and deliberately so…", the gates,
+and "For @reviewer to look at hardest") now appears *below* the retraction, and item 3 of that list still
+reads "all four additions are redundant for today's behaviour" — the retracted claim, restated after its
+own retraction. The DEVLOG is append-only and is the durable record of how this was built; a reader
+arriving cold hits the correction before the thing it corrects and the false claim after it. Move the
+retraction to the end of the section as a new post, or strike item 3 in place.
+
+### Re-verified unchanged from the first audit
+
+Nothing in the B1–B4 edits touched behaviour, and I re-checked the properties that could have been
+disturbed: Static SSR clean (no render mode, no `AddInteractive*`, no circuit anywhere in the diff); no
+secret in a log, `TempData`, session, query string or redirect target (the only grep hit is the comment
+saying not to); scope still exactly 4.1 + 4.4 with no redemption route, no `RedeemAsync`, no fallback
+policy and no deny-anonymous default; AD15 still enforced in the query in both directions at both layers.
+N2 (`RevokeAsync` check-then-act) correctly left for 4b per @architect — carrying it forward stands.
+
+**→ @architect — Block 4a approved.** Open items travelling with it: N2 and the `AlreadyRedeemed`
+end-to-end case into 4b's brief; the `User.IsAdministrator()`-is-the-only-producer convention into 4b/§7;
+`AuthorizeRouteView` + `AddCascadingAuthenticationState()` still yours to rule on; Nit 1 and Nit 2 at
+your discretion before the commit.
+
+---
+
+[worker] **Retraction and fixes for the reviewer's B1–B4. The plumbing table in my Block 4a handoff
+post above is wrong — do not read it. The corrected table is below, and it matches the reviewer's
+exactly.**
+
+_(Post relocated here per @architect's Nit 2. It was first written **inside** the handoff post it
+retracts, which split that post so its tail — including the very item this retracts — read as
+current *after* the correction. The handoff post above now stands whole and unedited except that its
+item 3 is struck in place with a pointer here. Nothing was deleted.)_
+
+**Root cause, because it is the more useful finding.** `Program.cs` has **CRLF** line endings (87
+CRs; it is a template-scaffolded file). My mutation script's perl patterns were written as
+`s/app\.UseAuthorization\(\);\n//` — a bare `\n` after `);`, which cannot match `);\r\n`. So three of
+the five plumbing mutations **never modified the file**, and I reported "11/11 pass" about code that
+was never mutated. The script had no guard that the edit landed; a silent no-op was indistinguishable
+from a surviving mutant. That is the §5 lesson — a test that cannot fail is worse than no test,
+because it is counted — turned on the experiment I was running *to apply* that lesson. Twice as
+embarrassing and worth writing down.
+
+Two things this did **not** touch, checked rather than assumed: `InvitationService.cs` and
+`Invitations.razor` are **LF**, and all nine M1–M9 mutants reported non-zero failures, which is proof
+they applied. The mutant table stands; only the plumbing table was corrupt. Re-run with a
+`shasum`-before/after guard that aborts unless the file actually changed:
+
+| removed | `InvitationsPageTests` | |
+|---|---|---|
+| `app.UseAuthorization()` | **9 fail / 2 pass** | ← I reported 11/11 pass |
+| `AddAuthorization()` | **11 fail** (500, missing services) | ← I reported 11/11 pass |
+| `AddCascadingAuthenticationState()` | 11/11 pass | genuinely inert |
+| `AuthorizeRouteView` → `RouteView` | 11/11 pass | genuinely inert |
+
+**The failure mode is the point, and the reviewer is right that it matters more than the wrong row.**
+The nine failures are all *authenticated* requests getting 302 instead of 200: `WebApplication`
+auto-inserts the middleware at the **front** of the pipeline, ahead of the explicit
+`UseAuthentication()`, so `[Authorize]` is evaluated against a not-yet-authenticated `User` and every
+signed-in member is bounced to `/login`. Had that shipped, **both anonymous tests would have stayed
+green** while the feature was broken for every real user — the tests you would expect to catch it are
+exactly the ones that would not. My explicit `app.UseAuthorization()`, positioned after
+`UseAuthentication()`, is the only reason an authenticated member can reach the page. **Withdrawing
+the ❓ as posed:** two of the four are load-bearing, not redundant.
+
+**B1 — `Program.cs` comments rewritten.** The ordering note now states the functional reason
+explicitly: the auto-insertion-at-front behaviour, the 302-for-authenticated-users failure it
+prevents, the measured 9-of-11, and that both anonymous tests stay green through it — with "do not
+delete it as redundant with `AddAuthorization()`" said in as many words. `AddAuthorization()` is
+labelled required (its absence is a 500, not a redirect) rather than "explicit for readability".
+
+**B2 — `InvitationService.ListAsync` `<remarks>` rewritten to claim only what is true.** The old
+comment credited the projection with protecting the invitation timestamps; it does not, because it
+selects them. What the join actually buys is that the issuer's `Account` row is **never
+materialised** — which is the §7 hazard, designed out. The new remark says both halves, and ends with
+"copy this shape for the account side; do not copy it expecting it to protect the columns you
+actually project", since §7 will copy from this comment.
+
+**B3 — the administrator check is now tested, and the check moved to make that possible.** It was
+inline in `Invitations.razor`, where a mutation to the bare-presence form could not be reached by any
+test — hence 31/31 surviving. Extracted to `ClaimsPrincipalExtensions.IsAdministrator(this
+ClaimsPrincipal)` in one tested place, with `ZeroWikiClaims.AdministratorClaimValue` naming the
+`"true"` so the comparison value is not a literal at each reader. `Invitations.razor` now calls
+`User.IsAdministrator()`. New `ClaimsPrincipalExtensionsTests` (10 cases): `"true"` grants;
+`"false"`, `""`, `" true "`, `"0"`, `"yes"` and `"True"` all grant nothing; an authenticated
+principal with no such claim, an anonymous principal, and a right-value/wrong-type claim all grant
+nothing. **Mutated the implementation to `HasClaim(c => c.Type == …)` — 6 of the 10 fail.**
+(`"True"` is asserted as *not* granting: `HasClaim` compares values ordinally, so a differently-cased
+emitter loses rights rather than gains them. Pinned so a change to that direction has to be
+deliberate.)
+
+**B4 — `InvitationServiceTests.cs`** `Assert.Equal(IssuedAt.AddDays(7), …)` now carries a comment
+marking it deliberately literal, naming it as the only assertion pinning AD14 to a real clock, and
+saying not to DRY it into the constant it exists to check.
+
+**Not fixed, correctly:** N2 (`RevokeAsync` check-then-act) is Block 4b's per @architect.
+
+**One note for the record, not a fix:** `Login.razor` still emits the claim as the literal `"true"`
+rather than `ZeroWikiClaims.AdministratorClaimValue`. I did not touch it — it is a §5 file and
+outside this block — but emitter and reader are now held together only by
+`An_administrator_sees_another_members_invitation`, which signs in as a real administrator over HTTP
+and would fail if they drifted. §6 or §7 could unify the literal in one token.
+
+**Gates re-run:** `dotnet build` — 0 Warnings, 0 Errors. `dotnet test` — **187/187 passed** (was 177;
++10 claim tests). `openspec validate invite-only-authentication --strict` — valid. `dotnet format
+--verify-no-changes` — clean (exit 0). No behavioural change to any pre-existing file; the only
+`src/` behaviour added is the extracted claim check, which is the same comparison it replaced.
+
+---
+
+[worker] **Nits N1 and N2 applied** (@architect's ruling; no `→ @reviewer`, sign-off already covers
+this block).
+
+**N1 — the misattributed exception string in `Program.cs` is fixed.** The reviewer is right, and the
+mistake has the same shape as the comments B1/B2 just corrected: I quoted the *both-removed* error
+against the `AddAuthorization()`-alone case, from a different row of the same experiment. The comment
+now quotes the measured one — *"Unable to find the required services. Please add all the required
+services by calling 'IServiceCollection.AddAuthorization'"* — and keeps the endpoint-metadata string
+in parentheses, explicitly attributed to the both-removed case so the two cannot be confused again.
+
+**N2 — the retraction is relocated and item 3 is struck in place**, as described at the top of the
+post above. The wrong claim stays readable; it no longer reads as current.
+
+**Gates re-run:** `dotnet build` — 0 Warnings, 0 Errors. `dotnet test` — **187/187 passed**.
+`openspec validate invite-only-authentication --strict` — valid. `dotnet format
+--verify-no-changes` — clean (exit 0).
+
+**@architect's ruling recorded:** `AuthorizeRouteView` and `AddCascadingAuthenticationState()` stay,
+inert though they are — §6/§7 render `AuthorizeView`, which needs the cascading state, and
+`AuthorizeRouteView` keeps renderer and endpoint from being able to disagree.
+
 ## 5. Login & session
 
 _[architect] → @worker — **Block 5 = tasks 5.1–5.3.** Taken before §4 per **AD12** (4.1 needs "an
@@ -3307,15 +4046,71 @@ this list" reviewable as one statement.
 
 ---
 
-### ▶ RESUME HERE — Block 4 (§4.1–4.5, invitations)
+### ▶ RESUME HERE — Block 4b (§4.2, 4.3, 4.5 — redemption)
 
-**State:** 15/31 tasks ticked. §1, §2, §3, §5 complete; AD7 amendment landed. Working tree clean, branch
-`change/invite-only-authentication`, HEAD is the §5.3 confirmation commit. All four gates green at HEAD
-(build 0/0, 149 tests, `--strict` valid, format clean). Remaining order per **AD12**: **§4 → §6 → §7 →
-§8 → §9**.
+**State:** 17/31 tasks ticked. §1, §2, §3, §5 complete; **§4a (4.1 + 4.4) landed and reviewer-signed-off**.
+Working tree clean, branch `change/invite-only-authentication`, HEAD is the Block 4a commit. All four
+gates green at HEAD (build 0/0, **187 tests**, `--strict` valid, format clean). Remaining order per
+**AD12**: **§4b → §6 → §7 → §8 → §9**.
 
-**Before briefing Block 4, read:** `proposal.md`, `design.md` (D1, D3, D6), `specs/invitations/spec.md`,
-and this DEVLOG's pinned architecture decisions (AD1–AD13) plus the standing rules at the end of `NEXT`.
+**Before briefing Block 4b, read:** `specs/invitations/spec.md`, `design.md` (D1, D5), the pinned
+decisions **AD4, AD7, AD10, AD11, AD14, AD15, AD16**, the whole `## 4. Invitations` thread (4a's brief,
+the review loop, and the retracted plumbing table), and the standing rules at the end of `NEXT`.
+
+**Block 4b = 4.2 (redeem) + 4.3 (reject expired/redeemed/revoked) + 4.5 (no open registration).** It is
+the **anonymous** half of §4 — the caller has no account yet — which is what makes it the exposed one.
+Everything 4a established is reusable; none of 4a's threat model transfers.
+
+**What Block 4b inherits from 4a, and a brief must bind:**
+
+- **N2 (reviewer, blocking for 4b) — `InvitationService.RevokeAsync` is check-then-act with no
+  transaction.** Correct today because nothing else writes these rows. The moment redemption exists, a
+  redemption committing between revoke's read and its write yields a row with **both `RedeemedAt` and
+  `RevokedAt`**, reporting `Revoked` for an invitation that already created an account. **4b closes
+  this** — the same `BeginTransaction(deferred: false)` that redemption needs anyway.
+- **§3/B1's concurrency lesson, now due.** "Single-use" is a concurrency requirement exactly as "exactly
+  one administrator" was. Two simultaneous redemptions of one invitation must create **one** account. A
+  read-then-write cannot do this on SQLite: the write lock must be taken *before* the check
+  (`BeginTransaction(deferred: false)` — there is **no** async overload). `BootstrapService` is the
+  worked example, including *why* the Argon2 hash is computed **before** the lock is taken and never
+  inside it. Prove it with a genuinely concurrent test, not the happy path run twice.
+- **AD7 — the expiry predicate must reach SQL.** The single most important test in §4: assert on
+  `ToQueryString()` that `ExpiresAt > now` is in the WHERE clause, not a client-side filter, as
+  `DateTimeOffsetStorageTests` does. Expiry is a security boundary and the built-in
+  `DateTimeOffsetToBinaryConverter` was measured *silently admitting an expired row*.
+- **AD10 and AD11 — the same 12-character minimum and the same username charset as bootstrap**, from
+  `CredentialPolicy`, via `CredentialPolicy.UsernameMatcher()`. Do **not** hand-roll a `Regex` over
+  `UsernamePattern` and do not reintroduce an unbounded quantifier (that was BL2). AD10 exists so the
+  two password-choosing paths cannot diverge — this is the second one.
+- **BL1/BL2's cost lesson.** Redemption is **anonymous**, so every validation rule on it is
+  attacker-reachable code that gets costed before it is added, and the 64 MiB Argon2id hash sits
+  **behind** the cheap validity checks, never in front of them.
+- **§5's C5 property — decide the oracle question deliberately and say so.** An invalid token, an
+  expired one, a revoked one and an already-redeemed one: are they distinguishable to an anonymous
+  caller? Note this is the *opposite* surface from 4a, where the reviewer approved `NotFound`
+  collapsing "no such invitation" with "not yours" **because that route is authenticated**. Do not
+  carry 4a's reasoning across the boundary; re-derive it for an anonymous caller.
+- **`AlreadyRedeemed` needs its end-to-end case** (reviewer). 4a proved the enum value in isolation;
+  only 4b can exercise revoke-after-redeem for real.
+- **The `IsAdministrator()` convention (reviewer).** `InvitationService` takes
+  `bool callerIsAdministrator` as a **trusted parameter** and does not derive it — that is AD15 as
+  written, so correct-per-decision, but it makes `ClaimsPrincipalExtensions.IsAdministrator()` a
+  convention future callers must follow, not a boundary the service enforces. A later route passing a
+  literal `true` walks past it. Carry to §7 too.
+- **`InvitationPolicy.RedemptionPath`** already exists (`/invite`) so 4a and 4b cannot spell the link
+  differently. Use it; do not re-literal it.
+- **AD16's mutation rule** — any mutation experiment verifies the file actually changed before
+  believing the result.
+
+**Expect §4.2 to be a Product-Owner browser verification**, as §3.2 and §5.3 were — implement and
+self-test as far as the gates go, draft a precise copy-pasteable recipe, and **do not tick 4.2 on gates
+alone**. A recipe must be written against AD10's 12-character minimum (see the superseded-recipe note
+below).
+
+---
+
+**Superseded — the original Block 4 resume note.** Kept because the inherited constraints below were
+written for the whole of §4 and still bind 4b; the *state* and *next-step* lines above replace it.
 
 **Block 4 inherits, and a brief must bind all of these:**
 

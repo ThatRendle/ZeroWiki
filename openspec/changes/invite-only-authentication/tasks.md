@@ -19,10 +19,10 @@
 
 ## 4. Invitations
 
-- [ ] 4.1 Issue a single-use, expiring invitation as an authenticated member
+- [x] 4.1 Issue a single-use, expiring invitation as an authenticated member
 - [ ] 4.2 Redeem an invitation: validate (unredeemed, unexpired, unrevoked), create account with chosen username/password, mark redeemed
 - [ ] 4.3 Reject expired, already-redeemed, or revoked invitations
-- [ ] 4.4 Revoke an unused invitation
+- [x] 4.4 Revoke an unused invitation
 - [ ] 4.5 Ensure there is no open/self-service registration path
 
 ## 5. Login & session

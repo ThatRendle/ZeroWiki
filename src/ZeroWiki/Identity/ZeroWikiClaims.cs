@@ -12,4 +12,11 @@ public static class ZeroWikiClaims
     /// claim gives later sections everything a role would, without implying a role table.
     /// </remarks>
     public const string IsAdministrator = "zerowiki:is_administrator";
+
+    /// <summary>
+    /// The only value of <see cref="IsAdministrator"/> that grants anything. Named rather than
+    /// spelled out at each reader, because the claim has to be matched <em>on its value</em> — a
+    /// check for the claim's mere presence reads <c>"false"</c> as an administrator.
+    /// </summary>
+    public const string AdministratorClaimValue = "true";
 }

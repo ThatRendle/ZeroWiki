@@ -15,6 +15,7 @@ builder.Services.AddSingleton<ISecretTokenGenerator, SecretTokenGenerator>();
 builder.Services.AddScoped<GitTokenService>();
 builder.Services.AddScoped<BootstrapService>();
 builder.Services.AddScoped<LoginService>();
+builder.Services.AddScoped<InvitationService>();
 
 // Cookie authentication only — deliberately not ASP.NET Core Identity, whose deferred surface
 // (email confirmation, 2FA, external logins, role UI) is dead weight for an invite-only wiki.
@@ -40,6 +41,18 @@ builder.Services
         options.ReturnUrlParameter = "returnUrl";
     });
 
+// Required, not decorative: without it every request to a page carrying [Authorize] fails with
+// "Unable to find the required services. Please add all the required services by calling
+// 'IServiceCollection.AddAuthorization'". (Removing this *and* the UseAuthorization() call below
+// gives the different, more familiar "Endpoint ... contains authorization metadata, but a
+// middleware was not found that supports authorization" — a distinct experiment, quoted here only
+// so the two are not confused.) Locking the site down by default is §6's job, not this.
+builder.Services.AddAuthorization();
+
+// Supplies the cascading AuthenticationState an AuthorizeView or AuthorizeRouteView reads. Nothing
+// renders one yet; §6 and §7 will.
+builder.Services.AddCascadingAuthenticationState();
+
 var app = builder.Build();
 
 await app.MigrateIdentityDbAsync();
@@ -55,9 +68,22 @@ if (!app.Environment.IsDevelopment())
 app.UseStatusCodePagesWithReExecute("/not-found", createScopeForStatusCodePages: true);
 app.UseHttpsRedirection();
 
-// Establishes HttpContext.User for every request. Locking routes down is §6's job — nothing
-// here denies anything yet.
+// Establishes HttpContext.User, then enforces the [Authorize] attributes individual pages carry.
+//
+// UseAuthorization() is load-bearing here and its position is the whole point — do not delete it as
+// redundant with AddAuthorization(). WebApplication auto-inserts the authorization middleware at the
+// *front* of the pipeline, ahead of this UseAuthentication() call, where it evaluates [Authorize]
+// against a User that has not been authenticated yet: every signed-in member is then bounced to
+// /login and no authenticated request can ever reach a guarded page. Naming it here, after
+// authentication, is what puts it in the right place.
+//
+// Measured by removing this one line: nine of the eleven invitations page tests fail, all of them
+// authenticated requests getting 302 instead of 200 — while *both* anonymous tests stay green. The
+// failure hides behind exactly the tests you would expect to catch it.
+//
+// Denying anonymous access site-wide is §6's job.
 app.UseAuthentication();
+app.UseAuthorization();
 
 app.UseAntiforgery();
 
