@@ -107,6 +107,8 @@ public sealed class Argon2idPasswordHasher : IPasswordHasher
         return CryptographicOperations.FixedTimeEquals(computed, stored.Hash);
     }
 
+    public bool CanVerify(string? storedHash) => storedHash is not null && TryParse(storedHash, out _);
+
     private static byte[] Derive(
         string password,
         byte[] salt,

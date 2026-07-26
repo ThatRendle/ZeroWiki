@@ -123,5 +123,7 @@ public sealed class BootstrapConcurrencyTests : IDisposable
         public string Hash(string password) => $"$stub${password.Length}";
 
         public bool Verify(string password, string? storedHash) => Hash(password) == storedHash;
+
+        public bool CanVerify(string? storedHash) => storedHash?.StartsWith("$stub$", StringComparison.Ordinal) == true;
     }
 }

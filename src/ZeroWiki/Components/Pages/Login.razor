@@ -1,0 +1,94 @@
+@page "/login"
+@using System.Security.Claims
+@using Microsoft.AspNetCore.Authentication
+@using Microsoft.AspNetCore.Authentication.Cookies
+@using ZeroWiki.Identity
+@using ZeroWiki.Web
+@inject LoginService LoginService
+@inject NavigationManager Navigation
+
+<PageTitle>Sign in</PageTitle>
+
+<h1>Sign in</h1>
+
+<EditForm Model="Input" FormName="login" OnValidSubmit="SubmitAsync">
+    <DataAnnotationsValidator />
+
+    @if (_rejected)
+    {
+        <p class="login-failed" role="alert">@RejectionMessage</p>
+    }
+
+    <p>
+        <label>
+            Username
+            <InputText @bind-Value="Input.Username" autocomplete="username" />
+        </label>
+        <ValidationMessage For="() => Input.Username" />
+    </p>
+
+    <p>
+        <label>
+            Password
+            <InputText @bind-Value="Input.Password" type="password" autocomplete="current-password" />
+        </label>
+        <ValidationMessage For="() => Input.Password" />
+    </p>
+
+    <button type="submit">Sign in</button>
+</EditForm>
+
+@code {
+    /// <summary>
+    /// The single answer to every rejection. An unknown username, an unusable stored hash and a
+    /// wrong password all produce this and nothing else — which of the three it was is recorded
+    /// in the log, not in the response.
+    /// </summary>
+    private const string RejectionMessage = "Your username or password is incorrect.";
+
+    private bool _rejected;
+
+    [CascadingParameter]
+    private HttpContext? HttpContext { get; set; }
+
+    [SupplyParameterFromQuery(Name = "returnUrl")]
+    private string? ReturnUrl { get; set; }
+
+    [SupplyParameterFromForm(Name = nameof(Input))]
+    private LoginInput? PostedInput { get; set; }
+
+    private LoginInput Input => PostedInput ??= new();
+
+    private async Task SubmitAsync()
+    {
+        var context = HttpContext
+            ?? throw new InvalidOperationException("Signing in requires the static server-rendered HttpContext.");
+
+        var account = await LoginService.VerifyCredentialsAsync(Input.Username, Input.Password);
+        if (account is null)
+        {
+            _rejected = true;
+            return;
+        }
+
+        // Carries what §4 (the invitation issuer), §7 (the token owner) and §8 (the commit
+        // author) will each need to identify the acting account.
+        List<Claim> claims =
+        [
+            new(ClaimTypes.NameIdentifier, account.Id.ToString()),
+            new(ClaimTypes.Name, account.Username),
+        ];
+
+        if (account.IsAdministrator)
+        {
+            claims.Add(new Claim(ZeroWikiClaims.IsAdministrator, "true"));
+        }
+
+        await context.SignInAsync(
+            CookieAuthenticationDefaults.AuthenticationScheme,
+            new ClaimsPrincipal(new ClaimsIdentity(claims, CookieAuthenticationDefaults.AuthenticationScheme)));
+
+        // Never redirect to an unvalidated target: see LocalUrl.
+        Navigation.NavigateTo(LocalUrl.IsLocal(ReturnUrl) ? ReturnUrl : "/", replace: true);
+    }
+}

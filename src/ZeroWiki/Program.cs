@@ -1,3 +1,4 @@
+using Microsoft.AspNetCore.Authentication.Cookies;
 using ZeroWiki.Components;
 using ZeroWiki.Data;
 using ZeroWiki.Identity;
@@ -13,6 +14,31 @@ builder.Services.AddSingleton<IPasswordHasher, Argon2idPasswordHasher>();
 builder.Services.AddSingleton<ISecretTokenGenerator, SecretTokenGenerator>();
 builder.Services.AddScoped<GitTokenService>();
 builder.Services.AddScoped<BootstrapService>();
+builder.Services.AddScoped<LoginService>();
+
+// Cookie authentication only — deliberately not ASP.NET Core Identity, whose deferred surface
+// (email confirmation, 2FA, external logins, role UI) is dead weight for an invite-only wiki.
+builder.Services
+    .AddAuthentication(CookieAuthenticationDefaults.AuthenticationScheme)
+    .AddCookie(options =>
+    {
+        options.Cookie.Name = "ZeroWiki.Authentication";
+        options.Cookie.HttpOnly = true;
+        options.Cookie.SameSite = SameSiteMode.Lax;
+
+        // Always outside development. Development serves plain HTTP, where Always would mean the
+        // browser silently never returns the cookie — a symptom indistinguishable from a wrong
+        // password, and one that would cost somebody an afternoon.
+        options.Cookie.SecurePolicy = builder.Environment.IsDevelopment()
+            ? CookieSecurePolicy.SameAsRequest
+            : CookieSecurePolicy.Always;
+
+        options.ExpireTimeSpan = TimeSpan.FromDays(14);
+        options.SlidingExpiration = true;
+        options.LoginPath = "/login";
+        options.LogoutPath = "/logout";
+        options.ReturnUrlParameter = "returnUrl";
+    });
 
 var app = builder.Build();
 
@@ -28,6 +54,10 @@ if (!app.Environment.IsDevelopment())
 }
 app.UseStatusCodePagesWithReExecute("/not-found", createScopeForStatusCodePages: true);
 app.UseHttpsRedirection();
+
+// Establishes HttpContext.User for every request. Locking routes down is §6's job — nothing
+// here denies anything yet.
+app.UseAuthentication();
 
 app.UseAntiforgery();
 

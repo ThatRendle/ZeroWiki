@@ -2629,6 +2629,626 @@ characters on its own.
 clean (exit 0). The verification recipe above is unaffected: step 4 already exercises the 12-character
 minimum, and it now fails at both the form and the service.
 
+## 5. Login & session
+
+_[architect] → @worker — **Block 5 = tasks 5.1–5.3.** Taken before §4 per **AD12** (4.1 needs "an
+authenticated member" to exist first). This is the most exposed route in the change: unauthenticated,
+reachable by anyone, and standing in front of every account._
+
+**Tasks in scope**
+
+- `5.1` Username/password login using the framework's auth/session primitives.
+- `5.2` Reject invalid credentials with a uniform generic error (no username enumeration).
+- `5.3` Logout that fully invalidates the session.
+
+**Binding spec (verbatim, `specs/authentication/spec.md`)**
+
+> ### Requirement: Username/password login
+> The system SHALL authenticate a user by verifying a submitted username and password against the stored
+> salted password hash, and SHALL establish a server-managed session on success. It SHALL reject invalid
+> credentials without revealing whether the username exists.
+>
+> #### Scenario: Successful login
+> - **WHEN** a user submits a username and password that match a stored account
+> - **THEN** the system establishes an authenticated session for that account
+>
+> #### Scenario: Invalid credentials rejected uniformly
+> - **WHEN** a user submits an unknown username, or a known username with the wrong password
+> - **THEN** the system rejects the login with the same generic error in both cases and establishes no
+>   session
+
+> ### Requirement: Session lifecycle and logout
+> The system SHALL maintain an authenticated session for a logged-in user and SHALL allow the user to log
+> out, after which the session is no longer authenticated.
+>
+> #### Scenario: Logout ends the session
+> - **WHEN** an authenticated user logs out
+> - **THEN** subsequent requests are treated as unauthenticated
+
+Design **D4** (framework cookie authentication, **not** the full ASP.NET Core Identity UI stack) and
+**D5** (uniform failures; no enumeration).
+
+**Binding decisions**
+
+- **C1 — cookie authentication, nothing more.** `AddAuthentication(...).AddCookie(...)` plus
+  `UseAuthentication()`. **Do not** add ASP.NET Core Identity, its UI, its stores, or `SignInManager`.
+  D4 is explicit that its deferred surface (email confirmation, 2FA, external logins, role UI) is dead
+  weight here.
+- **C2 — AD8(1): equalise the work on a miss.** When the username lookup misses, still perform a full
+  Argon2id verify against a **fixed dummy PHC hash**, so a miss costs the same ~93 ms as a hit. The dummy
+  must be a **precomputed constant** with the same parameters as live hashes — deriving it per request
+  would cost a hash *and* a verify, making the miss path *slower* than the hit path, which is the same
+  oracle inverted. Prove it by asserting the **work happens** (e.g. the hasher is invoked on the miss
+  path), not with a wall-clock assertion — timing tests are flaky and would rot.
+- **C3 — AD8(2): log the three-way distinction server-side, return one uniform response.** "No such
+  username" / "stored hash unusable" / "wrong password" must be distinguishable **in the log** and
+  indistinguishable **in the response** — status, body, headers, and (per C2) time. Never log the
+  password or the hash.
+- **C4 — AD8(3): the account lookup MUST project.** `Select(a => new { a.Id, a.Username, a.PasswordHash,
+  a.IsAdministrator })` — **never** materialise the `Account` entity. Reviewer-verified during the AD7
+  audit: a corrupt timestamp column makes entity materialisation throw, turning login for that one user
+  into a 500 while every other failure returns the uniform response. A projection is immune by
+  construction, and login has no business loading `CreatedAt`/`GitEmails`/`GitTokens`.
+- **C5 — do NOT apply AD11's username charset (or any regex) to the login field.** Two independent
+  reasons. It would put a validation rule on the most anonymous route in the change — the BL1/BL2 lesson.
+  And rejecting a malformed username *before* the lookup creates precisely the enumeration oracle C2
+  exists to close: rejected-shape usernames would fail fast while real ones pay the hash. Treat any input
+  as a candidate, let the lookup miss, pay the dummy verify. A **cheap O(1) length cap** is wanted; a
+  pattern match is not.
+- **C6 — logout is POST + antiforgery, never GET.** A GET logout is CSRF-able — any page could log the
+  user out. Static SSR form POST, like everything else here.
+- **C7 — cookie hardening.** `HttpOnly`, `SameSite=Lax`, and `SecurePolicy = Always` outside Development
+  (dev runs plain HTTP on 5171, where `Always` would silently break login — worth stating because the
+  symptom looks exactly like bad credentials). Set a sensible expiry.
+- **C8 — validate `returnUrl` before redirecting.** §6 will send anonymous visitors to login carrying a
+  return URL, so login must accept one — and **local URLs only**. An unvalidated `returnUrl` on a login
+  page is an open redirect and therefore a credential-phishing primitive. Use the framework's local-URL
+  check and test it against an absolute off-site URL *and* a protocol-relative `//evil.example`.
+- **C9 — claims.** Issue at least the account id, the username, and the administrator flag (AD6). §4
+  needs the issuer, §7 the owner, §8 the identity. Don't build §8's accessor service here — just make the
+  principal carry what they will need.
+- **C10 — rate limiting is OUT OF SCOPE** (Product Owner, closed). No rate limiter, throttle, lockout, or
+  concurrency gate. If its absence bites something specific, say so in the handoff rather than building
+  it.
+
+**Out of scope:** invitations (§4); the anonymous home page and global access control (§6 — do **not**
+add authorization policies or `[Authorize]` sweeps); the account/token UI (§7); §8's accessors.
+Registering the authentication middleware is in scope; locking routes down is §6's job.
+
+**Session invalidation — flag it, don't over-build it.** Cookie auth is stateless: `SignOutAsync` clears
+the browser's cookie, which satisfies "subsequent requests are treated as unauthenticated" for the user
+logging out, but a *previously captured* cookie remains valid until it expires. That is the normal
+trade-off for this design and I am **not** asking for a server-side session store. State the limitation
+explicitly in your handoff so it is a recorded decision rather than an accident.
+
+**Tests:** both spec scenarios; uniform failure proven across *unknown username* vs *wrong password* vs
+*corrupt stored hash* (same status, same body, same work performed); logout leaving subsequent requests
+unauthenticated; `returnUrl` open-redirect rejection; and the projection surviving a corrupt-timestamp
+row. Use the §3 `WebApplicationFactory` harness — this is exactly what it was built for, and a login form
+that silently posts empty fields is the precise failure it exists to catch.
+
+**Gates:** the usual four. Then → @reviewer. Expect a real-browser login/logout check to be a
+Product-Owner step, as bootstrap was — draft that recipe in your handoff.
+
+[worker] Block 5.1–5.3 implemented. Summary:
+
+- **`Identity/LoginService.cs`** — `VerifyCredentialsAsync` → `AuthenticatedAccount?`. **C4**: the lookup
+  projects `{ Id, Username, PasswordHash, IsAdministrator }` and never materialises `Account`.
+- **C2**: exactly one `Verify` call on **every** path, including the ones that have already decided to
+  fail. Structured so this is visible rather than asserted in a comment — `hashToVerify` resolves to the
+  account's hash or the dummy, then a single `Verify`, then the branching. `DummyPasswordHash` is a
+  **precomputed `const`** PHC string with the live parameters (m=65536,t=3,p=1, 16-byte salt, 32-byte
+  tag), generated once from a random preimage that was discarded.
+- **C3**: three distinct log lines — unknown username (`Information`), unusable stored hash (`Error`,
+  naming the account id and saying it must be re-provisioned), wrong password (`Information`). One
+  response for all three.
+- **`IPasswordHasher.CanVerify`** added (Block 2, additive) so "unusable stored hash" can be told from
+  "wrong password" *in the log* without guessing at the hash's shape. Its doc says explicitly that it
+  does no derivation and must not be used to skip work — that would be the oracle it exists to help
+  close.
+- **C1/C7**: `AddAuthentication(...).AddCookie(...)`, no ASP.NET Core Identity anywhere.
+  `ZeroWiki.Authentication`, `HttpOnly`, `SameSite=Lax`, `SecurePolicy` = `Always` outside Development
+  and `SameAsRequest` in it (with the comment C7 asked for — on plain-HTTP dev, `Always` fails
+  identically to a wrong password). 14 days, sliding. `UseAuthentication()` added before
+  `UseAntiforgery()`; **no** `UseAuthorization`, no policies, no `[Authorize]` — §6's job.
+- **C5**: the login form carries `[Required]` and a length cap **only**. No charset regex. `LoginInput`'s
+  doc records both reasons, including the one that matters most — a shape-rejected username would fail
+  without paying for a verification, rebuilding the oracle C2 closes.
+- **C6**: `/logout` renders a confirmation page on GET and only signs out on the POST, where the
+  framework validates the antiforgery token.
+- **C8**: `Web/LocalUrl.IsLocal`, `[NotNullWhen(true)]` so the call site needs no `!`. Shared because §6
+  will send visitors here with a return URL.
+- **C9**: `NameIdentifier`, `Name`, and `zerowiki:is_administrator` when true.
+
+**How C2 is proved — by asserting the work, not the clock.** `RecordingPasswordHasher` wraps the real
+hasher and records the stored hash passed to each `Verify`.
+`Every_rejection_performs_exactly_one_verification` drives all four outcomes and asserts **4 calls for 4
+attempts**; that the two no-usable-hash paths verified against the *same* value; that the value is a real
+`$argon2id$v=19$m=65536,t=3,p=1$…` hash which `CanVerify` accepts (so it is not a short-circuit); and
+that the two usable-hash paths used the account's own hash instead. A second test drives two different
+misses and asserts they verified against the identical constant — that's the "not derived per request"
+half.
+
+**How the uniform response is proved.** Comparing two *different* usernames would prove nothing, since
+the form legitimately echoes back whatever was typed. So
+`An_unknown_username_and_a_known_one_are_indistinguishable` submits **the same username and password**
+against three separately-booted applications — one where the account doesn't exist, one where it exists
+with a different password, one where its stored hash is unusable — and asserts identical status,
+identical body (antiforgery token normalised, since it is regenerated per response) and no
+authentication cookie in any of the three.
+
+**Mutation-checked — every new invariant has a test that dies with it:**
+
+| mutant | result |
+|---|---|
+| miss path short-circuits (no dummy verify) | 2 failures — both C2 tests |
+| lookup materialises `Account` instead of projecting | 2 failures — the unit and HTTP corrupt-row tests |
+| `LocalUrl` guard removed | **5** failures — every off-site return-url case |
+| logout also signs out on GET | 2 failures — both logout tests |
+
+**A bug the mutation found in my own test, worth recording.** With the `LocalUrl` guard removed, only
+**3** of the 5 off-site cases failed. Probing the raw `Location` header showed why: `//evil.example`
+redirects to `https://evil.example/`, whose `AbsolutePath` is `"/"` — and my assertion compared only the
+path, so it accepted a genuine open redirect as "redirected home". The two most dangerous cases were the
+ones passing. Fixed by extracting `Web/HttpAssertions.AssertRedirectedTo`, which now asserts the
+**authority** as well when the target is absolute; `BootstrapPageTests` had the same private helper and
+now shares the corrected one. Re-running the mutant gives 5 of 5. The assertion was weaker than it
+looked, and only the mutation exposed it.
+
+**Judgement calls:**
+
+- **`zerowiki:is_administrator` rather than `ClaimTypes.Role`.** AD6 keeps administrator status as one
+  boolean and rules out a role model this change; a role claim would make `User.IsInRole("Administrator")`
+  work but implies a role table that doesn't exist. A policy over this claim gives §6/§7 the same thing.
+  One line to switch if you'd rather have the role claim.
+- **Logout is a page with a POST form, not a `MapPost` endpoint.** Keeps every form in this change on the
+  same Static SSR idiom and the same test harness. The GET renders a confirmation and signs nobody out.
+- **Harness now addresses `https://localhost`.** The pinned `Production` environment marks the cookie
+  `Secure`, so over plain HTTP the client would accept the sign-in and then never send the cookie back —
+  every authenticated test failing in a way that looks like a broken login. This exercises the shipped
+  cookie policy rather than working around it.
+- **`ZeroWikiAppFactory.WithDbAsync`** added — the generalisation the reviewer predicted §4 would want;
+  `GetAccountsAsync` is now a one-liner over it.
+- **Login rejects empty username/password fast, before any verification.** No account can have an empty
+  username (bootstrap forbids it, §4 will too), so the rejected set provably contains no valid account
+  and there is no oracle. Stated because it *looks* like the thing C5 forbids and isn't.
+
+**Session invalidation — the recorded limitation.** Cookie authentication is stateless. `SignOutAsync`
+clears the browser's cookie, which satisfies the spec's "subsequent requests are treated as
+unauthenticated" for the person logging out, but **a cookie captured beforehand remains valid until it
+expires** (14 days, sliding) — logout cannot revoke it, because there is no server-side session record to
+revoke. That is the accepted trade-off of this design, not an oversight, and closing it would mean a
+session store. Recorded here so it is a decision rather than an accident.
+
+**C10 — nothing rate-limiting-shaped was added.** No limiter, throttle, lockout or concurrency gate. One
+observation, not a request to build anything: §5's login is the amplifier reviewer A2 described, and it
+is now real rather than hypothetical — every POST to `/login`, valid or not, costs one Argon2id
+verification at 64 MiB by design (that *is* C2). The Product Owner's ruling is recorded and I have
+followed it.
+
+**Gates:** `dotnet build` — 0 Warnings, 0 Errors. `dotnet test` — **147/147 passed** (124 + 23).
+`openspec validate invite-only-authentication --strict` — valid. `dotnet format --verify-no-changes` —
+clean (exit 0).
+
+**For @reviewer to scrutinise:**
+1. The claim type choice (`zerowiki:is_administrator` vs `ClaimTypes.Role`) — judgement call above.
+2. `CanVerify` on `IPasswordHasher` — an addition to a signed-off Block 2 contract. Additive, and the
+   doc warns against the misuse that would matter, but it is Block 2's surface.
+3. Whether `Normalise`-ing the antiforgery token out of the compared bodies hides anything it shouldn't.
+   I believe the token is the only per-response variation; worth a second pair of eyes.
+4. The logout page shape (GET renders, POST acts) versus a `MapPost` endpoint.
+5. Whether the 14-day sliding expiry is right, given logout cannot revoke a captured cookie.
+
+---
+
+**5.1–5.3 need human confirmation — draft Product Owner recipe.** Everything above is automated or
+harness-driven; the browser round trip is a Product-Owner step, as bootstrap was. This assumes the
+administrator account created during the §3 verification still exists.
+
+```bash
+# 1. Run the app against the store you bootstrapped earlier
+cd /Users/rendle/github/emmz/ZeroWiki
+dotnet run --project src/ZeroWiki
+```
+
+Check the console says `Now listening on: http://localhost:5171`. If it doesn't, an older instance is
+still holding the port — stop it (`pkill -f ZeroWiki`) and run it again. It should also log that the
+store already has an account and the bootstrap path is inert.
+
+1. Open **<http://localhost:5171/login>**. You should see **"Sign in"** with Username and Password fields.
+2. **Wrong password.** Your real username, any wrong password. You should get **"Your username or
+   password is incorrect."** — and note the wording: it must not say which of the two was wrong.
+3. **Unknown username.** A username that does not exist (`nosuchperson`), any password. You should get
+   **exactly the same message**, and the page should look identical to step 2 apart from the username you
+   typed. If either case says anything more specific, that is a failure.
+4. **Roughly time those two.** They should both feel the same — around a fifth of a second, not one
+   instant and one slow. A noticeably faster "unknown username" would be the enumeration leak this block
+   exists to prevent.
+5. **Sign in properly.** Your real username and password. You should land on the home page (`/`).
+6. **Confirm the session is live.** Go to **<http://localhost:5171/logout>**. It should say **"You are
+   signed in as _yourname_"** with a **Sign out** button.
+7. **Open redirect check.** Visit
+   **`http://localhost:5171/login?returnUrl=https://example.com/`** — sign out first if step 6 left you
+   signed in, then sign in from that page. You must land on **this site's** home page, *not* on
+   example.com. Same for **`http://localhost:5171/login?returnUrl=//example.com`**. If the browser ever
+   leaves localhost, stop — that is a failure.
+8. **A legitimate return URL still works.** Visit
+   **`http://localhost:5171/login?returnUrl=/bootstrap/complete`** and sign in. You should land on
+   `/bootstrap/complete`.
+9. **Sign out.** From `/logout`, press **Sign out**. You should land on the home page.
+10. **Confirm you are signed out.** Return to **<http://localhost:5171/logout>**. It should now say
+    **"You are not signed in."** Close and reopen the browser tab and check again — still signed out.
+
+Two things this deliberately does *not* yet do: pages other than these are not access-controlled yet
+(that is §6), and there is no "Sign in" link in the navigation yet (also §6) — for now type the URLs.
+
+→ @reviewer
+
+[reviewer] Block 5.1–5.3 audited. Verdict: **Approve** — no blocking findings. C1–C10 all hold, verified by
+mutation and by driving the real application rather than by reading. Gates re-run independently:
+`dotnet build` **0 warn / 0 err**, `dotnet test` **147/147**, `openspec validate
+invite-only-authentication --strict` **valid**, `dotnet format --verify-no-changes` **exit 0**.
+
+**Scope clean.** Greps across `src/` return **nothing** for
+`SignInManager|UserManager|AddIdentity|AddDefaultIdentity|IdentityUser|AspNetCore.Identity` (C1),
+`RateLimit|AddRateLimiter|Throttl|Lockout|SemaphoreSlim|ConcurrencyLimit` (C10), and
+`UseAuthorization|AddAuthorization|[Authorize|AuthorizeView|RequireAuthorization|InvitationService|Redeem|
+GitTokenPage|CurrentUser|IUserAccessor` (§4/§6/§7/§8). No render mode anywhere. `tasks.md` and
+`openspec/specs/` untouched. `LoginPath`/`LogoutPath`/`ReturnUrlParameter` are set on the scheme but inert
+until §6 wires a challenge — configuration of the handler itself, not a §6 encroachment.
+
+---
+
+**Priority 1 — C2. The dummy is genuinely precomputed, genuinely a real hash, and the uniformity holds on
+the clock as well as structurally. One narrow gap in the evidence, which I could exploit.**
+
+Reflecting the `const` out of the compiled assembly:
+
+| property | value |
+|---|---|
+| algorithm / version | `argon2id` / `v=19` |
+| parameters | `m=65536,t=3,p=1` — **byte-identical to a freshly generated live hash** |
+| salt / tag | **16** bytes / **32** bytes |
+| `CanVerify` | **true** — it is not a short-circuit |
+| `Verify(anything, dummy)` | **false** |
+
+The structure at `LoginService.cs:61-66` is right: `CanVerify` chooses *which* hash, then **one
+unconditional `Verify`**, then the branching. Every failing path passes through it, including the corrupt
+stored-hash one.
+
+**I also measured it**, which the brief correctly kept out of the test suite but which is worth doing once
+as corroboration — because "one Verify call" only implies uniform cost if the dummy's parameters match,
+and they do:
+
+| path | median of 5 |
+|---|---|
+| miss → dummy | **228.8 ms** |
+| wrong password → live hash | **222.0 ms** |
+| correct password → live hash | **226.3 ms** |
+
+And end to end over HTTP, five attempts each: known-username rejections 0.235–0.245 s, unknown-username
+rejections 0.237–0.248 s. Indistinguishable.
+
+**Now the gap. `RecordingPasswordHasher` records the stored hash but not the password**
+(`RecordingPasswordHasher.cs:20-24`), so the C2 tests prove *"exactly one verification, against the right
+constant"* — not *"…with the submitted password"*. That distinction is load-bearing here, because
+`Argon2idPasswordHasher.Verify` short-circuits on an empty password. Measured:
+
+| call | cost |
+|---|---|
+| `Verify("", dummy)` | **0.0 ms** |
+| `Verify("x", dummy)` | **220.2 ms** |
+
+So I built the mutant: keep exactly one `Verify`, keep the same dummy constant, but pass `string.Empty` as
+the password on the no-usable-hash paths.
+
+> **Result: 147/147 pass.** All ten `LoginServiceTests` green, with the mutation verifiably in place.
+
+That mutant is a free miss path — the enumeration oracle C2 exists to close — and the suite does not see
+it. **The shipped code is correct**; this is a hole in the evidence, not a defect, which is why it is a nit
+rather than a blocker. It closes with one line: record the password alongside the hash and assert the
+submitted one was passed. Worth doing now rather than later, because §4's redemption and every future
+credential path will lean on this same recorder.
+
+Everything else about the C2 evidence is as strong as it sounds, and stronger than a wall-clock test would
+have been: the miss short-circuit mutant fails 2 tests, the derived-per-request dummy fails 2, and the
+parameters are pinned by the exact PHC prefix assertion so a cheaper dummy cannot slip past.
+
+**Priority 2 — C3. Uniform in the response, distinguishable in the log, and I checked the headers.**
+
+The three-separately-booted-apps design is the right one, for exactly the reason given: the form echoes
+the submitted username, so comparing two usernames against one app would compare two legitimately
+different pages. Confirmed empirically — case A (`admin`, wrong password) and case B (`nosuchperson`, same
+password) differ in the body by **one line**, the echoed `value="…"`, and by nothing else.
+
+I extended the comparison to the **full header set**, which the test does not cover:
+
+| check | result |
+|---|---|
+| header sets across account-absent / wrong-password / unusable-hash | **identical** (normalising only `Date`, `Server` and the antiforgery cookie value) |
+| headers present | `Cache-Control`, `Content-Type`, `Pragma`, `Transfer-Encoding`, `blazor-enhanced-nav` |
+| status | 200 in all three |
+| body (antiforgery normalised) | wrong-password ≡ unusable-hash **byte-identical**; vs unknown-username, only the echoed username |
+| `ZeroWiki.Authentication` cookie | **absent in all three** |
+
+**The three-way distinction is present in the log**, verbatim from a real run:
+
+```
+Login rejected: wrong password for account 17ab0f21-….
+Login rejected: no account with username nosuchperson.
+Login rejected: the stored password hash for account 17ab0f21-… is unusable and cannot be verified
+  against. The account must be re-provisioned.
+```
+
+And nothing that should not be: the password, the wrong password, the string `argon2id`, and the corrupt
+value `not-a-hash` each appear **0** times across both server logs. **Answering your question 3** — no, the
+`Normalise` does not hide anything: with the token blanked, two of the three bodies are byte-identical and
+the third differs only by input the user themselves typed. The token really is the only per-response
+variation, confirmed at header level too.
+
+**Priority 3 — C5. No pattern crept in, and malformed usernames pay full price.**
+
+`LoginInput.cs` carries `[Required]` and `[StringLength]` only — no `RegularExpression`, no reference to
+`CredentialPolicy.UsernamePattern` or `UsernameMatcher()`. Measured against the running app:
+
+| submitted username | response time |
+|---|---|
+| `admin` (exists) | 0.262 s |
+| `nosuchperson` | 0.247 s |
+| `admin:user` | 0.260 s |
+| `café` | 0.263 s |
+| `a b c` | 0.256 s |
+| `../../etc/passwd` | 0.258 s |
+| `%00admin` | 0.260 s |
+
+Every AD11-illegal shape reaches the lookup, misses, and pays the dummy verify. No fast-fail, no oracle —
+exactly what C5 asks for, and the `LoginInput` doc records *why* so a future hand doesn't "harmonise" it
+with the registration rule.
+
+The two inputs that *are* rejected fast are worth putting on the record with numbers, because the
+reasoning matters more than it looks: a **65-character** username costs 0.002 s and an **empty** one
+0.001 s. Both are safe precisely because no stored account can be either — bootstrap's service guard and
+the column width forbid over-length, and both bootstrap and §4 forbid empty — so the rejected set provably
+contains no valid account and the timing difference reveals nothing about the store. The worker's
+"it looks like the thing C5 forbids and isn't" is correct, and now measured. **§4 must preserve that
+property**: any cheap pre-lookup rejection it adds has to be one no account could ever satisfy.
+
+**Priority 4 — C8. The fix is complete, and I swept the suite for the same assertion shape.**
+
+The self-caught bug is a good catch and the extraction is the right fix. Verified independently:
+
+- **`LocalUrl.IsLocal` — 32 of 32** hostile inputs correct against the real compiled code: `//evil.example`,
+  `///evil.example`, `/\evil.example`, `\/evil.example`, `\\evil.example`, `//user@evil.example`, absolute
+  `http`/`https` (any case), `javascript:`/`data:` schemes, bare and dot-relative, and leading
+  space/tab/newline before a protocol-relative URL. Legitimate paths — `/`, `/foo?x=1#y`,
+  `/localhost:5171@evil.example`, `/%2F%2Fevil.example` — all accepted.
+- **Mutation: neutering the guard fails 5 of 5** off-site cases, including the two
+  (`//evil.example`, `/\evil.example`) that previously passed against the path-only assertion. The
+  correction is proven, not asserted.
+- **Suite sweep: `HttpAssertions.cs:15-27` is now the *only* place in the entire test project that
+  inspects `Headers.Location`.** `grep -rE 'AbsolutePath|Headers\.Location|OriginalString|IsAbsoluteUri'`
+  over `tests/` returns four hits, all inside that one helper; `BootstrapPageTests` and `LoginPageTests`
+  both delegate to it. No path-only comparison survives anywhere.
+
+One observation on the helper, not a finding: when `Location` is *relative* the authority branch is
+skipped, and safety then rests on the string comparison — which does hold, since `//evil.example` parses as
+a relative `Uri` whose `OriginalString` is not `"/"`. It is correct; a `LocalUrl.IsLocal` assertion on that
+branch would make it correct *by construction* rather than by arithmetic, if you want the belt.
+
+**C4 — the projection holds.** `LoginService.cs:49-59` projects `{ Id, Username, PasswordHash,
+IsAdministrator }` and never materialises `Account`. Mutation: replacing it with
+`SingleOrDefaultAsync(a => a.Username == …)` fails **2** tests — the unit test and the HTTP one. The HTTP
+test is the one that matters: with a corrupt `CreatedAt`, the wrong password still returns the uniform 200
+rejection and the *correct* password still logs in. AD8(3) discharged.
+
+---
+
+**C6, C7, C9 and the remaining checks — all confirmed against the running app**
+
+- **C6** — GET `/logout` renders a confirmation and signs nobody out; POST **without** a token → **400**;
+  POST with a token → 302 → `/` and the cookie cleared. Mutation (sign out on GET as well) fails **2**
+  tests. A GET logout would be triggerable by an `<img>` tag; it isn't.
+- **C7** — in the pinned `Production` harness the cookie carries `httponly`, `secure`, `samesite=lax`; in
+  Development over plain HTTP I measured `path=/; samesite=lax; httponly` and **no `secure`**, which is the
+  intended `SameAsRequest` branch. Both halves of the policy are exercised, and the harness addressing
+  `https://localhost` genuinely tests the `Secure` flag rather than dodging it — that judgement call is
+  right and the comment explaining it is the kind that stops someone "simplifying" it back to HTTP.
+- **C9** — `NameIdentifier`, `Name`, and the administrator claim only when true.
+- **Session invalidation** — the limitation is stated accurately and is the correct trade-off for a
+  stateless cookie. See the architectural note below on the interaction with sliding expiry.
+- **Your question 4** — the logout page is the better shape, and not only for idiom: a bare `MapPost`
+  endpoint answers a GET with 405, whereas this gives a human a page that says whether they are signed in.
+  Keep it.
+
+---
+
+**@architect — your two rulings. I agree with both, with one forward-note on each.**
+
+**1. `zerowiki:is_administrator` over `ClaimTypes.Role` — upheld, and it does not make §6 harder.** §6's
+global denial is `RequireAuthenticatedUser()`, which is claim-agnostic; §7's admin-only surface is one
+`AddPolicy(… RequireClaim(…))` line. Nothing is lost, and `ClaimTypes.Role` would actively invite
+`[Authorize(Roles="Administrator")]`, which is a role model asserted in the type system while AD6 says
+there isn't one. **The forward-note: §6/§7 must write `RequireClaim(ZeroWikiClaims.IsAdministrator,
+"true")`, not `RequireClaim(ZeroWikiClaims.IsAdministrator)`.** The claim is emitted *only when true*
+today, so the value-less form happens to be equivalent — but it stops being equivalent the moment anyone
+emits `"false"`, and it would then grant administrator rights to every non-administrator. The XML doc
+records the invariant; the policy should not depend on it.
+
+**2. `CanVerify` — accepted, and the hazard you named is closed by construction *and* by test.** It is not
+used as a pre-check: it selects which hash to verify against, and the single `Verify` at `:66` is
+unconditional. I built the exact misuse — return early when the stored hash is unusable, before verifying
+— and it **fails `Every_rejection_performs_exactly_one_verification`**. So the interface's warning is
+enforced, not merely written. The doc itself (`IPasswordHasher.cs`, "it must not be used to skip work on a
+credential path: a caller that verifies in one case and not the other has built a timing oracle") names
+the failure rather than the rule, which is what makes it hard to fall into. The implementation reuses the
+same `TryParse` as `Verify`, so the two cannot disagree about what is parseable.
+
+**The forward-note, worth deciding before §4 adds a second consumer:** the misuse is prevented by
+documentation, not by shape. A `Verify` returning a tri-state (`Verified` / `WrongPassword` / `Unusable`)
+would make it *impossible* — there would be no separate cheap call to reach for — at the cost of touching
+every existing caller. I am **not** asking for it now: one consumer, documented, mutation-tested. But if
+§4 or §7 wants the same distinction, take that as the signal to change the shape rather than to copy the
+pattern a second time.
+
+---
+
+**Nits (non-blocking)**
+
+- **N1 — record the password in `RecordingPasswordHasher`** (`RecordingPasswordHasher.cs:20-24`). The one
+  line that closes the M3 gap above. Assert in `Every_rejection_performs_exactly_one_verification` that
+  each call received the submitted password, and the "free miss path" mutant dies.
+- **N2 — login does not trim the username, while everything that writes one does.**
+  `LoginService.cs:51` matches `a.Username == username` on the raw input. §3's N3 was resolved with
+  "trim first, then validate, so the two paths cannot disagree about what a username *is*" — and login is
+  now the path that disagrees: a pasted `"admin "` fails with "Your username or password is incorrect."
+  Trimming here is provably safe (every stored username is trimmed, so a trim can only map onto the same
+  candidate set) and provably oracle-free (it happens before the lookup, uniformly, for every input).
+- **N3 — `LoginInput.cs` hard-codes `"A username can be at most 64 characters."`** while
+  `CredentialPolicy.MaximumUsernameLengthRuleDescription` holds exactly that string beside its number.
+  Block 3's N2 ruling applies; `LoginInput` already uses the constant for the password message two lines
+  below, so this is a one-word fix.
+
+**Architectural notes**
+
+- **A1 — sliding expiry turns "14 days" into "indefinitely" for a captured cookie.** Your recorded
+  limitation is right and I am not asking for a session store. But the two settings interact in a way
+  worth stating explicitly (your question 5): `ExpireTimeSpan = 14 days` with `SlidingExpiration = true`
+  means a stolen cookie is renewed on every use, so it never expires as long as the attacker keeps using
+  it — and logout cannot revoke it. The limitation as written implies a bounded 14-day window; sliding
+  removes the bound. A **non-sliding absolute expiry** (or a shorter sliding window) restores it and is a
+  one-line change. That is a product-shaped call, not a defect — flagging so the recorded decision matches
+  the actual behaviour.
+- **A2 — C10 followed, and the observation is fair.** Nothing rate-limiting-shaped exists. And the
+  worker is right that A2 is now real rather than hypothetical: every POST to `/login` costs one 64 MiB
+  Argon2id verification **by design**, because that *is* C2. I measured ~0.24 s per request. The PO's
+  ruling stands and Block 5 has honoured it; recording the measurement so a future rate-limiting change
+  starts from a number.
+
+---
+
+**Product Owner recipe — drove all ten steps end to end. No defects; two clarity notes.**
+
+| step | claim | result |
+|---|---|---|
+| pre-flight | `Now listening on: http://localhost:5171`, store already populated | exact match, including the inert-bootstrap line |
+| 1 | `/login` shows "Sign in" with two fields | 200, `<h1>Sign in</h1>`, `Input.Username` + `Input.Password` |
+| 2 | wrong password → "Your username or password is incorrect." | exact match |
+| 3 | unknown username → **the same** message, page identical apart from the typed username | exact match — normalised diff is **0 lines** |
+| 4 | both feel the same, ~a fifth of a second | known 0.235–0.245 s, unknown 0.237–0.248 s |
+| 5 | correct credentials land on `/` | 302 → `/`, auth cookie set |
+| 6 | `/logout` says "You are signed in as *admin*" | exact match |
+| 7 | `returnUrl=https://example.com/` and `returnUrl=//example.com` both land on this site | both `Location: http://localhost:5171/` — **tested unencoded, as a Product Owner would type them** |
+| 8 | `returnUrl=/bootstrap/complete` is honoured | `Location: http://localhost:5171/bootstrap/complete` |
+| 9 | Sign out lands on `/` | 302 → `/`, `Set-Cookie` clears the cookie |
+| 10 | `/logout` now says "You are not signed in."; still signed out in a new tab | exact match; a fresh client with no cookies also sees it |
+
+Step 7 is the one I most expected to break, because it depends on `[SupplyParameterFromQuery]` surviving
+the form POST — the query string has to be on the form's action for the return URL to still be there when
+`SubmitAsync` runs. It does, in both the encoded and unencoded forms.
+
+**Two clarity notes, neither a defect:**
+1. **Step 7's "sign out first if step 6 left you signed in" is unnecessary and slightly confusing** — it
+   asks them to sign out before they have been shown how, and signing out is step 9. I checked: visiting
+   `/login` while already signed in renders the form, and re-submitting works and honours the return URL
+   (302 → `/`). The step succeeds either way, so the clause can simply be dropped.
+2. **Step 4 asks them to judge timing by feel.** That is the right instrument for a human and the numbers
+   back it up, but it is worth telling them what a *failure* looks like in wall-clock terms — "if the
+   unknown username comes back instantly while the real one takes a noticeable pause, stop" — so they are
+   comparing against something rather than a vibe. Optional.
+
+**5.1–5.3 need the Product Owner's browser confirmation** before ticking, as bootstrap did. The recipe is
+accurate and stands alone; I would hand it over with those two edits, or as-is.
+
+---
+
+**✅ SIGN-OFF — Block 5 (§5.1–5.3, login & session) APPROVED.** All four gates green (build 0/0,
+**147/147**, `--strict` valid, format clean), scope confined to §5, and C1–C10 verified — the ones that
+matter (C2 uniformity, C3 uniform response, C4 projection, C5 no-pattern, C6 POST-only logout, C8 open
+redirect) each by a mutation that dies with the invariant. The `IPasswordHasher` addition to Block 2 is
+additive, documented against its one dangerous misuse, and that misuse is caught by an existing test.
+Clear to tick **5.1 and 5.2**; **5.3 stays unticked pending the Product Owner's browser run**. N1 is the
+one I would take before §4 starts reusing the recorder.
+
+[worker] Post-sign-off — N1, N2, N3 applied, plus the two recipe corrections. No behaviour change except
+the username trim.
+
+**N1 — the recorder now records both arguments, and the gap is confirmed closed.**
+`RecordingPasswordHasher` records a `Verification(Password, StoredHash)` per call.
+`Every_rejection_performs_exactly_one_verification` now asserts the *password* on all four paths as well
+as the stored hash, and a new `A_rejected_login_verifies_the_password_that_was_actually_submitted`
+asserts the miss path verifies the submitted, non-empty password. **Reproduced your mutant to check
+rather than assuming**: passing `string.Empty` on the no-usable-hash paths previously passed 147/147 and
+now fails **2 tests**. The class doc records why both arguments matter, including your 0.0 ms vs 220 ms
+measurement, so nobody trims it back to one field when §4 reuses it.
+
+**N2 — login trims the username**, in `LoginInput`'s setter, the same shape §3's N3 ruling established
+for `BootstrapInput`. The doc states the oracle-freedom reason explicitly (it happens before the lookup,
+on every input equally) so it doesn't read as an exception to C5. New HTTP test signs in with
+`"  alice  "`. **N3** — the 64-character message now comes from
+`CredentialPolicy.MaximumUsernameLengthRuleDescription`; no magic strings left in that file.
+
+**A1 untouched** — `SlidingExpiration = true` with the 14-day window left exactly as it is, pending the
+Product Owner. Noting for the record that the reviewer's framing is sharper than mine: a captured cookie
+is renewed on every use, so "valid until it expires" is not the whole limitation — in the presence of an
+attacker who keeps using it, it does not expire at all. My §5 handoff understated that.
+
+**Two forward-notes carried, no action now:** §6/§7 must write `RequireClaim(…, "true")` and never the
+bare `RequireClaim(…)`, which would grant administrator to anyone the moment a `"false"` value is ever
+emitted; and if §4 or §7 wants `CanVerify`'s usable/unusable distinction, the answer is to **change the
+shape** — a tri-state `Verify` — rather than copy a pattern whose safety rests on documentation plus one
+mutation-tested assertion.
+
+**Gates:** `dotnet build` — 0 Warnings, 0 Errors. `dotnet test` — **149/149 passed** (147 + 2).
+`openspec validate invite-only-authentication --strict` — valid. `dotnet format --verify-no-changes` —
+clean (exit 0).
+
+---
+
+**5.3 — Product Owner verification recipe (REISSUED; supersedes the draft above).** Corrected on the two
+points from driving all ten steps, and generic about the username. Stands alone; paste verbatim.
+
+```bash
+# 1. Run the app against the store you bootstrapped earlier
+cd /Users/rendle/github/emmz/ZeroWiki
+dotnet run --project src/ZeroWiki
+```
+
+Check the console says `Now listening on: http://localhost:5171`. If it doesn't, an older instance is
+still holding the port — stop it (`pkill -f ZeroWiki`) and run it again. It should also log that the
+store already has an account and the bootstrap path is inert.
+
+Throughout, **your username** means the administrator account you created during the §3 check, and
+**your password** the one you set then.
+
+1. Open **<http://localhost:5171/login>**. You should see **"Sign in"** with Username and Password fields.
+2. **Wrong password.** Your username, any wrong password. You should get **"Your username or password is
+   incorrect."** — note the wording: it must not say which of the two was wrong.
+3. **Unknown username.** A username that does not exist (`nosuchperson`), any password. You should get
+   **exactly the same message**, and the page should look identical to step 2 apart from the username you
+   typed. Anything more specific in either case is a failure.
+4. **Roughly time those two.** Both should take about the same — a noticeable pause, on the order of a
+   fifth of a second, in *both* cases. **What a failure looks like:** the unknown username comes back
+   perceptibly quicker than the wrong password — effectively instant against a distinct pause. That
+   difference is enough to tell an attacker which usernames exist, which is the leak this block exists
+   to prevent. If they feel the same, that is the pass.
+5. **Sign in properly.** Your username and password. You should land on the home page (`/`).
+6. **Confirm the session is live.** Go to **<http://localhost:5171/logout>**. It should say **"You are
+   signed in as _your username_"** with a **Sign out** button.
+7. **Open redirect check.** Visit **`http://localhost:5171/login?returnUrl=https://example.com/`** and
+   sign in — it is fine to do this while already signed in from step 5. You must land on **this site's**
+   home page, *not* on example.com. Repeat with **`http://localhost:5171/login?returnUrl=//example.com`**.
+   If the browser ever leaves localhost, stop — that is a failure.
+8. **A legitimate return URL still works.** Visit
+   **`http://localhost:5171/login?returnUrl=/bootstrap/complete`** and sign in. You should land on
+   `/bootstrap/complete`.
+9. **Sign out.** From **<http://localhost:5171/logout>**, press **Sign out**. You should land on the home
+   page.
+10. **Confirm you are signed out.** Return to **<http://localhost:5171/logout>**. It should now say
+    **"You are not signed in."** Close and reopen the browser tab and check again — still signed out.
+
+Two things this deliberately does *not* yet do: pages other than these are not access-controlled yet
+(that is §6), and there is no "Sign in" link in the navigation yet (also §6) — for now type the URLs.
+
 ## NEXT
 
 - **Block 1 (§1.1–1.4)** ✅ committed by @architect — reviewer-approved, all four gates green
@@ -2684,6 +3304,17 @@ this list" reviewable as one statement.
   AD11 + `CredentialPolicy.UsernameMatcher()` (same charset, don't hand-roll a `Regex`), the
   `ISecretTokenGenerator` primitive from Block 2 (AD4 — hash invitation tokens SHA-256, plaintext shown
   once), and the standing service-boundary rule below.
+
+- **AD13 — session expiry stays sliding, 14 days. Product Owner's decision (2026-07-26),** answering
+  reviewer note A1. **Record the consequence honestly, because it is stronger than the limitation the
+  Architect originally wrote down:** cookie authentication is stateless, so `SignOutAsync` clears the
+  browser's cookie but cannot revoke one already captured — and with `SlidingExpiration = true` that
+  cookie is **renewed on every use**, so it does not expire at all while an attacker keeps using it. The
+  14-day figure bounds *idleness*, not the cookie's life. The Architect's earlier phrasing ("valid until
+  it expires") implied a bound that does not exist; corrected here. The PO accepted this knowingly in
+  exchange for not re-authenticating a small trusted group every fortnight. Restoring a hard bound is a
+  one-line change (`SlidingExpiration = false`); genuine revocation would need a server-side session
+  store, which is not in this change.
 
 **Standing rule established in Block 3 (applies to §4 onward):** structural invariants are enforced at
 the service boundary always; a policy *number* only where the record is privileged and the mistake is

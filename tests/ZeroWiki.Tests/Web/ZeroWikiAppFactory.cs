@@ -19,20 +19,44 @@ namespace ZeroWiki.Tests.Web;
 /// </remarks>
 public sealed class ZeroWikiAppFactory : WebApplicationFactory<Program>
 {
+    /// <summary>The origin every test client addresses; see <see cref="CreateHttpClient"/>.</summary>
+    public static readonly Uri BaseAddress = new("https://localhost");
+
     private readonly string _databasePath =
         Path.Combine(Path.GetTempPath(), $"zerowiki-web-{Guid.NewGuid():n}.db");
 
     /// <summary>A client that surfaces redirects instead of following them.</summary>
+    /// <remarks>
+    /// Addressed over HTTPS because the pinned <c>Production</c> environment marks the
+    /// authentication cookie <c>Secure</c>: over plain HTTP the client would accept the sign-in
+    /// response and then never send the cookie back, so every authenticated test would fail in a
+    /// way that looks like a broken login. This exercises the shipped cookie policy rather than
+    /// working around it.
+    /// </remarks>
     public HttpClient CreateHttpClient() =>
-        CreateClient(new WebApplicationFactoryClientOptions { AllowAutoRedirect = false });
+        CreateClient(new WebApplicationFactoryClientOptions
+        {
+            AllowAutoRedirect = false,
+            BaseAddress = BaseAddress,
+        });
 
-    public async Task<IReadOnlyList<Account>> GetAccountsAsync()
+    /// <summary>Runs <paramref name="action"/> against the running application's own store.</summary>
+    public async Task<T> WithDbAsync<T>(Func<IdentityDbContext, Task<T>> action)
     {
         await using var scope = Services.CreateAsyncScope();
-        var db = scope.ServiceProvider.GetRequiredService<IdentityDbContext>();
 
-        return await db.Accounts.AsNoTracking().ToListAsync();
+        return await action(scope.ServiceProvider.GetRequiredService<IdentityDbContext>());
     }
+
+    public async Task WithDbAsync(Func<IdentityDbContext, Task> action) =>
+        await WithDbAsync<object?>(async db =>
+        {
+            await action(db);
+            return null;
+        });
+
+    public async Task<IReadOnlyList<Account>> GetAccountsAsync() =>
+        await WithDbAsync(db => db.Accounts.AsNoTracking().ToListAsync());
 
     /// <remarks>
     /// The environment is pinned rather than inherited: <c>Program.cs</c> branches on it for the

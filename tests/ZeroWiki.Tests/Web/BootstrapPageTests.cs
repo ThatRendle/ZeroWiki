@@ -147,14 +147,8 @@ public sealed class BootstrapPageTests : IDisposable
             StringComparison.Ordinal);
     }
 
-    /// <summary>Blazor emits the redirect target absolute, so compare on the path.</summary>
-    private static void AssertRedirectedTo(string expectedPath, HttpResponseMessage response)
-    {
-        Assert.Equal(HttpStatusCode.Redirect, response.StatusCode);
-
-        var location = Assert.IsType<Uri>(response.Headers.Location);
-        Assert.Equal(expectedPath, location.IsAbsoluteUri ? location.AbsolutePath : location.OriginalString);
-    }
+    private static void AssertRedirectedTo(string expectedPath, HttpResponseMessage response) =>
+        HttpAssertions.AssertRedirectedTo(expectedPath, response);
 
     private static async Task<HttpResponseMessage> SubmitAsync(
         HttpClient client,
