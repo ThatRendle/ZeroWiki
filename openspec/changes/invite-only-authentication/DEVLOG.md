@@ -2654,16 +2654,36 @@ minimum, and it now fails at both the form and the service.
   that amplifier through an *earlier* door, since DataAnnotations runs before `OnValidSubmit` (500 in
   0.253 s → 302 in 0.0023 s). Also landed: the reusable `WebApplicationFactory` harness for Static SSR
   forms, AD10, AD11, and the credential guards at the service boundary.
-- **⏸ §3.2 is NOT ticked — awaiting Product Owner browser verification.** Everything is implemented,
-  reviewer-approved and gate-green; the recipe above has been driven end-to-end over HTTP **twice** by
-  @reviewer with every message byte-checked. It must not be ticked until the Product Owner confirms in a
-  real browser.
-- **Block 4 (§4 — invitations)** is next once §3.2 is confirmed. Inherits: AD7 (server-side expiry
-  predicate — land the test proving `ExpiresAt > now` reaches SQL), AD10 (same 12-char minimum),
-  AD11 + `CredentialPolicy.UsernameMatcher()` (same charset; don't hand-roll a `Regex`), the
-  `ISecretTokenGenerator` primitive from Block 2 (AD4 — hash invitation tokens SHA-256, show plaintext
-  once), and the Static SSR form harness. **Lesson carried from BL1/BL2:** a validation rule is
-  attacker-reachable code — cost every credential rule on an anonymous route before adding it.
+- **§3.2** ✅ **verified by the Product Owner in a real browser (2026-07-26)** and ticked. §3 is complete.
+
+**AD12 — section execution order is resequenced: §5 → §4 → §6 → §7 → §8 → §9.** Architect's call;
+`tasks.md` is unchanged and every task still gets done, only the order of blocks moves.
+
+*Why §5 before §4:* task **4.1 is specified as "issue … as an authenticated member"** and 4.4's revoke
+surface is likewise a member action — but §5 (login and session) is what makes "the authenticated member"
+exist. Building §4's UI first means building it against an identity mechanism that isn't there yet and
+retrofitting it afterwards, or splitting §4 into a service-now / UI-later pair that leaves 4.1 and 4.4
+half-ticked across two blocks. §5 has **no** dependency on §4 — login only needs an account, and §3 now
+mints one — so the dependency runs one way only. Doing §5 first also means the Product Owner can actually
+log in, which is what makes §4's issuing flow verifiable end to end when it lands.
+
+*Why §6 after §4:* §6 denies anonymous access globally, and the routes needing exemption are spread
+across §3 (`/bootstrap`, `/bootstrap/complete`), §5 (login) and §4 (invitation redemption, which is
+necessarily anonymous — the invitee has no account yet). Running §6 once all three exist lets it exempt
+them in a single deliberate pass instead of being amended three times, and makes "deny everything except
+this list" reviewable as one statement.
+
+- **Block 5 (§5.1–5.3 — login & session)** is next. Inherits **AD8 in full** (dummy-hash timing
+  uniformity; three-way server-side logging behind one uniform response; the account lookup **must
+  project**, never materialise the `Account` entity — a corrupt timestamp column otherwise turns login
+  for that one user into a 500 while everyone else gets the uniform failure). Also inherits the Static
+  SSR form harness from §3 and the BL1/BL2 lesson: **a validation rule is attacker-reachable code** —
+  cost every rule on an anonymous route before adding it. Login is the most exposed route in the change.
+- **Block 4 (§4 — invitations)** follows §5. Inherits: AD7 (land the test proving the `ExpiresAt > now`
+  expiry predicate reaches **SQL**, not a client-side filter), AD10 (same 12-char minimum on redemption),
+  AD11 + `CredentialPolicy.UsernameMatcher()` (same charset, don't hand-roll a `Regex`), the
+  `ISecretTokenGenerator` primitive from Block 2 (AD4 — hash invitation tokens SHA-256, plaintext shown
+  once), and the standing service-boundary rule below.
 
 **Standing rule established in Block 3 (applies to §4 onward):** structural invariants are enforced at
 the service boundary always; a policy *number* only where the record is privileged and the mistake is
