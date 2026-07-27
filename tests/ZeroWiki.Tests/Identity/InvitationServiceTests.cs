@@ -33,7 +33,12 @@ public sealed class InvitationServiceTests : IDisposable
             new DbContextOptionsBuilder<IdentityDbContext>().UseSqlite(_connection).Options);
         _db.Database.Migrate();
 
-        _service = new InvitationService(_db, _tokenGenerator, _time);
+        _service = new InvitationService(
+            _db,
+            _tokenGenerator,
+            new CountingPasswordHasher(),
+            _time,
+            new CapturingLoggerProvider().CreateLogger<InvitationService>());
     }
 
     public void Dispose()

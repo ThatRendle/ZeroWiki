@@ -70,6 +70,51 @@ Greenfield repo — this change scaffolds the whole solution. Binding calls made
   match `Program.cs`'s CRLF silently mutated nothing, and a no-op mutation is indistinguishable from
   a surviving mutant unless you check the edit landed). **Any mutation run in this repo verifies the
   file actually changed before believing the result.**
+- **AD17 — a failed redemption names its reason, except for a token that matches nothing. Product
+  Owner's decision (2026-07-26).** "Expired" / "already used" / "revoked" are told to the invitee; a
+  token that resolves to **no stored row** gets a single uniform "this invitation link is not valid".
+  **Why this does not contradict §5's uniform login error, which still stands in full:** §5's
+  requirement is *no username enumeration*, and a username is a low-entropy value an attacker can
+  guess. An invitation token is high-entropy and SHA-256-hashed at rest (AD4), so anyone shown a
+  reason has already **proven possession of a real token** — there is nothing left to enumerate, and
+  the reason is a fact about a secret they demonstrably hold. **This is the boundary, and it binds:**
+  the three named reasons are reachable **only after** the presented token has matched a stored hash.
+  Deriving a reason from anything an unauthenticated caller can supply *without* a matching token
+  would reintroduce exactly the oracle §5 closed. Rationale for naming them at all: a genuine invitee
+  whose link expired must be able to tell that from a typo, or they retry instead of asking for a new
+  link.
+- **AD18 — redemption creates the account; it does not establish a session. Product Owner's decision
+  (2026-07-26).** On success the invitee is redirected to `/login` to sign in with the credentials
+  they just chose. **§5's login stays the only route in the system that mints a session**, which is
+  the whole point: the uniform-failure behaviour, the dummy-hash timing equalisation and the
+  three-way server-side logging (AD8) all live there and are tested there. A second session-minting
+  path would either duplicate those properties or quietly not have them. It costs the invitee one
+  extra step, and makes that step the hardened one.
+- **AD19 — a test must assert that the condition it is named for actually occurred, not infer it from
+  the outcome. Architect's ruling (2026-07-27),** generalising AD16 after Block 4b hit the same
+  mistake in three different disguises. Every one produced **a green suite describing something other
+  than the system**:
+  1. **A mutation that never landed** (4a) — the script's `\n` could not match a CRLF file, so three
+     mutants modified nothing and were reported as "tests survived". Fix: checksum before/after.
+  2. **A race that stopped happening** (4b/B1) — eight redemption attempts released by
+     `SetResult()` onto a saturated thread pool drained near-serially, so the losers refused at the
+     *pre-lock* check and the race never occurred. `deferred: false → true` — reverting the entire
+     write-lock discipline — passed the full `dotnet test` **0/4 caught**. Fix: make the rendezvous
+     **positional, not temporal** — park every attempt at a known point in the code (here, the seam
+     between the pre-lock read and `BEGIN IMMEDIATE`), on dedicated threads, so starvation can only
+     make the test *time out and fail loudly*. Now caught **3/3, no variance**.
+  3. **A seam that quietly moved** (4b/N9) — the revoke test hooked the clock read between the
+     revocability decision and the write. Adding a harmless `_ = timeProvider.GetUtcNow();` at the top
+     of the method — the shape an ordinary refactor produces — moved the seam, and the test's XOR was
+     then satisfied on its *other* branch, so the real N2 regression **passed 3/3**. Fix: assert
+     inside the hook that the interleaving happened (`Assert.False(redemption.Wait(…))`), so the test
+     now *refuses to run* against a seam it cannot find, and names the line that moved it.
+
+  **The common shape:** each test knew what the *outcome* should be and never checked that the
+  *situation* it was written for had arisen. Note that the code was correct in all three cases — this
+  is not about finding bugs, it is about whether the proof would still fail if the bug returned. **A
+  filtered test run is not evidence**: B1 was caught under a filter and invisible under the full
+  `dotnet test`, which is the gate the workflow actually runs. Verify mutants under the full suite.
 
 ## 1. Identity store
 
@@ -3367,6 +3412,1012 @@ post above. The wrong claim stays readable; it no longer reads as current.
 **@architect's ruling recorded:** `AuthorizeRouteView` and `AddCascadingAuthenticationState()` stay,
 inert though they are — §6/§7 render `AuthorizeView`, which needs the cascading state, and
 `AuthorizeRouteView` keeps renderer and endpoint from being able to disagree.
+
+---
+
+_[architect] → @worker — **Block 4b = tasks 4.2, 4.3 and 4.5.** Read this whole post before starting.
+Block 4a is committed and signed off; you are extending it, not revisiting it._
+
+**This is the anonymous half of §4, and that is the entire point of the split.** The caller has no
+account, no session and no audit trail. Every line you add is reachable by anyone who can make an
+HTTP request. 4a's code is reusable; **4a's threat model is not**, and the review will check that you
+did not carry it across.
+
+**Tasks in scope**
+
+- `4.2` Redeem an invitation: validate (unredeemed, unexpired, unrevoked), create the account with a
+  chosen username and password, mark the invitation redeemed.
+- `4.3` Reject expired, already-redeemed, or revoked invitations.
+- `4.5` Ensure there is no open/self-service registration path.
+
+**Binding spec (verbatim, `specs/invitations/spec.md`)**
+
+> ### Requirement: Invite-only account creation
+>
+> The system SHALL create new accounts only by redeeming a valid invitation. The system SHALL NOT
+> offer open/self-service registration.
+>
+> #### Scenario: No open registration
+>
+> - **WHEN** an anonymous visitor attempts to create an account without an invitation
+> - **THEN** the system does not create an account and provides no open registration path
+>
+> #### Scenario: Account created by redeeming an invitation
+>
+> - **WHEN** a valid, unredeemed, unexpired invitation is redeemed with a chosen username and password
+> - **THEN** the system creates the account and marks the invitation as redeemed
+
+> ### Requirement: Invitation validity and revocation
+>
+> #### Scenario: Expired invitation is rejected
+>
+> - **WHEN** an invitation is redeemed after its expiry
+> - **THEN** the system rejects it and creates no account
+>
+> #### Scenario: Already-redeemed invitation cannot be reused
+>
+> - **WHEN** an invitation that has already created an account is redeemed again
+> - **THEN** the system rejects it and creates no second account
+>
+> #### Scenario: Revoked invitation cannot be redeemed
+>
+> - **WHEN** an invitation is revoked and then a redemption is attempted
+> - **THEN** the system rejects it and creates no account
+
+**Binding decisions — the five that will decide the review**
+
+1. **"Single-use" is a CONCURRENCY requirement, exactly as "exactly one administrator" was (§3/B1).**
+   Two simultaneous redemptions of the same invitation must create **one** account. A read-then-write
+   cannot achieve this on SQLite: the read takes no write lock, so both callers observe an unredeemed
+   invitation and both inserts succeed. Take the write lock **before** the check —
+   `connection.BeginTransaction(deferred: false)`, which issues `BEGIN IMMEDIATE`. **There is no async
+   overload**; `BeginTransactionAsync()` gives you the deferred transaction that does *not* hold.
+   `BootstrapService.CreateFirstAdministratorAsync` is the worked example — follow its whole shape,
+   including enlisting via `db.Database.UseTransactionAsync(...)` so EF's bookkeeping stays straight.
+   **Prove it with a genuinely concurrent test** (`BootstrapConcurrencyTests` is the pattern), not the
+   happy path run twice.
+2. **The Argon2id hash is computed BEFORE the write lock is taken, and never inside it.** ~93 ms at
+   64 MiB; holding SQLite's single write lock for that long serialises every other writer behind a CPU
+   burn. But equally — **the cheap validity checks come before the hash** (BL1/BL2's lesson). This
+   route is anonymous, so an attacker who can make the server derive a 64 MiB hash before it notices
+   the token is garbage has a free amplifier. Order: cheap token lookup and validity → hash → write
+   lock → re-check under lock → insert. Note that this puts a *pre-lock* check and an
+   *under-lock* re-check in the same method; that is deliberate and is what bootstrap does.
+3. **AD7 — the expiry predicate MUST reach SQL. This is the single most important test in §4.** Assert
+   on `ToQueryString()` that `ExpiresAt > now` appears in the WHERE clause and is not a client-side
+   filter, exactly as `DateTimeOffsetStorageTests` does. Expiry is a security boundary, and the
+   built-in `DateTimeOffsetToBinaryConverter` was **measured silently admitting an expired row** —
+   that is why AD7's fixed-width ISO-8601 converter exists. A test that only checks "an expired
+   invitation is rejected" against a correctly-configured context would pass while the boundary was
+   one converter change from failing open.
+4. **AD17 — name the reason, but only after the token has matched a stored row.** Expired / already
+   used / revoked are told to the invitee; a token matching **nothing** gets one uniform "this
+   invitation link is not valid". The named reasons must be **unreachable** without a hash match — if
+   any input an anonymous caller controls can produce a distinguishing response without possessing a
+   real token, you have rebuilt the oracle §5 closed. Test both halves: the reasons are distinct for
+   a held token, and an unknown token is indistinguishable from a malformed one.
+5. **AD18 — redemption does NOT establish a session.** Create the account, mark the invitation
+   redeemed, redirect to `/login`. Do not call `SignInAsync` anywhere in this block. §5's login stays
+   the only route that mints a session.
+
+**Also binding, and cheaper to get right the first time**
+
+- **AD10 + AD11 — the same 12-character password minimum and the same username charset as bootstrap.**
+  Use `CredentialPolicy` and `CredentialPolicy.UsernameMatcher()`. **Do not hand-roll a `Regex`** over
+  `UsernamePattern` and do not reintroduce an unbounded quantifier (that was BL2). AD10 exists
+  *precisely* so the two password-choosing paths cannot diverge — this is the second one, and it is
+  the reason the constant is shared rather than duplicated.
+- **N2 (reviewer, carried from 4a — you are closing it).** `RevokeAsync` is currently check-then-act
+  with no transaction. Harmless while nothing else writes these rows; the moment redemption exists, a
+  redemption committing between revoke's read and its write yields a row with **both `RedeemedAt` and
+  `RevokedAt`**, reporting `Revoked` for an invitation that already created an account. Close it with
+  the same write-lock discipline, and test the interleaving.
+- **`AlreadyRedeemed` needs its end-to-end case.** 4a could only prove the enum value in isolation.
+  Now that redemption exists, exercise revoke-after-redeem for real.
+- **`InvitationPolicy.RedemptionPath`** (`/invite`) already exists so 4a's link and 4b's page cannot
+  spell the path differently. Use it; do not re-literal it.
+- **The token arrives in the URL — treat that as a known cost, not a thing to fix here.** A copy-a-link
+  handoff is `design.md`'s resolved answer, so the token is in the query string and therefore in
+  browser history and any proxy log. Do not make it worse: **never log the token**, and do not put it
+  in the redirect target after a successful redemption. Redemption consumes it, which is what bounds
+  the exposure.
+- **The `IsAdministrator()` convention (reviewer).** `InvitationService` takes
+  `bool callerIsAdministrator` as a **trusted parameter** and does not derive it — AD15 as written, so
+  correct, but it means `ClaimsPrincipalExtensions.IsAdministrator()` is a convention callers must
+  follow rather than a boundary the service enforces. Nothing to change; do not add a *third* caller
+  that passes a literal.
+- **AD16's mutation rule** — verify the file actually changed (checksum before/after) before believing
+  any mutation result. A no-op mutation is indistinguishable from a surviving mutant, and that is how
+  4a's plumbing table came to be wrong.
+
+**4.5 — how to prove a negative.** "No open registration" is not provable by a test that pokes at
+guessed URLs; the next route someone adds would not be covered. Build the **structural** test:
+enumerate the application's endpoints (`EndpointDataSource` off the booted `ZeroWikiAppFactory`) and
+assert that the set of endpoints reachable **anonymously** that can create an `Account` is exactly
+`{/bootstrap (inert once populated), /invite (requires a matching token)}`. That test stays true as
+routes are added, which a URL-guessing test does not. If you find a materially better shape, say so in
+the DEVLOG before building it.
+
+**Test expectations** — `dotnet test` is at **187** green; you add to that.
+
+- The concurrent-redemption test (binding decision 1) and the `ToQueryString()` expiry test (3) are
+  the two the reviewer will look at hardest. Neither can be replaced by a happy-path test.
+- Reuse `tests/ZeroWiki.Tests/Web/` (`ZeroWikiAppFactory`, `StaticSsrForm`, `HttpAssertions`),
+  `RecordingPasswordHasher`, `CapturingLoggerProvider`. `StaticSsrForm` gained a form-scoped overload
+  in 4a for multi-form pages.
+- Prove **no account is created** on every rejection path, not merely that the response was an error.
+  The spec's wording is "rejects it and creates no account" — assert the store.
+- **Break your own implementation on purpose and confirm each new test goes red.** §5 shipped two
+  tests that asserted nothing while passing; 4a shipped a claim check no test could reach. Both were
+  found by mutation, not by reading.
+
+**Product-Owner verification — 4.2 does NOT get ticked on gates alone.** Like §3.2 and §5.3, redeeming
+an invitation in a real browser is a human-in-the-loop step. Implement and self-test to the gates,
+then **draft a precise, copy-pasteable recipe** for the Product Owner: exact commands, what to click,
+what they should see at each step, ending with a successful login as the new account. Write it against
+**AD10's 12-character minimum** and **AD18's redirect-to-login** — the §3 recipe went stale by
+predating AD10, and this one must not repeat that. Post the recipe to the DEVLOG and hand off; the
+Architect gates the tick on the Product Owner's confirmation.
+
+**Done-gates — all four, before anything is ticked**
+
+1. `dotnet build` clean (no errors)
+2. `dotnet test` green — your new tests **and** all 187 existing ones
+3. `openspec validate invite-only-authentication --strict`
+4. `dotnet format --verify-no-changes` clean
+
+Post progress and any `❓ @architect` questions to this section as you go, then hand off with
+`→ @reviewer`.
+
+---
+
+[worker] **Block 4b — plan, and the two calls the brief leaves to me.** Posting before I build so
+neither is a surprise at review. Brief read in full, plus 4a's thread, AD4/7/10/11/14/15/16/17/18 and
+the `NEXT` standing rules.
+
+**Shape:** `InvitationService` gains `RedeemAsync` (anonymous, token-authorised), `ValidateAsync`
+(the advisory "why can't I redeem this" the GET renders), and a shared `Redeemable(...)` queryable so
+the AD7 predicate exists in exactly one place. `RevokeAsync` gets the same write-lock discipline
+(closing N2). New `/invite/{Token}` Static SSR page; success redirects to `/login` (AD18) — no
+`SignInAsync` anywhere in the block. Order inside `RedeemAsync` is BL1's: token hash → cheap validity
+→ **Argon2id** → `BEGIN IMMEDIATE` → SQL re-check under the lock → insert.
+
+**Call 1 — redemption has a sixth outcome, `UsernameTaken`, and it is *inside* AD17's boundary.**
+AD17 names three reasons and one uniform answer for a token matching no row. It does not cover "your
+token is fine, but that username is taken" — which is not an invitation state at all. Not naming it
+would tell a genuine invitee "this invitation link is not valid" about a link that is perfectly valid,
+and they would burn the invite chasing the wrong problem. I am treating this as a gap AD17 does not
+address rather than a decision to reinterpret, and I am holding the boundary AD17 *does* bind: the
+uniqueness check happens **under the write lock, after the presented token has already matched a
+stored hash**, so `UsernameTaken` is unreachable without possession of a real token, exactly like the
+three named reasons. A taken username does **not** consume the invitation — the invitee retries with
+another name. ❓ @architect — say so if you would rather this collapse into the uniform message.
+
+**Call 2 — both credential guards go at the service boundary, mirroring `BootstrapService`.** The
+brief says "the same 12-character password minimum and the same username charset **as bootstrap**",
+and bootstrap enforces both in the service *and* in the form. `NEXT`'s standing rule pulls the other
+way ("a policy *number* only where the record is privileged and the mistake irreversible… do not cite
+it as precedent"). I read the standing rule as a bar on *generalising* AD10 into services, not as a
+bar on the one other path AD10 names by name so "the two cannot diverge" — and no password reset
+exists in this change, so a weak password here is as permanent as bootstrap's. Fail-closed, one `if`,
+in front of the hash so it cannot become an amplifier. Flagging it because it is the closer of the two
+readings; @reviewer, this is the line to argue with if either of you reads the standing rule the other
+way.
+
+**4.5** — building the structural test as briefed, with one strengthening: rather than reading
+`[Authorize]` metadata off each endpoint (which §6's fallback policy would make meaningless — the
+policy lives in middleware options, not endpoint metadata), I enumerate `EndpointDataSource` and then
+**probe each route anonymously over the real pipeline**, classifying by what the site actually does.
+That keeps the test true through §6 instead of silently going vacuous the moment §6 lands. Same
+assertion either way: the anonymously reachable set is exactly the named list, and only two members of
+it can create an account.
+
+---
+
+[worker] **Block 4b (4.2 + 4.3 + 4.5) implemented.** Summary:
+
+- **`InvitationRedemption`** — six-member outcome enum. `Redeemed`, the uniform `NotValid`, the three
+  AD17 reasons, and `UsernameTaken` (call 1 in my plan post above).
+- **`InvitationService.RedeemAsync(presentedToken, username, password)`** in the order the brief
+  fixed: structural credential guards → `string.IsNullOrEmpty(token)` → SHA-256 token hash → cheap
+  indexed lookup and classification → **Argon2id** → `BEGIN IMMEDIATE` → SQL re-check under the lock
+  → uniqueness check under the lock → one `SaveChanges` inserting the account and stamping
+  `RedeemedAt` → commit. Early returns roll back by disposal.
+- **`InvitationService.Redeemable(IQueryable<Invitation>, DateTimeOffset)`** — the AD7 predicate, in
+  one public place so the check and the test that reads its SQL cannot diverge. It is what the
+  redemption path runs; there is no second copy.
+- **`ValidateAsync`** — the advisory "why can't I redeem this", shared with `RedeemAsync`'s pre-lock
+  check so the page's courtesy answer and the authoritative one come from the same code.
+- **`RevokeAsync` now holds the write lock across its read and its write — N2 closed.**
+- **`/invite/{Token}`** (`RedeemInvitation.razor`) — Static SSR, one POST-only form, `Input.*` field
+  names, no render mode, no circuit. Success → `Navigation.NavigateTo("/login")`. **No `SignInAsync`
+  anywhere in the block** (grep-verified), no logging of anything, no `TempData`/session/query-string
+  carriage of the token, and the token is not in the redirect target.
+- **`RedeemInvitationInput`** — AD10/AD11 from `CredentialPolicy`, same attributes as
+  `BootstrapInput`, same BL0008 no-initializer idiom.
+- **Tests: 55 new (242 total).** `InvitationRedemptionTests` (30), `InvitationRedemptionConcurrencyTests`
+  (3), `RedeemInvitationPageTests` (18), `NoOpenRegistrationTests` (4). `InvitationServiceTests` gained
+  one line for the new constructor parameter; nothing else of 4a's was touched.
+
+**A real defect the tests found, worth stating plainly because it is not obvious.** My first version
+ran the advisory `ValidateAsync` in `OnInitializedAsync` unconditionally. That hides the form when the
+invitation is bad — and **a form that is not in the render tree has no submit handler for the
+framework to dispatch a POST to**, so an invitation that expired while the invitee was typing got a
+bare **400**, not a decision. The authoritative under-lock check was unreachable from the page on
+exactly the paths 4.3 is about. The advisory check is now confined to the GET
+(`HttpMethods.IsGet(HttpContext.Request.Method)`), so the POST always reaches `RedeemAsync` and
+`RedeemAsync` is always what refuses. **M13 below is that mutation** — the tests now hold it down.
+
+**Judgement calls where the brief left latitude:**
+
+1. **`UsernameTaken` is a sixth outcome, and it does not consume the invitation.** Reasoned in my plan
+   post; AD17's boundary is held (unreachable without a hash match — it is checked *under the lock*,
+   after the token has matched). The page keeps the form up for this one outcome only, so a name clash
+   cannot burn a good link. If @architect prefers the uniform message, it is a small change.
+2. **Both credential guards at the service boundary**, mirroring bootstrap. Also reasoned above; this
+   is the call I would most expect an argument about, and the standing rule is the thing to argue
+   from.
+3. **The reason-classification precedence is used → revoked → expired**, matching `Invitations.razor`'s
+   `Describe`, so the issuer's list and the invitee's page cannot tell different stories about one
+   row. Pinned by a test and by M17.
+4. **Redemption disagreeing with SQL fails closed to the uniform message.** If the under-lock SQL gate
+   refuses a row that the C# re-read then classifies as fine — which would mean the AD7 converter
+   failure mode — the answer is `NotValid`, not a redemption and not a guess at a reason.
+5. **No logging.** `LoginService` logs its three-way distinction because AD8 requires it; nothing in
+   §4's spec asks for a redemption audit trail, and adding one would put a fifth dependency and a new
+   "what is safe to log next to a token" question into an anonymous path. Flagging rather than
+   deciding it is out of scope forever — §7 may want it.
+6. **`Redeemable` is `public static`.** The alternative was asserting only on captured SQL; I did both,
+   but the brief asked for `ToQueryString()`, and `ToQueryString()` cannot be pointed at a query built
+   privately inside a service without exposing it. Exposing the predicate is the honest way to make the
+   test read production code rather than a lookalike.
+
+**AD7 is pinned twice, deliberately.** `The_redeemability_predicate_is_evaluated_in_sql` asserts
+`ToQueryString()` contains `"ExpiresAt" > `, `"RedeemedAt" IS NULL` and `"RevokedAt" IS NULL` in the
+WHERE clause. `The_expiry_comparison_reaches_sqlite_on_the_redemption_path_itself` reads the statements
+SQLite **actually executed** during a real `RedeemAsync` (via `LogTo`) and asserts the same. The first
+can be satisfied by a helper nobody calls; the second cannot.
+
+**Broke it on purpose — 17 mutants, all caught.** Every run used a `shasum` before/after guard that
+aborts on a no-op (AD16). Baseline and restored both 86/86 on
+`FullyQualifiedName~Invitation|FullyQualifiedName~NoOpenRegistration`.
+
+| mutant | failures |
+|---|---|
+| M1 `Redeemable` drops `ExpiresAt > asOf` | **3** |
+| M2 `Redeemable` drops `RedeemedAt IS NULL` | **3** |
+| M3 `Redeemable` drops `RevokedAt IS NULL` | **2** |
+| M4 the write lock becomes `deferred: true` | **2** |
+| M5 the password is hashed **inside** the write lock | **1** |
+| M6 the password is hashed **before** the token is checked | **1** |
+| M7 `RevokeAsync` loses its write lock (the N2 regression) | **1** |
+| M8 an unmatched token is told a reason (AD17 breach) | **7** |
+| M9 redemption mints an administrator | **2** |
+| M10 the username uniqueness check is dropped | **3** |
+| M11 AD10's password guard removed | **1** |
+| M12 AD11's username guard removed | **4** |
+| M13 the advisory check also runs on the POST (the defect above) | **4** |
+| M14 the consumed token is carried into the redirect | **1** |
+| M15 a username clash consumes the invitation | **2** |
+| M16 `app.MapGet("/register", …)` added to `Program.cs` | **1** |
+| M17 reason precedence puts expiry before "used" | **3** |
+
+M16 is the one that says whether 4.5's structural test is worth anything: adding a real open
+registration route to `Program.cs` fails
+`The_routes_an_anonymous_visitor_can_reach_are_exactly_the_ones_named` without anybody having
+guessed the URL. M5 is worth a word too — it is asserted by opening a second connection and issuing
+`BEGIN IMMEDIATE` *while a hash is in flight*, so it measures the lock rather than the clock.
+
+**A process note, because it cost half an hour and would cost the next person the same.** My first
+mutation harness restored with `git checkout -- <file>`. Block 4b is **uncommitted**, so that
+restored `InvitationService.cs` to 4a and silently deleted the block's work in it; every mutant after
+the first then reported a no-op. The landing guard caught it immediately (that is what it is for), and
+the file was rewritten and re-verified green before anything else ran. **A mutation harness in this
+repo must restore from a copy, never from git, while the work is uncommitted.** Recorded next to
+AD16's rule since it is the same family of mistake.
+
+**Gates:** `dotnet build` — 0 Warnings, 0 Errors. `dotnet test` — **242/242 passed** (187 existing +
+55 new), re-run four times, all green. `openspec validate invite-only-authentication --strict` —
+valid. `dotnet format --verify-no-changes` — clean (exit 0). *Wall-clock note so it is not read as a
+regression: the full suite takes ~2 minutes on this machine, but the 187 pre-existing tests take 1 m
+36 s of that on their own — it is real Argon2id at 64 MiB, not anything this block added.*
+
+**For @reviewer to look at hardest:**
+1. **`UsernameTaken` (call 1)** — whether a sixth outcome is inside AD17 or a reinterpretation of it.
+   I argued the former in the plan post; it is the call most worth a second reading.
+2. **The service-boundary credential guards (call 2)** — the standing rule can be read against this.
+3. **`RedeemAsync`'s two-checks-one-method shape** — a pre-lock advisory classification and an
+   under-lock SQL gate, with the `?? NotValid` fail-closed fallback between them. Bootstrap has the
+   same shape, but mine has a third read in the raced branch and that is the bit I would audit.
+4. **`WriteLock` disposing both halves.** EF's `UseTransaction` enlistment does **not** own the
+   `SqliteTransaction`, so disposing only the enlistment would leave `BEGIN IMMEDIATE` holding the
+   store's write lock. `BootstrapService` gets this right by nesting two `await using`s; I moved it
+   into one type. Worth confirming the ordering is equivalent.
+5. **`NoOpenRegistrationTests.IsAssetPlumbing`** matches two ASP.NET Core marker types **by name**
+   because both are `internal`. I argued it fails safe (a rename un-filters and floods the assertion),
+   but it is the loosest thing in the block.
+
+→ @reviewer
+
+---
+
+[worker] **Product-Owner verification recipe for 4.2** (@architect — 4.2 is not tickable on gates).
+
+**This was dry-run end to end before being written down**, per the §3 lesson: the app was started on
+the real `http` profile and every step below driven over HTTP against a throwaway store. Each
+"you should see" is a transcribed result, not an expectation. Your own store at
+`src/ZeroWiki/App_Data/identity.db` was not touched.
+
+**Setup**
+
+```bash
+cd /Users/rendle/github/emmz/ZeroWiki
+pkill -f ZeroWiki          # a stale instance still holding 5171 looks exactly like a feature bug
+dotnet run --project src/ZeroWiki
+```
+
+Leave it running. It binds **`http://localhost:5171`** only — `https://localhost:7070` is
+connection-refused on this profile.
+
+**1 — sign in as yourself.** Open `http://localhost:5171/login` and sign in with your existing
+administrator account (the one you created during the §3 check).
+→ You land on the home page.
+
+**2 — issue an invitation.** Go to `http://localhost:5171/invitations` and click **“Create an
+invitation”**.
+→ A box appears headed **“Invitation created”**, with a link of the form
+`http://localhost:5171/invite/<43 random characters>`. **Copy it now** — it is shown once and
+reloading the page will not show it again. The table below gains a row reading **“Waiting to be
+used”** with a **Revoke** button.
+
+**3 — become the invitee.** Open a **private / incognito window** (this matters: the invitee must be
+anonymous, and your normal window is signed in). Paste the link.
+→ Page titled **“Accept your invitation”**, with **Username**, **Password** and **Confirm password**
+boxes and a **“Create my account”** button.
+
+**4 — check the password minimum (AD10).** Type username `newcomer`, password `short` in both
+password boxes, click **Create my account**.
+→ The page comes back with **“A password must be at least 12 characters.”** and no account is
+created. This is the same 12 as the bootstrap form, from the same constant.
+
+**5 — redeem it properly.** Username `newcomer`, password `another good passphrase` in both boxes
+(24 characters), click **Create my account**.
+→ You are taken to the **sign-in page** at `http://localhost:5171/login`. **You are deliberately not
+signed in** — AD18: redemption creates the account, login is the only thing in ZeroWiki that starts a
+session.
+
+**6 — sign in as the new account.** Still in the private window, sign in as `newcomer` /
+`another good passphrase`.
+→ You land on the home page. Visit `http://localhost:5171/logout` to confirm: it reads **“You are
+signed in as newcomer.”** *(This is the step that proves the whole loop — the password you chose in a
+browser was hashed with Argon2id and verifies on login.)*
+
+**7 — the link is spent (4.3).** In the private window, paste the **same** invitation link again.
+→ **“This invitation has already been used to create an account. If that was you, sign in instead.”**
+and **no form**.
+
+**8 — a bad link says nothing (AD17).** Visit `http://localhost:5171/invite/nonsense`.
+→ **“This invitation link is not valid. Ask whoever invited you for a new one.”** Note it does *not*
+say expired, used or revoked — a token matching nothing gets one uniform answer, so it cannot be used
+to probe for real invitations.
+
+**9 — back in your own window**, reload `http://localhost:5171/invitations`.
+→ The row now reads **“Used”** and its **Revoke** button is gone.
+
+**Optional extras if you want to see 4.3's other two paths**
+
+- **Revoked:** issue a second invitation, copy the link, click **Revoke** on its row, then open the
+  link in the private window → **“This invitation was withdrawn. Ask whoever invited you for a new
+  one.”**
+- **Name clash:** issue a third invitation and try to redeem it as `newcomer` → **“That username is
+  already taken. Your invitation is still good — choose another name and try again.”** The form stays
+  up and the row still reads “Waiting to be used”, so the link is not wasted.
+
+**Afterwards.** The `newcomer` account persists in your gitignored store. To remove it (with the app
+stopped):
+
+```bash
+pkill -f ZeroWiki
+sqlite3 src/ZeroWiki/App_Data/identity.db "DELETE FROM Accounts WHERE Username = 'newcomer';"
+```
+
+Leave the used invitation row alone — it is harmless, and it is the record that the invitation was
+consumed. **Do not delete `App_Data/`**: it holds your administrator account and nothing recreates it.
+
+---
+
+[worker] **@architect's four rulings applied.** Recipe above is unaffected — no behaviour the Product
+Owner sees has changed.
+
+**Ruling 1 — `UsernameTaken` stays, and the residual is now named in the code.** The `<remarks>` on
+`InvitationRedemption.UsernameTaken` states it as an oracle rather than around it: **a holder of a
+live, unredeemed invitation can probe whether a username exists**, which is username enumeration —
+the thing §5 spends a dummy hash and a three-way private log closing — reached from a direction §5
+does not cover. It records who can reach it (someone the system is actively granting membership to,
+not an anonymous stranger — the distinction §5's oracle did not require), why every alternative is
+worse (a uniform message leaves a genuine invitee unable to get in *and* unable to learn why), that
+the invitation deliberately survives the clash, and that **neither reason survives being carried to
+another surface, so this is not precedent**. No "no security impact" softening anywhere in it.
+
+**Ruling 2 — the guard comment now rests on AD10's own wording**, quoting *"applies to every path
+where a user chooses a password — §3 bootstrap and §4 invitation redemption — so the two cannot
+diverge"*, so a reader sees the decision scoping itself to both paths rather than §3's exception being
+widened. AD11 is stated separately as a structural invariant (RFC 7617 makes a colon illegal in the
+Basic-auth userid the git remote will present), which belongs at the boundary unconditionally.
+@architect is right that this is the stronger argument; I had cited the brief, which is the weaker one.
+
+**Rulings 3 and 4** — precedence and the fail-closed disagreement branch — unchanged.
+
+**Ruling 5 — logging added, exactly two statements.**
+
+- **Success:** `"Invitation {InvitationId} redeemed: it created account {AccountId}."` The comment
+  above it says why it is load-bearing rather than chatter — `Invitation` has `RedeemedAt` but **no
+  `RedeemedByAccountId`**, so once a row is consumed the store can say it was used and *not by whom*,
+  and this line is the only place that answer exists. It also records that adding the column would be
+  a schema change outside this change's specs, so nobody "tidies" the line away thinking the store
+  covers it.
+- **Refusal:** one `Rejected(outcome)` helper logging
+  `"Invitation redemption refused: {Outcome}."`, funnelling all four refusal returns through one
+  place. The `ArgumentException` paths are caller errors, not refusals, and stay unlogged.
+- **Never** the token, its hash, or the password — `LoginService`'s posture, and asserted rather than
+  asserted-about.
+
+Three new tests (245 total): the success line carries both ids;
+every refusal names its reason in order; and `No_token_hash_or_password_ever_reaches_the_log` sweeps
+the whole log after a refusal, a clash and a success.
+
+**Mutants re-run in full after the edit — 20 now, all caught.** Three of the earlier patterns
+(M6/M10/M15) stopped matching once the refusal returns were funnelled through `Rejected(...)`; the
+landing guard reported them as no-ops rather than as survivors, which is the second time this block
+that AD16's rule was the thing that noticed. Patterns fixed and re-run. Baseline and restored both
+89/89 on the block filter. Three new:
+
+| mutant | failures |
+|---|---|
+| M18 the success line drops the account id | **1** |
+| M19 refusals are no longer logged | **1** |
+| M20 the refusal log carries the presented token | **2** |
+
+**Standing rule, for pinning as requested: a mutation harness restores from a *copy*, never from
+`git checkout`, while the block is uncommitted.** Mine used `git checkout -- <file>` and so restored
+`InvitationService.cs` to 4a, deleting the block's uncommitted work in it; every mutant after the
+first then reported a no-op. AD16's landing guard is what turned a silent wipe into an immediate
+`!!! NO-OP` on the very next line of output. The rule generalises past mutation: **any script in this
+repo that "restores" a file must restore what was there, not what git last saw.**
+
+**And the §4.3 defect, restated in @architect's terms because the framing is better than mine:** the
+advisory `ValidateAsync` running on every render hides the form when the invitation is bad, and **a
+form absent from the render tree has no submit handler for the framework to dispatch a POST to** — so
+an invitation expiring mid-typing returned a bare **400** and the authoritative under-lock check
+became unreachable **on exactly the 4.3 paths this block exists to implement**. It reads as a UI
+nicety and is a hole in the requirement. M13 is the mutation that pins it, and it fails 4 tests.
+
+**Gates re-run:** `dotnet build` — 0 Warnings, 0 Errors. `dotnet test` — **245/245 passed** (187
+existing + 58 new). `openspec validate invite-only-authentication --strict` — valid. `dotnet format
+--verify-no-changes` — clean (exit 0). No `→ @reviewer` per @architect; the review is being spawned.
+
+---
+
+[reviewer] **Block 4b (4.2, 4.3, 4.5 + 4a's N2) audited. Verdict: Request changes** — **two** blocking
+findings, and they are both in the same place: *the two properties the brief named as the ones the
+review would look at hardest are the two the test suite does not actually hold down.* The
+implementation is right. The proofs are not.
+
+**Gates re-verified independently, all four green:** `dotnet build --no-incremental` 0 Warnings /
+0 Errors; `dotnet test` **245/245**; `openspec validate invite-only-authentication --strict` valid;
+`dotnet format --verify-no-changes` exit 0. The worker's numbers reproduce exactly.
+
+**Method note, since it is what found both blockers.** I re-ran seven mutants myself under my own
+landing guard, restoring **from a copy in the scratchpad, never from git** (the block is
+uncommitted). Five reproduced the worker's result. Two survived — one of the worker's own (M4) and
+one I constructed. Working tree restored and checksum-verified against the handoff state afterwards:
+`InvitationService.cs` `be7fcb7a…`, `Program.cs` `0a878430…`, `RedeemInvitation.razor` `835135ca…`,
+probe file deleted, `git status` byte-identical to the pre-audit snapshot.
+
+---
+
+### 🚫 B1 — the concurrency proof does not survive the gate the workflow actually runs
+
+`M4` (the write lock becomes `deferred: true`) is **caught 6 runs out of 6** when
+`InvitationRedemptionConcurrencyTests` is run on its own, and caught under the worker's 89-test block
+filter (3 runs: 1, 2, 2 failures — already variable). It **passes `dotnet test` 245/245, 4 runs out of
+4.** That is the gate in `CLAUDE.md` step 5, and it is the one a future block will run.
+
+The mechanism is in `InvitationRedemptionConcurrencyTests.cs:60-76`. `release.SetResult()` with
+`RunContinuationsAsynchronously` queues eight continuations onto the thread pool; under full-suite
+parallel load the pool is already saturated by the other test classes, so the eight are drained
+near-serially. The winner commits before the losers reach their `SELECT`, every loser refuses at the
+**pre-lock** `RejectionAsync`, and the deferred-transaction race never materialises. Wall-clock
+corroborates: with M4 applied the class alone takes **1 m** (SQLite busy-timeout waits — the race
+happening), while inside the full suite all 245 finish in **14 s** (the race not happening).
+
+So the test does not prove single-use under concurrency; it proves it *when the machine happens to be
+idle*. The brief's wording was "prove it with a genuinely concurrent test, not the happy path run
+twice" — as landed this is closer to the happy path run eight times whenever the suite is busy.
+
+**Suggested shape (your call, @worker).** Stop hoping for parallelism and force the rendezvous. The
+block already has the hook: `CountingPasswordHasher.OnHash` fires *between* the pre-lock check and
+`BEGIN IMMEDIATE`, which is exactly the point at which all attempts must be parked for the race to
+exist. Hold every attempt there on a `Barrier`/`CountdownEvent` until all of them have completed the
+pre-lock read, then release. With `deferred: false` the second blocks on `BEGIN IMMEDIATE`, re-reads
+the winner's committed row and refuses; with `deferred: true` both `SELECT` clean and both insert.
+Run the attempts on dedicated threads (`TaskCreationOptions.LongRunning` or `new Thread`) so pool
+starvation cannot serialise them. **Re-verify M4 under the full `dotnet test`, not under a filter** —
+the filter is what made this invisible.
+
+Same caveat applies to `A_revocation_racing_a_redemption_never_leaves_a_row_that_is_both`: the
+assertion is good (it checks the exclusive-or of the two outcomes *against the row*, not just the
+row), but its ability to *catch* a regression rests on the same scheduling luck. Please re-check
+**M7** under the full suite once B1's construction lands.
+
+### 🚫 B2 — AD17's boundary is unasserted for `UsernameTaken`, the one outcome kept *because* it sits inside that boundary
+
+@architect's ruling 1 let the sixth outcome stay on the explicit ground that it is "under the lock,
+post-hash-match, so inside AD17's boundary". Nothing in the suite pins that.
+
+I moved the uniqueness check to before the token lookup — five inserted lines, landing-guard verified
+(`be7fcb7a…` → `144e1176…`). An anonymous caller then presents `"not-a-real-token"` with username
+`"alice"` and is told **`UsernameTaken`**: username enumeration with no invitation at all, from an
+anonymous stranger, which is precisely the oracle the `<remarks>` argues is acceptable *only* because
+the prober must hold a live invitation. **The worker's entire block suite stays green — 89/89.** A
+single-assertion probe fails it in 456 ms.
+
+`InvitationService.cs:279-282` is correct today. Nothing holds it there. M8 pins the boundary for the
+three named reasons (`RejectionAsync`'s `null` arm — 8 failures), but the sixth outcome has no
+equivalent, and the reason the gap is invisible is structural: **every existing garbage-token test
+uses a username that does not exist** — `"bob"` in `InvitationRedemptionTests.cs:111-122`,
+`"intruder"` in `NoOpenRegistrationTests.cs:118-131`. The one input that would expose it is never
+supplied.
+
+**Fix:** one service-level assertion — an unmatched token plus an **existing** username returns
+`NotValid` — and, ideally, its page-level twin asserting the body is byte-identical to the
+unmatched-token/unknown-username body (`An_unknown_token_is_indistinguishable_from_a_malformed_one`
+already has the right shape to extend). Then re-run your MX equivalent and confirm it goes red.
+
+---
+
+### Notes — not blocking
+
+- **N1 — the authoritative under-lock expiry check compares against a pre-hash clock.**
+  `InvitationService.cs:246` captures `now`; ~93 ms of Argon2id (`:257`) and an unbounded wait on
+  `BEGIN IMMEDIATE` (`:259`, default SQLite busy timeout 30 s) then pass before `Redeemable(…, now)`
+  runs at `:263`. The decision that "binds" therefore uses a timestamp up to ~30 s stale and can admit
+  an invitation that expired while the caller was queued. Trivial against a 7-day lifetime and of no
+  adversarial value (you would have to be racing your own just-expired token), but the block's own
+  framing is that the under-lock check is the authoritative one, and re-reading `GetUtcNow()` after
+  the lock costs nothing. Worth deciding rather than inheriting.
+- **N2 — `OpenConnectionAsync` has no matching close.** `BeginWriteLockedTransactionAsync`
+  (`InvitationService.cs:391`) increments EF's open-count; `WriteLock.DisposeAsync` (`:421-425`)
+  disposes both transaction halves — correctly, and your item 4 is right that disposing only the
+  enlistment would leave `BEGIN IMMEDIATE` holding the lock — but never calls `CloseConnectionAsync`,
+  so the connection stays open for the life of the scoped context. `BootstrapService.cs:93` has the
+  identical omission and was approved in §3, so this is consistency rather than a regression; 4b just
+  adds two more call sites and `RevokeAsync` now hits it on every call. `WriteLock` is the one place
+  that would fix all of them.
+- **N3 — `RevokeAsync` now takes the store's global write lock on every call, including `NotFound`.**
+  `:131` runs before the scoping query, so any authenticated member can take `BEGIN IMMEDIATE` by
+  revoking an id that does not exist. Correct per N2's closure and low risk on an authenticated
+  surface; recorded because §6/§7 put more writers behind the same single lock.
+- **N4 — a corrupt AD7 timestamp is a 500 on an anonymous route.** The under-lock read materialises
+  the `Invitation` entity (`:263`) and `RejectionAsync` projects `ExpiresAt` (`:365`); both throw on
+  an unreadable value, so the AD7 corruption mode surfaces as a 500 rather than the uniform refusal.
+  It is *inside* AD17's boundary (only a token holder reaches it), so not an enumeration oracle — but
+  it is the same shape as §5's R4 and belongs on §7's note list.
+- **N5 — the log sweep asserts the rendered message only.** `CapturingLoggerProvider.Messages` is
+  `formatter(state, …)`, so a secret passed as a *surplus* argument beyond the template's
+  placeholders would be dropped from the rendered string and escape
+  `No_token_hash_or_password_ever_reaches_the_log` while still reaching a structured sink. M20 landed
+  inside the template, so it was caught. Asserting over `Entries`' state would close it. Theoretical;
+  recorded only.
+- **N6 — `RedeemAsync` throws `ArgumentException` on an anonymous route** (`:233`, `:238`).
+  Unreachable today — I checked `RedeemInvitationInput`'s DataAnnotations attribute by attribute
+  against both guards and they mirror exactly, and `OnValidSubmit` gates the call — so no anonymous
+  500. It is §3's approved shape, but it means "no 500 on the anonymous surface" rests on two files
+  agreeing. `A_username_outside_the_permitted_charset_is_rejected_and_creates_nothing` at page level
+  is what would catch a divergence; keep it.
+- **N7 —** `No_password_is_hashed_for_a_token_that_was_never_going_to_work` covers garbage, expired
+  and revoked but not `AlreadyRedeemed`. Same code path; one more line for completeness.
+- **N8 —** your item 5 (`IsAssetPlumbing` matching two `internal` marker types by name) is indeed the
+  loosest thing in the block, and your fail-safe argument holds: a rename un-filters and floods the
+  assertion rather than letting a route escape. No action.
+
+### Answers to the five things you asked me to look at hardest
+
+1. **`UsernameTaken` inside AD17** — your reasoning is correct and I agree with @architect's ruling.
+   It is reachable only after the under-lock `Redeemable` match (`:266` gates `:279`), it does not
+   consume the invitation (early return, rollback by disposal — pinned by
+   `A_taken_username_refuses_without_consuming_the_invitation`), and the `<remarks>` names the leak as
+   an oracle rather than softening it, records who can reach it, and refuses to be precedent. That is
+   the right shape. **The problem is B2: the property is argued, not asserted.**
+2. **Service-boundary credential guards** — I read the standing rule your way. AD10 names this path
+   explicitly ("§3 bootstrap and §4 invitation redemption — so the two cannot diverge"), which is the
+   decision scoping itself rather than §3's exception widening, and AD11 is a structural invariant
+   (RFC 7617) that belongs at a boundary unconditionally. Both sit in front of the hash. No argument
+   from me.
+3. **The two-checks-one-method shape** — correct, including the third read in the raced branch. The
+   `?? NotValid` fail-closed fallback at `:272-273` is the right answer for "SQL and this process
+   disagree about the same row": a refusal, not a guess, not a redemption.
+4. **`WriteLock` disposing both halves** — ordering is equivalent to bootstrap's (enlistment first,
+   raw transaction second) and the reasoning in the `<remarks>` is right. See N2 for the one thing
+   neither shape does.
+5. **`IsAssetPlumbing`** — see N8.
+
+### Checked and clean — recorded so the audit shows it was looked at, not assumed
+
+- **AD18** — no `SignInAsync` anywhere in the block (swept all five source files).
+  `Redeeming_does_not_sign_the_invitee_in` asserts the *absence of the auth cookie* **and** that a
+  guarded page still bounces the invitee, which is the property rather than the absence of a call.
+- **Ordering, both halves of binding decision 2** — credential guards (`:230-239`) → empty-token
+  guard (`:241`) → SHA-256 (`:247`) → cheap indexed lookup (`:252`) → **Argon2id** (`:257`) →
+  `BEGIN IMMEDIATE` (`:259`) → under-lock SQL re-check (`:263`) → uniqueness (`:279`) → one
+  `SaveChanges` + commit (`:303-304`). `The_password_is_hashed_before_the_write_lock_is_taken`
+  measures the **lock** (a competing `BEGIN IMMEDIATE` with a 2 s timeout) rather than the clock,
+  which is the right instrument for the claim.
+- **AD7, pinned twice, and both pins are real.** M1 reproduced — 3 failures. `ToQueryString()` at
+  `InvitationRedemptionTests.cs:343` plus the executed-statement read at `:352-365`; the second
+  cannot be satisfied by a helper nobody calls, which was the point.
+- **AD17's three named reasons** — M8 reproduced, 8 failures.
+  `An_unknown_token_is_indistinguishable_from_a_malformed_one` compares **whole response bodies**,
+  not substrings. That is the right strength.
+- **Timing** — all four refusal classes return from the same pre-lock branch with no key derivation,
+  so nothing separates them by cost. Only a *valid* token pays the 93 ms, and reaching that requires
+  already holding it. No timing oracle inside AD17's boundary.
+- **4.5's structural test is worth what it claims.** M16 reproduced — 1 failure. And because
+  `IsDeniedToAnonymous` treats 405 as "reached", a `MapPost("/register", …)` is caught too, not only a
+  `MapGet`. `InvitationRedemptionRoute` being built from `InvitationPolicy.RedemptionPath` also pins
+  the page's `@page` literal against the constant, which is the one thing a `@page` attribute cannot
+  do for itself.
+- **The `ValidateAsync` render-tree defect and its fix** — M13 reproduced, 4 failures. No sibling
+  remains: the advisory check is the only `_outcome` producer on the GET, `SubmitAsync` the only one
+  on the POST, and `An_invitation_that_goes_bad_while_the_form_is_open_is_refused_on_the_post` drives
+  all three 4.3 states through a real POST. Good catch, and the right framing of why it mattered.
+- **The two log statements** — M20 reproduced independently (1 failure). Success carries both ids;
+  all four refusal returns funnel through `Rejected`; token, hash and password are asserted absent
+  (subject to N5).
+- **4a's N2 genuinely closed** — read and write inside one `BEGIN IMMEDIATE`, and the test asserts
+  the exclusive-or of the two reported outcomes against the stored row. (Subject to B1's caveat about
+  what that test can *catch*.)
+- **Scope** — `git status` is exactly the block's files. `Program.cs` untouched: no §6 fallback
+  policy, no deny-anonymous default, no §7 account UI, no NavMenu entry. Nothing pulled forward.
+- **Static SSR** — no `@rendermode`, no island, no circuit assumption. Antiforgery and POST-only both
+  asserted, including the `?_handler=…` GET attempt, which is the version of that test that actually
+  means something.
+- **Token hygiene** — never logged (asserted), no `TempData`, no session, not in the redirect target
+  (`The_consumed_token_is_not_carried_into_the_redirect` reads the real `Location`).
+- **Your mutation harness** — I read `mutate4b.sh`. The landing guard is real (`shasum` before/after
+  with an explicit `!!! NO-OP` branch), restore is `mktemp -d` + `cp` with `trap restore EXIT`, never
+  `git checkout`. AD16's rule is genuinely implemented, and it is what made B1 and B2 findable rather
+  than confusable with noise. The process note is worth pinning as you asked.
+
+**4.2 stays untickable on gates** — human-in-the-loop, and the recipe reads accurately and was
+dry-run; that is @architect's and the Product Owner's gate, not mine.
+
+→ @worker for B1 and B2. Everything else is yours to take or leave.
+
+---
+
+[worker] **B1 and B2 fixed, plus N1, N5 and N7. Both blockers verified under the full `dotnet test`,
+not under a filter.**
+
+The verdict is right and the framing is the useful part: the implementation was correct and the
+proofs were not, on exactly the two properties the brief singled out. Taking that seriously — both
+fixes below are about making the property *impossible to hold by luck*, not about adding an assertion
+next to the old one.
+
+**B1 — the rendezvous is now positional, not temporal.** The old shape fired
+`release.SetResult()` and trusted the scheduler; under a loaded pool the eight continuations drained
+near-serially, the winner committed before the losers reached their `SELECT`, and every loser refused
+at the cheap pre-lock check — so the race the test is named after never happened. Rewritten to park
+every attempt *at a known point in the code*: `CountingPasswordHasher.OnHash` runs after the pre-lock
+validity read and before `BEGIN IMMEDIATE`, which is the only instant at which all eight have found
+the invitation redeemable and none holds the lock. A `CountdownEvent` releases them together. Attempts
+start on dedicated threads (`TaskCreationOptions.LongRunning`), and the class raises the thread-pool
+floor for its lifetime so pool starvation can only make the rendezvous *time out*, never make it pass
+for the wrong reason. The 30 s wait is a deadlock guard, not a timing assertion.
+
+`A_revocation_racing_a_redemption…` got the same treatment and is now **deterministic**, which I did
+not expect to be possible without a production hook. There is one: `RevokeAsync` reads the clock
+exactly once, *between* deciding the invitation is revocable and writing that decision — precisely
+N2's check-then-act window. A `TimeProvider` that runs a callback on its first read is therefore a
+seam into the middle of the method, reachable by no amount of scheduling pressure from outside. The
+redemption is parked before its own lock, released into that seam, and given a bounded 500 ms to land.
+Against the correct implementation it cannot land (it is blocked on `BEGIN IMMEDIATE`) and the window
+always elapses; against a check-then-act revocation it commits instantly and the row ends up carrying
+both timestamps. Renamed to
+`A_revocation_cannot_commit_over_a_redemption_that_lands_while_it_is_deciding`, because that is the
+property rather than the setup.
+
+**B2 — the boundary is asserted now, at both layers.** You were right that the gap was structural:
+every garbage-token test named a username that did not exist, so the one input combination that
+exposes a drifted uniqueness check was never supplied. Added
+`An_unmatched_token_naming_an_existing_username_still_gets_the_uniform_refusal` (theory over an
+unmatched token and an empty one) asserting `NotValid` **and** that the answer is identical to the one
+an unknown username gets, plus the page-level twin
+`An_unmatched_token_reveals_nothing_about_whether_the_username_exists`, which posts an existing and a
+non-existent username against a dead link and compares **whole response bodies**.
+
+**N1 — the under-lock check reads the clock again.** `now` was captured before ~93 ms of Argon2id and
+before an unbounded wait on `BEGIN IMMEDIATE`; the decision that binds now compares against
+`underLock = timeProvider.GetUtcNow()` taken after the lock is granted, and `RedeemedAt`/`CreatedAt`
+use it too. Pinned by `An_invitation_that_expires_while_the_caller_waits_for_the_lock_is_refused`,
+using a new `SteppingTimeProvider` that returns one instant on the first clock read and a
+post-expiry one on every read after — a gap `FakeTimeProvider` cannot express, because it is moved
+from outside and this gap is inside a single call.
+
+**N5 — and here your premise does not survive measurement, which changed the fix.** I probed
+`Microsoft.Extensions.Logging` rather than reasoning about it:
+
+| shape | in the rendered message? | in the structured values? |
+|---|---|---|
+| argument **beyond** the template's placeholders | no | **no** — reaches no sink at all |
+| value in a placeholder | yes | yes |
+| value carried by `BeginScope` | **no** | **no** (the old capturer discarded scopes entirely) |
+
+So a surplus argument is **not** a leak — it is dropped on both paths, and the mutant for it (M22)
+correctly survives; I am recording that rather than quietly deleting the mutant. The shape that *is* a
+leak is a **log scope**: it reaches a structured sink while appearing in no message, which is exactly
+what a message-only sweep waves through. `CapturingLoggerProvider` now captures scope state
+(`BeginScope` used to return `null`), `Written` folds message + structured values + scope values, and
+the sweep reads `Written`. **M23 — the presented token carried in a `BeginScope` — is caught.** The
+`<remarks>` on `Written` records the measured table so the next person does not re-derive it.
+
+**N7** — `No_password_is_hashed_for_a_token_that_was_never_going_to_work` now covers all four refusal
+outcomes including `AlreadyRedeemed`, with a `Forget()` on the hasher so the legitimate setup
+redemption cannot mask the assertion.
+
+**Not taken, as you left them:** N2 (`OpenConnectionAsync` unclosed — shared with `BootstrapService`,
+so it is a §3 change), N3, N4, N6, N8.
+
+**Mutation — 23 mutants, every one now run under the full `dotnet test`, which is the gate that
+matters.** Filtered runs are what made B1 invisible, so the harness gained a `FULL=1` mode and the
+whole set was re-run through it. Baseline 249/249.
+
+| mutant | full-suite result |
+|---|---|
+| **M4** write lock becomes `deferred: true` | **caught 4/4 runs, 2 failures every time** |
+| **MX** uniqueness check drifts in front of the token lookup (**B2**) | **caught, 3 failures** |
+| **M7** `RevokeAsync` loses its write lock | **caught 3/3 runs, 1 failure every time** |
+| **M21** under-lock check reuses the pre-hash clock (**N1**) | caught, 1 |
+| **M23** token leaks through a log scope (**N5**) | caught, 1 |
+| M22 secret as a surplus log argument | **survives — correctly**; see the table above |
+| M1 / M2 / M3 `Redeemable` drops a clause | 4 / 3 / 2 |
+| M5 hash inside the lock · M6 hash before the token check | 3 · 1 |
+| M8 unmatched token told a reason | 9 |
+| M9 · M10 · M11 · M12 | 2 · 5 · 1 · 4 |
+| M13 advisory check on the POST · M14 token in the redirect | 5 · 1 |
+| M15 · M16 · M17 · M18 · M19 · M20 | 2 · 1 · 3 · 1 · 1 · 2 |
+
+M4 is the one to look at: **4 consecutive full-suite runs, 2 failures each, no variance.** Previously
+0/4. M7 likewise 3/3. The green path is equally stable — 5 consecutive full runs, 249/249, 15 s each.
+
+**Gates:** `dotnet build --no-incremental` — 0 Warnings, 0 Errors. `dotnet test` — **249/249** (187
+existing + 62 new). `openspec validate invite-only-authentication --strict` — valid. `dotnet format
+--verify-no-changes` — clean (exit 0).
+
+**One scope note to declare:** `CapturingLoggerProvider` is a §5-era shared helper and I changed it —
+additively (scope capture plus `Written`; `Messages`, `Entries.Level` and `Entries.Message` are
+untouched, and `LoginServiceTests` needed no edit). N5 could not be closed without it, since the leak
+lives in the part the capturer was throwing away.
+
+→ @reviewer
+
+---
+
+[reviewer] **Block 4b re-audit (4.2, 4.3, 4.5). Verdict: Approve.** Both blockers are genuinely
+closed — verified independently under the full suite, not from the table — and the N5 correction is
+right: **my premise was wrong, and the worker's measurement is the one to trust.**
+
+**Gates re-verified independently:** `dotnet build --no-incremental` 0 Warnings / 0 Errors;
+`dotnet test` **249/249**, run 3× (17 s / 15 s / 16 s); `openspec validate … --strict` valid;
+`dotnet format --verify-no-changes` clean. Working tree restored and `cmp`-verified against my
+round-2 copy afterwards; both probe files deleted.
+
+### B1 — closed. Reversed on my own measurement.
+
+`M4` under the **full `dotnet test`**: **caught 3/3 consecutive runs, 2 failures every time, no
+variance.** In round 1 the same mutant under the same command was 0/4. The rewrite does what it
+claims.
+
+The reason it works is worth stating because it generalises: the rendezvous is now **positional**.
+Parking every attempt at `CountingPasswordHasher.OnHash` — after the pre-lock validity read, before
+`BEGIN IMMEDIATE` — makes the race a property of *where the code is*, not of how the scheduler feels,
+and the `CountdownEvent` means the eighth attempt's arrival is what starts it rather than a clock.
+The `LongRunning` threads and the raised pool floor are belt: with a positional rendezvous, starvation
+can only make the wait **time out and fail loudly**, which is the correct failure direction and is
+exactly what round 1's shape got backwards. Green stability is fine too — the concurrency class alone
+is 5/5 green at 1–2 s, and `M4` runs take 1 m (busy-timeout contention, i.e. the race genuinely
+happening).
+
+### B2 — closed, and I checked the *right* assertion goes red.
+
+I re-ran your `MX`, and then wrote my own with the drift placed differently — **after** the
+empty-token guard rather than before it, which is the subtler and more realistic refactor. It lands
+(`fb5b125a…` → `685b6253…`) and the two tests that go red are precisely the two that should:
+
+```
+Failed …InvitationRedemptionTests.An_unmatched_token_naming_an_existing_username_still_gets_the_uniform_refusal
+Failed …RedeemInvitationPageTests.An_unmatched_token_reveals_nothing_about_whether_the_username_exists
+```
+
+Nothing incidental, both layers, and the page-level twin comparing whole response bodies is the right
+strength. Your reading of why the gap existed — every garbage-token test named a username that did not
+exist — was the correct diagnosis, and the theory now supplies the one combination that was missing.
+
+### N5 — **you were right and I was wrong.** Measured independently, and the correction stands.
+
+I did not take the table on trust; I measured `Microsoft.Extensions.Logging` itself, through a real
+`LoggerFactory` and a real `ILoggerProvider` implementing `ISupportExternalScope` — i.e. the shape a
+structured sink actually uses — so the answer does not come from the double being audited:
+
+| shape | rendered message | structured state | scope |
+|---|---|---|---|
+| argument **beyond** the placeholders | `False` | `False` (state keys were `Known`, `{OriginalFormat}` — the surplus is never enumerated) | — |
+| value in a placeholder | `True` | `True` | — |
+| value carried by `BeginScope` | `False` | `False` | **`True`** (scope keys: `Leaked`) |
+
+That is your table exactly. **A surplus argument reaches no sink and is not a leak; a scope value
+reaches a structured sink while appearing in no message.** My round-1 note was aimed at the hole that
+isn't there and missed the one that is. `M22` surviving is correct, and keeping it on the record
+rather than deleting it is the right call — a mutant that *should* survive, documented as such, is
+worth more than a clean table. `M23` is caught (1 failure, reproduced). The measured table living in
+`Written`'s `<remarks>` is the durable part.
+
+### The determinism claim — true, correctly reasoned, and I found the one thing that can undo it
+
+**It is genuinely deterministic, and I could not break it by load.** `RevokeAsync` does read the clock
+exactly once, between `RedeemedAt is not null` and the write — I checked the method, it is the only
+`GetUtcNow()` in it — so `HookedTimeProvider` really is a seam into the middle of a method that no
+outside scheduling pressure can reach. `M7` is caught **3/3 consecutive full-suite runs, 1 failure
+every time**, by `A_revocation_cannot_commit_over_a_redemption_that_lands_while_it_is_deciding`, and
+each run completes in 15 s rather than stalling on a busy timeout — a race would show as variance and
+there is none. Against the correct implementation the redemption is blocked on `BEGIN IMMEDIATE` and
+the 500 ms always elapses; against check-then-act it lands immediately. That is a real proof, not a
+probabilistic one, and it is a better answer than I expected to the note I raised.
+
+**What it rests on, though, is an unasserted production invariant — see N9. Non-blocking, but please
+read it.**
+
+### Notes (numbering continues from my first audit)
+
+- **N9 — the N2 guard's sensitivity depends on "the first clock read in `RevokeAsync` is the one
+  between the decision and the write", and nothing asserts that.** I tested it rather than speculating.
+  `MZ1`: add a harmless extra `_ = timeProvider.GetUtcNow();` at the top of `RevokeAsync` — the shape
+  an ordinary refactor produces when someone hoists a clock read for reuse. Suite stays green, 249/249,
+  correctly: it is not a bug. `MZ2`: that same refactor **plus `M7`** — the real N2 regression —
+  **stays green 3/3 full-suite runs.** The hook now fires before the lock is taken, the redemption is
+  released early and commits, the revocation reports `AlreadyRedeemed`, and the test's XOR is satisfied
+  on its *other* branch. The guard is silently disarmed by a change that is not itself wrong.
+  This is B1's defect one level up — B1's version was scheduling-dependent, this one is
+  code-shape-dependent, and both pass for the wrong reason while looking green. **Cheap fix: assert the
+  interleaving the test is named for.** Record inside the hook whether `redemption.Wait(ClosingWindow)`
+  returned `false` — i.e. the redemption was still blocked when the revocation wrote — and assert it.
+  A moved seam then fails loudly instead of quietly asserting the easy branch. (Asserting
+  `HookedTimeProvider`'s read count is `1` is the weaker proxy version;
+  `SteppingTimeProvider` already exposes `Reads` for exactly this and currently has no consumer.)
+  Carry the pattern to §7 if it reuses this shape.
+- **N10 — §5's log sweep is still on the weaker instrument.** `LoginServiceTests.cs:164`
+  (`No_password_or_hash_is_ever_written_to_the_log`) still reads `Messages`, so it remains blind to the
+  scope shape this block just proved is the real hole. Not a 4b regression — `LoginService` opens no
+  scopes, and leaving §5 alone was the right scope call — but the finding is now general and the
+  instrument exists. One-line change; §9's test-consolidation task is the natural home.
+- **N11 — `CapturingLoggerProvider` guards `_scopes` but not `_entries`.** `_scopes` is
+  `lock`-protected on add, remove and read; `_entries.Add` (`:92`) is not. No test shares one provider
+  across concurrent writers today — the concurrency tests each build their own — so there is no live
+  race, but the asymmetry invites one. Same `lock`, one line.
+- **N12 — scope capture is provider-global rather than ambient.** A scope opened on one thread is
+  attributed to entries logged on another. For a "no secrets anywhere" sweep that over-captures, which
+  fails safe and is the right bias; it would give a wrong answer if a test ever asserted that a scope
+  **is** present on a specific entry. Worth a line in the `<remarks>` so nobody builds a positive
+  assertion on it.
+- **N13 —** `An_unmatched_token_naming_an_existing_username_still_gets_the_uniform_refusal`'s second
+  assertion (comparing the `"nobody"` and `"alice"` answers) is implied by the first now that both are
+  `NotValid`. Harmless and it documents intent; keeping it is fine.
+
+**Round-1 notes N2, N3, N4, N6, N8 stand as declined — all correctly.** N2 is a §3 change (shared with
+`BootstrapService`) and does not belong in this block; the rest were recorded for later sections.
+
+### The scope declaration — ruled on: genuinely additive, no §5 meaning shifted
+
+Checked rather than accepted. `CapturingLoggerProvider` has exactly two consumers outside 4b's own
+files — `LoginServiceTests.cs:164` (`Messages`) and `:183` (`Entries`, via `Assert.Collection` lambdas
+reading `.Level` and `.Message`). Both members keep their names, their shapes and their semantics:
+`Messages` still projects `entry.Message`, `Entries` still yields one entry per `Log` call in order.
+`LogEntry` gained two positional members, and no consumer constructs or deconstructs it. `BeginScope`
+went from returning `null` to returning a real disposable — strictly additive; nothing depended on the
+null. `LoginServiceTests` needed no edit and is green in every one of the runs above. **The change was
+also necessary**: N5 could not be closed from outside the capturer, because the leak lives in the part
+it was discarding. Declared, justified, and correct.
+
+### Re-verified, and the harness
+
+- **`FULL=1` is real** — I read `mutate4b.sh:36-42`; it swaps the filtered `dotnet test --filter` for
+  the bare `dotnet test`, with the landing guard unchanged in front of it. I ran every mutant below
+  through the worker's own harness in that mode, so a no-op would have printed.
+- **My independent full-suite results:** M4 caught 3/3 (2 failures each) · M7 caught 3/3 (1 each) ·
+  MX caught (3) · my own MX variant caught (2, both the right tests) · M21 caught (1) · M23 caught (1)
+  · **M22 survives — correctly.** Green baseline 249/249 ×3.
+- **N1's fix** — the under-lock decision now compares against `underLock`, taken after the lock is
+  granted, and `RedeemedAt`/`CreatedAt` use it too, which is the consistent choice.
+  `An_invitation_that_expires_while_the_caller_waits_for_the_lock_is_refused` pins it via
+  `SteppingTimeProvider`, and M21 confirms the pin bites. That is a cleaner close than the note asked
+  for.
+- **N7's fix** — all four refusal outcomes, with `Forget()` placed after the setup redemption so the
+  legitimate hash cannot mask `Assert.Empty(Derivations)`. Correct.
+- **Scope** — `git status` is the block's files plus the two declared test helpers. `Program.cs` byte-
+  identical to HEAD. Nothing from §6 or §7 pulled forward.
+- Everything I signed off in round 1 (AD7's two pins, AD17's three named reasons, AD18, the ordering,
+  4.5's structural test, the render-tree fix, token hygiene, Static SSR, antiforgery) re-verified
+  unchanged.
+
+**4.2 still needs the Product Owner's browser confirmation** and must not be ticked on gates — the
+recipe is unaffected by this round, as the worker says.
+
+**Signed off. → @architect.**
+
+---
+
+[worker] **N9 and N11 applied.** No `→ @reviewer` per @architect; N9's fix is the reviewer's own
+prescription and the sign-off covers the block.
+
+**N9 — the interleaving is asserted now, not inferred.** The finding is B1's defect one level up:
+B1 was scheduling-dependent, this is **code-shape-dependent**. The test knew *what the outcome should
+be* but not *that the race had happened*, so `MZ1` — a harmless `timeProvider.GetUtcNow()` at the top
+of `RevokeAsync`, the shape an ordinary refactor produces — moved the hooked clock read out from
+between the revocation's read and its write, and the XOR was then satisfied on its other branch.
+`MZ2`, that refactor plus the real N2 regression, sailed through green.
+
+The fix is one assertion inside the hook: `redemption.Wait(ClosingWindow)` must return **`false`**.
+That states the interleaving directly — the redemption is still blocked on `BEGIN IMMEDIATE` because
+the revocation holds it — rather than deducing it from what the two callers reported. Verified under
+the full `dotnet test`:
+
+| mutant | before N9's fix | after |
+|---|---|---|
+| **MZ2** — innocent refactor **+ the N2 regression** | **green 3/3** | **caught 3/3, 1 failure each** |
+| **MZ1** — the innocent refactor alone | green (correctly) | **caught** — see below |
+| M7 — the N2 regression on its own | caught | caught 2/2 |
+| M4 — `deferred: true` | caught | caught 2/2, unchanged |
+
+**MZ1 alone now fails too, and that is the intended consequence rather than a side effect** — worth
+stating plainly, because it changes what the test means. It no longer passes-or-fails on the outcome;
+it refuses to run at all against a seam it cannot find. The message says exactly that, and the stack
+trace lands on the line that moved it:
+
+> The redemption completed while the revocation was still deciding. The hooked clock read is no
+> longer the one between the revocation's read and its write, so this test is not exercising the
+> interleaving it is named for.
+> — `at ZeroWiki.Identity.InvitationService.RevokeAsync(…) in InvitationService.cs:line 131`
+
+So a refactor that moves the seam is told which line moved it, instead of silently inheriting a test
+that has stopped testing. That is the third variant of one mistake this block has now hit: a mutation
+that never landed (round 1), a race that stopped happening (B1), and a seam that quietly moved (N9).
+All three produce a green suite that is describing something other than the system.
+
+**N11 — the capturer's data race is closed.** `_entries.Add` was unguarded while `_scopes` was
+locked; one `Lock` now guards both, `Entries` returns a snapshot so a reader cannot enumerate a list
+another thread is appending to, and `formatter(state, …)` is invoked *outside* the lock — a
+caller-supplied formatter could log again, and re-entering from inside it would deadlock the one
+helper that must never be the flaky thing.
+
+**Not taken, as ruled:** N10 (§5's sweep still uses `Messages` — carried to §9), N12 (scope capture is
+provider-global; over-captures, fails safe, and no positive assertion is built on it), N13.
+
+**Gates:** `dotnet build --no-incremental` — 0 Warnings, 0 Errors. `dotnet test` — **249/249**, four
+consecutive full runs, 15 s each. `openspec validate invite-only-authentication --strict` — valid.
+`dotnet format --verify-no-changes` — clean (exit 0).
+
+**4.2's Product-Owner recipe re-confirmed, not assumed.** The logging and N1's under-lock clock both
+touch the redemption path, so the recipe was **driven end to end again** over the real `http` profile
+on port 5171 against a throwaway store: bootstrap → sign in → issue → anonymous invitee opens the
+link → short password refused with the 12-character message → redeem → **302 to `/login`** → invitee
+still anonymous at `/invitations` → sign in as the new account → `/logout` reads "signed in as
+newcomer" → the link reports already-used → a bogus link gives the uniform message → the issuer's row
+reads "Used". Every step reproduced. **The recipe needs no edit.**
+
+Two things the re-drive showed from the real application's console rather than a test double: the
+audit line appears as `Invitation 88952545-… redeemed: it created account 161fd712-…`, and a `grep`
+for the issued token across the whole run log returns **0**. The Product Owner's store at
+`src/ZeroWiki/App_Data/identity.db` was not touched — timestamp verified unchanged afterwards.
 
 ## 5. Login & session
 
