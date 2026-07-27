@@ -4419,6 +4419,25 @@ audit line appears as `Invitation 88952545-… redeemed: it created account 161f
 for the issued token across the whole run log returns **0**. The Product Owner's store at
 `src/ZeroWiki/App_Data/identity.db` was not touched — timestamp verified unchanged afterwards.
 
+---
+
+_[architect] — **4.2 CONFIRMED by the Product Owner (2026-07-27). §4 is complete.**_
+
+The Product Owner walked the full recipe in a real browser and reported **"all good"** — every step
+reproduced: sign in as admin → issue an invitation → open the link anonymously in a private window →
+short password refused with AD10's 12-character message and no account created → redeem successfully →
+land on the sign-in page **not signed in** (AD18) → sign in as the new account → reuse the link and get
+"already used" (4.3) → a bogus link gets the uniform "not valid" message, naming no state (AD17's
+boundary) → the issuer's row reads "Used" with Revoke gone.
+
+That closes the last human-in-the-loop gate in §4. **4.2 ticked; §4 is 5/5 and the change is 20/31.**
+
+Worth recording for §6 and §7, which will both want a browser step: this recipe was **dry-run over HTTP
+against a throwaway store before it was handed over**, so every "you should see" was transcribed rather
+than predicted, and the Product Owner's real store was verified untouched afterwards. That is the
+standard for a verification recipe here — a recipe that has not been driven is a guess, and it wastes
+the one reviewer whose time cannot be parallelised.
+
 ## 5. Login & session
 
 _[architect] → @worker — **Block 5 = tasks 5.1–5.3.** Taken before §4 per **AD12** (4.1 needs "an
@@ -5097,16 +5116,61 @@ this list" reviewable as one statement.
 
 ---
 
-### ▶ RESUME HERE — Block 4b (§4.2, 4.3, 4.5 — redemption)
+### ▶ RESUME HERE — §6 (anonymous experience & access control)
 
-**State:** 17/31 tasks ticked. §1, §2, §3, §5 complete; **§4a (4.1 + 4.4) landed and reviewer-signed-off**.
-Working tree clean, branch `change/invite-only-authentication`, HEAD is the Block 4a commit. All four
-gates green at HEAD (build 0/0, **187 tests**, `--strict` valid, format clean). Remaining order per
-**AD12**: **§4b → §6 → §7 → §8 → §9**.
+**State: 20/31 tasks ticked. §1, §2, §3, §4, §5 all complete.** §4 landed as two blocks — 4a (4.1, 4.4)
+in `f8d1f61`, 4b (4.3, 4.5) in `52c77a9` — and **4.2 was confirmed in a browser by the Product Owner
+(2026-07-27)**, walking the full recipe: issue → anonymous redeem → 12-character refusal → redirect to
+login without a session → sign in as the new account → already-used on reuse → uniform message on a
+bogus link. Working tree clean, branch `change/invite-only-authentication`, HEAD is the §4 confirmation
+commit. All four gates green at HEAD (build 0/0, **249 tests**, `--strict` valid, format clean).
+Remaining per **AD12**: **§6 → §7 → §8 → §9**.
 
-**Before briefing Block 4b, read:** `specs/invitations/spec.md`, `design.md` (D1, D5), the pinned
-decisions **AD4, AD7, AD10, AD11, AD14, AD15, AD16**, the whole `## 4. Invitations` thread (4a's brief,
-the review loop, and the retracted plumbing table), and the standing rules at the end of `NEXT`.
+**Before briefing §6, read:** `specs/authentication/spec.md`, `design.md` (D5, D7/Static SSR), and the
+pinned decisions — especially **AD16** and **AD19** (the evidence standard), **AD6/AD15** (the
+administrator flag), and **AD18** (login is the only route that mints a session).
+
+**§6 = 6.1 (home shows only Login when anonymous) + 6.2 (deny anonymous access to content, redirect to
+login) + 6.3 (auth pages render as Static SSR, no persistent circuit).** Likely one block; the Architect
+carves it at brief time.
+
+**§6 inherits, and a brief must bind:**
+
+- **AD16 is now live and load-bearing for §6.** `AddAuthorization()` and `app.UseAuthorization()` are
+  **required**, and `UseAuthorization()`'s *position* — after the explicit `UseAuthentication()` — is
+  what stops `WebApplication`'s front-of-pipeline auto-insertion evaluating `[Authorize]` against a
+  not-yet-authenticated `User` and 302-ing **every signed-in member** to `/login`.
+  `AuthorizeRouteView` and `AddCascadingAuthenticationState()` are inert today and were kept
+  **deliberately for §6/§7's `AuthorizeView`** — do not delete them as dead code; AD16 is the ruling
+  that says why they are there.
+- **§6 owns the global fallback policy**, which §4 explicitly did not pull forward. 4.1's `[Authorize]`
+  is per-page; 6.2's deny-anonymous default is the systemic version, and the login redirect belongs
+  here.
+- **The failure signature to design tests against (AD16's lesson).** Anonymous-denial tests stay green
+  through a break that denies *everyone* — they assert anonymous is denied, and the breakage denies
+  anonymous too. **§6's suite must assert the authenticated path as hard as the anonymous one**, or it
+  will describe a site nobody can log into.
+- **AD19 — assert the condition, not just the outcome.** Verify mutants under the **full**
+  `dotnet test`, never a filter; a filtered run is what hid Block 4b's B1.
+- **`ClaimsPrincipalExtensions.IsAdministrator()`** is the single producer of the administrator flag.
+  It is a **convention**, not a boundary — `InvitationService` takes `bool callerIsAdministrator` as a
+  trusted parameter (AD15 as written). Do not add a caller that passes a literal.
+- **§7 projection note, still open** — a `ToListAsync()` over `Account` entities throws if any single
+  row has a corrupt value-converted timestamp, poisoning a list everyone reads. `InvitationService.
+  ListAsync`'s join is the shape to copy for the account side; its `<remarks>` states precisely what
+  that shape does and does not buy.
+- **Carried from Block 4b's review, for §9:** §5's log-secrecy sweep still uses `Messages`, now
+  measured to be the weaker instrument — a value passed via `BeginScope` reaches a structured sink
+  while appearing in no message. Not a §5 regression (`LoginService` opens no scopes), but §9 should
+  move it to `Written`.
+- **Open, unchanged:** AD9 (raising Argon2 constants owes rehash-on-verify), and Block 4b's declined
+  notes — N2 (`OpenConnectionAsync` never closed, shared with `BootstrapService`, so it is a §3 change
+  too), N3, N4 (a corrupt AD7 timestamp is a 500 rather than a uniform refusal — inside AD17's
+  boundary, so not an oracle), N6, N8.
+
+---
+
+**Superseded — the Block 4b resume note.** Kept for the record; §4 is complete.
 
 **Block 4b = 4.2 (redeem) + 4.3 (reject expired/redeemed/revoked) + 4.5 (no open registration).** It is
 the **anonymous** half of §4 — the caller has no account yet — which is what makes it the exposed one.
