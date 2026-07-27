@@ -115,6 +115,30 @@ Greenfield repo — this change scaffolds the whole solution. Binding calls made
   is not about finding bugs, it is about whether the proof would still fail if the bug returned. **A
   filtered test run is not evidence**: B1 was caught under a filter and invisible under the full
   `dotnet test`, which is the gate the workflow actually runs. Verify mutants under the full suite.
+- **AD20 — the `UsernameTaken` enumeration oracle is an ACCEPTED RISK. Product Owner's decision
+  (2026-07-27),** recorded so it is never quietly re-litigated and never silently widened. **The
+  leak, stated plainly:** redemption tells the invitee when their chosen username is taken, so a
+  holder of a live, unredeemed invitation can resubmit with different names and learn which
+  usernames exist. That is the enumeration AD8 and §5 spend a dummy hash and a three-way private log
+  to close on the login form, reached from a direction §5 does not cover.
+
+  **Why it is accepted — and neither reason generalises:**
+  1. The prober must **possess a live invitation**. They are someone the system is actively granting
+     membership to, not an anonymous stranger — which is precisely what §5's oracle did *not*
+     require. The distinction is the whole argument.
+  2. **User-chosen unique usernames cannot be offered without it.** A uniform message leaves a
+     genuine invitee unable to get in *and* unable to learn why. Every alternative is worse for the
+     person the feature exists to serve.
+
+  **Bounds that are part of the acceptance, not incidental:** the invitation is **not consumed** by a
+  name clash (consuming it would punish the invitee for a collision they could not predict), and the
+  outcome is reachable **only after** the presented token has matched a stored hash — AD17's
+  boundary, which Block 4b's review found *unasserted* and now pins at both the service and page
+  layers. **Do not cite AD20 as precedent** for naming a reason on any other surface; the reasoning
+  is specific to a caller holding a valid invitation. Reversing it is cheap in code and expensive in
+  invitee experience — that is the trade, and it was made with eyes open. Recorded in three places
+  that outlive this thread: here, `design.md`'s Risks / Trade-offs, and the `<remarks>` on
+  `InvitationRedemption.UsernameTaken`.
 
 ## 1. Identity store
 
