@@ -4430,7 +4430,7 @@ land on the sign-in page **not signed in** (AD18) → sign in as the new account
 "already used" (4.3) → a bogus link gets the uniform "not valid" message, naming no state (AD17's
 boundary) → the issuer's row reads "Used" with Revoke gone.
 
-That closes the last human-in-the-loop gate in §4. **4.2 ticked; §4 is 5/5 and the change is 20/31.**
+That closes the last human-in-the-loop gate in §4. **4.2 ticked; §4 is 5/5 and the change is 18/31.**
 
 Worth recording for §6 and §7, which will both want a browser step: this recipe was **dry-run over HTTP
 against a throwaway store before it was handed over**, so every "you should see" was transcribed rather
@@ -5118,7 +5118,10 @@ this list" reviewable as one statement.
 
 ### ▶ RESUME HERE — §6 (anonymous experience & access control)
 
-**State: 20/31 tasks ticked. §1, §2, §3, §4, §5 all complete.** §4 landed as two blocks — 4a (4.1, 4.4)
+**State: 18/31 tasks ticked. §1, §2, §3, §4, §5 all complete.** *(Counted from `tasks.md`, not carried
+forward: the pre-§4 resume note said "15/31" but the real figure was 13/31 — §1 4 + §2 3 + §3 3 + §5 3.
+The error rode along through 4a and 4b before being caught here. **Count the file; do not trust the
+previous note's arithmetic.**)* §4 landed as two blocks — 4a (4.1, 4.4)
 in `f8d1f61`, 4b (4.3, 4.5) in `52c77a9` — and **4.2 was confirmed in a browser by the Product Owner
 (2026-07-27)**, walking the full recipe: issue → anonymous redeem → 12-character refusal → redirect to
 login without a session → sign in as the new account → already-used on reuse → uniform message on a
