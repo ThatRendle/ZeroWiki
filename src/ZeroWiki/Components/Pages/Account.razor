@@ -1,0 +1,227 @@
+@page "/account"
+@* Anonymous requests never reach here — AnonymousGate answers them and the fallback policy would
+   refuse them anyway (AD21). The attribute is kept for the same reason the invitations page keeps
+   it: the page states its own requirement rather than inheriting it from a pipeline it cannot see. *@
+@attribute [Authorize]
+@using System.Globalization
+@using System.Security.Claims
+@using ZeroWiki.Identity
+
+@inject GitTokenService GitTokenService
+
+<PageTitle>Account</PageTitle>
+
+<h1>Account</h1>
+
+<h2>Git access tokens</h2>
+
+<p>
+    A git access token is the password git asks for when you clone, pull or push this wiki's
+    content. Your sign-in password is not accepted there, and a token can be revoked on its own
+    without changing anything else about your account.
+</p>
+
+@if (User.Identity?.Name is { Length: > 0 } username)
+{
+    <p>Give git your username, <strong class="git-username">@username</strong>, and a token below.</p>
+}
+
+@if (_issuedToken is not null)
+{
+    <div class="issued-git-token" role="alert">
+        <h3>Token created</h3>
+        <p>
+            Copy it now. It is shown <strong>once</strong> — only a hash of it is stored, so it
+            cannot be shown again or recovered. If you lose it, generate another and revoke this one.
+        </p>
+        <p><code class="git-token">@_issuedToken</code></p>
+    </div>
+}
+
+@if (_revoked is true)
+{
+    <p class="revocation-outcome" role="alert">That token is revoked and can no longer be used for git.</p>
+}
+else if (_revoked is false)
+{
+    <p class="revocation-outcome" role="alert">@NoSuchTokenMessage</p>
+}
+
+<EditForm Model="this" FormName="generate-git-token" OnValidSubmit="GenerateAsync">
+    <button type="submit">Generate a git access token</button>
+</EditForm>
+
+@* Rendered whether or not there is a row to revoke, so a resubmitted form — a refresh, or the back
+   button after revoking the last one — still finds a handler to reach. *@
+<EditForm Model="RevokeInput" FormName="revoke-git-token" OnValidSubmit="RevokeAsync">
+    @if (_tokens.Count == 0)
+    {
+        <p>No git access tokens yet.</p>
+    }
+    else
+    {
+        <table>
+            <thead>
+                <tr>
+                    <th scope="col">Created</th>
+                    <th scope="col">State</th>
+                    <th scope="col"><span class="visually-hidden">Actions</span></th>
+                </tr>
+            </thead>
+            <tbody>
+                @foreach (var token in _tokens)
+                {
+                    <tr>
+                        <td>@Format(token.CreatedAt)</td>
+                        <td>@Describe(token)</td>
+                        <td>
+                            @if (token.RevokedAt is null)
+                            {
+                                <button type="submit" name="RevokeInput.TokenId" value="@token.Id">
+                                    Revoke
+                                </button>
+                            }
+                        </td>
+                    </tr>
+                }
+            </tbody>
+        </table>
+    }
+</EditForm>
+
+@code {
+    /// <summary>
+    /// The one answer to a revoke this caller cannot carry out, whether the identifier names
+    /// nobody's token or somebody else's.
+    /// </summary>
+    /// <remarks>
+    /// Re-derived for this surface rather than carried over from the invitations page, because the
+    /// two are not the same shape: the caller here is authenticated and is naming a token that is
+    /// supposed to be their own. Collapsing the two costs the honest user nothing — a token they own
+    /// is on the page in front of them — and it keeps the form from answering "does this identifier
+    /// name a real token" for an identifier its owner was never shown. A token id is a
+    /// <see cref="Guid"/> and so is not guessable, which makes the oracle a narrow one; closing it
+    /// is free, and leaving it open would leave a distinction for a later admin-facing surface to
+    /// build on by accident.
+    /// </remarks>
+    private const string NoSuchTokenMessage = "That token no longer exists.";
+
+    private IReadOnlyList<GitTokenSummary> _tokens = [];
+    private string? _issuedToken;
+    private bool? _revoked;
+
+    [CascadingParameter]
+    private HttpContext? HttpContext { get; set; }
+
+    // No property initializer: an initializer on a [SupplyParameterFromForm] property can be
+    // overwritten with null by a post (BL0008). The explicit Name is the binding prefix, and it has
+    // to match the field name the revoke buttons above are rendered with.
+    [SupplyParameterFromForm(Name = nameof(RevokeInput))]
+    private RevokeGitTokenInput? PostedRevokeInput { get; set; }
+
+    private RevokeGitTokenInput RevokeInput => PostedRevokeInput ??= new();
+
+    private HttpContext Context => HttpContext
+        ?? throw new InvalidOperationException("Managing git access tokens requires the static server-rendered HttpContext.");
+
+    private ClaimsPrincipal User => Context.User;
+
+    private Guid CallerAccountId => Guid.TryParse(User.FindFirstValue(ClaimTypes.NameIdentifier), out var accountId)
+        ? accountId
+        : throw new InvalidOperationException("The signed-in principal carries no account identifier.");
+
+    protected override async Task OnInitializedAsync()
+    {
+        ForbidCaching();
+
+        await LoadAsync();
+    }
+
+    /// <summary>
+    /// Declares that nothing may keep a copy of this response.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// "Shown once" (AD4) is a promise about the client as much as about the store, and the back
+    /// button is where it is actually broken: a browser is free to re-present a response it has kept,
+    /// credential and all, without asking the server. The headers that prevent that arrive today as a
+    /// side effect of antiforgery — nobody chose them for this reason, nothing records that the
+    /// guarantee leans on them, and a change to antiforgery or a new response path would withdraw
+    /// them in silence. They are set here so the property has an owner.
+    /// </para>
+    /// <para>
+    /// Registered as an <c>OnStarting</c> callback rather than assigned outright, because an
+    /// assignment here does not survive: antiforgery writes its own cache headers when the token is
+    /// rendered — after this component initialises — and it assigns rather than merges. A callback
+    /// runs immediately before the headers are flushed, so it is the last writer and nothing
+    /// downstream can quietly replace what it sets.
+    /// </para>
+    /// <para>
+    /// <b>No test can tell whether this method ran, and that is why this paragraph exists.</b>
+    /// Antiforgery emits a byte-identical <c>Cache-Control</c>, so deleting the call below leaves
+    /// every test on this page green: an assertion can only observe the header's value, never its
+    /// author. The call is therefore not redundant with what the tests check — it is the part they
+    /// cannot check. It exists so the guarantee stops depending on antiforgery continuing to happen
+    /// to set these headers, and this remark is the only thing standing between a reader who
+    /// notices the tests pass without it and a silent removal.
+    /// </para>
+    /// <para>
+    /// This does not contradict AD21's "the app emits no <c>Cache-Control</c>", and the two should
+    /// not be read as competing rules. AD21's subject is the anonymous landing page, whose body is
+    /// byte-identical for every stranger — which is exactly what makes it safe, and valuable, to
+    /// cache at an edge. This response is the opposite case in every respect: it is per-member, and
+    /// once per token it carries a credential that is supposed to exist in exactly one place. Both
+    /// rules point the same way — never let a cache hold something not every reader may see.
+    /// </para>
+    /// </remarks>
+    private void ForbidCaching()
+    {
+        var response = Context.Response;
+
+        response.OnStarting(static state =>
+        {
+            var headers = ((HttpResponse)state).Headers;
+            headers.CacheControl = "no-store, no-cache";
+            headers.Pragma = "no-cache";
+
+            return Task.CompletedTask;
+        }, response);
+    }
+
+    private async Task GenerateAsync()
+    {
+        var issued = await GitTokenService.IssueAsync(CallerAccountId);
+
+        // The plaintext exists only for this render. It is deliberately not carried through a
+        // redirect, a query string, TempData or a session: every one of those puts the credential
+        // somewhere it outlives the response — browser history, an access log, a proxy — and the
+        // store holds nothing but its hash, so there is no second chance to show it.
+        _issuedToken = issued.Token;
+
+        await LoadAsync();
+    }
+
+    private async Task RevokeAsync()
+    {
+        // The identifier came from the browser and authorises nothing: the service re-scopes it to
+        // this account's own tokens, so a posted identifier naming somebody else's is simply not
+        // found.
+        _revoked = await GitTokenService.RevokeAsync(CallerAccountId, RevokeInput.TokenId);
+
+        await LoadAsync();
+    }
+
+    /// <remarks>
+    /// The list is a projection and the username above comes off the signed-in principal, so this
+    /// page materialises no <see cref="ZeroWiki.Data.Account"/> row at all. That is the §7 hazard
+    /// designed out rather than survived: an account whose value-converted timestamp cannot be read
+    /// would otherwise take down a page it has no business appearing on.
+    /// </remarks>
+    private async Task LoadAsync() => _tokens = await GitTokenService.ListAsync(CallerAccountId);
+
+    private static string Describe(GitTokenSummary token) =>
+        token.RevokedAt is null ? "Active" : "Revoked";
+
+    private static string Format(DateTimeOffset value) =>
+        value.UtcDateTime.ToString("yyyy-MM-dd HH:mm 'UTC'", CultureInfo.InvariantCulture);
+}

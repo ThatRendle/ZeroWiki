@@ -64,7 +64,7 @@ public sealed class InvitationRedemptionConcurrencyTests : IDisposable
     public InvitationRedemptionConcurrencyTests()
     {
         _databasePath = Path.Combine(Path.GetTempPath(), $"zerowiki-redeem-{Guid.NewGuid():n}.db");
-        _connectionString = new SqliteConnectionStringBuilder { DataSource = _databasePath }.ToString();
+        _connectionString = TestDatabase.ConnectionStringFor(_databasePath);
 
         using var db = NewContext();
         db.Database.Migrate();
@@ -80,12 +80,7 @@ public sealed class InvitationRedemptionConcurrencyTests : IDisposable
     public void Dispose()
     {
         ThreadPool.SetMinThreads(_minimumWorkerThreads, _minimumCompletionPortThreads);
-        SqliteConnection.ClearAllPools();
-
-        foreach (var path in new[] { _databasePath, $"{_databasePath}-wal", $"{_databasePath}-shm" })
-        {
-            File.Delete(path);
-        }
+        TestDatabase.Delete(_databasePath);
     }
 
     [Fact]
@@ -256,6 +251,10 @@ public sealed class InvitationRedemptionConcurrencyTests : IDisposable
                             // Seconds. Long enough not to trip on scheduling noise, short enough
                             // that a genuinely held lock fails the test rather than hanging it.
                             DefaultTimeout = 2,
+
+                            // Built here rather than through TestDatabase because of the timeout
+                            // above, but non-pooled for the reason given there.
+                            Pooling = false,
                         }.ToString());
                     probe.Open();
 

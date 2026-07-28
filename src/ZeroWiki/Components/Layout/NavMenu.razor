@@ -20,6 +20,14 @@
                     </NavLink>
                 </div>
                 <div class="nav-item px-3">
+                    @* AD23 deleted the header bar, so the account page needs a way in and this is
+                       the smaller of the two options the Product Owner left open. Inside
+                       <Authorized> like everything else here, or it would reopen §6's B1 by hand. *@
+                    <NavLink class="nav-link" href="account">
+                        Account
+                    </NavLink>
+                </div>
+                <div class="nav-item px-3">
                     @* A link, not a button: signing out is a POST carrying an antiforgery token, and
                        the /logout page is where that form lives. *@
                     <NavLink class="nav-link" href="logout">

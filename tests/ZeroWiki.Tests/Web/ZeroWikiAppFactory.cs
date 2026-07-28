@@ -1,10 +1,11 @@
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
-using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
 using ZeroWiki.Data;
+using ZeroWiki.Tests.Identity;
 
 namespace ZeroWiki.Tests.Web;
 
@@ -24,6 +25,13 @@ public sealed class ZeroWikiAppFactory : WebApplicationFactory<Program>
 
     private readonly string _databasePath =
         Path.Combine(Path.GetTempPath(), $"zerowiki-web-{Guid.NewGuid():n}.db");
+
+    private readonly string _connectionString;
+
+    /// <summary>Everything this application logged, so a test can sweep it for a secret.</summary>
+    public CapturingLoggerProvider Logs { get; } = new();
+
+    public ZeroWikiAppFactory() => _connectionString = TestDatabase.ConnectionStringFor(_databasePath);
 
     /// <summary>A client that surfaces redirects instead of following them.</summary>
     /// <remarks>
@@ -66,7 +74,16 @@ public sealed class ZeroWikiAppFactory : WebApplicationFactory<Program>
     /// </remarks>
     protected override void ConfigureWebHost(IWebHostBuilder builder) => builder
         .UseEnvironment(Environments.Production)
-        .UseSetting("ConnectionStrings:IdentityDb", $"Data Source={_databasePath}");
+        .UseSetting("ConnectionStrings:IdentityDb", _connectionString)
+        .ConfigureLogging(logging => logging
+            .AddProvider(Logs)
+
+            // A provider-specific rule, so it outranks appsettings' "Microsoft.AspNetCore":
+            // "Warning" for this sink alone and changes what no other provider sees. Without it the
+            // request log sits below the threshold and never reaches the capture — and the request
+            // log is the entry that carries the URL, which is where a secret nobody meant to write
+            // down would turn up.
+            .AddFilter<CapturingLoggerProvider>(category: null, level: LogLevel.Trace));
 
     protected override void Dispose(bool disposing)
     {
@@ -77,11 +94,8 @@ public sealed class ZeroWikiAppFactory : WebApplicationFactory<Program>
             return;
         }
 
-        SqliteConnection.ClearAllPools();
-
-        foreach (var path in new[] { _databasePath, $"{_databasePath}-wal", $"{_databasePath}-shm" })
-        {
-            File.Delete(path);
-        }
+        // Safe without clearing any connection pool: TestDatabase turns pooling off, so disposing
+        // the host above closed every handle to this file.
+        TestDatabase.Delete(_databasePath);
     }
 }

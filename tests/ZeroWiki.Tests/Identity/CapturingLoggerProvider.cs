@@ -6,7 +6,17 @@ namespace ZeroWiki.Tests.Identity;
 /// Captures log entries so tests can assert what an operator would be able to see — and, just as
 /// importantly, what must never appear there.
 /// </summary>
-public sealed class CapturingLoggerProvider
+/// <remarks>
+/// <b>This must not implement <c>ISupportExternalScope</c>, and that is not an oversight.</b> A
+/// provider that implements it is handed the logging factory's shared scope provider, and the
+/// factory then stops routing <see cref="ILogger.BeginScope"/> through the provider's own loggers
+/// altogether — so <see cref="Written"/> would no longer see a single scope value. That is the exact
+/// class of leak this helper exists to catch: measured on live code in §7, a credential passed to
+/// <c>BeginScope</c> reaches a structured sink while appearing in no rendered message, so
+/// <see cref="Messages"/> passes the whole suite and only <see cref="Written"/> fails. Adding the
+/// interface as a tidy-up would make that leak invisible again with every test still green.
+/// </remarks>
+public sealed class CapturingLoggerProvider : ILoggerProvider
 {
     /// <summary>
     /// Guards both lists. They are written from whatever thread logged, and this helper is now used
@@ -17,6 +27,12 @@ public sealed class CapturingLoggerProvider
     private readonly Lock _guard = new();
 
     private readonly List<LogEntry> _entries = [];
+
+    /// <summary>
+    /// Every open scope in the provider, not just those on the logging thread — so an entry records
+    /// scopes another request had open at the time. Sound for "this string reached no sink", which is
+    /// what this helper is for; not sound for asserting that a given entry carried a given scope.
+    /// </summary>
     private readonly List<object?> _scopes = [];
 
     /// <summary>A snapshot, so a reader cannot enumerate a list another thread is appending to.</summary>
@@ -64,6 +80,26 @@ public sealed class CapturingLoggerProvider
             .Prepend(entry.Message));
 
     public ILogger<T> CreateLogger<T>() => new CapturingLogger<T>(this);
+
+    /// <summary>Plugs the same capture into a running application's logging.</summary>
+    /// <remarks>
+    /// <para>
+    /// Handing a logger to one service only sweeps what that service wrote. The secret this is used
+    /// to hunt for is one that reached <em>any</em> sink, and the sink most likely to receive one
+    /// nobody meant to write is the request log, which prints the URL — so a credential that leaked
+    /// into a query string or a redirect target is visible here and nowhere else.
+    /// </para>
+    /// <para>
+    /// The category is not recorded, deliberately: the question this helper answers is whether a
+    /// string reached a sink, which no category changes the answer to.
+    /// </para>
+    /// </remarks>
+    ILogger ILoggerProvider.CreateLogger(string categoryName) => new CapturingLogger<CapturingLoggerProvider>(this);
+
+    /// <remarks>Nothing is held open; the entries outlive the host so a test can still read them.</remarks>
+    public void Dispose()
+    {
+    }
 
     public sealed record LogEntry(
         LogLevel Level,

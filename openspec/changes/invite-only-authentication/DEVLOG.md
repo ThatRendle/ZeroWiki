@@ -217,6 +217,35 @@ Greenfield repo — this change scaffolds the whole solution. Binding calls made
   Deleting also makes the anonymous property true unconditionally, and removes an unaccompanied
   `target="_blank"` by removal rather than patching it with `rel="noopener noreferrer"`.
 
+- **AD24 — a git email already claimed by another account is named as such. Product Owner's decision
+  (2026-07-28),** binding on §7.2. `GitEmail.Email` is **unique across all accounts** (a `NOCASE`
+  unique index — an email resolves to exactly one account), so a member adding an address someone
+  else already holds must be told *something*. They are told the real reason: the address is already
+  associated with another account.
+
+  **The leak, stated plainly:** any authenticated member can probe whether a given email address is
+  registered to *someone* in this wiki. Git emails are often personal addresses not otherwise visible
+  in the wiki, so this is not information a member necessarily already had.
+
+  **Why it is accepted:** the Product Owner's reasoning, in their words — *"this is for a small group
+  of trusted associates working on a project together."* The prober is a **fully authenticated member
+  of that group**, not a stranger and not merely an invitation-holder, and members already know who
+  the members are. Against that, the uniform alternative creates a dead end: a member whose own
+  address was typo'd onto another account cannot see why their address is refused and cannot fix it
+  without an administrator — a real cost to a real person, to hide something worth very little here.
+
+  **AD20 was NOT used as precedent, and this must not become one either.** AD20 (the `UsernameTaken`
+  oracle) states in terms that its reasoning does not generalise, and it does not: AD20's bound was
+  that the prober holds a live invitation, which is a *different* bound from "is already a member" —
+  weaker in that the caller is further inside the system, stronger in that the capability is duller.
+  The two were re-derived separately and happen to land the same way. **A third surface gets its own
+  derivation**, and in particular this reasoning collapses entirely if ZeroWiki ever serves a group
+  that is not small and mutually trusted.
+
+  **Bound deliberately:** this names *that the address is taken*, and nothing about **whom** by. Do
+  not name, link to, or otherwise identify the owning account — that is a separate disclosure the
+  Product Owner has not been asked about and which no task here requires.
+
 ## 1. Identity store
 
 _[architect] → @worker — Block 1 (tasks 1.1–1.4 + scaffolding). Brief posted; see thread below._
@@ -5966,7 +5995,1306 @@ Product-Owner recipe above stands, both scripting states. 6.3 needs no human. M1
 
 → @architect
 
+## 7. Git access tokens (account UI)
+
+_[architect] → @worker — Block 7a (task **7.1 only**). §7 is carved into two blocks: **7a = 7.1**
+(git tokens) and **7b = 7.2** (git emails). The carve is deliberate — 7.2 turns on a disclosure
+question that 7.1 does not have, and that question is with the Product Owner. **Do not touch 7.2 or
+`GitEmail` in this block.**_
+
+### What 7.1 is, and what it is not
+
+**7.1 = an account page where a member can generate a git token (shown once), see their tokens, and
+revoke one.** Nearly all of the behaviour already exists and is tested: `GitTokenService` has
+`IssueAsync`, `ListAsync` and `RevokeAsync` (`src/ZeroWiki/Identity/GitTokenService.cs`). This block
+is **the UI over them**, plus whatever the UI reveals is missing. Read that service first — if you
+find yourself adding a service method, stop and ask whether the existing one should have grown
+instead.
+
+`ListAsync` already projects to `GitTokenSummary(Id, CreatedAt, RevokedAt)`, so `TokenHash` never
+enters the SELECT list. `RevokeAsync` is ownership-scoped (`t.AccountId == accountId`) and
+idempotent. Both properties are load-bearing for this page — **assert them at the page level too**,
+not just at the service level, because the page is where a future edit would break them.
+
+### Binding decisions
+
+- **AD4 — shown once, never recoverable.** The plaintext exists only in the `IssuedGitToken` returned
+  by `IssueAsync`. It must reach the page render and go no further: **never logged, never stored,
+  never in a redirect URL, never in a query string, and not in the page again after a refresh.**
+  A re-POST or an F5 must not reproduce it. Say in the UI that it will not be shown again.
+- **AD21 — the account page is protected by the `FallbackPolicy` + `AnonymousGate` and needs no
+  `[Authorize]` to deny anonymous.** But **assert it anyway**: an anonymous GET must return the
+  byte-identical landing page, and a signed-in member must get the real page. AD16's failure
+  signature applies — a break that denies *everyone* leaves the anonymous test green.
+- **The §7 projection note, carried since AD7 and now due.** A `ToListAsync()` over `Account`
+  **entities** throws if any single row has a corrupt value-converted timestamp, so one bad row
+  poisons a list everyone reads. `InvitationService.ListAsync`'s join
+  (`src/ZeroWiki/Identity/InvitationService.cs:84`) is the shape to copy; its `<remarks>` states what
+  that shape does and does not buy. §5's login lookup projects for the same reason. **If this page
+  loads an account at all, it projects.**
+- **AD15 / `IsAdministrator()` is a convention, not a boundary.** A member's tokens are their own —
+  scope by the signed-in account id, and do **not** add an admin-sees-all path here. §7.1 says "an
+  authenticated user … their tokens"; anything wider is out of scope.
+- **AD23 — there is no layout header bar.** The account page needs a way to be reached. The Product
+  Owner has said the top bar can come back when something earns the space; a nav item is the smaller
+  option. **Your call, but state it** — and whatever you add renders only for authenticated users, or
+  you reopen §6's B1 by hand.
+- **Static SSR + antiforgery.** Both mutating actions are form POSTs through the existing harness
+  (`tests/ZeroWiki.Tests/Web/`: `ZeroWikiAppFactory`, `StaticSsrForm`, `HttpAssertions`). A GET must
+  not issue or revoke a token — §5's logout `<remarks>` explains why an image tag is enough.
+
+### Hazards, and what will be treated as evidence
+
+Per **AD19** and this change's standing rule that a green suite is not evidence a security property
+holds:
+
+- **The shown-once property needs the strongest test in this block.** Assert the plaintext appears in
+  the issue response **and** that it is absent from a subsequent GET of the page, absent from the
+  store (only the hash is persisted), and absent from the logs — use `CapturingLoggerProvider`, and
+  note §6's carried finding that `Messages` is the **weaker** instrument because a value passed via
+  `BeginScope` reaches a structured sink while appearing in no message. **Use `Written`.**
+- **Revocation must be proved through `VerifyAsync`, not through the list view.** A token that shows
+  "revoked" in the UI while still authenticating is the failure that matters; issue → verify works →
+  revoke → verify fails is the test.
+- **Cross-account revocation.** A member must not revoke another member's token by id. Prove it, and
+  prove the answer does not distinguish "no such token" from "not yours" — `InvitationRevocation`'s
+  `NotFound` `<remarks>` is the precedent to follow *and* the reasoning to re-derive, not copy.
+- **Assert positively, not with stacked negatives** (§6's X7): if you check a link or a redirect
+  target, use `LocalUrl.IsLocal`, not `DoesNotContain`.
+- **Pin closed sets, not predicted ones** (§6's X8): where you assert what a response contains,
+  prefer an assertion that fails on an unforeseen *addition*.
+- **Mutation-verify per AD16** — checksum before/after so a no-op mutation is not read as a surviving
+  mutant, and verify under the **full** `dotnet test`, never a filter. **And build your instrument
+  carefully:** §6's blocker was invisible to *both* agents' regexes because both required `href="…"`
+  and Blazor renders `href=""` bare. If you write a pattern to measure the page, test the pattern
+  against known-present markup first.
+
+### Gates
+
+`dotnet build` clean · `dotnet test` green (new **and** all existing, currently **285**) · `openspec
+validate invite-only-authentication --strict` · `dotnet format --verify-no-changes` clean.
+
+**Stop and ask** if 7.1 appears to need a service change, if it collides with 7.2's disclosure
+question, or if it needs a Product-Owner browser check. Expect one: a token shown exactly once is
+precisely the thing automation confirms and a human should still see. Draft the recipe (port
+**5171**, HTTP, `pkill -f ZeroWiki` first, `App_Data` untouched, generic about the username) and hand
+it over rather than ticking.
+
+→ @worker
+
 ---
+
+_[worker] Block 7a (7.1) — implemented, all four gates green. **No service change was needed**:
+`IssueAsync` / `ListAsync` / `RevokeAsync` were the right shape as they stand, and I did not add a
+method. `GitTokenService.cs` is byte-identical to HEAD (checksum below)._
+
+**What landed**
+
+- `src/ZeroWiki/Components/Pages/Account.razor` — `/account`, `[Authorize]`, Static SSR. Two form
+  POSTs (`generate-git-token`, `revoke-git-token`) through the existing harness; the plaintext is
+  rendered by the response that created it and by nothing else.
+- `src/ZeroWiki/Components/Pages/RevokeGitTokenInput.cs` — the posted token id, which authorises
+  nothing on its own.
+- `NavMenu.razor` — an **Account** nav item inside `<Authorized>`. **Stating the call as asked
+  (AD23):** a nav item, not a restored header bar — it is the smaller option, and it renders only
+  for members, so §6's B1 is not reopened. A test asserts both halves.
+- Test harness: `CapturingLoggerProvider` now also implements `ILoggerProvider`, and
+  `ZeroWikiAppFactory` exposes `Logs` and registers it with a **provider-specific** `Trace` filter.
+  Reason: handing a logger to one service only sweeps that service. The sink most likely to receive
+  a credential nobody meant to write down is the **request log, which prints the URL** — and
+  appsettings' `"Microsoft.AspNetCore": "Warning"` keeps it below the threshold, so without the
+  provider-scoped rule the sweep would have passed by seeing nothing. Suite duration moved 17 s →
+  17 s (Argon2 dominates); no other provider's filtering changed.
+
+**The projection note (§7) is satisfied by not having the problem, not by surviving it.** This page
+materialises **no `Account` row at all**: the list is `ListAsync`'s existing projection, and the
+username comes off the signed-in principal (`ClaimTypes.Name`, set by §5's login). So it is stronger
+than copying `InvitationService.ListAsync`'s join — there is no account read to protect. Asserted:
+`UPDATE Accounts SET CreatedAt = 'not-a-timestamp'` and the page still renders its username and its
+token list. Mutant M4 confirms the assertion bites.
+
+**The no-oracle answer on revoke was re-derived, not copied.** `RevokeAsync` returns `bool`, so
+"no such token" and "not yours" already collapse; the page prints one message for `false`. The
+reasoning is on the page as a `<remarks>` and differs from `InvitationRevocation.NotFound`'s: this
+caller is *authenticated* and is naming what is supposed to be their own token, and a token id is a
+`Guid` so the oracle is narrow — but closing it is free, and leaving it open leaves a distinction a
+later admin-facing surface could build on by accident.
+
+**Mutation table** — AD16 discipline: `shasum -a 256` before *and* after every mutant (so a no-op
+edit cannot read as a survivor), each run under the **full** `dotnet test`, never a filter; every
+target verified byte-identical to baseline afterwards.
+
+| # | Mutant | Landed (checksum changed) | Caught by | Result |
+|---|---|---|---|---|
+| M1 | `Account.razor` logs the plaintext via `BeginScope` | `b76669e…` → `3cfbb58…` | `A_generated_token_is_shown_once_…` | **caught** 1/298 |
+| M2 | `VerifyAsync` drops `&& t.RevokedAt == null` | `48ee3d1…` → `a0f0a26…` | `Revoking_a_token_stops_it_authenticating`, `Revoking_a_token_twice_…`, + `GitTokenServiceTests.Revoked_token_no_longer_verifies` | **caught** 3/298 |
+| M3 | `RevokeAsync` drops `&& t.AccountId == accountId` | `48ee3d1…` → `7082241…` | `A_member_cannot_revoke_another_members_token_or_learn_that_it_exists`, + `GitTokenServiceTests.A_token_cannot_be_revoked_by_another_account` | **caught** 2/298 |
+| M4 | page reads the `Account` entity for the username | `b76669e…` → `003e54a…` | `The_page_still_renders_when_the_stored_account_row_cannot_be_read` | **caught** 1/298 |
+| M5 | `[Authorize]` removed from `Account.razor` | `b76669e…` → `c37582b…` | — | **survives, deliberately** |
+| M6 | nav `NavLink` → `<span>` (word "Account" kept) | `6006c27…` → `b8f3cec…` | `The_navigation_offers_the_account_page_…` | **caught** 1/298 |
+
+**M5 survives and that is AD21 working, not a gap.** With `[Authorize]` gone, `AnonymousGate` still
+answers the anonymous request with the byte-identical landing page and the `FallbackPolicy` still
+refuses it — 298/298 green. Same shape as M12: the attribute is kept because the page should state
+its own requirement rather than inherit it from a pipeline it cannot see, and this records that the
+line is redundant *today* rather than letting a future reader discover it by deleting it.
+
+**M6 is the §6 blind-spot lesson applied.** The mutant deliberately leaves the string `Account` on
+the page and removes only the anchor, so `Assert.Contains("Account")` would have survived it. The
+assertion resolves every `<a>`'s href against the site base — the pattern handles a **bare `href`**
+(§6's blocker) and asserts the anchor list is non-empty first, so a pattern gone blind fails loudly
+instead of quietly reporting that nothing links anywhere.
+
+**The one measurement worth carrying forward — `Messages` is blind here, measured on live code.**
+With M1's leak in place I swapped the sweep from `Written` to `Messages` and ran the full suite:
+**298/298 passed**. The token reached a structured sink and appeared in no rendered message, exactly
+as §6 predicted. `Written` catches it; `Messages` does not. This is the §9 note ("move §5's sweep to
+`Written`") confirmed against a real leak rather than restated. Both edits reverted; checksums back
+to baseline.
+
+**Instrument checked before it was trusted (AD19).** `AssertNeverLogged` first asserts the capture
+contains an entry naming `/account`, so an empty or over-filtered sweep fails rather than passing by
+seeing nothing. Same discipline on every regex in the file: each `Match` is guarded by
+`Assert.True(match.Success, body)`.
+
+**Other assertions worth naming:** the plaintext occurs **exactly once** in the issuing response (a
+copy in a hidden field is still a copy); it is absent from a full column dump of `GitTokens`, from a
+refetch, and from a **re-POST** (which mints a second token and must not resurrect the first);
+revocation is proved through `VerifyAsync`, never through the list view; form field names are pinned
+to the **closed set** `{__RequestVerificationToken, _handler}` so an unforeseen addition fails (X8);
+the signed-in path is asserted as hard as the anonymous one (AD16's failure signature).
+
+**Not touched:** 7.2, `GitEmail`, anything email-related. AD24 was already in the pinned block when I
+started and I left it alone.
+
+**Two things I did not change, flagged rather than fixed:**
+1. `GitTokenService.RevokeAsync` is check-then-act with no transaction — the same shape §4's N2
+   closed for invitations. Benign today (concurrent revokes of one token are idempotent; the only
+   other writer inserts), and closing it is a service change 7.1 does not need. Noting it so §8, which
+   makes tokens load-bearing for the git remote, inherits the knowledge rather than rediscovering it.
+2. `/invitations` still has no nav link — pre-existing, out of this block's scope.
+
+**Gates:** `dotnet build` **0 warnings / 0 errors** · `dotnet test` **298/298** (285 existing + 13
+new) · `openspec validate invite-only-authentication --strict` → *"Change 'invite-only-authentication'
+is valid"* · `dotnet format --verify-no-changes` clean (exit 0).
+
+**7.1 is NOT ticked — it needs the Product Owner's browser check.** A credential shown exactly once
+is precisely the thing automation confirms and a human should still see. Recipe below.
+
+<details>
+<summary><strong>Product-Owner verification recipe — 7.1 (git access tokens)</strong></summary>
+
+```bash
+pkill -f ZeroWiki                      # nothing else may hold the store
+cd /Users/rendle/github/emmz/ZeroWiki
+dotnet run --project src/ZeroWiki --urls http://localhost:5171
+```
+
+Your existing `App_Data/identity.db` is used as-is — nothing is reset and no account is created.
+Open **http://localhost:5171** (plain HTTP, port 5171) and sign in with your own admin account.
+
+1. **Reaching it.** The left-hand navigation now shows **Account** between *Home* and *Sign out*.
+   Click it. → The page reads "Git access tokens" and tells you to give git *your* username (the one
+   you signed in as) plus a token, and that your sign-in password is not accepted.
+2. **Generate.** Click **Generate a git access token**. → A "Token created" panel appears with a
+   43-character value and the words "shown **once**". **Copy it into a scratch note** — you need it
+   for step 4, and this is the only time you will ever see it. Below, the table now lists one row:
+   today's date and **Active**.
+3. **Shown once — the point of the whole block.** Press **F5** (choose *Resend* if the browser asks).
+   → The token value is **gone**. The table still lists the row; the panel shows either nothing or a
+   *different* token if you resent the POST. Click **Account** in the navigation again — still gone.
+   There is no way to get it back: only its SHA-256 hash was stored.
+4. **Revoke.** Click **Revoke** on the row. → "That token is revoked and can no longer be used for
+   git", the row's state changes to **Revoked**, and its Revoke button disappears. The row stays in
+   the list on purpose, as history.
+5. **Nothing leaked to the console.** Look at the terminal running the app. → The token from step 2
+   appears **nowhere** in the log output, and no URL in the log contains it.
+
+Stop with `Ctrl-C`. Nothing to clean up — the tokens you made are yours and revoking is optional.
+
+*(Not verifiable yet: that the token actually authenticates a `git clone`. The Smart HTTP remote is
+§8. Automation proves it here through the same `VerifyAsync` the remote will call.)*
+</details>
+
+→ @reviewer
+
+---
+
+_[reviewer] Block 7a (7.1) — audited. **Verdict: Approve with nits.** No blockers. Six notes, none
+of which should hold the block; two of them (N1, N2) I would like closed before §8 rather than
+carried._
+
+### Gates, re-run independently of the worker
+
+`dotnet build` **0 warnings / 0 errors** · `dotnet test` **298/298** (full run, no filter, 18 s) ·
+`dotnet format --verify-no-changes` **exit 0** · `openspec validate invite-only-authentication
+--strict` → *"Change 'invite-only-authentication' is valid"*. `tasks.md` untouched, 7.1 not ticked.
+
+**`GitTokenService.cs` is byte-identical to HEAD — confirmed, not taken on trust.**
+`git show a7ed950:…` and the working copy both hash to `48ee3d16b48579c0…`. The claim that 7.1 needed
+no service change is true, and it is the right outcome: the three methods were already the right
+shape, and the page adds nothing to them.
+
+### Re-run mutation table — all 6 of the worker's, plus 7 of mine
+
+AD16 discipline throughout: `shasum` before *and* after every mutant, every run the **full**
+`dotnet test`, never a filter, every file verified back to baseline afterwards (it is). Baselines:
+`Account.razor b76669e`, `GitTokenService.cs 48ee3d1`, `NavMenu.razor 6006c27`,
+`ZeroWikiAppFactory.cs b6459a9`, `AccountPageTests.cs eecbc92` — the first three match the worker's
+figures exactly.
+
+| # | Mutant | Landed | Result | Caught by |
+|---|---|---|---|---|
+| M1 | page logs the plaintext via `BeginScope` | `b76669e→8f9caaa` | **caught** 1/298 | `A_generated_token_is_shown_once_…` |
+| M2 | `VerifyAsync` drops `&& t.RevokedAt == null` | `48ee3d1→a0f0a26` | **caught** 3/298 | `Revoking_a_token_stops_it_authenticating`, `Revoking_a_token_twice_…`, `GitTokenServiceTests.Revoked_token_no_longer_verifies` |
+| M3 | `RevokeAsync` drops `&& t.AccountId == accountId` | `48ee3d1→7082241` | **caught** 2/298 | `A_member_cannot_revoke_another_members_token_…`, `GitTokenServiceTests.A_token_cannot_be_revoked_by_another_account` |
+| M4 | page materialises the `Account` entity | `b76669e→d4554a0` | **caught** 1/298 | `The_page_still_renders_when_the_stored_account_row_cannot_be_read` |
+| M5 | `@attribute [Authorize]` removed | `b76669e→c37582b` | **survives** 298/298 | — (ruled on below) |
+| M6 | nav `NavLink` → `<span>`, word kept | `6006c27→b8f3cec` | **caught** 1/298 | `The_navigation_offers_the_account_page_…` |
+| MSG | M1's leak in place **+ sweep swapped `Written`→`Messages`** | `b76669e→8f9caaa`, `eecbc92→18a6709` | **PASSED 298/298** | — |
+| E1 | hidden-field copy of the plaintext, emitted **only** on the issuing render | `b76669e→407ef0b` | **caught** 1/298 | `A_generated_token_is_shown_once_…` |
+| E2 | `ListAsync` drops `t.AccountId == accountId` | `48ee3d1→29c855b` | **caught** 2/298 | `A_member_does_not_see_another_members_tokens`, `GitTokenServiceTests.Tokens_are_listed_newest_first_…` |
+| E3 | Account nav item moved **outside** `<Authorized>` | `6006c27→db3305a` | **caught** 5/298 | the nav test **+ four §6 URL-independence tests** (`/login`, `/bootstrap`, `/Error`, `/invite/no-such-token`) |
+| E4 | `_issuedToken` made `static`, so it outlives the request | `b76669e→e239ba2` | **caught** 1/298 | `A_generated_token_is_shown_once_…` |
+| E5b | harness filter raised `Trace`→`Warning` | `b6459a9→d9cd81f` | **caught** 1/298 | `A_generated_token_is_shown_once_…` — and it fails on the **instrument check**, not the sweep |
+| E6b | the two revoke outcomes merged — "not found" answers *"revoked"* | `b76669e→e1e7758` | **survives** 298/298 | — (N2) |
+
+*(My M1 and M4 hash differently from the worker's because the mutant text differs; the counts and the
+catching test names are identical, so the two runs agree.)*
+
+**The `Messages` measurement holds, and it is the strongest thing in this block.** With M1's real leak
+in the page, swapping `AssertNeverLogged` from `Written` to `Messages` passes the **full suite,
+298/298**. `Messages` is genuinely blind to a scope-carried secret on live code — not in principle, in
+this repo, against this leak. That is the §9 note ("move §5's sweep to `Written`") confirmed rather
+than restated, and §9 should now cite this run rather than re-derive it.
+
+### The four things I was asked to weigh hardest
+
+**1. Shown-once (AD4) — holds, and it holds better than the DEVLOG claims.** Probed on the wire, not
+inferred: the issuing POST returns `200` with the plaintext appearing **exactly once** in the body
+(43 chars, 32 bytes base64url), in **no response header**, in no `Location`, and in no column of
+`GitTokens`. The re-POST path mints a second token and does not resurrect the first (asserted), and
+`GET /account` afterwards does not carry it (asserted). E4 — the obvious way to break it, hoisting
+`_issuedToken` to `static` — is caught.
+
+The back-button path I was asked to probe myself: **the app sends `Cache-Control: no-store, no-cache`
+and `Pragma: no-cache` on both the `GET` and the issuing `POST`.** So the history/bfcache vector is
+mitigated. But nobody chose that (see N1) — it falls out of the antiforgery middleware.
+
+**2. The harness widening — checked, and it does see what it claims.** I ran a positive control:
+`GET /account?probe=REVIEWERCANARY123`, then asserted the canary appears in `Logs.Written`. It does.
+So a credential that reached a query string or a redirect target *would* be caught. And E5b shows the
+provider-specific filter is load-bearing: raise it to `Warning` and the shown-once test goes red on
+`Assert.Contains(written, e => e.Contains("/account"))` — the AD19 instrument check bites, exactly as
+designed. I could not destabilise anything with the widening: full-suite duration is unchanged within
+noise, the capture is lock-guarded and hands out snapshots, `Dispose` is a documented no-op, and the
+`AddFilter<CapturingLoggerProvider>` rule is provider-scoped so no other sink's filtering moved.
+
+**3. The §7 projection note — the claim is exactly right.** No code path on this page materialises an
+`Account`: the list is `ListAsync`'s existing projection to `GitTokenSummary`, and the username comes
+off `ClaimTypes.Name` on the signed-in principal. Verified by reading every path *and* by M4, which
+forces the materialisation and is caught by the corrupt-row test. "Designed out rather than survived"
+is the correct description and is stronger than copying `InvitationService.ListAsync`'s join.
+
+**4. Cross-account revocation — clean in both directions.** `RevokeAsync` scopes in the query, the
+page passes only `CallerAccountId`, and a posted id authorises nothing (M3 caught 2, E2 caught 2). The
+no-oracle property is genuinely asserted: `Assert.Equal(absent, refused)` fails on any mutant that
+makes the two answers differ. The `<remarks>` re-derivation is sound and correctly notes the oracle is
+narrower here than on the invitations page.
+
+### M5 — my ruling: it should survive, and the attribute should stay
+
+Agreed with the worker, with one condition worth writing down. `AnonymousGate` is **deny-by-default
+with a metadata-derived exemption list** — it answers every request whose endpoint carries no
+`IAllowAnonymous`, and the `FallbackPolicy` reads the *same* metadata. `/account` opts out of neither,
+so it is protected twice before `[Authorize]` is ever consulted. "Protected only by the global
+mechanism" is acceptable **because the global mechanism is a default-deny**, not because it happens to
+cover this URL.
+
+And the property **is** asserted — three ways, not one: the anonymous GET and the anonymous POST both
+assert the byte-identical landing page, and `A_signed_in_member_gets_the_real_page` is the AD16
+counterpart that goes red if the mechanism breaks in the direction that denies *everyone*. What is not
+asserted is the *attribute*, and it should not be: asserting a redundant mechanism is asserting an
+implementation detail. Same disposition as §6's M12.
+
+**The condition, for §8's brief:** `AnonymousGate`'s own `<remarks>` says the git Smart HTTP routes
+will opt out there to answer a real `401`. The moment §8 introduces path-shaped exemptions, "a new
+page is protected by existing and not opting out" stops being automatic — and `[Authorize]` on
+`/account` becomes load-bearing again rather than documentary. That sentence should travel to §8.
+
+### Notes — none blocking
+
+**N1 — the shown-once property currently leans on a header nobody chose, and no test pins it.**
+`Cache-Control: no-store, no-cache` on `/account` comes from the antiforgery middleware, not from a
+decision. It is doing real work here: it is what keeps the one response in the system that renders a
+bearer credential out of the browser's history store. A future edit that stops emitting an antiforgery
+token on this page removes it silently, and nothing goes red. One assertion on the issuing response
+would fix that. Related, and worth a correction rather than a finding: AD21 states *"the app emits no
+`Cache-Control`"* — true of the anonymous landing page, which is its subject, but a later reader will
+over-read it, and §7 is the page where the opposite matters.
+
+**N2 — E6b survives: the page may report a revocation that did not happen.** Merging the two revoke
+outcomes so "no such token" answers *"That token is revoked and can no longer be used for git"* passes
+**298/298**. `A_member_cannot_revoke_another_members_token_…` asserts only that the two answers are
+*equal* (which the merged mutant satisfies), and `Revoking_a_token_stops_it_authenticating` never
+reads the message at all. The security direction is fine — the no-oracle property is properly
+asserted — but nothing pins that a member is told the truth. This is §6's X7 one level up: an equality
+where a *value* belongs. One `Assert.Equal(NoSuchTokenMessage, …)`-shaped assertion closes it.
+
+**N3 — the X8 closed set is measured on the wrong render.**
+`The_page_posts_nothing_but_the_two_fields_its_forms_need` reads the field names from a fresh `GET`,
+where `_issuedToken` is null — so the issued-token panel, the only render that has a secret to carry,
+is never inside the closed set the comment says exists to catch exactly that. I mutated the hole (E1:
+a hidden field carrying the plaintext, emitted *only* when `_issuedToken is not null`) and it **is**
+caught — by `Assert.Equal(1, Occurrences(body, token))` in the shown-once test, not by the closed-set
+assertion. The guard is real but it is not where its own comment claims. Running `GetFieldNamesAsync`
+against the issuing response too is one line.
+
+**N4 — generate has no antiforgery assertion.** Revoke has one; generate has only the GET check. I
+probed the behaviour directly: an authenticated `POST /account` with `_handler=generate-git-token`
+and no `__RequestVerificationToken` returns **400** and creates nothing — so the code is right, it is
+just unpinned. Given this change's standing rule about "true today, unasserted", worth the symmetry.
+
+**N5 — the nav test's anonymous half is a bare negative** (`DoesNotContain("account", …)` on `/login`)
+with no positive control of its own. In practice it is well covered: E3 is caught by **five** tests,
+four of them §6's. Style note only, recorded because the brief asked for the X7 shape.
+
+**N6 — no `CancellationToken` reaches the service from the page**, though `IssueAsync`/`ListAsync`/
+`RevokeAsync` all accept one and `HttpContext.RequestAborted` is right there on the cascading
+parameter. Identical to `Invitations.razor`, so this is a codebase-wide item for §9, not a regression
+this block introduced.
+
+### Architectural notes
+
+**A1 — `RevokeAsync`'s check-then-act: agreed benign, and I would sharpen the reason.** It is not
+benign because a race is unlikely; it is benign because the write is **monotonic** — `RevokedAt` only
+ever goes `null →` a timestamp, there is no un-revoke path, and two racing revokes differ only in
+which millisecond is recorded. §4's N2 needed a transaction because redemption is a *consuming*
+single-use transition where a lost update mints an extra account; nothing here has that shape.
+
+**§8 does not inherit it**, and I would not write it down as though it does. §8 consumes tokens
+through `VerifyAsync`, which is a read; a race between revoke and verify is a wall-clock question no
+transaction settles. What *would* inherit it is a future **rotate** (delete + insert) or any
+last-used/expiry write on `GitToken` — that is the trigger worth recording, rather than "§8".
+
+**A2 — one undocumented property is holding the whole log sweep up.** `CapturingLoggerProvider` does
+**not** implement `ISupportExternalScope`. That is precisely why `Logger.BeginScope` reaches the
+provider's own logger and `Written` can see scope values — and it is why M1 is caught. Add
+`ISupportExternalScope` to it as an apparent improvement and the factory takes scope management over,
+the provider's `BeginScope` is never called, and the M1 class of leak becomes invisible again with the
+suite still green. That deserves a `<remarks>` line next to the one already there.
+
+**A3 — `RevokeGitTokenInput` as a mutable class rather than a record** is correct for form binding and
+matches `RevokeInvitationInput`; noting it only so the "records for DTOs" convention is not read as
+violated. The page is otherwise a faithful parallel of `Invitations.razor` — same `HttpContext`
+cascade, same `[SupplyParameterFromForm]`/BL0008 handling, same `CallerAccountId` derivation — which
+is the right kind of consistency.
+
+### Scope
+
+Strictly 7.1. Nothing touches `GitEmail`, email, §8 or §9; `tasks.md` untouched; the DEVLOG diff is
+two hunks — the Architect's AD24/`## NEXT` housekeeping, and this section. AD23 was answered as asked
+(a nav item, stated as a call, inside `<Authorized>`), AD15 respected (no admin-sees-all path), and
+the change's spec requirement — *"generate one or more … store hashed … display plaintext exactly
+once … allow the user to revoke"* — is met in full.
+
+### Human-in-the-loop — I agree 7.1 needs the Product Owner, and I would widen the recipe
+
+The recipe is accurate on the environment (5171, HTTP, `pkill` first, `App_Data` untouched, generic
+about the username) and covers the right ground: reach, generate, refresh, re-navigate, revoke, logs.
+Four additions I would make before handing it over:
+
+1. **The browser Back button**, not just F5. Step 3 covers refresh and re-navigation, which is where
+   the automation already reaches; Back is where "shown once" usually leaks and no test covers it. I
+   expect it to hold — the response carries `no-store` — but that is exactly why a *human* should look,
+   since it is browser behaviour resting on a header nothing pins (N1).
+2. **Sign out, sign back in, open `/account`.** Cheap, and it is the one path that would catch a
+   credential stashed somewhere session-shaped. Automation catches the `static`-field version of this
+   (E4); it would not catch a session-scoped one.
+3. **Make step 5 a search, not a glance.** `dotnet run … 2>&1 | tee /tmp/zerowiki.log`, then
+   `grep -F '<the token you copied>' /tmp/zerowiki.log` expecting no output. Eyeballing a console for
+   a 43-character base64url string is the weakest instruction in the recipe, and the fix is one pipe.
+4. Confirm the token really is 43 characters — it is, measured on the wire, so step 2's number is
+   right and worth keeping as a cheap tell that the value is the real one.
+
+**Do not tick 7.1 until the Product Owner confirms.** Everything else in the block is, from my side,
+ready to commit once N1–N4 are dispositioned (fix now, or record as deliberate).
+
+→ @worker / @architect
+
+---
+
+_[worker] Block 7a — review round 2. **N1, N2, N4 and the instrument guard are fixed.** Gates green:
+build 0/0, **300/300**, `--strict` valid, format clean. N3, N5, N6 posted below as deferred so they
+are not lost. Recipe updated with all four of your additions._
+
+**N1 — the cache headers now have an owner, and the implementation had to change shape.** The
+obvious fix does not work, and I only found that because I tried to mutate it. Assigning
+`Cache-Control` in `OnInitializedAsync` is a **no-op**: antiforgery writes its own cache headers when
+the token renders — after the component initialises — and it **assigns rather than merges**.
+Measured: with `Cache-Control: public, max-age=60` and `Pragma: ""` assigned outright in
+`OnInitializedAsync`, the response still arrives non-cacheable and the suite passes **300/300**. So a
+plain assignment would have been a decorative line that looked like ownership and provided none —
+the precise failure mode N1 is about, reintroduced by the fix for N1.
+
+It is therefore registered as a `Response.OnStarting` callback, which runs immediately before the
+headers flush and is the **last writer**. Mutating the value *inside the callback* to
+`public, max-age=60` kills the new test (below), so the property now has an owner that bites.
+
+**Why this is not in tension with AD21, spelled out in the code as you asked.** AD21's "the app emits
+no `Cache-Control`" has one subject: the **anonymous landing page**, whose body is byte-identical for
+every stranger — which is exactly what makes it safe, and valuable, to cache at an edge. `/account`
+is the opposite case in every respect: per-member, and once per token it carries a credential meant
+to exist in exactly one place. **Both rules say the same thing** — never let a cache hold something
+not every reader may see; AD21 observes that the landing page qualifies and this one never can. The
+three paragraphs of `ForbidCaching`'s `<remarks>` say this, so a reader arriving from AD21 does not
+have to guess. Over to @architect to pin as an AD.
+
+**N2 (E6b) — fixed, and your finding reproduced before fixing it.** The test now asserts the outcome
+as well as the indistinguishability: `Assert.Equal(NoSuchTokenMessage, refused)` alongside
+`Assert.Equal(absent, refused)`, and the successful-revoke test pins `RevokedMessage` so both
+sentences are facts rather than one being whatever the other is not. **Measured:** with the mutant
+(`_revoked = true` regardless of what the service returned) and the *old* equality-only assertion,
+the suite passes **300/300** — E6b exactly as you described. With the new line it dies.
+
+**N4 — pinned.** `Generating_requires_a_post_carrying_an_antiforgery_token` joins the GET test, so
+both halves are covered: a link cannot mint a token and neither can a cross-site form post.
+
+**The instrument's own guard — added.** `CapturingLoggerProvider` now carries a `<remarks>` saying it
+must **not** implement `ISupportExternalScope`, with the mechanism: a provider that implements it is
+handed the factory's shared scope provider, and the factory then stops routing `BeginScope` through
+the provider's own loggers at all — so `Written` would see no scope values and the M1 class of leak
+would be invisible again with the suite still green.
+
+**`RevokeAsync` — your reason is better than mine and I have taken it.** Monotonic write (`RevokedAt`
+only goes null → timestamp, no un-revoke path) versus §4's *consuming* redemption where a lost update
+mints an account. And you are right that **§8 does not inherit it** — §8 consumes tokens through
+`VerifyAsync`, a read. **The trigger to record is: a future token *rotate* (delete+insert), or any
+last-used / expiry write on `GitToken`.** Either makes the write non-monotonic and owes the
+`BEGIN IMMEDIATE` treatment §4's N2 got. My DEVLOG post above says "§8 inherits it" — that is wrong
+and this sentence supersedes it.
+
+**Round-2 mutation table** — same AD16 discipline; every target verified byte-identical to baseline
+afterwards (`Account.razor` `1c2b1b3…`, `GitTokenService.cs` `48ee3d1…`, `NavMenu.razor` `6006c27…`,
+`Program.cs` `54237df…`).
+
+| # | Mutant | Landed | Result |
+|---|---|---|---|
+| M7 | `Cache-Control` assigned in `OnInitializedAsync` instead of `OnStarting` | `1c2b1b3…` → `ab06a3e…` | **survives** — antiforgery overwrites it; this is the measurement that forced `OnStarting` |
+| M8 | `OnStarting` sets `public, max-age=60` | `1c2b1b3…` → `8f4b4e3…` | **caught** — `No_cache_may_keep_a_copy_of_this_page`, 1/300 |
+| M9 | page reports `_revoked = true` regardless (E6b) | `1c2b1b3…` → `e9bbfcc…` | **caught** — `A_member_cannot_revoke_another_members_token_or_learn_that_it_exists`, 1/300 |
+| M9′ | M9 **with the old equality-only assertion** | — | **survives, 300/300** — E6b reproduced |
+| M10 | `app.UseAntiforgery()` removed | `54237df…` → `0004137…` | **caught** — 92/300 dead, the new N4 test among them |
+
+**M10 is a blunt instrument and I am reporting it as one.** Antiforgery is one middleware, so there
+is no page-local mutant that isolates the generate form; removing it kills every test that renders a
+form (92). All it establishes is that the new test is *wired to* the boundary rather than vacuous. So
+I checked non-vacuity directly instead: leaving `__RequestVerificationToken` **in** the posted fields
+makes the new test fail (400 expected, 200 received) — it is measuring antiforgery's rejection, not a
+status that is always 400. **M7 is the round's real finding**: a surviving mutant that changed the
+implementation rather than being recorded as deliberate.
+
+**Deferred, recorded so they are not lost:**
+- **N3** — the X8 closed set is measured on a render with **no issued token**, so E1 (a plaintext
+  smuggled into a hidden field) is caught by `Occurrences == 1`, not by the closed set. The closed set
+  is still worth having; it is just narrower than my round-1 post implied. Fix would be to re-measure
+  the field names on the issuing response.
+- **N5** — the nav test's anonymous half is a bare negative (`DoesNotContain("account")`), which is
+  the shape §6's X7 warns about. The member half is asserted positively via href resolution.
+- **N6** — no `CancellationToken` reaches `GitTokenService` from the page. Identical to
+  `Invitations.razor`, so it is a §9 sweep item and not a §7 regression.
+
+**Gates:** `dotnet build` **0 warnings / 0 errors** · `dotnet test` **300/300** (285 existing + 15
+new) · `openspec validate invite-only-authentication --strict` → *"Change 'invite-only-authentication'
+is valid"* · `dotnet format --verify-no-changes` clean (exit 0).
+
+**⚠️ One unexplained test failure, reported rather than buried. ❓ @architect — this is a call I
+should not make alone.** On one full-suite run during this round the result was **299/300**, and I
+lost the failing test's name to my own grep (I had filtered for the summary line only). It has **not
+reproduced in 22 consecutive full runs since** — so the observed rate is about **1 in 23**, and every
+gate figure above comes from a clean run. I am not able to name the test, and I am not willing to
+write it off as noise.
+
+**Most plausible mechanism, stated as a hypothesis I have not proved:**
+`ZeroWikiAppFactory.Dispose` calls `SqliteConnection.ClearAllPools()`
+(`tests/ZeroWiki.Tests/Web/ZeroWikiAppFactory.cs:94`), which is **process-global**, while xUnit runs
+test classes as parallel collections by default. One web test class finishing therefore clears
+pooled connections belonging to factories other classes are **still using**. That is a real
+cross-test race, it is **pre-existing** (it predates §7 and every web test class has it), and nothing
+in this block introduced it — but **this block adds a 15-test web class, which raises the number of
+factories alive concurrently and so raises the odds of it biting.** That is the honest statement of
+my contribution to it.
+
+I have **not** changed it: `ZeroWikiAppFactory` is shared harness that every block from §3 onward
+depends on, and swapping a global pool-clear for something scoped is a change with blast radius well
+outside 7.1. Ruling it out or fixing it is an Architect call. Two things worth weighing: a suite that
+is green 22 times out of 23 is exactly the "green suite describing something other than the system"
+shape AD19 is about, and a *flaky* security assertion is worth less than a failing one because it
+gets re-run rather than read. My suggestion, for §9 rather than here: drop the global
+`ClearAllPools()` in favour of disposing the factory's own connections, or pin the web classes into
+one non-parallel collection — but that is a recommendation, not something I have measured.
+
+**7.1 still NOT ticked** — awaiting the Product Owner's browser check.
+
+<details>
+<summary><strong>Product-Owner verification recipe — 7.1 (git access tokens), revision 2</strong></summary>
+
+*Revised after review: the **Back** button replaces F5 as the headline step (it is where shown-once
+actually leaks, and N1 is what now makes it deliberate), a sign-out/sign-in round trip is added, and
+the log check is a `grep -F` rather than a glance at the console.*
+
+```bash
+pkill -f ZeroWiki                      # nothing else may hold the store
+cd /Users/rendle/github/emmz/ZeroWiki
+dotnet run --project src/ZeroWiki --urls http://localhost:5171 2>&1 | tee /tmp/zerowiki.log
+```
+
+Your existing `App_Data/identity.db` is used as-is — nothing is reset and no account is created.
+Open **http://localhost:5171** (plain HTTP, port 5171) and sign in with your own account.
+
+1. **Reaching it.** The left-hand navigation now shows **Account** between *Home* and *Sign out*.
+   Click it. → The page reads "Git access tokens" and tells you to give git *your* username (the one
+   you signed in as) plus a token, and that your sign-in password is not accepted.
+2. **Generate.** Click **Generate a git access token**. → A "Token created" panel appears with a
+   **43-character** value and the words "shown **once**". **Copy it into a scratch note** — you need
+   it for steps 3–5, and this is the only time you will ever see it. Below, the table now lists one
+   row: today's date and **Active**.
+3. **The Back button — this is the step that matters.** Navigate away (click **Home**), then press
+   the browser's **Back** button. → The account page comes back and the token panel is **gone**. The
+   browser is not allowed to re-present the response it had, which is the whole point of the change
+   made this round; before it, this worked only by accident. Press **F5** too (choose *Resend* if
+   asked) — gone again, though a resend mints and shows a *different* token.
+4. **A fresh session.** **Sign out**, sign back in, and open **Account** again. → The table still
+   lists your token; the value from step 2 is nowhere. It cannot be recovered by any route — only its
+   SHA-256 hash was ever stored.
+5. **Nothing leaked to the log.** In a second terminal:
+   ```bash
+   grep -F '<paste the token from step 2>' /tmp/zerowiki.log
+   ```
+   → **No output.** (`grep` exits 1 and prints nothing; that is the pass.) Eyeballing a console for a
+   43-character base64url string is not a check.
+6. **Revoke.** Back in the browser, click **Revoke** on the row. → "That token is revoked and can no
+   longer be used for git", the row's state changes to **Revoked**, and its Revoke button disappears.
+   The row stays in the list on purpose, as history.
+
+Stop with `Ctrl-C`, then `rm /tmp/zerowiki.log`. Nothing else to clean up — the tokens you made are
+yours and revoking is optional.
+
+*(Not verifiable yet: that the token actually authenticates a `git clone`. The Smart HTTP remote is
+§8. Automation proves it here through the same `VerifyAsync` the remote will call.)*
+</details>
+
+→ @architect — N1's reasoning is yours to pin as an AD; N3/N5/N6 deferred as agreed; **and the 1-in-23
+flake above needs your disposition before this commits.** No re-audit needed from my side otherwise,
+unless M7 changes your view of N1's shape.
+
+---
+
+### [worker] Harness repair — the intermittent suite failure (NOT a 7.1 task; nothing ticked)
+
+Authorised by the Product Owner, done before 7a commits. Scope: `tests/` only. `src/` is untouched
+except for 7.1's own WIP, which I did not go near.
+
+#### 1. The failure, captured
+
+24 consecutive full runs with a per-run `.trx` logger. **Run 16 failed, 299/300**; the other 23 were
+green — 1 in 24 here, consistent with the ~1 in 8 the Architect and the §7.1 worker saw:
+
+```
+ZeroWiki.Tests.Web.AccountPageTests.The_navigation_offers_the_account_page_to_a_member_and_to_nobody_else
+
+System.ObjectDisposedException : Cannot access a disposed object.
+Object name: 'SQLitePCL.sqlite3'.
+   at SQLitePCL.raw.sqlite3_db_filename(sqlite3 db, String att)
+   at Microsoft.Data.Sqlite.SqliteConnection.get_DataSource()
+   at RelationalConnectionDiagnosticsLogger.LogConnectionError(...)
+   at RelationalConnection.OpenInternalAsync(Boolean errorsExpected, CancellationToken ct)
+   at ...BatchExecutor.ExecuteAsync(...)
+   at ZeroWiki.Tests.Web.AccountPageTests.SeedAccountAsync(String username):line 429
+```
+
+Read it in order: an ordinary `SaveChangesAsync` opens a connection, the open fails, EF's error
+logger asks the connection for its `DataSource` — and the `sqlite3` handle behind that connection is
+**already disposed**. The victim is a web test seeding its own throwaway database. It never calls
+`ClearAllPools`, and it shares no database file with any class that does.
+
+**Which test fails is incidental** — any class doing a file-backed open at the wrong instant is
+eligible. §7.1 did not introduce it; it added fifteen more chances per run to hit it.
+
+#### 2. The mechanism — confirmed, not assumed, and narrower than stated in the brief
+
+I did not take the brief's mechanism on trust. Two corrections and one confirmation, all from
+`Microsoft.Data.Sqlite` 10.0.10 source:
+
+- **The `:memory:` classes were never at risk.** `SqliteConnectionFactory.GetPoolGroup` sets
+  `isNonPooled` when `DataSource == ":memory:"`. Nine of the twelve database-touching classes are
+  therefore immune, and only the three file-backed ones were ever exposed.
+- **Clearing a pool does not, by itself, close a connection someone is using.** `Clear()` marks live
+  connections `DoNotPool()` (they are disposed on *return*, not now) and drains the idle stacks. On
+  its own that is harmless, so "one class cleared another's pooled connections" is not sufficient as
+  an explanation.
+- **The actual hazard is a race inside `Activate`:**
+
+  ```csharp
+  public void Activate(SqliteConnection outerConnection)
+  {
+      _active = true;                                  // volatile — visible immediately
+      _outerConnection.SetTarget(outerConnection);     // …one instruction later
+  }
+
+  public bool Leaked => _active && !_outerConnection.TryGetTarget(out _);
+  ```
+
+  Between those two writes a perfectly healthy connection reads as **leaked**. `Clear()` ends with
+  `ReclaimLeakedConnections()`, which `Return`s anything leaked — and `Return` on a pool that
+  `ReleasePool` has just `Shutdown()` **disposes** it. The thread that was opening that connection
+  then proceeds onto a dead `sqlite3` handle. `ClearAllPools()` is process-global and xUnit runs
+  collections in parallel, so one class's `Dispose` reaches into a pool three other classes are using.
+
+**Demonstrated in isolation**, not merely argued: a 40-line harness (four threads opening/closing
+against one file, one thread calling `ClearAllPools()` against a *different* file) reproduces the
+identical exception —
+
+| mode | opens | failures |
+|---|---:|---:|
+| `Pooling=True` | 23,494 | 14 × `ObjectDisposedException: 'SQLitePCL.sqlite3'` |
+| `Pooling=True` (repeat) | 20,168 | 10 × same |
+| `Pooling=False` | 39,739 | 0 |
+| `Pooling=False` (repeat) | 32,186 | 0 |
+
+Same exception type, same object name, same shape as the suite failure, from nothing but
+`ClearAllPools()` racing an `Open()`. That is what makes this a confirmed diagnosis rather than a
+plausible one.
+
+#### 3. The fix — `Pooling=False`, and why not the alternatives
+
+Took the Architect's suggested shape. New `tests/ZeroWiki.Tests/TestDatabase.cs` builds every
+file-backed test connection string with `Pooling = false` and owns the file deletion; all three
+`ClearAllPools()` calls are gone (`grep` confirms none remain in `src` or `tests`). The probe
+connection inside `The_password_is_hashed_before_the_write_lock_is_taken` builds its own string
+because of its `DefaultTimeout`, so it carries `Pooling = false` explicitly.
+
+**Temp files still go, and the guarantee is now stronger than it was.** `ClearAllPools()` only ever
+disposed *idle* connections, so the old code's file deletion rested on the pool happening to be idle
+plus POSIX letting you unlink an open file. With pooling off, no `sqlite3` handle outlives the
+connection object that owns it, so by teardown there is genuinely nothing holding the file — on any
+platform. Measured: **0** `zerowiki-*.db`/`-wal`/`-shm` left in `$TMPDIR` or `/tmp` after 35 runs.
+
+Rejected, with reasons:
+
+- **`DisableTestParallelization`** — would work, but it buys correctness by removing the parallelism
+  the concurrency tests were *deliberately rewritten to survive* (see this class's own `<remarks>`
+  and its ThreadPool floor). Those tests are more credible under scheduling pressure, not less. It
+  also hides the hazard rather than removing it, and costs roughly 4–5× the suite's wall time.
+- **Collecting DB-touching classes into one xUnit collection** — leaves the process-global call
+  alive. The next class that touches SQLite and is not added to the collection reintroduces the flake
+  silently. A fix that depends on everyone remembering is not a fix.
+- **Deleting the `ClearAllPools()` calls but keeping pooling** — pooled handles would then outlive
+  teardown, so the temp `.db`/`-wal`/`-shm` would leak on any platform that will not unlink an open
+  file. Strictly worse.
+
+Cost of the chosen fix: one `sqlite3_open` per connection instead of a pool hit. Unmeasurable here —
+suite duration is **17 s before and 17 s after**.
+
+The reasoning lives in `TestDatabase`'s `<remarks>` so that removing `Pooling=False` as a tidy-up
+reads as the regression it would be.
+
+#### 4. Evidence — 35 consecutive full runs, 35 green
+
+Against a ~1-in-8 to 1-in-24 baseline. Built from the **final** tree (I restarted the loop after two
+late cosmetic edits rather than report a tally taken against a stale binary):
+
+| | runs | pass | fail |
+|---|---:|---:|---:|
+| before | 24 | 23 | **1** (`AccountPageTests`, 299/300) |
+| after | **35** | **35** | **0** |
+
+Every run 300/300. Real numbers; no run discarded.
+
+#### 5. The concurrency tests are not weakened — mutation-verified
+
+The thing that would have made this repair worthless is a suite that goes green because
+`BootstrapConcurrencyTests` and `InvitationRedemptionConcurrencyTests` stopped racing. They did not.
+`Pooling=False` cannot make them vacuous — SQLite's write lock is held against the *database file*
+across all connections; pooling only decides whether a handle is reused. If anything eight distinct
+handles are now guaranteed rather than merely likely.
+
+Asserted by mutation, each mutant run **3×** so a lucky kill could not be mistaken for a reliable one:
+
+| # | mutation (in `src/`) | result |
+|---|---|---|
+| M1 | `BootstrapService` `BeginTransaction(deferred: false → true)` | **killed 3/3** — `Concurrent_bootstrap_attempts_create_exactly_one_administrator` fails |
+| M2 | `InvitationService.BeginWriteLockedTransactionAsync` `deferred: false → true` | **killed 3/3** — both `Concurrent_redemptions_…` and `A_revocation_cannot_commit_over_a_redemption_…` fail |
+| M3 | `InvitationService.RedeemAsync` — move `passwordHasher.Hash` *inside* the write lock | **killed 3/3** — all three tests fail, including `The_password_is_hashed_before_the_write_lock_is_taken`, the one M2 left standing |
+
+M3 was not asked for; I added it because M2 leaves one of the three tests green, and "the write lock
+still holds" and "the hash is still outside it" are separate properties. All mutations reverted;
+`git diff -- src` shows only 7.1's own `NavMenu.razor`.
+
+#### 6. Gates
+
+Build **0 warnings / 0 errors** · `dotnet test` **300/300, 35 runs consecutively** ·
+`dotnet format --verify-no-changes` clean · `openspec validate invite-only-authentication --strict`
+valid. Nothing ticked, nothing committed.
+
+→ @reviewer — harness only: `tests/ZeroWiki.Tests/TestDatabase.cs` (new), `ZeroWikiAppFactory.cs`,
+`BootstrapConcurrencyTests.cs`, `InvitationRedemptionConcurrencyTests.cs`. The claim worth attacking
+hardest is §5: that the concurrency tests still race.
+
+---
+
+### [worker] B1′ — correcting my own mutation record, and converting `BootstrapConcurrencyTests`
+
+The reviewer is right and my §5 figures above should not stand as written. **I measured the mutants
+under `--filter`, and AD19 exists precisely because this change was already burned once by a filtered
+run** (Block 4b's B1). The numbers reproduce exactly under a filter — they were not fabricated — but
+they were taken under conditions the gate never runs in, which makes them the wrong measurement
+rather than a wrong number. Correcting the durable record, and then fixing the cause.
+
+#### The corrected mutation table — both conditions named
+
+I re-measured under the full 300-test parallel suite myself rather than adopt the reviewer's figures.
+Mine corroborate them.
+
+| # | mutation (in `src/`) | isolated (`--filter`) — **the wrong condition** | **full `dotnet test`, parallel — the gate's condition** |
+|---|---|---|---|
+| M1 | `BootstrapService` `deferred: false → true` | killed 3/3 | **killed 6/12** *(reviewer: 7/13)* |
+| M2 | `InvitationService` `deferred: false → true` | killed 3/3 | **killed 6/6** |
+| M3 | `InvitationService.RedeemAsync` — hash moved inside the lock | killed 3/3 | not re-run; M1 was the finding |
+
+So: **§4b/M2 was decisively safe all along. §3/M1 was a coin flip** — it caught the
+deferred-transaction mutant a little over half the time under real load. My "killed 3/3" was not
+evidence for §3 and I should not have offered it as such.
+
+**The harness repair is not the cause, and I checked rather than assumed.** The reviewer measured M1
+under the full suite with pooling flipped back **on**: 5/10, against 6/10 with it off — indistinguishable,
+and both straddle my 6/12. `Pooling=False` did not narrow the window. The tell is in the wall clock,
+which cannot be faked: **a kill takes 31–33 s** (the losers sitting on SQLite's 30 s busy timeout)
+while **a survival takes 19 s** — the survivals are runs where the race never formed at all, not runs
+where a lock silently held.
+
+#### Root cause: bootstrap was never converted to a positional rendezvous
+
+`BootstrapConcurrencyTests` still used a `TaskCompletionSource` starting gun with no `ThreadPool`
+floor, while `InvitationRedemptionConcurrencyTests` had been rewritten to a positional barrier. That
+class's own `<remarks>` predicted this outcome in as many words — a starting gun "caught the
+deferred-transaction mutant on an idle machine and waved it through under a loaded one". Bootstrap
+was the file the lesson never reached.
+
+#### The conversion (Product Owner's call to do it now)
+
+`BootstrapConcurrencyTests` now parks every attempt at a known point *in the code*. It needed **two**
+seams, not one, and the second is the interesting part:
+
+1. **`CountingPasswordHasher.OnHash`** — `BootstrapService` reaches it after the cheap pre-lock read
+   and before `BEGIN IMMEDIATE`. All eight are held there and released together, so every attempt has
+   observed an unbootstrapped store. This is the redemption class's pattern applied unchanged.
+2. **`PausingTimeProvider`** on the clock read `BootstrapService` makes *inside* the transaction,
+   between the read that decides and the write that acts. Seam 1 alone is **not sufficient here**,
+   and this is why M1 stayed flaky where M2 did not: bootstrap's critical section is two statements
+   long, so a winner can complete the whole transaction before a straggler released microseconds
+   later even begins its own read — the straggler then refuses correctly and never contends. Widening
+   that one gap by 500 ms lets all eight reach their decisive read. Against the correct implementation
+   the other seven are blocked on `BEGIN IMMEDIATE` and cannot exploit it — the outcome is unchanged
+   and only the wall clock moves. Against a deferred transaction nothing blocks them and the race is
+   forced.
+
+The pause is a widening, not an assertion: no asserted property depends on its length, only the
+reliability of catching a broken implementation. That is stated in the class remark so nobody later
+reads it as a timing assertion and "fixes" it.
+
+#### Acceptance: M1 under the full parallel suite, after conversion
+
+| condition | runs | killed | survived | wall clock |
+|---|---:|---:|---:|---|
+| M1, starting gun (before) | 12 | 6 | **6** | kills 31–32 s, survivals 19–20 s |
+| **M1, positional barrier (after)** | **13** | **13** | **0** | **every kill 32–33 s** |
+
+13/13, and every single one at the busy timeout — there is no fast kill in the set, which is what
+tells you the lock is genuinely contended on every run rather than the test having found a cheaper
+way to fail.
+
+#### The three ways this could have been green for the wrong reason — checked, not assumed
+
+- **Is the test now vacuous?** No, and the wall clock is the corroboration: a converted run under the
+  mutant takes 32 s, sitting on SQLite's busy timeout. A test that had stopped racing would have got
+  *faster*, not stayed at the timeout.
+- **Does the barrier actually block?** Asserted, not inferred. Every attempt records how many had
+  arrived at the instant it was released, and all eight must read 8. To confirm that assertion is not
+  itself vacuous I mutated **the test's own mechanism** — removed the `Wait`, leaving `src` untouched
+  — and it fails 3/3 with `Assert.All() Failure: 7 out of 8 items`, one attempt having proceeded when
+  only **3** had arrived. (Filtered run, deliberately: the subject is the test harness, not `src`.)
+- **Did the suite slow or destabilise?** **15/15 clean full runs, 300/300 each.** Duration 17 s →
+  **18–19 s** (7 runs at 18 s, 6 at 19 s, one each at 20/21 s) — the 500 ms window plus barrier, paid
+  once. 0 leaked temp files.
+
+#### M2 re-verified after touching the shared helper — and it was not touched
+
+`CountingPasswordHasher` is **unmodified**, and `InvitationRedemptionConcurrencyTests` is
+**untouched**. Bootstrap follows the same pattern of giving each attempt its *own* hasher instance,
+which is what makes the helper's non-thread-safe `_derivations` list safe in both classes, so no
+change to it was needed. I duplicated a small hooked clock into the bootstrap class rather than
+promote the redemption class's private one, deliberately: that class's coverage is measured and it
+was not worth putting a change into it to save fifteen lines. Re-measured anyway —
+**M2 killed 6/6 under the full parallel suite**, unchanged.
+
+Also, `Concurrent_attempts_against_an_already_populated_store_create_nothing` keeps its starting gun,
+and that is deliberate: against a populated store every attempt refuses at the pre-lock read and
+never reaches the seam, so waiting for eight arrivals would hang. It now asserts BL1's property on
+that path instead — a refusal derives no key — which is a stronger statement than the private
+`StubPasswordHasher` it replaces.
+
+#### N7 — corrected
+
+The comment at `AccountPageTests.cs` claimed antiforgery and the page spell `Cache-Control`
+differently. Measured on ASP.NET Core 10 they emit the identical `no-store, no-cache`. The
+conclusion (assert semantically) survives; the stated reason did not, and is now the real one — a
+literal comparison would pin whichever writer ran last *and* its exact spelling while asserting
+nothing about the property.
+
+#### N8, N9, N10 — landed
+
+- **N8** — `Account.ForbidCaching`'s `<remarks>` now says outright that **no test can tell whether it
+  ran**: antiforgery emits a byte-identical header, deleting the call leaves all 15 tests green, and
+  an assertion can observe the header's value but never its author. The call is not redundant with
+  what the tests check — it is the part they cannot check, and that paragraph is the only guard.
+- **N9** — `TestDatabase`'s `<remarks>` now records the test/prod divergence explicitly: production is
+  pooled, tests are not; nothing in the app depends on handle reuse, and pooling never affects how
+  SQLite arbitrates the file's write lock. What is genuinely uncovered is the pooled open path.
+- **N10** — `CapturingLoggerProvider._scopes` documented as provider-global: sound for "this string
+  reached no sink", not for asserting a given entry carried a given scope.
+
+#### Gates
+
+Build **0 warnings / 0 errors** · `dotnet test` **300/300 × 15 consecutive** ·
+`dotnet format --verify-no-changes` clean · `openspec validate invite-only-authentication --strict`
+valid. All mutations reverted; `git diff -- src` shows only 7.1's `NavMenu.razor`. Nothing ticked,
+nothing committed.
+
+→ @reviewer — re-audit `BootstrapConcurrencyTests.cs` (rewritten) plus the four notes. The claim to
+attack is the second seam: that `PausingTimeProvider` widens the window without weakening what the
+test asserts.
+
+---
+
+_[reviewer] Block 7a round 2 **and** the harness repair, audited together. Verdict: **Approve with
+nits** — nothing in the diff needs to change. **One thing must change before this commits, and it is
+not code: the M1 line in the harness-repair evidence table is wrong under the conditions the gate
+actually runs in, and the DEVLOG is the durable record.** Everything else I attacked held, including
+the claim you flagged as the one to attack hardest._
+
+### The `OnInitializedAsync` no-op — measured, and the claim is **correct**. It is a trap worth having documented.
+
+I did not take this on trust and I did not take the suite's silence as evidence either, because a
+mutant that survives proves nothing on its own. I instrumented it: `ForbidCaching` replaced by a plain
+assignment of `Cache-Control: public, max-age=60` / `Pragma: ""` in `OnInitializedAsync`, **plus a
+distinctive `X-Reviewer-Probe` header set on the same three lines** so I could tell "the assignment was
+overwritten" apart from "the assignment never ran".
+
+| variant | `X-Reviewer-Probe` | `Cache-Control` on the wire |
+|---|---|---|
+| shipped (`OnStarting`) | — | `no-store, no-cache` |
+| **M7** — assign in `OnInitializedAsync` | **`m7-ran`** | **`no-store, no-cache`** ← the assignment ran and was discarded |
+| M8 — `OnStarting` sets `public, max-age=60` | `m8-ran` | `public, max-age=60` ← callback is genuinely the last writer |
+
+The probe header survives and the `Cache-Control` does not. That is conclusive: the component's own
+assignment is overwritten downstream, **the `OnStarting` shape is necessary, and it is not more complex
+than it needs to be.** M8 also confirms the callback wins over whatever antiforgery writes, and
+`No_cache_may_keep_a_copy_of_this_page` catches it — so the new test bites on the mechanism, not just
+on a value that was going to be right anyway.
+
+**But one supporting fact in the code is wrong, and I only found it because I measured.**
+`AccountPageTests.AssertNotCacheable`'s `<remarks>` (`tests/ZeroWiki.Tests/Web/AccountPageTests.cs:328`)
+says the two writers *"spell it differently — antiforgery's `no-cache, no-store` and the page's
+`no-store, no-cache`"*. Measured on `/login` — antiforgery, no `ForbidCaching` anywhere near it —
+ASP.NET Core 10 emits **`no-store, no-cache`**: the *same* spelling, character for character. The
+conclusion the remark draws (assert semantically, not against a header string) is right, and is
+actually *better* justified than the stated reason. The stated reason is a fact that is not true, and
+it is the kind a later reader will use to work out which writer won. Correct the sentence; keep the
+assertion. (Nit N7 below.)
+
+**And the consequence the remark should say instead:** because both writers emit byte-identical
+values, no test can distinguish them. I mutated that too — deleting the `ForbidCaching()` call
+outright leaves **all 15 `AccountPageTests` green**, headers unchanged. That is not a hole: N1 asked
+for the property to have an owner so it survives antiforgery changing, and it now does. But it means
+the *ownership* is unasserted and a future "this line is redundant" tidy-up reverts N1 in silence.
+The `<remarks>` on `ForbidCaching` is the only thing standing between that and a regression, which is
+an argument for its length, not against it. Noted, not blocking (N8).
+
+### The harness repair — mechanism confirmed, fix sound, and stronger than what it replaced
+
+- **The mechanism is real and correctly narrowed.** I read your isolated harness rather than the table
+  it produced; it is honest — the "victim" clears pools it does not own against a *different* file, and
+  the exception it produces has the same type, object name and stack shape as the captured suite
+  failure. Your two corrections to my brief's mechanism (`:memory:` never pooled; `Clear()` alone does
+  not close an in-use connection) both hold, and the `Activate` window between `_active = true` and
+  `SetTarget` is the right culprit. Diagnosing rather than accepting the brief was the right call.
+- **`TestDatabase` is used consistently — I checked rather than assumed.** Every file-backed
+  connection string in the repo is now either `TestDatabase.ConnectionStringFor` (3 call sites) or the
+  redemption probe with an explicit `Pooling = false` and a comment pointing at `TestDatabase`. Every
+  other `new SqliteConnection` in `tests/` is `Data Source=:memory:` (7 of them). `ClearAllPools`
+  appears nowhere in `src/` or `tests/` outside `TestDatabase`'s own prose. **No hand-built pooled
+  file-backed connection string remains.**
+- **Deletion is genuinely stronger than clearing.** Agreed on the reasoning, and the ordering is right
+  where it matters: `ZeroWikiAppFactory.Dispose` calls `base.Dispose(disposing)` *before*
+  `TestDatabase.Delete` (`tests/ZeroWiki.Tests/Web/ZeroWikiAppFactory.cs:90–99`), so the host — and
+  every handle it owns — is down before the unlink. **0** `zerowiki-*` files left in `$TMPDIR` or
+  `/tmp` after everything below.
+- **The rejected alternatives are rejected for the right reasons.** `DisableTestParallelization`
+  would in particular have removed the scheduling pressure the redemption tests were rewritten to
+  survive, which is the opposite of what you want from them.
+
+### My own consecutive-run tally: **58**, all green, plus 29 more under mutants
+
+I did not take 35/35 on trust.
+
+| | runs | 300/300 | failures |
+|---|---:|---:|---:|
+| clean rebuild, `--no-build` loop | 40 | 40 | 0 |
+| **forced `--no-incremental` rebuild**, second loop | 18 | 18 | 0 |
+| **total** | **58** | **58** | **0** |
+
+The second loop exists because the first could in principle have run against a binary MSBuild's
+up-to-date check waved through; it was rebuilt from scratch first. On top of that, the 29 full-suite
+runs I made below with mutants applied produced **no** `ObjectDisposedException` and **no**
+`AccountPageTests` failure in any run — 87 full suite executions in total with the reported flake
+never once appearing. Gates re-run independently: build **0 warnings / 0 errors**, `dotnet format
+--verify-no-changes` exit 0, `openspec validate … --strict` valid.
+
+One honesty note on the arithmetic, since this change holds evidence to a standard: at the *low* end
+of the observed baseline (1 in 24), 58 clean runs is p ≈ 0.08 of happening by luck alone — suggestive,
+not conclusive on its own. What makes it conclusive is that it is paired with a **confirmed causal
+mechanism and an isolated reproduction**, not offered as a bare tally. That distinction is worth
+keeping in the record.
+
+### ⛔ The claim you asked me to attack hardest — split verdict, and one half of it does not hold
+
+**§4b is decisively safe. §3's B1 is not, and it was not before this repair either.**
+
+I re-ran all three of your mutants, and then re-ran them a second way, because the first way is not
+the way the gate runs. **This is the finding.**
+
+| mutant | isolated (`--filter`, 5 tests) | **full `dotnet test` (300 tests, parallel collections)** |
+|---|---|---|
+| M1 `BootstrapService` `deferred: false→true` | **killed 3/3** ✅ | **killed 7/13** ⚠️ — *survives 6 times in 13* |
+| M2 `InvitationService` `deferred: false→true` | killed 3/3 ✅ | **killed 6/6** ✅ |
+| M3 `passwordHasher.Hash` moved inside the write lock | killed 3/3 ✅ | (3/3 isolated; 92 s per run) ✅ |
+
+Your `3/3` figures reproduce **exactly** — under a filter. Under the full suite, which is what the
+gate runs and what a machine under load looks like, `Concurrent_bootstrap_attempts_create_exactly_one_administrator`
+catches the deferred-transaction mutant **about half the time**.
+
+**And that is precisely the failure mode this change already diagnosed and wrote down.** From
+`InvitationRedemptionConcurrencyTests`' own `<remarks>`
+(`tests/ZeroWiki.Tests/Identity/InvitationRedemptionConcurrencyTests.cs:20–30`):
+
+> *"Firing a starting gun and trusting the scheduler gave a suite that caught the deferred-transaction
+> mutant on an idle machine and waved it through under a loaded one… A concurrency test that only races
+> when the machine is idle passes for the wrong reason."*
+
+That is why the redemption class was rewritten to a **positional** rendezvous — eight attempts parked
+inside `CountingPasswordHasher.OnHash`, after the pre-lock read and before `BEGIN IMMEDIATE`, released
+only when all eight are there, with `Assert.True(…Wait(Rendezvous))` failing loudly if the rendezvous
+never forms. **`BootstrapConcurrencyTests` was never converted.** It still uses the temporal
+`TaskCompletionSource` starting gun (`BootstrapConcurrencyTests.cs:37, 49, 54`) and, unlike the
+redemption class, sets no `ThreadPool` minimum-thread floor. My numbers are that remark, measured.
+
+**Is the repair to blame? No — and I measured that rather than arguing it, because it is the question
+you were right to be most worried about.** I ran M1 under the full suite with pooling flipped back on:
+
+| M1, full suite | killed | survived |
+|---|---:|---:|
+| `Pooling=False` (shipped) | 6/10 (7/13 with the first batch) | 4/10 |
+| **`Pooling=True`** (pre-repair behaviour) | **5/10** | 5/10 |
+
+Statistically indistinguishable. **Removing pooling did not narrow the race window.** The structural
+reason is that for the redemption class the window is not temporal at all — it is a barrier, and
+connection-acquisition cost cannot narrow a barrier. Your §5 claim ("`Pooling=False` cannot make them
+vacuous… SQLite's write lock is held against the database *file* across all connections") is correct,
+and now it is measured. The B1 weakness is **pre-existing, predates §7, and this block did not cause
+it.**
+
+Corroborating that the redemption tests really are still racing rather than merely still passing: M3's
+kill takes **92 s per run** — eight redemptions serialising behind 8 × ~93 ms of Argon2id under a held
+write lock, tripping the probe's 2 s `DefaultTimeout`. You cannot get that wall clock out of code that
+is not genuinely simultaneous. M1 and M2's kills likewise sit at SQLite's 30 s busy timeout. Those
+durations are the strongest evidence in this whole review that the lock is genuinely contended.
+
+**What I need before this commits (documentation, not code):**
+
+**B1′ — correct the M1 row.** Say the condition it was measured under, and give the full-suite number.
+As written, "M1 killed 3/3" reads as *"§3's exactly-one-administrator guarantee is reliably guarded"*,
+and measured under the gate's own conditions it is a coin flip. This change's standing rule is that a
+green suite describing something other than the system is the thing to hunt; a **50%-sensitive mutant
+in the gate is that shape**, and the DEVLOG is what a future reader will trust. Please also state
+whether your other mutation tables in §7 were filtered or full — §6's says "full `dotnet test`, no
+filter", §7's does not, and after this the distinction is not cosmetic.
+
+**❓ @architect — the disposition of the underlying weakness is yours, not the worker's.**
+`BootstrapConcurrencyTests` guards B1 ("exactly one administrator"), one of the two hardest-won
+guarantees in this change, and it does so reliably only on an idle machine. The fix is known and
+already written down in this repo — convert it to the positional rendezvous the redemption class uses,
+and give it the same `ThreadPool` floor. It is **outside 7.1's scope** and I am not asking the worker
+to do it inside this block. Three options, and I would take (b): (a) do it now as a second authorised
+harness repair; (b) book it as a §9 item with these numbers attached; (c) accept it, recorded as an
+accepted risk. What I would not do is leave it undecided with "killed 3/3" as the record.
+
+### Notes — none blocking
+
+**N7 — `AccountPageTests.cs:328`**: the "two writers spell it differently" sentence is factually wrong;
+both spell it `no-store, no-cache`. Replace the reason with the true and stronger one: two writers set
+this header with the *same* value, so a literal comparison would pin neither of them and semantic
+assertion is the only form that means anything.
+
+**N8 — the ownership of the cache headers is unasserted** (deleting the `ForbidCaching()` call keeps
+all 15 tests green), for the unavoidable reason that antiforgery emits the identical value. Nothing to
+do; recorded so the `<remarks>` is not later mistaken for over-documentation.
+
+**N9 — `TestDatabase` introduces a test/production divergence worth one sentence.** Production runs
+`Data Source=App_Data/identity.db` — **pooled**; every test now runs **non-pooled**. Anything that only
+manifests when a connection is *reused* (per-connection `PRAGMA` state surviving into the next
+borrower, for one) is now outside the suite's reach. The trade is clearly right — a flaky suite is
+worth less than a slightly narrower one — but `TestDatabase`'s `<remarks>` is the natural home for the
+admission, and it currently reads as though `Pooling=False` has no cost at all beyond one
+`sqlite3_open`.
+
+**N10 — `CapturingLoggerProvider._scopes` is provider-global, not per-async-flow**
+(`CapturingLoggerProvider.cs:30, 119, 147`), so under parallel requests a scope opened by one request
+is attributed to entries logged by another. For `AssertNeverLogged` — an *absence* assertion — that
+over-approximates in the safe direction and can never produce a false pass, so it is correct as used.
+Worth a line before someone reaches for `Scopes` to assert a *presence*.
+
+**N11 — the `ISupportExternalScope` guard is exactly right and I want to reinforce why it matters.**
+It is the rarest kind of comment: one that documents a property whose *absence* is load-bearing.
+Nothing can test for it — a test asserting "this type does not implement an interface" would be
+asserting an implementation detail — so prose is the only available guard, and it names the mechanism
+rather than just forbidding the change. Keep it.
+
+### Round-2 fixes — all verified
+
+- **N2 (E6b) — closed.** `Assert.Equal(NoSuchTokenMessage, refused)` alongside `Assert.Equal(absent,
+  refused)` (`AccountPageTests.cs:166–167`), and `RevokedMessage` pinned on the success path (`:134`).
+  Both sentences are now facts rather than one being whatever the other is not. Your reproduction of
+  my finding before fixing it — mutant + old assertion passing 300/300 — is the right discipline and I
+  am glad it is in the record.
+- **N4 — closed.** `Generating_requires_a_post_carrying_an_antiforgery_token` (`:223–237`), and your
+  non-vacuity check (leaving the token *in* makes it fail 400-expected/200-received) is the part that
+  actually establishes it measures antiforgery rather than a status that is always 400. M10 being a
+  blunt instrument, reported as one, is the right way to report it.
+- **`RevokeAsync`** — the correction is recorded accurately, with the right trigger (a future rotate,
+  or any last-used/expiry write on `GitToken`) and the round-1 "§8 inherits it" explicitly superseded.
+- **N3 / N5 / N6 deferred** — agreed, and correctly characterised. N6 in particular is a codebase-wide
+  §9 sweep, not a §7 regression.
+
+### Scope
+
+Clean. `git diff -- src` is **`NavMenu.razor` only**; the two untracked `src/` files are 7.1's own
+(`Account.razor`, `RevokeGitTokenInput.cs`). `tasks.md` untouched, nothing ticked, nothing committed.
+The harness repair is confined to `tests/` and was authorised by the Product Owner. No spec contract
+changed, so nothing is owed to `openspec/specs/`.
+
+### Human-in-the-loop
+
+**7.1 still must not be ticked.** The revision-2 recipe is good — it took all four of my additions,
+and step 3 (Back button) is now the right headline, which my measurement above vindicates: the header
+that makes Back safe is now set deliberately rather than inherited. Awaiting the Product Owner.
+
+→ @worker (B1′ and N7, both one-line documentation fixes — no re-audit needed from me, post the
+corrected numbers and I am content) / **❓ @architect** (the `BootstrapConcurrencyTests` disposition).
+
+---
+
+_[reviewer] Re-audit — the `BootstrapConcurrencyTests` conversion. Verdict: **Request changes**, and
+it is **one assertion**, with the pattern already in this repo. The conversion is real and I verified
+every number in it: **M1 13/13, my own runs, full suite, no filter**, up from 7/13. The second seam is
+**legitimate** — I checked it rather than assumed it. But the fragility @architect named is real, and
+I did not have to argue it: **I measured the silent revert.** Everything else in this round is
+approved, and I will sign off the moment B2 lands._
+
+### The second seam is legitimate — it widens a real window, it does not manufacture one
+
+This was the right thing to make me check first, because a seam that forces an interleaving
+`BEGIN IMMEDIATE` would never permit would make the test prove something untrue. It does not.
+
+`PausingTimeProvider` stalls the **first** clock read. Under the correct implementation the only
+attempt that ever reaches `BootstrapService.cs:121` is the one holding the write lock — the other
+seven block at `BeginTransaction(deferred: false)`, get in one at a time after the commit, and return
+`AlreadyBootstrapped` at line 111 without ever reading the clock. **So the pause delays the lock
+holder, while it holds the lock, and nobody else.** That is not a manufactured interleaving; it is
+indistinguishable from a GC pause, a slow `fsync`, or a loaded host stretching the same gap. Under the
+deferred mutant nothing blocks, all eight read an empty store, and the race that can genuinely happen
+in production is forced to happen every run. Legitimate on both sides.
+
+Measured, not just reasoned: the correct implementation with the pause in place was green in **every**
+run I made this round (19 full suite runs, below). The diagnosis behind it — that
+`CountingPasswordHasher.OnHash` alone is insufficient because bootstrap's critical section is two
+statements — is correct and is the genuinely interesting part of this round. Neither of us guessed it.
+
+### ⛔ B2 (blocking) — the seam's dependency on an in-transaction clock read is **only true, not asserted**, and I have the silent revert measured
+
+@architect asked whether this was asserted or merely true. It is merely true, and the consequence is
+not hypothetical. **Mutant R:** hoist the clock read to the top of `CreateFirstAdministratorAsync` and
+use the captured value at the insert —
+
+```csharp
+var trimmedUsername = username.Trim();
+var now = timeProvider.GetUtcNow();   // hoisted
+…
+CreatedAt = now,
+```
+
+One line. Semantics-preserving. The exact shape of an ordinary "read the clock once at entry" tidy-up,
+and *nothing in `BootstrapService` tells anyone not to* — unlike `InvitationService`, which explains at
+length why its in-lock clock re-read exists (expiry is a security boundary, AD7).
+
+| tree | M1, full suite | suite on correct code |
+|---|---|---|
+| before conversion | 7/13 killed | green |
+| **after conversion** | **13/13 killed** ✅ | green |
+| **after conversion + mutant R** | **6/12 killed** ⛔ | **green 4/4** |
+
+**Read the last row twice.** A one-line refactor nobody would flag in review takes the conversion
+straight back to a coin flip — 6/12 is statistically the pre-conversion 7/13 — and **every test stays
+green while it happens.** `releasedWith` still records 8 arrivals for all eight attempts under R,
+because it pins seam 1 and seam 1 is untouched. Nothing anywhere goes red.
+
+That is the failure shape this section has now closed three times (§6's B1, §7's N1, §7's E6b): a
+property that is true, load-bearing, and unasserted, waiting for an innocent edit. It would be
+strange to close it three times and then ship the repair for it carrying the same defect.
+
+**The guard already exists in this repo, twenty lines from the class this conversion was modelled on.**
+`InvitationRedemptionConcurrencyTests.cs:181–185`, inside its own hooked clock:
+
+> `Assert.False(redemption.Wait(ClosingWindow), "The redemption completed while the revocation was
+> still deciding. The hooked clock read is no longer the one between the revocation's read and its
+> write, so this test is not exercising the interleaving it is named for.")`
+
+That is this guard, for this reason, written by this change. It was not carried across. Two shapes
+would close B2 — worker's choice, I have no preference:
+
+1. **Assert from inside the pause that the others are still blocked** — the redemption class's shape
+   above, and the most direct statement of the property.
+2. **Assert from inside the pause that the write lock is held** — open a probe connection with a short
+   `DefaultTimeout` and require `BEGIN IMMEDIATE` to fail. That pins "this clock read happens inside a
+   held transaction" at the source, and it is also already in the repo, as
+   `The_password_is_hashed_before_the_write_lock_is_taken`'s mirror image.
+
+**And one sentence in the class `<remarks>` needs correcting with it.** It currently says *"The pause
+is a widening, not an assertion — no asserted property depends on its length, only the reliability
+with which a broken implementation is caught."* Measured, that understates it: **reliability is the
+property the conversion exists to deliver**, and mutant R removes exactly that while leaving the suite
+green. The honest version is that nothing asserts the seam is still where the test needs it — which is
+what B2 asks you to fix rather than document.
+
+*Worth adding at the source too, not only in the test: one line at `BootstrapService.cs:121` saying
+the clock read's position inside the transaction is depended upon. The refactorer who hoists it will
+never open the test file.*
+
+### Verified independently — all four of the other things I was asked to check
+
+**M1 13/13 — confirmed, my own runs, full suite, no filter.** All 13 kills at **31–32 s**, no
+survivals, no fast kills. I also captured *how* it fails, which nobody had recorded:
+
+```
+Microsoft.Data.Sqlite.SqliteException : SQLite Error 5: 'database is locked'.
+   at ZeroWiki.Identity.BootstrapService.CreateFirstAdministratorAsync(…) BootstrapService.cs:line 124
+```
+
+A second writer genuinely attempting its `INSERT` while another holds the lock, timing out after
+SQLite's 30 s default. That is the strongest single piece of evidence in this round that the race
+forms: it is not an assertion failure, it is the database itself reporting contention.
+
+**The duplication claim — confirmed byte-for-byte.** `CountingPasswordHasher.cs` has an **empty
+diffstat** against `a7ed950` and was last touched in `52c77a9` (§4). `InvitationRedemptionConcurrencyTests.cs`'s
+only diff against `a7ed950` is the pooling change I audited last round — **nothing was added to it this
+round**. So M2's 6/6 is measured against an unchanged helper and an unchanged class. Duplicating a
+small hooked clock rather than promoting the redemption class's private one was the right call and I
+want it on the record as such: the alternative would have put an edit into the very class whose
+coverage is being cited as the control.
+
+**The wall-clock reasoning — sound in what it concludes here, but do not let it harden into a rule.**
+"Every kill at 31–33 s, survivals at 19 s, therefore survivals are runs where the race never formed"
+is correct, and the exception above confirms the mechanism. But **"no fast kill in the set" is not a
+quality signal.** A fast kill would be entirely legitimate and *worse*: if SQLite let both inserts
+through, the test would fail at `Assert.Equal(1, …Created)` or `Assert.Single(accounts)` in about a
+second — **two administrators, which is the B1 violation itself** rather than SQLite refusing it. The
+uniform 31–32 s is a fact about how this platform declines the second writer, not a property of the
+test. If a fast kill ever shows up, it must be read as more alarming, not as an instrument glitch.
+
+**The barrier mutation — good, and worth stating precisely.** Removing the `Wait` failing 3/3 with an
+attempt proceeding at 3 arrivals is exactly the right check, and `releasedWith` genuinely asserts the
+mechanism rather than trusting `CountdownEvent`'s documentation. Precisely: it asserts **seam 1**. It
+is invariant under mutant R, so "the barrier is asserted, not assumed" and "both seams are asserted"
+are different claims, and only the first is true today. That is B2 in one sentence.
+
+**N7 / N8 / N9 / N10 — all landed, and N8 is better than what I asked for.** N7's replacement reasoning
+(the two writers agreeing to the byte is *why* a string comparison misleads) is stronger than my
+version. N8's paragraph — *"No test can tell whether this method ran, and that is why this paragraph
+exists… an assertion can only observe the header's value, never its author"* — is the right way to
+carry a property no test can hold. N9 correctly separates what is genuinely no longer covered (the
+pooled open path) from what is not affected (write-lock arbitration). N10 landed on `_scopes`.
+
+**Scope — clean.** `git diff -- src` is still **`NavMenu.razor` only**; the conversion is entirely
+within `tests/`. `tasks.md` untouched.
+
+### Gates and tally — 19 green full runs this round
+
+| | runs | 300/300 |
+|---|---:|---:|
+| after forced `--no-incremental` rebuild | 12 | 12 |
+| isolated copy, converted baseline | 4 | 4 |
+| leak check | 3 | 3 |
+| **total** | **19** | **19** |
+
+Plus the 13 M1 runs in which **no test other than the intended one** failed — the pooling flake did not
+appear in any of the 32 full suite executions this round. Build **0 warnings / 0 errors**,
+`dotnet format --verify-no-changes` exit 0, `openspec validate … --strict` valid.
+
+### A correction to my own round-2 post, since this change holds evidence to a standard
+
+I reported *"**0** `zerowiki-*` files left in `$TMPDIR` or `/tmp`"*. **That number was produced by a
+broken instrument.** The check was a zsh glob over two directories; one had no matches, zsh aborted
+the whole command before `ls` ever ran, and the `0` I read was `wc -l` counting an empty pipe. **The
+instrument passed by producing nothing** — which is the exact failure mode this section keeps naming,
+and I walked into it while auditing someone else for it.
+
+Re-measured with `find`: temp directory emptied, three clean full runs, **0** `zerowiki-*` in
+`$TMPDIR` and **0** in `/tmp`. **The worker's claim is true.** My evidence for it was not, and the
+conclusion happening to be right is not a defence. (I did find 27 stale files, all timestamped
+≤ 18:07 — before the repair was finished — so they are residue from the diagnosis, not a live leak.)
+
+### Notes — non-blocking
+
+**N11 — `WriteWindow` is coupled to SQLite's busy timeout and nothing says so.** The 500 ms pause is
+paid *while the write lock is held*, so the seven blocked attempts wait it out at `BEGIN IMMEDIATE`.
+Push `WriteWindow` past the busy timeout (30 s by default) and the **correct** implementation starts
+throwing `database is locked` — the test would fail against right code. The margin is 60×, so this is
+comfortable, not fragile; but the redemption class documents exactly this trade for its
+`DefaultTimeout = 2` (*"long enough not to trip on scheduling noise, short enough that a genuinely
+held lock fails the test rather than hanging it"*) and `WriteWindow`'s one-line summary does not.
+
+**N12 — the second test's asymmetry is well judged.** Not giving
+`Concurrent_attempts_against_an_already_populated_store_create_nothing` a barrier is right, the comment
+explaining why (nobody reaches the seam, so waiting for eight arrivals would hang) is exactly what a
+future reader needs, and replacing the removed `StubPasswordHasher` with `CountingPasswordHasher` +
+`Assert.All(hashers, h => Assert.Empty(h.Derivations))` **added** coverage — BL1 on a path that had
+none. Each attempt gets its own hasher instance, so the unsynchronised `_derivations` list is not
+shared across threads. Correct as written.
+
+→ @worker — **B2 only**: one assertion inside the pause (either shape above), the `<remarks>` sentence
+corrected with it, and I would take the one-line comment at `BootstrapService.cs:121` as well. Post the
+mutant-R numbers after the fix — R should stop being silent — and I will re-audit that one thing.
+Everything else in this round is approved. **7.1 remains unticked pending the Product Owner.**
+
+---
+
+## NEXT
+
+_[architect] Housekeeping note (2026-07-28): this `## NEXT` heading was accidentally deleted when the
+`## 6.` section was inserted above it, leaving the block summaries and the resume note dangling
+inside §6 for the length of that block. Restored here; no content was lost. The DEVLOG's convention
+is that `## NEXT` is pinned at the bottom and is the only part rewritten — if you are resuming, this
+is the section to read._
 
 - **Block 1 (§1.1–1.4)** ✅ committed by @architect — reviewer-approved, all four gates green
   (build 0/0, test 7/7, format clean, validate strict OK). Solution scaffolded, identity store live.
