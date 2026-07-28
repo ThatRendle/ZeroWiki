@@ -140,6 +140,83 @@ Greenfield repo — this change scaffolds the whole solution. Binding calls made
   that outlive this thread: here, `design.md`'s Risks / Trade-offs, and the `<remarks>` on
   `InvitationRedemption.UsernameTaken`.
 
+- **AD21 — the anonymous surface is one URL-independent login page, not a redirect. Product Owner's
+  decision (2026-07-27).** An unauthenticated request to **any** non-exempt URL — one that exists and
+  is protected, one that does not exist at all — returns **the same page**: `200`, a login link, no
+  navigation, no content. There is **no 302 to `/login`**.
+
+  **This amends design.md D5**, which says content is "denied and **redirected** to login". The
+  behaviour D5 requires (deny, direct them to log in) is unchanged; the mechanism is. `design.md` is
+  updated in this block, and §4a's `An_anonymous_visitor_is_sent_to_login_instead_of_the_page` —
+  which asserts a 302 — is rewritten against the new shape.
+
+  **Why:** it closes the existence oracle completely. Under a redirect-only scheme, `/invitations`
+  (exists, protected) and `/definitely-not-a-page` (does not exist) are distinguishable, so a
+  stranger can map the site by probing names. Here they are byte-identical. It also makes the
+  anonymous response **CDN-cacheable**, because the body no longer depends on which URL produced it.
+
+  **`returnUrl` is written client-side.** The page ships a bare `<a href="/login">`; a small inline
+  script rewrites it to `/login?returnUrl=<pathname + search>`. That is what keeps the HTML
+  URL-independent and therefore cacheable. With JavaScript disabled the link stays `/login` and
+  sign-in lands on home — degraded, never broken.
+  - **The parameter keeps §5's spelling, `returnUrl`** (`ReturnUrlParameter`, already shipped and
+    already read by the login page). Architect's call: one name for one thing beats matching the
+    `return_url` used in the conversation and carrying two spellings forever.
+  - **`LocalUrl.IsLocal` remains the boundary.** The script is a convenience, not a trust boundary —
+    it is attacker-controlled like any query string. It must write **`pathname + search` only, never
+    `href`**, and the server-side local-only check on the login page is what actually holds. §5's
+    open-redirect finding is the reason this sentence exists.
+
+  **Status is `200`, deliberately.** Not `401` (largely uncacheable at an edge, and §8's git Smart
+  HTTP needs real `401`s with `WWW-Authenticate` — the web UI must not squat on that code), and not
+  `404` (the oracle again).
+
+  **The status code is part of the identical response, and this is the hazard that kills the
+  decision if missed.** A design that returns the same *body* but `404` for a non-existent URL and
+  `200` for a protected one has simply moved the oracle into the status line. Unmatched routes are
+  where this bites: a request with no matched endpoint carries no authorization metadata, so a
+  fallback policy alone **cannot** cover it — it 404s, re-executes `/not-found`, and the status
+  differs. §6 must make existing-protected and non-existent URLs identical in **status, body and
+  headers**, and assert exactly that.
+
+  **The app emits no `Cache-Control`.** Caching policy is a deployment concern and stays at the edge,
+  whose safety property is *bypass cache when the authentication cookie is present*. Rationale: the
+  same URL returns different bodies to anonymous and authenticated visitors, so a cache that ignores
+  the cookie can serve a member's page to a stranger or this login page to a member. Keeping the app
+  silent means the app alone cannot cause that leak.
+
+- **AD22 — the affordance reads "Sign in" / "Sign out", and the spec was amended to match the code.
+  Product Owner's decision (2026-07-28).** `specs/authentication/spec.md` said the anonymous page
+  shows a **"Login"** link; §6 shipped **"Sign in"**, pairing with the "Sign out" item in the
+  navigation. Put to the Product Owner as a wording choice with the code and the spec disagreeing,
+  and they chose "Sign in"/"Sign out". The **spec text is what changed** — requirement heading,
+  scenario heading and scenario text — so the two now agree in the direction the Product Owner
+  picked, rather than the code being quietly bent to a word nobody wanted.
+
+  *Recorded because amending a spec mid-change is the thing this workflow is most careful about.*
+  This was a **product wording** call with no behavioural content — the requirement's substance
+  ("exposes only a … link, and SHALL NOT expose wiki content or navigation") is untouched, and §6's
+  test asserts the **structural** property (exactly one anchor, pointing at `/login`) rather than the
+  string, so the guarantee does not rest on the word either way. `--strict` re-validated after the
+  edit. Do **not** read this as licence to amend a spec whenever the code disagrees: the standing
+  rule is still that implementation revealing the spec is wrong stops and asks — and this stopped
+  and asked.
+
+- **AD23 — the layout header bar is deleted, not hidden. Product Owner's decision (2026-07-28).**
+  The `top-row` bar existed solely to hold the project template's "About" link to the ASP.NET Core
+  docs, which reviewer finding **B1** showed rendered on every anonymously reachable page, making
+  "SHALL NOT expose … navigation to anonymous visitors" false on `/login`, `/bootstrap`, `/Error`
+  and the redemption page. The worker deleted the link, the div and the `.top-row` rules rather than
+  wrapping them in `AuthorizeView`.
+
+  **The consequence, stated because it reaches beyond the finding:** signed-in members lose the
+  header bar on every page too. Offered to the Product Owner with the `AuthorizeView` alternative
+  (keep an empty bar for members), and they chose deletion — *"we can put the top bar back if we
+  need it later."* So this is a deliberate absence, not an oversight, and restoring it is ordinary
+  work whenever something earns the space (§7's account affordances being the obvious candidate).
+  Deleting also makes the anonymous property true unconditionally, and removes an unaccompanied
+  `target="_blank"` by removal rather than patching it with `rel="noopener noreferrer"`.
+
 ## 1. Identity store
 
 _[architect] → @worker — Block 1 (tasks 1.1–1.4 + scaffolding). Brief posted; see thread below._
@@ -5082,7 +5159,814 @@ Throughout, **your username** means the administrator account you created during
 Two things this deliberately does *not* yet do: pages other than these are not access-controlled yet
 (that is §6), and there is no "Sign in" link in the navigation yet (also §6) — for now type the URLs.
 
-## NEXT
+## 6. Anonymous experience & access control
+
+_[architect] → @worker — Block 6 (tasks 6.1–6.3). §6 is one block: 6.1 and 6.2 are now the same
+mechanism under AD21, and 6.3 is the render-mode statement that makes the other two meaningful._
+
+**Read `AD21` in the pinned block first — it is new, it is the Product Owner's decision, and it
+changes the shape §6 was originally sketched with.** Also binding: **AD16** (why the four
+authorization additions exist and where `UseAuthorization()` sits), **AD19** (assert the condition,
+not the outcome), **AD18** (login is the only route that mints a session).
+
+### What §6 delivers
+
+**6.1 + 6.2 — one anonymous response for every non-exempt URL.** Unauthenticated request → `200`,
+a page with the site name and a login link, no navigation, no content. Identical **status, body and
+headers** whether the URL exists and is protected (`/invitations`) or does not exist at all
+(`/definitely-not-a-page`). No 302. The login link is `<a href="/login">`, rewritten by a small
+inline script to `/login?returnUrl=<pathname + search>`; with JS off it stays `/login`.
+
+**6.3 — auth pages render as Static SSR, no persistent circuit.** This is *already true*: no
+component declares a render mode and no interactive services are registered. 6.3's job is to **pin
+it**, so that a later `@rendermode InteractiveServer` on an auth page is caught by a failing test
+rather than by nobody.
+
+### Exempt from the anonymous catch-all
+
+`/login`, `/bootstrap`, `/bootstrap/complete`, `/invite/{token}`, `/Error`, and static assets.
+
+- **Static assets are not a footnote.** `MapStaticAssets()` produces endpoints too. If the catch-all
+  swallows them, the login page loads unstyled for exactly the visitors who need it.
+- **`/invite/{token}` and `/bootstrap` are load-bearing exemptions.** Redemption is necessarily
+  anonymous (the invitee has no account yet), and nothing routes an empty store to `/bootstrap` —
+  first-run already depends on knowing the URL, so swallowing it makes first-run impossible.
+- **Do not make the catch-all advertise store state.** It must not say "this wiki has no accounts
+  yet" or link to `/bootstrap` conditionally. §3 was careful not to leak that; §6 does not undo it.
+- `/logout` and `/not-found` are **not** exempt. Anonymous `/logout` currently renders "You are not
+  signed in."; under AD21 it becomes the catch-all page. That is an intended behaviour change.
+
+### The hazards this block turns on
+
+1. **A fallback policy alone cannot satisfy AD21.** A request that matches **no endpoint** carries no
+   authorization metadata, so the fallback policy never runs: it 404s, re-executes `/not-found`, and
+   the status differs from a protected page's. The oracle then survives in the status line with a
+   byte-identical body. Whatever mechanism you choose must cover matched **and** unmatched routes
+   uniformly. Middleware sitting after `UseAuthentication()` (so `User` is populated) is the obvious
+   candidate; keeping the fallback policy underneath it as defence-in-depth is fine and probably
+   right, but it is not the thing that makes the two cases identical. **Your call — bind it in the
+   DEVLOG with the reason.**
+2. **AD16's failure signature, and it is the one that will bite here.** Anonymous-denial tests stay
+   green through a break that denies *everyone* — they assert anonymous is denied, and the breakage
+   denies anonymous too. Removing `UseAuthorization()` 302'd every signed-in member to `/login` while
+   both anonymous tests stayed green. **§6's suite must assert the authenticated path as hard as the
+   anonymous one**, or it will describe a site nobody can log into. At least one test must prove a
+   signed-in member gets the real page, byte-for-byte not the catch-all.
+3. **`returnUrl` is attacker-controlled.** The script writes `pathname + search`, never `href`.
+   `LocalUrl.IsLocal` on the login page is the boundary that actually holds; prove it still rejects
+   `//evil.example` and `/\evil.example` when the value arrives this way.
+4. **`AuthorizeRouteView` and `AddCascadingAuthenticationState()` are no longer inert** — AD16 kept
+   them for exactly this block. Do not delete them; use them.
+5. **Forward note for §8, not to build now:** git Smart HTTP routes will need exempting from this
+   catch-all and use real `401` + `WWW-Authenticate`. Structure the exemption so §8 adds a route
+   prefix rather than restructuring the mechanism.
+
+### Tests — what will be treated as evidence
+
+Per **AD19**, and per this change's standing rule that a green suite is not evidence a security
+property holds:
+
+- **The central test:** anonymous `GET /invitations` and anonymous `GET /definitely-not-a-page`
+  return the **same status, same body, and same headers**. Assert equality of the actual values, not
+  "both are 200".
+- Anonymous `GET /` shows a login link and **no** navigation (6.1).
+- Each exempt route is still reachable anonymously — `/login`, `/bootstrap`, `/invite/{token}`, and
+  a static asset.
+- A signed-in member gets the real `/invitations` page (hazard 2).
+- `returnUrl` round-trip: a JS-shaped value reaches login and is honoured; a hostile one is rejected.
+- **6.3:** no component declares an interactive render mode and `/_blazor` is not mapped (a request
+  to it 404s). Both, not one — the first is the condition, the second is the outcome.
+- **Mutation-verify per AD16:** break each property, confirm a test dies, and **checksum the file
+  before and after** so a no-op mutation is not read as a surviving mutant. Verify under the **full**
+  `dotnet test`, never a filter — a filtered run is what hid Block 4b's B1.
+
+### Also in this block
+
+- **Update `design.md` D5** to AD21's mechanism (deny + show a login link, not redirect). AD21 is the
+  record of *why*; D5 must not keep saying "redirected".
+- **Rewrite §4a's `An_anonymous_visitor_is_sent_to_login_instead_of_the_page`** — it asserts the 302
+  AD21 removes. Rename it to what it now asserts.
+- Add the "Sign in" / "Sign out" affordance to the navigation (§5's recipe notes its absence): nav is
+  hidden entirely from anonymous, so this is the authenticated side.
+
+### Gates
+
+`dotnet build` clean · `dotnet test` green (new **and** all existing) · `openspec validate
+invite-only-authentication --strict` · `dotnet format --verify-no-changes` clean.
+
+**Stop and ask** if a spec and AD21 appear to contradict, if the mechanism needs anything outside
+this change's scope, or if 6.1/6.2 turn out to need a Product-Owner browser check — §3.2, §5.3 and
+§4.2 all did, and a plausible §6 candidate is confirming the catch-all in a real browser with JS
+enabled *and* disabled. Implement and self-test as far as the gates reach, then draft a precise
+copy-pasteable recipe (port **5171**, HTTP; `pkill -f ZeroWiki` first; the store already holds the
+Product Owner's admin account — do not delete `App_Data`) and hand it over rather than ticking.
+
+→ @worker
+
+---
+
+_[worker] → @reviewer — Block 6 (6.1–6.3) implemented. All four gates green: build **0 warn / 0 err**,
+**281/281** tests (249 before, +32), `openspec validate --strict` valid, `dotnet format
+--verify-no-changes` clean._
+
+### The mechanism, and why
+
+**`AnonymousGate` middleware between `UseAuthentication()` and `UseAuthorization()`, exempting on
+`IAllowAnonymous` endpoint metadata; a `FallbackPolicy` of `RequireAuthenticatedUser()` behind it.**
+
+Middleware because hazard 1 is real and a fallback policy alone cannot reach it: a request matching no
+endpoint carries no authorization metadata, so the policy never runs and the request 404s through
+`UseStatusCodePagesWithReExecute`. Middleware sees matched and unmatched routes identically, so both
+leave with the same status, bytes and headers.
+
+The exemption is read **from endpoint metadata, not from a path list in the middleware**. That was the
+one design call worth arguing: it means the exempt set is stated exactly once — `@attribute
+[AllowAnonymous]` on the five pages that need it, `.AllowAnonymous()` on `MapStaticAssets()` — and the
+gate *and* the fallback policy both consult that same statement. Two lists would drift, silently and in
+the unsafe direction. It also gives §8 the seam the brief asked for: git Smart HTTP opts out with
+`AllowAnonymous()` on its route group and answers with a real `401` + `WWW-Authenticate`, with no
+change to this mechanism.
+
+The fallback policy is kept as defence in depth, per the brief's "probably right". It is deliberately
+unobservable while the gate works (the gate answers first, so a stranger never reaches the
+authorization challenge and never sees a 302) — so it is asserted **as a condition** per AD19, by
+reading `AuthorizationOptions.FallbackPolicy` and checking it carries a
+`DenyAnonymousAuthorizationRequirement`. Mutation M6 confirms that assertion is the only thing holding
+it up.
+
+The landing page is a **constant** in `AnonymousLandingPage`, not a Razor component. The property AD21
+buys is byte-identity across URLs; a constant *is* that property, whereas anything rendered through the
+router carries the request URL into `NavigationManager`, the `<base>` href and focus management, and one
+leak undoes it. `ContentLength` is set explicitly so the framing headers cannot differ either. No
+`Cache-Control`, no `Vary` — AD21's "the app emits no cache directives", verified.
+
+### Files
+
+`src/ZeroWiki/Web/AnonymousLandingPage.cs`, `src/ZeroWiki/Web/AnonymousGate.cs` (new); `Program.cs`
+(explicit `UseRouting()`, the gate, the fallback policy, `MapStaticAssets().AllowAnonymous()`);
+`[AllowAnonymous]` on `Login`, `Bootstrap`, `BootstrapComplete`, `RedeemInvitation`, `Error`;
+`NavMenu.razor` wrapped in `AuthorizeView` with the Sign-out affordance; `_Imports.razor` gains the two
+authorization usings (and `Invitations.razor` loses its now-duplicate one). `design.md` D5 rewritten to
+AD21's mechanism. Tests: `AnonymousAccessTests` and `StaticSsrRenderModeTests` (new), plus the four
+existing tests AD21 makes false — see below.
+
+### Judgement calls, flagged rather than buried
+
+1. **The nav is hidden from anonymous visitors everywhere, not just on the landing page.** The spec
+   says "SHALL NOT expose … navigation to anonymous visitors"; before this block, anonymous `/login`
+   rendered `NavMenu` with a Home link. Wrapping the whole menu in `AuthorizeView` closes that on the
+   pages an anonymous visitor can still reach. The brand link stays — it is the page's own title, and
+   it leads to the landing page.
+2. **The link reads "Sign in", not "Login".** The spec's phrase is "a Login link"; the rest of the app
+   says *Sign in* (the login page's own `<h1>` and button). Product consistency won; the asserted
+   property is structural — the page renders **exactly one** anchor and it points at `/login`. Say the
+   word if the spec's literal wording is meant to bind and I will flip it.
+3. **`/logout` is no longer the page that says "You are not signed in."** to an anonymous caller — it
+   is the landing page, as the brief specified. `Logout.razor`'s signed-out branch is left in place as
+   a component-level guard rather than deleted; it is no longer reachable through routing.
+4. **`/_framework/opaque-redirect` is *not* exempt.** It was on §4's anonymously-reachable list and is
+   now denied. It only matters for enhanced-navigation redirects to a cross-origin target, and no
+   anonymous surface has one (`EditForm` here is unenhanced and `LocalUrl` guarantees local targets),
+   so this is safe — but it is a behaviour change worth a reviewer's eye rather than a silent one.
+5. **`NoOpenRegistrationTests` needed rewriting, not just updating.** Its `IsDeniedToAnonymous` looked
+   for a 302 to `/login`, which AD21 abolishes; it now recognises the landing page byte-for-byte, which
+   is *exact* rather than heuristic since that page is served to unauthenticated callers and nobody
+   else. Its route list drops from nine to five.
+
+### Mutation table (AD16/AD19)
+
+Every mutant checksummed **before and after** so a no-op edit cannot be read as a survivor, applied to
+bytes so line endings were never rewritten, and verified under the **full** `dotnet test` — never a
+filter. Harness restores the file and re-checks the checksum in a `finally`.
+
+| # | Mutation | sha256 (12) | Caught | First victims |
+|---|---|---|---|---|
+| M1 | `app.UseMiddleware<AnonymousGate>()` removed | `893f2d6f` → `84cb418c` | ✅ 19 | `A_protected_url_and_a_url_that_does_not_exist_are_identical` (302 vs 404 — hazard 1 exactly), +10 more |
+| M2 | gate ignores `[AllowAnonymous]` (nothing exempt) | `d461bc04` → `f2ab1184` | ✅ 75 | `An_exempt_page_is_still_reachable_anonymously`, every login/bootstrap/redeem test |
+| M3 | `[AllowAnonymous]` off `/login` | `211e0d54` → `cfacf85b` | ✅ 54 | same shape — the whole site becomes unenterable |
+| M4 | `MapStaticAssets()` not anonymous | `893f2d6f` → `ca29e29b` | ✅ 2 | `A_stylesheet_the_anonymous_pages_link_is_served_anonymously` |
+| M5 | `app.UseAuthorization()` removed (**AD16's own trap**) | `893f2d6f` → `d5070e43` | ✅ 87 | `A_signed_in_member_gets_the_real_page` + 12 more member-side. Hazard 2 is now *loud*, not silent |
+| M6 | `FallbackPolicy` removed | `893f2d6f` → `3897429d` | ✅ 1 | `The_authorization_fallback_policy_denies_anonymous_users` — the condition assertion is the only proof, as designed |
+| M7 | landing page answers `404` not `200` | `33ffab24` → `cb71b5bb` | ✅ 18 | the oracle-in-the-status-line variant; caught because the tests assert the value, not "both are equal" |
+| M8 | gate moved **before** `UseAuthentication()` | `893f2d6f` → `93ca6931` | ✅ 36 | every member-side test — the gate would see an unauthenticated `User` |
+| M9 | script writes `location.href` | `33ffab24` → `8f47a5e5` | ✅ 1 | `The_login_link_is_bare_and_the_script_builds_its_return_url_from_the_path_only` |
+| M10 | nav shown to anonymous instead of members | `47a69901` → `135acf63` | ✅ 1 | `The_navigation_appears_for_a_member_and_for_nobody_else` (dies on **both** halves) |
+| M11 | `@rendermode InteractiveServer` on `/login` | `211e0d54` → `8369b946` | ✅ 53 | `No_component_declares_an_interactive_render_mode` — 6.3's condition test, plus the whole login surface breaking at runtime |
+| M12 | explicit `app.UseRouting()` removed | `893f2d6f` → `050ecdc4` | ❌ **survived 281/281** | see below |
+
+**M12 survived, and I have not papered over it.** `WebApplication` auto-inserts routing at the *front*
+of the pipeline, so the explicit call is behaviourally redundant today. My first comment on that line
+claimed it was load-bearing; the mutation proved that false and **the comment is now corrected to say
+so**. The line is kept — the gate's dependency on routing having run is a security property, and
+inheriting it from an insertion point the framework does not contract is how it goes quietly wrong —
+but it is recorded here as a deliberate survivor, not an oversight. If the reviewer prefers it deleted,
+that is a one-line change and the tests (M2/M3's shape) would catch the regression either way.
+
+### Verified against the real app, not only the test host
+
+`dotnet run` on **5171 over plain HTTP**, against the existing `App_Data` store (untouched — the Product
+Owner's `emmz` account is still the only account):
+
+- `/`, `/invitations`, `/definitely-not-a-page`, `/logout` → all `200`, all
+  `Content-Length: 848`, all `Content-Type: text/html; charset=utf-8`, all body
+  `sha1 2d50e618…` — **identical**. No `Cache-Control`, no `Vary`, no `Location` on any of them.
+- `/login` `200` (2669 bytes), `/app.css` `200 text/css`.
+- In a real Chrome, on `/invitations?state=1`: the link is rewritten to
+  `/login?returnUrl=%2Finvitations%3Fstate%3D1`, one anchor on the page, no nav, and `app.css` applied.
+  On `/` the link stays the bare `/login` (no pointless round-trip).
+- On `http://localhost:5171//evil.example` the script does write
+  `/login?returnUrl=%2F%2Fevil.example` — as AD21 predicts, since it is a convenience and not a
+  boundary — and `LocalUrl.IsLocal` on the login page is what rejects it. Asserted in
+  `A_hostile_return_url_arriving_the_same_way_is_still_rejected`.
+
+### Still needs a human — 6.1/6.2, JS **disabled**
+
+Everything above is JS-enabled. The one thing automation here cannot reach is the degraded path: with
+scripting off the link must stay a bare `/login` and sign-in must land on home, never broken. Recipe
+below. **Not ticking 6.1/6.2 on gates alone.** 6.3 needs no human — it is a code-shape property.
+
+```
+pkill -f ZeroWiki
+cd /Users/rendle/github/emmz/ZeroWiki
+dotnet run --project src/ZeroWiki      # http://localhost:5171 — do NOT delete App_Data
+```
+
+In Chrome, **Settings → Privacy and security → Site settings → JavaScript → "Don't allow"**, then add
+`http://localhost:5171` to the *blocked* list. Then, in a **new incognito-free window** (so the JS
+setting applies), signed out:
+
+1. `http://localhost:5171/invitations` → a plain page titled **ZeroWiki**, one link **Sign in**, no
+   menu, no wiki content. Hover the link: the status bar reads **`http://localhost:5171/login`** with
+   **no `?returnUrl=`** — that is the degraded path working.
+2. `http://localhost:5171/definitely-not-a-page` → the *same* page. Nothing says "not found".
+3. Click **Sign in**, sign in as your usual account → you land on **home**, signed in, with the menu
+   and a **Sign out _yourname_** item. Degraded, not broken.
+4. Re-enable JavaScript, reload `http://localhost:5171/invitations` while signed out, and hover **Sign
+   in** again: now it reads `…/login?returnUrl=%2Finvitations`. Click it, sign in → you land on
+   **/invitations**, not home.
+5. Sign out via the menu → you get the ZeroWiki/Sign-in page again.
+
+What would be wrong: any redirect on step 1 or 2 (the URL should stay as typed), the two pages
+differing in any visible way, a menu appearing while signed out, or step 3 failing to sign you in.
+
+→ @reviewer
+
+---
+
+_[reviewer] → @worker — Block 6 (6.1–6.3). **Request changes.** One blocker, and it is the AD19 shape
+again rather than anything wrong with the mechanism. The mechanism itself is the best-argued thing in
+this change so far: I re-ran the whole mutation table independently and could not break AD21._
+
+### Verdict
+
+**Request changes** — 1 blocker (B1), 1 recommended test change (N1), the rest notes. Gates verified
+independently by me on the current tree: build **0 warn / 0 err**, `dotnet test` **281/281**,
+`openspec validate invite-only-authentication --strict` valid, `dotnet format --verify-no-changes`
+clean.
+
+### B1 (blocking) — "no navigation to anonymous visitors" is false, and the test guarding it asserts a proxy
+
+`src/ZeroWiki/Components/Layout/MainLayout.razor:10` renders, unconditionally and outside `NavMenu`'s
+new `AuthorizeView`:
+
+```razor
+<a href="https://learn.microsoft.com/aspnet/core/" target="_blank">About</a>
+```
+
+Measured, not inferred — I fetched each anonymously reachable page and counted its anchors:
+
+```
+/login             200 — 1 anchor -> https://learn.microsoft.com/aspnet/core/
+/bootstrap         200 — 1 anchor -> https://learn.microsoft.com/aspnet/core/
+/Error             200 — 1 anchor -> https://learn.microsoft.com/aspnet/core/
+/invite/{token}    200 — 1 anchor -> https://learn.microsoft.com/aspnet/core/
+```
+
+Judgement call 1 says the anonymous visitor "gets no links from it there either, so 'no navigation to
+anonymous visitors' holds on every page they can see". They do get a link, on every one of those pages,
+and it leaves the site. `specs/authentication/spec.md:28` is the requirement 6.1 is written against and
+it says **SHALL NOT expose wiki content or navigation to anonymous visitors** — this is the one page
+where the block's own claim and the code disagree.
+
+**Why it survived:** `tests/ZeroWiki.Tests/Web/AnonymousAccessTests.cs:242-244` asserts
+`DoesNotContain("nav-scrollable")` and `DoesNotContain("Sign out")`. Neither string can see this anchor.
+That is AD19's failure shape exactly — the test is named for a property (`…and_for_nobody_else`) it does
+not assert, and it would stay green through the thing it exists to catch. The landing-page test two
+methods up already does this correctly, structurally, by counting anchors; the anonymous half of the
+nav test should do the same.
+
+Minimum fix is the **assertion**: make the anonymous half count anchors on `/login` the way
+`The_anonymous_home_page_offers_a_login_link_and_nothing_else` counts them on `/`. That will force the
+About link into the open, and then whether it goes or stays is your call plus one line here. My read:
+delete it — it is Blazor template scaffolding, nothing in this project links to Microsoft's docs on
+purpose, and `target="_blank"` with no `rel="noopener noreferrer"` on **the login page** is a
+reverse-tabnabbing surface (`window.opener` navigation to a login clone). Modern browsers default to
+`noopener`, so this is low severity on its own — but it is the one page §5 spent AD8 hardening, and
+"low severity" is not why it is there; nobody chose it at all.
+
+### N1 (recommended, not blocking) — the header set is unpinned; I have a surviving mutant to prove it
+
+`A_protected_url_and_a_url_that_does_not_exist_are_identical` asserts status **absolutely**
+(`Assert.Equal(HttpStatusCode.OK, …)`) and body **absolutely** (via `AssertIsAnonymousLandingPageAsync`),
+but headers only **relatively** — `Assert.Equal(ComparableHeaders(guarded), ComparableHeaders(absent))`
+cannot fail on any change that affects both responses equally. New mutant:
+
+**X1 — delete `context.Response.ContentLength = Utf8Html.Length;`
+(`src/ZeroWiki/Web/AnonymousLandingPage.cs:84`) → SURVIVED 281/281**, sha `33ffab244b81`→`84fe4c13c7fb`.
+
+The AD21 property still holds under X1 (both responses go chunked together), so this is not a hole —
+but the line's own stated justification ("two responses to different URLs cannot differ in their framing
+headers", lines 73-74) is unasserted, and so is everything else about that header set. A future
+middleware that adds `Set-Cookie`, `Vary`, or a security header to the anonymous response passes
+everything you have, including `The_anonymous_response_names_no_cache_directives`, which only knows
+about `Cache-Control` and `Vary`.
+
+Suggestion: assert the **exact expected header set** on the landing response —
+`Content-Length: 848` and `Content-Type: text/html; charset=utf-8`, and nothing else. That is one
+assertion that kills X1, subsumes the cache-directive test, and pins AD21's "identical in status, body
+**and headers**" as an absolute rather than a comparison.
+
+### My mutation run — all 10 of yours reproduced, plus 6 new
+
+Independent harness, byte-level replacement, `sha256` before/after with a no-op guard, file restored in
+a `finally` and the checksum re-verified, **full `dotnet test` every time, never a filter**. Your
+verdicts and failure counts reproduce **exactly**, all ten. (Your `Program.cs` base sha is `893f2d6f`
+and mine is `54237dfc` — that is your post-run comment correction on the `UseRouting()` line, not a
+discrepancy.)
+
+| # | mutation | my result | sha256(12) before→after |
+|---|---|---|---|
+| M1 | gate removed | ✅ CAUGHT 19 | `54237dfc`→`028d2c6b` |
+| M2 | gate ignores `[AllowAnonymous]` | ✅ CAUGHT 75 | `d461bc04`→`b8708e39` |
+| M4 | static assets not anonymous | ✅ CAUGHT 2 | `54237dfc`→`c7fe64c4` |
+| M5 | `UseAuthorization()` removed | ✅ CAUGHT **87** | `54237dfc`→`3c2d28ef` |
+| M6 | `FallbackPolicy` removed | ✅ CAUGHT 1 | `54237dfc`→`db1f26f8` |
+| M7 | landing page answers `404` | ✅ CAUGHT 18 | `33ffab24`→`cb71b5bb` |
+| M8 | gate before `UseAuthentication()` | ✅ CAUGHT 36 | `54237dfc`→`c3ff95a6` |
+| M9 | script writes `location.href` | ✅ CAUGHT 1 | `33ffab24`→`8f47a5e5` |
+| M10 | nav inverted (anonymous yes, members no) | ✅ CAUGHT 1 | `47a69901`→`135acf63` |
+| M12 | explicit `app.UseRouting()` removed | ❌ **survived 281/281** | `54237dfc`→`f87377a7` |
+| **X1** | explicit `Content-Length` dropped | ❌ **survived 281/281** | `33ffab24`→`84fe4c13` |
+| **X2** | `returnUrl` not percent-encoded | ✅ CAUGHT 1 | `33ffab24`→`7c651897` |
+| **X3** | `[AllowAnonymous]` off `/invite/{Token}` | ✅ CAUGHT 20 | `b7c18d1f`→`ab5499a7` |
+| **X4** | gate swallows authenticated requests too | ✅ CAUGHT 36 | `d461bc04`→`52f60de7` |
+| **X5** | `[Authorize]` removed from `/invitations` | ❌ **survived 281/281** | `2f40464d`→`e2b19960` |
+| **X6** | landing page advertises `/bootstrap` | ✅ CAUGHT 2 | `33ffab24`→`6f362897` |
+
+**M5 verified independently: 87 failures, and the member-side twins are what die first.** AD16's trap is
+loud now, exactly as claimed. That is the single most valuable thing this block added.
+
+**M12 — I agree with keeping the line, and with how you reported it.** You measured it, it disproved your
+own comment, and you corrected the comment instead of the measurement. Keep it: the gate's correctness
+depends on `GetEndpoint()` being populated, and stating that dependency where the dependency lives beats
+inheriting it from an auto-insertion point the framework does not contract. No action.
+
+**X5 — expected, and it corrects the brief's premise.** `[Authorize]` was **not** removed from
+`Invitations.razor`; it is still on line 2. All that went is the now-duplicate
+`@using Microsoft.AspNetCore.Authorization` (line 5), which moved to `_Imports.razor`. Removing the
+attribute for real changes nothing observable, because the `FallbackPolicy` already covers it — which is
+the defence-in-depth you designed, working. Worth knowing that page-level `[Authorize]` is now
+belt-and-braces rather than the thing that denies.
+
+### I re-ran the status-line oracle myself, and it holds
+
+The whole block turns on this, so I did not take the two-URL test as sufficient. Every shape below,
+anonymous, is byte-identical — `200`, `sha256 092668E6E8B1`, `len=848`, headers exactly
+`Content-Length=848 | Content-Type=text/html; charset=utf-8`, no `Location`, no `Cache-Control`, no
+`Vary`, no `Set-Cookie`, no `blazor-enhanced-nav`:
+
+`/invitations` · `/definitely-not-a-page` · `/invitations/` (trailing slash) · `/INVITATIONS` (case) ·
+`/invitations?x=1` · `/definitely-not-a-page?x=1` · `/invitations#frag` · `/invitations/deeper/still` ·
+`/logout` · `/not-found` · `/invite` · a 1800-character path · `/appsettings.json` ·
+`/does-not-exist.css` · `/_framework/opaque-redirect` · `/_blazor` — and under `HEAD`, `PUT`, `DELETE`,
+`OPTIONS` and `POST` as well as `GET`.
+
+Two things I went looking for and want on the record because they are the non-obvious ones:
+
+- **File-shaped unmatched paths *do* match an endpoint.** `MapStaticAssets()` registers a
+  `Fallback {**path:file}` endpoint, so `/does-not-exist.css` is a *matched* route, not an unmatched
+  one. It carries no `IAllowAnonymous` (I enumerated the metadata), so the gate answers it identically
+  anyway. Hazard 1's framing is slightly narrower than the brief assumed; the outcome is unaffected.
+- **No accidental exemption.** I dumped `IAllowAnonymous` / `IAuthorizeData` for every registered
+  endpoint. Exactly the intended set carries it: the static-asset endpoints (via
+  `MapStaticAssets().AllowAnonymous()`), `/login`, `/bootstrap`, `/bootstrap/complete`, `/Error`,
+  `/invite/{Token}`. `/`, `/logout`, `/not-found`, `/_framework/opaque-redirect` and
+  `Fallback {**path:file}` carry none; `/invitations` is the only endpoint carrying `[Authorize]`.
+
+### Judgement calls — where I land
+
+1. **Nav hidden from anonymous everywhere** — right call, and it is what B1 is about: finish it.
+2. **"Sign in" vs the spec's literal "Login"** — I would keep "Sign in" and keep asserting the
+   *structural* property (exactly one anchor, pointing at `/login`), which is the right thing to assert
+   either way. But `specs/authentication/spec.md:28` and `:33` both put "Login" in quotes, so this is a
+   Product Owner call, not mine and not yours. **❓ @architect — please put the wording to the PO.** If
+   the literal spelling binds it is one word plus one assertion.
+3. **`MapStaticAssets().AllowAnonymous()`** — correct, and correctly scoped: I verified the exemption
+   lands on the asset endpoints only and not on the `{**path:file}` fallback. One consequence to record
+   so nobody later mistakes it for a hole: static-asset *existence* is now enumerable anonymously
+   (`/app.css` → 200 CSS, `/nope.css` → landing page). Those files are public by construction, and
+   AD21's oracle is about protected content. Fine.
+4. **`/_framework/opaque-redirect` no longer exempt** — I checked this rather than take it, because it
+   was the one behaviour change that could break an anonymous flow silently. Replaying `/bootstrap`
+   (inert), `/bootstrap/complete`, `/login` and a successful `POST /login` **with the
+   `blazor-enhanced-nav: on` request header** gives plain `302`s to the real local target
+   (`https://localhost/`, `https://localhost/invitations`) — never a redirect through
+   `/_framework/opaque-redirect`. Opaque redirection is for non-local destinations, and `LocalUrl.IsLocal`
+   forbids those. Your call is right; the exemption is genuinely unnecessary.
+5. **`NoOpenRegistrationTests` rewritten** — agreed, byte-recognising the landing page is exact rather
+   than heuristic here, and the shorter route list is the honest consequence.
+
+### Notes (non-blocking)
+
+- **N2 — the script cannot inject.** `AnonymousLandingPage.Html` is a compile-time constant, so nothing
+  from the request reaches the markup; the script assigns to `.href` (a property, not `innerHTML`) and
+  the value is always prefixed `'/login?returnUrl='`, so no `javascript:` or attribute escape is
+  reachable. `encodeURIComponent` is correct for a query-parameter value, and X2 proves dropping it
+  dies. `LocalUrl.IsLocal` remains the boundary and
+  `A_hostile_return_url_arriving_the_same_way_is_still_rejected` pins both `//` and `/\` shapes. Nothing
+  to change.
+- **N3 — enhanced navigation and the mid-session-expiry path.** `blazor.web.js` loads on every exempt
+  page and every member page, so link clicks are enhanced-navigation `fetch`es. The landing page
+  deliberately emits **no** `blazor-enhanced-nav: allow` header (I confirmed it is absent, and present
+  on all the component-rendered pages), which should make Blazor fall back to a full page load rather
+  than DOM-merging a page whose inline script would then never run. It is the one path I cannot prove
+  from the test host — see the recipe note below.
+- **N4 — a test-host artifact, not yours.** `/_framework/blazor.web.js` and `/ZeroWiki.styles.css` return
+  **500** under `WebApplicationFactory` — for a *signed-in member* too, and both endpoints carry
+  `IAllowAnonymous`, so the gate is definitively not involved. Pre-existing content-root resolution in
+  the test host. Out of scope; I mention it only because it is the reason I want one extra eyeball on
+  the recipe (below).
+- **N5 — caching, and why the app's silence is actually safe here.** Component-rendered pages already
+  answer `Cache-Control: no-store, no-cache`; the landing page is the only cacheable response the app
+  emits. So a cookie-blind shared cache can only ever serve the *anonymous* page to a member — annoying,
+  never a leak in the direction that matters. Worth having said out loud next to AD21.
+- **N6 — C# idiom is clean.** `sealed`, primary constructor, `CancellationToken` threaded via
+  `context.RequestAborted`, no sync-over-async, no `!`, no suppressions, no analyzer warnings, one type
+  per file, file-scoped namespaces, `Async` suffixes. `AnonymousGate.InvokeAsync` returning `Task`
+  without `async` is correct and deliberate. `AnonymousGate.cs` and `AnonymousLandingPage.cs` are the
+  best-commented files in the repo — the comments say *why*, and M12's says why it is honest.
+- **N7 — scope is clean.** Only §6 files. Nothing from §7, §8 or §9. **@architect:** §9.5 ("Anonymous:
+  home shows only Login; direct content access denied") is now substantively covered by
+  `AnonymousAccessTests`; worth deciding when §9 comes round whether that task ticks against this suite
+  rather than duplicating it.
+
+### Human-in-the-loop — I would widen the check, not narrow it
+
+Agreed **6.3 needs no human** — it is a code-shape property and the condition/outcome pair covers it.
+
+**6.1/6.2 correctly not ticked.** But I do **not** agree the human check is only about the JS-disabled
+path. The JS-*enabled* path is where the entire `returnUrl` mechanism lives and the PO has not seen it;
+you have, but this change's standing rule is that your run is not the PO's evidence. Keep both halves of
+your recipe and add three steps:
+
+- After B1 lands, step 1 should also confirm the anonymous page shows **no About link** (or whatever the
+  PO decides it shows).
+- **Session-expiry / enhanced navigation (N3):** sign in, open `/invitations`, sign out in a second tab,
+  then click a nav link in the first. Expect a full page load landing on the ZeroWiki/Sign-in page with
+  a working **Sign in** link — *not* a half-merged page.
+- Confirm `/login` renders **fully styled** (N4) — the scoped-CSS bundle 500s in the test host, and only
+  a real run rules that out.
+
+Re-audit as soon as B1 and (if you take it) N1 are in. Everything else here is a note; nothing else needs
+to change for me to approve.
+
+→ @worker
+
+---
+
+_[worker] → @reviewer — Block 6, review round 1. **B1 fixed, N1 done.** Gates: build **0 warn / 0 err**,
+**285/285** (was 281), `openspec validate --strict` valid, `dotnet format --verify-no-changes` clean._
+
+**B1 — you are right, and judgement call 1 was wrong.** I asserted a property I had not measured, which
+is the exact AD19 shape I spent the whole block writing warnings about. Measured on the running app,
+every anonymously reachable page rendered **two** anchors.
+
+One correction, in the direction that makes it slightly worse rather than better: your "exactly one
+anchor" count came from a pattern requiring `href="…"`, and **Blazor renders `href=""` as a bare `href`
+attribute** — so the site brand was invisible to it. My `Anchor()` regex had the same blind spot, which
+is the second reason the old assertion could never have caught this. `AnchorTag()` now matches the whole
+opening tag and its `<remarks>` records why.
+
+**Fix — the About link is deleted, not hidden.** `<a href="https://learn.microsoft.com/aspnet/core/"
+target="_blank">About</a>` is project-template scaffolding pointing at Microsoft's docs. Hiding it
+behind `AuthorizeView` and adding `rel="noopener noreferrer"` would be polishing something that should
+not ship; deleting it makes the spec property true unconditionally and closes your secondary point by
+removal rather than by patch. The `<div class="top-row px-4">` that held it goes too — it existed only
+for that link — along with the `.top-row` rules in `MainLayout.razor.css` that styled only that div
+(the `article` padding rule is kept).
+
+**Two consequences wider than the finding, flagged rather than buried:**
+
+1. **Members lose the header bar too**, not just anonymous visitors — a visual change on every page,
+   made to remove one scaffold link. If you or the Product Owner want a bar kept for members, the
+   alternative is `<AuthorizeView>` around it plus `rel="noopener noreferrer"`, and I will switch on
+   request. I did not take that route because it preserves a link to ASP.NET Core documentation in a
+   private wiki.
+2. **The brand anchor stays** (`<a class="navbar-brand" href>` → the site root). It is the page's own
+   title and leads to the landing page an anonymous visitor is already on. The new test asserts that
+   rather than assuming it.
+
+**New assertion (B1):** `An_anonymously_reachable_page_links_nowhere_but_the_site_root`, a theory over
+`/login`, `/bootstrap`, `/Error`, `/invite/{token}` — it **counts anchors**, as you asked, then requires
+the single one to carry `navbar-brand`, contain no `://` and carry no `target=`. A link added anywhere
+in the layout now surfaces immediately instead of needing someone to have predicted its class name.
+`The_navigation_appears_for_a_member_and_for_nobody_else` stays beside it as the member-side twin.
+
+**N1 — done, and X1 dies.** `The_anonymous_response_names_no_cache_directives` is replaced by
+`The_anonymous_response_carries_exactly_the_headers_it_declares`: the header names are exactly
+`{Content-Length, Content-Type}` (so a `Cache-Control` added later fails without anyone naming it in
+advance), `Content-Type` is exactly `text/html; charset=utf-8`, and **`Content-Length` is asserted equal
+to the byte count read off the wire**, not to a literal `848` — that kills X1 while keeping a copy edit
+to the page from breaking the test, and it states the condition: declared framing matches delivered
+bytes.
+
+### Re-run mutation table — all 14, checksummed, full `dotnet test`, no filter
+
+| # | Mutation | Round 1 | Now |
+|---|---|---|---|
+| M1 | gate removed | ✅ 19 | ✅ 20 |
+| M2 | exemption ignored | ✅ 75 | ✅ 79 |
+| M3 | `[AllowAnonymous]` off `/login` | ✅ 54 | ✅ 55 |
+| M4 | assets not anonymous | ✅ 2 | ✅ 2 |
+| M5 | `UseAuthorization()` removed | ✅ 87 | ✅ 92 |
+| M6 | fallback policy removed | ✅ 1 | ✅ 1 |
+| M7 | landing page 404s | ✅ 18 | ✅ 18 |
+| M8 | gate before `UseAuthentication()` | ✅ 36 | ✅ 36 |
+| M9 | script writes `location.href` | ✅ 1 | ✅ 1 |
+| M10 | nav inverted | ✅ 1 | ✅ **5** — now dies on the anchor audit too, not only the class-name check |
+| M11 | `@rendermode InteractiveServer` | ✅ 53 | ✅ 54 |
+| M12 | explicit `UseRouting()` removed | ❌ survived | ❌ survived **285/285** — unchanged, still deliberate |
+| **X1** | `context.Response.ContentLength` deleted | ❌ survived 281/281 | ✅ **1** — `The_anonymous_response_carries_exactly_the_headers_it_declares` |
+| **B1'** | About link restored to the layout | *(not run)* | ✅ **4** — all four cases of `An_anonymously_reachable_page_links_nowhere_but_the_site_root` |
+
+Checksums for the two new mutants: `MainLayout.razor c24ee560 → 585f24a0`,
+`AnonymousLandingPage.cs 33ffab24 → 84fe4c13`. Both landed; the harness restores and re-verifies each
+file in a `finally`.
+
+### Re-verified on the running app (5171, HTTP, `App_Data` untouched)
+
+- `/login`, `/bootstrap`, `/Error`, `/invite/nope` → **one** anchor each, the brand; no external href,
+  no `target=`.
+- `/`, `/invitations`, `/definitely-not-a-page` → still `200`, `Content-Length: 848`,
+  `Content-Type: text/html; charset=utf-8`, body `sha1 2d50e618…`, no `Cache-Control`, no `Vary`.
+
+**Not actioned, as instructed:** the "Sign in" vs "Login" wording (Product Owner's call), and N4's
+`blazor.web.js` / `ZeroWiki.styles.css` 500s under `WebApplicationFactory` (pre-existing test-host
+artifact that hits members too).
+
+**N5 accepted and worth recording:** component-rendered pages already answer `Cache-Control: no-store,
+no-cache`, so the landing page is the only cacheable response the app emits — a cookie-blind shared
+cache can therefore only serve the *anonymous* page to a member, never the reverse. Good to have that
+said next to AD21.
+
+### Recipe, widened per your three steps — supersedes the one in my first post
+
+You are right that my run is not the PO's evidence, and that the JS-**enabled** path is where the whole
+`returnUrl` mechanism lives. Both halves kept; steps 1a, 6 and 7 are new.
+
+```
+pkill -f ZeroWiki
+cd /Users/rendle/github/emmz/ZeroWiki
+dotnet run --project src/ZeroWiki      # http://localhost:5171 — do NOT delete App_Data
+```
+
+**Part A — JavaScript enabled** (a normal window, signed out):
+
+1. `http://localhost:5171/invitations` → a plain page titled **ZeroWiki**: one link, **Sign in**, no
+   menu, no wiki content.
+   **1a. There must be no "About" link anywhere on it, and none on the sign-in page either** — that
+   link used to sit in the layout and was what made this check necessary.
+2. `http://localhost:5171/definitely-not-a-page` → the **same** page. Nothing says "not found", and the
+   URL stays as typed (no redirect).
+3. Hover **Sign in**: the status bar reads `…/login?returnUrl=%2Finvitations`. Click it, sign in →
+   you land on **/invitations**, not home.
+4. **`/login` must render fully styled** — proper fonts and spacing, not raw unstyled HTML. (The scoped
+   CSS bundle 500s in the test host, so only a real run rules this out.)
+5. Signed in, you should see the menu with **Home** and **Sign out _yourname_**. Sign out → the
+   ZeroWiki/Sign-in page again.
+6. **Mid-session expiry / enhanced navigation:** sign in, open `/invitations`, sign out **in a second
+   tab**, then click a nav link in the first tab. Expect a **full page load** landing on the
+   ZeroWiki/Sign-in page with a working **Sign in** link — *not* a half-merged page, and not a page
+   whose Sign in link does nothing.
+
+**Part B — JavaScript disabled.** Chrome **Settings → Privacy and security → Site settings →
+JavaScript → "Don't allow"**, add `http://localhost:5171` to the *blocked* list, then in a fresh window,
+signed out:
+
+7. `http://localhost:5171/invitations` → same page as step 1. Hover **Sign in**: it must read
+   **`http://localhost:5171/login`** with **no `?returnUrl=`**. Click it, sign in → you land on
+   **home**, signed in. Degraded, never broken.
+
+What would be wrong: any redirect at step 1, 2 or 7 (the URL should stay as typed); the two pages in
+steps 1 and 2 differing in any visible way; a menu or an About link appearing while signed out;
+`/login` rendering unstyled; a half-merged page at step 6; or sign-in failing at step 7.
+
+→ @reviewer
+
+---
+
+_[reviewer] → @architect — Block 6 (6.1–6.3), review round 2. **Approve with nits.** B1 is closed and
+the fix is better than the one I asked for; N1 is closed and I have a mutant proving it bites on a
+header nobody predicted. One new non-blocking note (X7). Nothing blocking remains._
+
+### Verdict
+
+**Approve with nits.** Gates verified independently by me on the current tree: build **0 warn / 0 err**,
+`dotnet test` **285/285**, `openspec validate invite-only-authentication --strict` valid,
+`dotnet format --verify-no-changes` clean, `tasks.md` untouched. Working tree is exactly this block's
+files plus @architect's AD22 spec amendment.
+
+### The bare-`href` claim — confirmed independently, and it is worse than reported
+
+@worker is right and I was wrong. Blazor does not render `href=""` as `href=""` — it renders it with
+**no value and no quotes at all**. Fetched raw, on all four anonymously reachable pages:
+
+```
+<a class="navbar-brand" href b-4dirb8zo57>
+```
+
+I re-ran my round-1 instrument (`<a\b[^>]*\bhref="[^"]*`) against the current pages: it matches
+**zero** anchors, because the only anchor left is the brand and the pattern cannot see it. So in round 1
+those pages carried **two** anchors and I reported **one**. Wrong in the safe direction — the About link
+was the one my pattern *could* see and the finding stood on it — but wrong, and had the About link not
+been there I would have reported "zero anchors, clean" on a page that had one. **The correction is the
+more important half of B1**: the original assertion could not have caught this even if it had counted
+anchors instead of looking for `nav-scrollable`, because both instruments were blind to the same thing.
+`AnchorTag()` (`<a\b[^>]*>`) matches the whole opening tag and sees it. Round-1 figure withdrawn; the
+corrected instrument is sound and is what the guarantee now rests on.
+
+### B1 — closed. Deletion was the better call, and B1' proves the guard
+
+`An_anonymously_reachable_page_links_nowhere_but_the_site_root` over `/login`, `/bootstrap`, `/Error`
+and `/invite/{token}`: **exactly one** anchor, carrying `navbar-brand`, no `://`, no `target=`.
+Independently mutated:
+
+**B1' — About link restored into `MainLayout.razor` → CAUGHT, 4 failures**, sha
+`c24ee560d7bf`→`25bc805150d0`. The regression the round-1 code shipped now dies loudly on all four
+theory cases.
+
+Deleting rather than hiding is right, and for the reason given: hiding leaves a `target="_blank"`
+without `rel="noopener noreferrer"` alive on the login page for members, patched rather than removed.
+AD23 records the member-side consequence as the Product Owner's call, so I treat it as intended and
+raise nothing.
+
+### N1 — closed, and I mutated a header nobody named
+
+`The_anonymous_response_carries_exactly_the_headers_it_declares` pins the header **names** to exactly
+`{Content-Length, Content-Type}` and asserts `Content-Length` against bytes read off the wire.
+
+- **X1 — explicit `ContentLength` dropped → now CAUGHT (1 failure)**, sha `33ffab244b81`→`84fe4c13c7fb`.
+  Round-1 survivor, dead.
+- **X8 (new) — the landing response emits `Cache-Control: public, max-age=60` → CAUGHT (1 failure)**,
+  sha `33ffab244b81`→`814d724a6e52`. This is the part I wanted proved rather than asserted: the pin
+  catches a header **by the set being closed**, not by anyone having predicted the name. AD21's "the app
+  emits no cache directives" is now a property of the test rather than a hope.
+
+Asserting the declared length against the delivered bytes rather than a literal `848` is better than
+what I suggested — a literal would have to be edited every time the page's copy changes, and an
+assertion people edit to make green is not an assertion.
+
+### `MainLayout.razor.css` — nothing else went with it
+
+Checked line by line:
+
+- The `article` padding rule survives, correctly reduced from `.top-row, article` to `article` inside
+  `@media (min-width: 641px)`.
+- `.page`, `main`, `.sidebar`, the sidebar sticky/width block and the whole `#blazor-error-ui` block are
+  untouched.
+- Everything removed was `.top-row`-scoped, including the `max-width: 640.98px` block and
+  `.top-row.auth ::deep a:first-child` — all of it addressed the deleted div. CSS isolation means those
+  rules only ever matched elements declared in `MainLayout.razor`, so they could not have been styling
+  anything else.
+- **The sidebar brand bar is unaffected:** `NavMenu.razor` still declares `<div class="top-row …">` and
+  its styling lives in `NavMenu.razor.css:18` (`min-height: 3.5rem; background-color: rgba(0,0,0,0.4)`),
+  which this diff does not touch. `grep` finds no dangling `top-row` reference anywhere else in `src/`
+  or `tests/`.
+
+### Full round-2 mutation table — 12 mutants, re-run by me
+
+Byte-level replacement, `sha256` before/after with a no-op guard, restore + checksum re-verify in a
+`finally`, **full `dotnet test` every time, never a filter.** Baseline 285/285.
+
+| # | mutation | result | sha256(12) before→after |
+|---|---|---|---|
+| M1 | gate removed | ✅ CAUGHT 20 | `54237dfc`→`028d2c6b` |
+| M2 | gate ignores `[AllowAnonymous]` | ✅ CAUGHT 79 | `d461bc04`→`b8708e39` |
+| M5 | `UseAuthorization()` removed (AD16 trap) | ✅ CAUGHT **92** | `54237dfc`→`3c2d28ef` |
+| M7 | landing page answers `404` | ✅ CAUGHT 18 | `33ffab24`→`cb71b5bb` |
+| M9 | script writes `location.href` | ✅ CAUGHT 1 | `33ffab24`→`8f47a5e5` |
+| M10 | nav inverted | ✅ CAUGHT **5** (was 1) | `47a69901`→`135acf63` |
+| M12 | explicit `app.UseRouting()` removed | ❌ survived 285/285 — **deliberate, agreed** | `54237dfc`→`f87377a7` |
+| X1 | explicit `Content-Length` dropped | ✅ **CAUGHT 1** (was surviving) | `33ffab24`→`84fe4c13` |
+| X4 | gate swallows authenticated requests too | ✅ CAUGHT 36 | `d461bc04`→`52f60de7` |
+| **B1'** | About link restored | ✅ **CAUGHT 4** | `c24ee560`→`25bc8051` |
+| **X7** | brand anchor → `href="//evil.example"` | ❌ **SURVIVED 285/285** — see below | `47a69901`→`8cfa1d03` |
+| **X8** | unpredicted `Cache-Control` on the landing response | ✅ **CAUGHT 1** | `33ffab24`→`814d724a` |
+
+Every count reproduces @worker's report. M5 is now **92** and M10 **5** — both up, because the four new
+tests are member-side-aware too. M12 unchanged and unchanged for the right reason.
+
+### X7 (new note, non-blocking) — the surviving brand anchor is checked by two negatives, and one has a hole
+
+`An_anonymously_reachable_page_links_nowhere_but_the_site_root` checks the brand with
+`DoesNotContain("://")` and `DoesNotContain("target=")`. A **protocol-relative** href satisfies both:
+
+**X7 — `<a class="navbar-brand" href="//evil.example">` in `NavMenu.razor` → SURVIVED 285/285**, sha
+`47a69901`→`8cfa1d03`.
+
+That is an off-origin link on `/login`, `/bootstrap`, `/Error` and the redemption page, passing the very
+test written to stop off-origin links on those pages. It is **not** exploitable as it stands — the href
+is a source literal, not attacker-controlled, so reaching it needs someone to edit `NavMenu.razor` — and
+`//host` is exactly the shape §5's open-redirect finding was about, which is why `LocalUrl.IsLocal`
+already exists and already rejects it (`LocalUrl.cs:28`).
+
+Suggested, cheap, and entirely optional: pull the href out of the matched tag and assert
+`LocalUrl.IsLocal(href) || string.IsNullOrEmpty(href)` instead of the two `DoesNotContain`s — one
+positive assertion, reusing the boundary the project already trusts, and it kills X7. **Not blocking:**
+the block's requirement (no navigation exposed to anonymous visitors) is asserted and B1' proves it; this
+is a sharper edge on a guard that already works.
+
+### Also worth one line, neither blocking
+
+- **AD22 closes my round-1 `❓`.** Noted that the guarantee is structural either way; the visible *word*
+  "Sign in" is still not asserted anywhere (`AssertIsAnonymousLandingPageAsync` compares the constant to
+  itself, so it cannot see a text change). Given AD22 explicitly says the property does not rest on the
+  word, I would leave it — recorded only so nobody later assumes the string is pinned.
+- **`ComparableHeaders` excludes `Date` and is measured through `TestServer`.** A real Kestrel adds
+  `Server:` that the test host does not, so "exactly these two" is a statement about what *the app*
+  declares, not about the bytes on the wire in production. That is the right thing to assert for AD21
+  ("the app emits no cache directives") and @worker's 5171 run already confirmed the wire form. No action.
+- Everything from round 1's notes N2–N7 still holds and none regressed: no accidental `IAllowAnonymous`,
+  opaque redirection still unreachable for local targets, C# idiom clean, scope still §6-only.
+
+### Sign-off and the human check
+
+**No blockers. Approve with nits** — X7 is the only open suggestion and I am content for it to land as
+it is, or in §7 when the account affordances touch the navigation again.
+
+The revised Product-Owner recipe is right, and it now covers the three things I asked for (styling,
+mid-session enhanced navigation, and no About link) as well as both scripting states. **6.1 and 6.2
+still must not be ticked on gates alone** — they need the Product Owner's confirmation. 6.3 needs no
+human.
+
+→ @architect
+
+---
+
+_[worker] → @architect — Block 6, round 3. **X7 landed** at the Architect's request. Gates: build
+**0 warn / 0 err**, **285/285**, `--strict` valid, format clean, `tasks.md` untouched. No new
+surprises._
+
+**X7 — the two negatives are replaced by one positive assertion.** `An_anonymously_reachable_page_
+links_nowhere_but_the_site_root` no longer checks the brand anchor with `DoesNotContain("://")` and
+`DoesNotContain("target=")` — both of which `//evil.example` satisfies. It now extracts the href and
+asserts `string.IsNullOrEmpty(href) || LocalUrl.IsLocal(href)`: one positive claim, reusing the
+boundary the project already trusts and already tests, instead of two negatives that would each have
+to anticipate a hostile spelling.
+
+Agreed on why it was worth doing now rather than in §7. `//host` is the **third** appearance of this
+shape in this change — §5's path-only redirect assertion that read `//evil.example` as "redirected
+home", `A_hostile_return_url_arriving_the_same_way_is_still_rejected` written *because* of it, and now
+an off-origin-link test that accepted an off-origin link. Two of the three were assertions, not code.
+The pattern is not "we keep writing open redirects", it is **"we keep writing checks that a
+protocol-relative URL walks past"** — so the fix is to stop hand-rolling the check at all, which is
+what `LocalUrl.IsLocal` is for.
+
+**Extraction detail, since it is where this could have gone wrong quietly.** `HrefAttribute()`'s value
+group is *optional*, because a bare `href` with no value and no quotes is the normal rendering here —
+your round-1 correction is exactly the trap, and a pattern that required `="…"` would have found no
+href, extracted the empty string by accident, and passed for the wrong reason. It is also anchored on
+`\s` rather than `\b` so it cannot match the tail of a `data-href`. The empty case is asserted local
+on its own merits: `href=""` resolves against `<base href="/">`.
+
+**Mutation verification — three hostile spellings, not one.** Checksummed before/after, full
+`dotnet test`, no filter.
+
+| # | Mutation to `NavMenu.razor` brand href | Result |
+|---|---|---|
+| **X7** | `href="//evil.example"` (protocol-relative — your finding) | ✅ caught, **4** — all four cases of the audit. `47a69901 → 8cfa1d03` |
+| **X7b** | `href="/\evil.example"` (the backslash variant browsers normalise) | ✅ caught, **5**. `47a69901 → f64b45ff` |
+| **X7c** | `href="https://evil.example"` (plain absolute — what the old `://` negative did catch) | ✅ caught, **4**. `47a69901 → 49dc1a74` |
+
+X7b's fifth failure is `BootstrapPageTests.Submitting_without_an_antiforgery_token_is_rejected`, an
+incidental side effect of a backslash in rendered markup, not a second real signal.
+
+Re-verified unchanged alongside it, since all three touch the same files: **M10** nav inverted ✅ 5,
+**B1'** About link restored ✅ 4, **X1** `ContentLength` deleted ✅ 1. Tree confirmed free of mutation
+residue afterwards (`MainLayout.razor` has no template link, `AnonymousLandingPage.cs` has its
+`ContentLength`, `NavMenu.razor` brand is back to `href=""`, `AuthorizeView` intact).
+
+**AD22 — nothing to do.** §6 already ships "Sign in"/"Sign out"; the spec moved to the code, not the
+other way round, and the test asserts the structural property (one anchor, pointing at `/login`) rather
+than the word, so it is unaffected either way.
+
+**Unchanged and still true:** 6.1 and 6.2 must not be ticked on gates alone — the widened
+Product-Owner recipe above stands, both scripting states. 6.3 needs no human. M12 still survives
+285/285 and is still deliberate.
+
+→ @architect
+
+---
 
 - **Block 1 (§1.1–1.4)** ✅ committed by @architect — reviewer-approved, all four gates green
   (build 0/0, test 7/7, format clean, validate strict OK). Solution scaffolded, identity store live.
@@ -5140,9 +6024,74 @@ this list" reviewable as one statement.
 
 ---
 
-### ▶ RESUME HERE — §6 (anonymous experience & access control)
+### ▶ RESUME HERE — §7 (git access tokens, account UI)
 
-**State: 18/31 tasks ticked. §1, §2, §3, §4, §5 all complete.** *(Counted from `tasks.md`, not carried
+**State: 19/31 tasks ticked** *(counted from `tasks.md`, not carried forward — see the standing
+warning below)*. **§1, §2, §3, §4, §5 complete; §6 committed with 6.3 ticked and 6.1/6.2 open on the
+Product Owner's browser check**, exactly as §3.2, §5.3 and §4.2 were. Working tree clean, branch
+`change/invite-only-authentication`. All four gates green at HEAD, verified by the Architect
+independently of both agents: build 0/0, **285 tests**, `--strict` valid, format clean.
+
+**Two tasks are deliberately unticked and are not forgotten work.** 6.1 and 6.2 are implemented,
+reviewed and green; what they lack is the Product Owner walking the recipe in a real browser across
+**both scripting states**. The recipe is in the `## 6.` thread. **Do not tick them on gates alone**,
+and do not treat §7 as blocked by them — §7 has no dependency on that confirmation.
+
+**§6 landed under AD21–AD23, which changed things §7 inherits:**
+
+- **AD21** — there is no 302-to-login anywhere any more. An unauthenticated request to any
+  non-exempt URL gets one byte-identical 200 page. **§7's account page is protected by default**
+  (the `FallbackPolicy` plus `AnonymousGate`) and needs no `[Authorize]` to be denied to anonymous —
+  but see the note below on asserting that rather than assuming it.
+- **The exemption is `[AllowAnonymous]` endpoint metadata**, read by both the gate and the fallback
+  policy so there is one list, not two that drift. §7 adds nothing anonymous; if it thinks it needs
+  to, that is a design question, not a local fix.
+- **AD22** — the affordance reads **"Sign in"/"Sign out"**, and `specs/authentication/spec.md` was
+  amended to match. `tasks.md`'s 6.1 text still says "Login" and 6.2 still says "redirect to login";
+  both predate AD21/AD22 and were **left unrewritten on purpose** (AD7's precedent: a correction
+  within a task is not new work). The spec, not `tasks.md`, is the authority.
+- **AD23** — there is no layout header bar. If §7 wants somewhere to hang account affordances, the
+  Product Owner has already said the top bar can come back for it; that is a normal piece of work,
+  not a regression to undo quietly.
+
+**The §7 projection note is now due — it has been carried since AD7 and §5 and this is the block it
+bites.** A `ToListAsync()` over `Account` entities **throws** if any single row has a corrupt
+value-converted timestamp, so one bad row poisons a list everyone reads. `InvitationService.
+ListAsync`'s join is the shape to copy; its `<remarks>` states precisely what that shape does and
+does not buy. §5's account lookup projects for the same reason.
+
+**What §6 proved about this suite, which §7 should assume applies to it too:**
+
+- **Both instruments were blind in the same place.** The reviewer's anchor pattern and the worker's
+  both required `href="…"`, and Blazor renders `href=""` as a bare, unquoted `href` — so both were
+  blind to the same anchor, and the round-1 "exactly one anchor" figure was withdrawn. The B1 finding
+  only surfaced because the offending link happened to be the one thing the broken pattern could see.
+  **A measurement agreeing with another measurement is not corroboration when both share a blind
+  spot.**
+- **`//host` walked past a check for the third time** (X7) — after §5's path-only redirect assertion
+  and the test written because of it. Two of the three were *assertions*, not code. The standing fix
+  is to stop hand-rolling the check: assert `LocalUrl.IsLocal(...)` positively rather than stacking
+  `DoesNotContain` negatives that must each anticipate a hostile spelling.
+- **A closed set beats a predicted one.** The anonymous response pins its header *names* to exactly
+  `{Content-Length, Content-Type}`, which caught a mutated-in `Cache-Control` nobody had named.
+  Prefer assertions that fail on the unforeseen addition.
+- **M12 survives deliberately** — removing the explicit `app.UseRouting()` changes nothing, because
+  `WebApplication` auto-inserts routing. The line is kept anyway: the gate's ordering dependency is a
+  security property and should be stated where it lives rather than inherited from an insertion point
+  the framework does not contract. Worker measured it, disproved its own comment, and corrected the
+  comment rather than the measurement.
+
+**Still open, unchanged:** AD9 (raising Argon2 constants owes rehash-on-verify); Block 4b's declined
+notes N2 (`OpenConnectionAsync` never closed, shared with `BootstrapService`, so it is a §3 change
+too), N3, N4, N6, N8; and §5's log-secrecy sweep still using `Messages` where `Written` is the
+stronger instrument — **§9 should move it**, since a value passed via `BeginScope` reaches a
+structured sink while appearing in no message.
+
+---
+
+**Superseded — the §6 resume note.** Kept for the record; §6 is committed.
+
+**State was: 18/31 tasks ticked. §1, §2, §3, §4, §5 all complete.** *(Counted from `tasks.md`, not carried
 forward: the pre-§4 resume note said "15/31" but the real figure was 13/31 — §1 4 + §2 3 + §3 3 + §5 3.
 The error rode along through 4a and 4b before being caught here. **Count the file; do not trust the
 previous note's arithmetic.**)* §4 landed as two blocks — 4a (4.1, 4.4)

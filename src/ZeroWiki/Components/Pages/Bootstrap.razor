@@ -1,4 +1,8 @@
 @page "/bootstrap"
+@* Load-bearing exemption (AD21): on a first run there is no account to authenticate as, so a
+   swallowed /bootstrap makes the wiki impossible to start. The page is inert the instant any
+   account exists, and it never advertises which of the two states it is in. *@
+@attribute [AllowAnonymous]
 @using ZeroWiki.Identity
 @inject BootstrapService BootstrapService
 @inject NavigationManager Navigation

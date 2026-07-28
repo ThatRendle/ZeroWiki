@@ -1,9 +1,24 @@
 using System.Net;
+using ZeroWiki.Web;
 
 namespace ZeroWiki.Tests.Web;
 
 public static class HttpAssertions
 {
+    /// <summary>
+    /// Asserts the response is the one page every unauthenticated request gets (AD21) — which is
+    /// also the only shape an anonymous denial takes, since nothing redirects a stranger to login.
+    /// </summary>
+    public static async Task AssertIsAnonymousLandingPageAsync(HttpResponseMessage response)
+    {
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        Assert.Equal(AnonymousLandingPage.Html, await response.Content.ReadAsStringAsync());
+    }
+
+    /// <summary>Asserts the caller was served something of its own rather than the landing page.</summary>
+    public static async Task AssertIsNotAnonymousLandingPageAsync(HttpResponseMessage response) =>
+        Assert.NotEqual(AnonymousLandingPage.Html, await response.Content.ReadAsStringAsync());
+
     /// <summary>
     /// Asserts a redirect to a path <em>on this site</em>.
     /// </summary>

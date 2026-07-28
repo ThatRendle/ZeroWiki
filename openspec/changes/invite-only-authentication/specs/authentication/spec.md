@@ -23,14 +23,14 @@ The system SHALL maintain an authenticated session for a logged-in user and SHAL
 - **WHEN** an authenticated user logs out
 - **THEN** subsequent requests are treated as unauthenticated
 
-### Requirement: Anonymous home shows only Login
+### Requirement: Anonymous home shows only Sign in
 
-The system SHALL present unauthenticated visitors a home page that exposes only a "Login" link, and SHALL NOT expose wiki content or navigation to anonymous visitors.
+The system SHALL present unauthenticated visitors a home page that exposes only a "Sign in" link, and SHALL NOT expose wiki content or navigation to anonymous visitors.
 
-#### Scenario: Anonymous visitor sees Login only
+#### Scenario: Anonymous visitor sees Sign in only
 
 - **WHEN** an unauthenticated visitor loads the home page
-- **THEN** the page shows a "Login" link and no wiki content or navigation
+- **THEN** the page shows a "Sign in" link and no wiki content or navigation
 
 #### Scenario: Anonymous access to content is denied
 

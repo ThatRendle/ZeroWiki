@@ -1,8 +1,10 @@
 using Microsoft.AspNetCore.Authentication.Cookies;
+using Microsoft.AspNetCore.Authorization;
 using ZeroWiki.Components;
 using ZeroWiki.Data;
 using ZeroWiki.Identity;
 using ZeroWiki.Security;
+using ZeroWiki.Web;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -46,11 +48,21 @@ builder.Services
 // 'IServiceCollection.AddAuthorization'". (Removing this *and* the UseAuthorization() call below
 // gives the different, more familiar "Endpoint ... contains authorization metadata, but a
 // middleware was not found that supports authorization" — a distinct experiment, quoted here only
-// so the two are not confused.) Locking the site down by default is §6's job, not this.
-builder.Services.AddAuthorization();
+// so the two are not confused.)
+builder.Services.AddAuthorization(options =>
+{
+    // Every endpoint requires an account unless it opts out with [AllowAnonymous]. This is not what
+    // implements AD21 — AnonymousGate is, and it runs first — it is what still holds if AnonymousGate
+    // is ever removed: a fallback policy cannot answer a request that matched no endpoint, but it
+    // can stop a matched one serving content to a stranger. Both read the same [AllowAnonymous]
+    // metadata, so there is one exemption list rather than two that can drift.
+    options.FallbackPolicy = new AuthorizationPolicyBuilder()
+        .RequireAuthenticatedUser()
+        .Build();
+});
 
-// Supplies the cascading AuthenticationState an AuthorizeView or AuthorizeRouteView reads. Nothing
-// renders one yet; §6 and §7 will.
+// Supplies the cascading AuthenticationState the navigation's AuthorizeView and AuthorizeRouteView
+// read.
 builder.Services.AddCascadingAuthenticationState();
 
 var app = builder.Build();
@@ -68,7 +80,17 @@ if (!app.Environment.IsDevelopment())
 app.UseStatusCodePagesWithReExecute("/not-found", createScopeForStatusCodePages: true);
 app.UseHttpsRedirection();
 
-// Establishes HttpContext.User, then enforces the [Authorize] attributes individual pages carry.
+// AnonymousGate reads a request's [AllowAnonymous] off its endpoint, so routing has to have run
+// before it — otherwise there is nothing to read and /login is swallowed with everything else.
+//
+// Named explicitly, and honestly: removing this line changes nothing today, because WebApplication
+// auto-inserts routing at the front of the pipeline. It is measured as a surviving mutant, kept
+// because the gate's ordering dependency is a security property and reading it off an insertion
+// point the framework does not contract is how it goes quietly wrong.
+app.UseRouting();
+
+// Establishes HttpContext.User, then answers unauthenticated requests, then enforces the
+// [Authorize] attributes individual pages carry.
 //
 // UseAuthorization() is load-bearing here and its position is the whole point — do not delete it as
 // redundant with AddAuthorization(). WebApplication auto-inserts the authorization middleware at the
@@ -81,13 +103,18 @@ app.UseHttpsRedirection();
 // authenticated requests getting 302 instead of 200 — while *both* anonymous tests stay green. The
 // failure hides behind exactly the tests you would expect to catch it.
 //
-// Denying anonymous access site-wide is §6's job.
+// AnonymousGate sits between the two so that no anonymous request ever reaches the authorization
+// middleware's challenge, which is a 302 to /login and would reintroduce exactly the existence
+// oracle AD21 closes.
 app.UseAuthentication();
+app.UseMiddleware<AnonymousGate>();
 app.UseAuthorization();
 
 app.UseAntiforgery();
 
-app.MapStaticAssets();
+// Anonymous by necessity: the login page has to be able to load its stylesheet, and swallowing the
+// assets would leave it unstyled for precisely the visitors who need it.
+app.MapStaticAssets().AllowAnonymous();
 app.MapRazorComponents<App>();
 
 app.Run();

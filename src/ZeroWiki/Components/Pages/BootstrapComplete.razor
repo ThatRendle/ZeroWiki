@@ -1,4 +1,7 @@
 @page "/bootstrap/complete"
+@* Exempt for the same reason /bootstrap is: it is where the first administrator lands, and they
+   have not signed in yet. *@
+@attribute [AllowAnonymous]
 @using ZeroWiki.Identity
 @inject BootstrapService BootstrapService
 @inject NavigationManager Navigation

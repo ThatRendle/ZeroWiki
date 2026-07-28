@@ -5,11 +5,12 @@
         <NavMenu />
     </div>
 
+    @* No header bar. It existed to hold the project template's "About" link to the ASP.NET Core
+       docs, which is not ZeroWiki navigation and rendered on every page an anonymous visitor can
+       reach — making "SHALL NOT expose … navigation to anonymous visitors" false on /login,
+       /bootstrap, /Error and the redemption page. Removing it settles that unconditionally, and
+       takes the unaccompanied target="_blank" with it. *@
     <main>
-        <div class="top-row px-4">
-            <a href="https://learn.microsoft.com/aspnet/core/" target="_blank">About</a>
-        </div>
-
         <article class="content px-4">
             @Body
         </article>

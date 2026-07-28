@@ -1,4 +1,7 @@
 @page "/login"
+@* Exempt from the anonymous landing page (AD21) — signing in is what an anonymous visitor is here
+   to do, and it is the only route in the system that mints a session (AD18). *@
+@attribute [AllowAnonymous]
 @using System.Security.Claims
 @using Microsoft.AspNetCore.Authentication
 @using Microsoft.AspNetCore.Authentication.Cookies

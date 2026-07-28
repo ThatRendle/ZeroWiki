@@ -1,4 +1,7 @@
 ﻿@page "/Error"
+@* Exempt because UseExceptionHandler re-executes into it, and a failure on an anonymous page must
+   report a failure rather than silently turning into the landing page. It carries no content. *@
+@attribute [AllowAnonymous]
 @using System.Diagnostics
 
 <PageTitle>Error</PageTitle>

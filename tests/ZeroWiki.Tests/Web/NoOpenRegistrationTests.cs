@@ -4,6 +4,7 @@ using Microsoft.Extensions.DependencyInjection;
 using ZeroWiki.Data;
 using ZeroWiki.Identity;
 using ZeroWiki.Security;
+using ZeroWiki.Web;
 
 namespace ZeroWiki.Tests.Web;
 
@@ -22,9 +23,9 @@ namespace ZeroWiki.Tests.Web;
 /// </para>
 /// <para>
 /// Reachability is measured by <em>asking the running site</em>, not by reading
-/// <c>[Authorize]</c> metadata off each endpoint. §6 denies anonymous access with a fallback policy
-/// that lives in the authorization middleware's options and not in endpoint metadata, so a
-/// metadata-driven version of this test would quietly stop meaning anything the moment §6 landed.
+/// <c>[AllowAnonymous]</c> metadata off each endpoint. That metadata is exactly what §6's gate
+/// consults to decide, so a metadata-driven version of this test would be asserting the gate's
+/// input against itself and would pass however the gate behaved.
 /// </para>
 /// </remarks>
 public sealed class NoOpenRegistrationTests : IDisposable
@@ -40,20 +41,21 @@ public sealed class NoOpenRegistrationTests : IDisposable
     /// Exactly two members can create an <see cref="Account"/>, and each is gated:
     /// <c>/bootstrap</c> is inert the instant any account exists, and <c>/invite/{Token}</c>
     /// refuses anything but a token matching a stored hash. Both gates are asserted below. The rest
-    /// read, sign in, sign out, or report an error. A self-service registration route would have to
-    /// be added to this list to make the suite green again.
+    /// sign in, confirm a completed bootstrap, or report an error. A self-service registration
+    /// route would have to be added to this list to make the suite green again.
+    /// <para>
+    /// Shorter than it was before §6: <c>/</c>, <c>/logout</c>, <c>/not-found</c> and
+    /// <c>/_framework/opaque-redirect</c> left it when AD21 made every non-exempt URL answer an
+    /// anonymous caller with the landing page.
+    /// </para>
     /// </remarks>
     private static readonly string[] AnonymouslyReachableRoutes =
     [
-        "/",
         "/Error",
-        "/_framework/opaque-redirect",
         "/bootstrap",
         "/bootstrap/complete",
         InvitationRedemptionRoute,
         "/login",
-        "/logout",
-        "/not-found",
     ];
 
     private readonly ZeroWikiAppFactory _app = new();
@@ -67,7 +69,7 @@ public sealed class NoOpenRegistrationTests : IDisposable
 
         foreach (var route in await RoutesAsync())
         {
-            if (!IsDeniedToAnonymous(await _app.CreateHttpClient().GetAsync(ProbeUrl(route))))
+            if (!await IsDeniedToAnonymousAsync(await _app.CreateHttpClient().GetAsync(ProbeUrl(route))))
             {
                 reachable.Add(route);
             }
@@ -167,27 +169,15 @@ public sealed class NoOpenRegistrationTests : IDisposable
         route.Replace("{Token}", token, StringComparison.Ordinal);
 
     /// <remarks>
-    /// A 302 to <c>/login</c> is the shape a denial takes here, because the cookie handler
-    /// challenges rather than returning 401. Anything else — including <c>/bootstrap</c>'s redirect
-    /// to <c>/</c> when it is inert — counts as reached, which is the conservative direction: it
-    /// puts more routes in front of the assertion, not fewer.
+    /// The landing page is the only shape a denial takes under AD21, and it is served to
+    /// unauthenticated callers and to nobody else, so recognising it byte-for-byte is exact rather
+    /// than heuristic. Anything else — including <c>/bootstrap</c>'s redirect to <c>/</c> when it is
+    /// inert — counts as reached, which is the conservative direction: it puts more routes in front
+    /// of the assertion, not fewer.
     /// </remarks>
-    private static bool IsDeniedToAnonymous(HttpResponseMessage response)
-    {
-        if (response.StatusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden)
-        {
-            return true;
-        }
-
-        if (response.StatusCode is not HttpStatusCode.Redirect || response.Headers.Location is not { } location)
-        {
-            return false;
-        }
-
-        var target = location.IsAbsoluteUri ? location : new Uri(ZeroWikiAppFactory.BaseAddress, location);
-
-        return target.AbsolutePath == "/login";
-    }
+    private static async Task<bool> IsDeniedToAnonymousAsync(HttpResponseMessage response) =>
+        response.StatusCode is HttpStatusCode.OK
+        && await response.Content.ReadAsStringAsync() == AnonymousLandingPage.Html;
 
     private async Task<IReadOnlyList<string>> PagesCollectingAPasswordAsync(string token)
     {

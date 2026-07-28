@@ -25,20 +25,15 @@ public sealed partial class InvitationsPageTests : IDisposable
     public void Dispose() => _app.Dispose();
 
     [Fact]
-    public async Task An_anonymous_visitor_is_sent_to_login_instead_of_the_page()
+    public async Task An_anonymous_visitor_gets_the_landing_page_instead_of_the_page()
     {
         // "As an authenticated member" is half of the requirement, and without this test it is one
-        // forgotten attribute away from being false.
+        // forgotten attribute away from being false. Under AD21 the denial is the landing page
+        // rather than a 302 to login, so that this URL is indistinguishable from one that does not
+        // exist; AnonymousAccessTests is where that indistinguishability itself is asserted.
         var response = await _app.CreateHttpClient().GetAsync(Page);
 
-        Assert.Equal(HttpStatusCode.Redirect, response.StatusCode);
-
-        var location = Assert.IsType<Uri>(response.Headers.Location);
-        var target = location.IsAbsoluteUri ? location : new Uri(ZeroWikiAppFactory.BaseAddress, location);
-        Assert.Equal(ZeroWikiAppFactory.BaseAddress.Authority, target.Authority);
-        Assert.Equal("/login", target.AbsolutePath);
-        Assert.Contains(Uri.EscapeDataString(Page), target.Query, StringComparison.OrdinalIgnoreCase);
-
+        await HttpAssertions.AssertIsAnonymousLandingPageAsync(response);
         Assert.DoesNotContain(
             "Create an invitation",
             await response.Content.ReadAsStringAsync(),
@@ -55,7 +50,7 @@ public sealed partial class InvitationsPageTests : IDisposable
             Page,
             [KeyValuePair.Create("_handler", IssueForm)]);
 
-        Assert.Equal(HttpStatusCode.Redirect, response.StatusCode);
+        await HttpAssertions.AssertIsAnonymousLandingPageAsync(response);
         Assert.Empty(await GetInvitationsAsync());
     }
 

@@ -87,9 +87,9 @@ public sealed partial class RedeemInvitationPageTests : IDisposable
         var setCookies = response.Headers.TryGetValues("Set-Cookie", out var headers) ? headers : [];
         Assert.DoesNotContain(setCookies, header => header.StartsWith("ZeroWiki.Authentication=", StringComparison.Ordinal));
 
-        var guarded = await invitee.GetAsync("/invitations");
-        Assert.Equal(HttpStatusCode.Redirect, guarded.StatusCode);
-        Assert.Contains("/login", Assert.IsType<Uri>(guarded.Headers.Location).ToString(), StringComparison.Ordinal);
+        // A page requiring a session answers an unauthenticated caller with the landing page and
+        // nothing else (AD21), so getting it back is the observable form of "holds no session".
+        await HttpAssertions.AssertIsAnonymousLandingPageAsync(await invitee.GetAsync("/invitations"));
     }
 
     [Fact]

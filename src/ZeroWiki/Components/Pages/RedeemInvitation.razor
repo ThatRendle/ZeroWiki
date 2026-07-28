@@ -1,4 +1,7 @@
 @page "/invite/{Token}"
+@* Load-bearing exemption (AD21): redemption is necessarily anonymous, because the invitee has no
+   account until this page creates one. The token, not a session, is what gates it. *@
+@attribute [AllowAnonymous]
 @using ZeroWiki.Identity
 @inject InvitationService InvitationService
 @inject NavigationManager Navigation

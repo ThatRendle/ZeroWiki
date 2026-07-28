@@ -49,9 +49,13 @@ Use the framework's session primitive (cookie authentication) rather than hand-r
 
 ### D5 — Uniform auth failures; anonymous sees only Login
 
-Login rejects unknown-username and wrong-password with the same generic error. Anonymous visitors get a home page with only a "Login" link, and direct requests to content are denied and redirected to login.
+Login rejects unknown-username and wrong-password with the same generic error. Anonymous visitors get a page with only a "Login" link and no navigation, and direct requests to content are denied by returning that same page rather than by redirecting.
 
-*Why:* avoids username enumeration and avoids leaking the existence or structure of content to the public.
+The denial is deliberately **not** a redirect to login (amended 2026-07-27, AD21). An unauthenticated request to **any** URL outside a small exempt set — `/login`, `/bootstrap`, `/bootstrap/complete`, the invitation redemption route, `/Error`, and static assets — returns the identical response: `200`, the same body, the same headers, whether the URL exists and is protected or does not exist at all. A redirect-only scheme distinguishes the two, so a stranger can map the site by probing names; returning one URL-independent page closes that oracle and makes the anonymous response cacheable at an edge. The status is `200` rather than `401` (which §8's git Smart HTTP needs for real, with a `WWW-Authenticate` challenge) or `404` (which would move the same oracle into the status line). Because a request matching no endpoint carries no authorization metadata, this cannot be a fallback authorization policy alone: it is middleware that covers matched and unmatched routes alike, with the fallback policy behind it as defence in depth.
+
+The requested URL is carried to login by a small inline script that rewrites the link to `/login?returnUrl=<pathname + search>`, so the HTML itself stays URL-independent; with scripting disabled the link stays a bare `/login` and sign-in lands on the home page. The script is a convenience, not a trust boundary — the value arrives at login as an ordinary attacker-controlled query string, and the server-side local-only check is what holds.
+
+*Why:* avoids username enumeration and avoids leaking the existence or structure of content — including which URLs exist — to the public.
 
 ### D6 — Identity store: SQLite on the volume
 

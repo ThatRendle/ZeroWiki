@@ -132,7 +132,12 @@ public sealed partial class LoginPageTests : IDisposable
         var response = await StaticSsrForm.PostAsync(client, "/logout", fields);
 
         AssertRedirectedTo("/", response);
-        Assert.Contains("You are not signed in.", await client.GetStringAsync("/logout"), StringComparison.Ordinal);
+
+        // The landing page is served to unauthenticated requests and to nothing else (AD21), so
+        // getting it back from a page that needs a session is the observable form of "no longer
+        // authenticated". Before AD21 this asserted the signed-out branch of /logout, which the
+        // gate now answers before the component is ever reached.
+        await HttpAssertions.AssertIsAnonymousLandingPageAsync(await client.GetAsync("/logout"));
     }
 
     [Fact]

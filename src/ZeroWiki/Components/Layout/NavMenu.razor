@@ -1,18 +1,32 @@
-﻿<div class="top-row ps-3 navbar navbar-dark">
+<div class="top-row ps-3 navbar navbar-dark">
     <div class="container-fluid">
         <a class="navbar-brand" href="">ZeroWiki</a>
     </div>
 </div>
 
-<input type="checkbox" title="Navigation menu" class="navbar-toggler" />
+@* Navigation exists only for members. An anonymous visitor reaches this layout on the handful of
+   [AllowAnonymous] pages — sign in, bootstrap, redeem — and gets no links from it there either, so
+   "no navigation to anonymous visitors" holds on every page they can see, not just the landing
+   page. AuthorizeView is why AddCascadingAuthenticationState() is registered (AD16). *@
+<AuthorizeView>
+    <Authorized>
+        <input type="checkbox" title="Navigation menu" class="navbar-toggler" />
 
-<div class="nav-scrollable" onclick="document.querySelector('.navbar-toggler').click()">
-    <nav class="nav flex-column">
-        <div class="nav-item px-3">
-            <NavLink class="nav-link" href="" Match="NavLinkMatch.All">
-                <span class="bi bi-house-door-fill-nav-menu" aria-hidden="true"></span> Home
-            </NavLink>
+        <div class="nav-scrollable" onclick="document.querySelector('.navbar-toggler').click()">
+            <nav class="nav flex-column">
+                <div class="nav-item px-3">
+                    <NavLink class="nav-link" href="" Match="NavLinkMatch.All">
+                        <span class="bi bi-house-door-fill-nav-menu" aria-hidden="true"></span> Home
+                    </NavLink>
+                </div>
+                <div class="nav-item px-3">
+                    @* A link, not a button: signing out is a POST carrying an antiforgery token, and
+                       the /logout page is where that form lives. *@
+                    <NavLink class="nav-link" href="logout">
+                        Sign out @context.User.Identity?.Name
+                    </NavLink>
+                </div>
+            </nav>
         </div>
-    </nav>
-</div>
-
+    </Authorized>
+</AuthorizeView>
