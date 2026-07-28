@@ -33,8 +33,8 @@
 
 ## 6. Anonymous experience & access control
 
-- [ ] 6.1 Home page shows only a "Login" link for unauthenticated visitors
-- [ ] 6.2 Deny anonymous access to content/other pages and redirect to login
+- [x] 6.1 Home page shows only a "Login" link for unauthenticated visitors
+- [x] 6.2 Deny anonymous access to content/other pages and redirect to login
 - [x] 6.3 Ensure auth pages render as Static SSR (no persistent circuit)
 
 ## 7. Git access tokens (account UI)

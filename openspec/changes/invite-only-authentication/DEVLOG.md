@@ -6026,16 +6026,16 @@ this list" reviewable as one statement.
 
 ### ▶ RESUME HERE — §7 (git access tokens, account UI)
 
-**State: 19/31 tasks ticked** *(counted from `tasks.md`, not carried forward — see the standing
-warning below)*. **§1, §2, §3, §4, §5 complete; §6 committed with 6.3 ticked and 6.1/6.2 open on the
-Product Owner's browser check**, exactly as §3.2, §5.3 and §4.2 were. Working tree clean, branch
+**State: 21/31 tasks ticked** *(counted from `tasks.md`, not carried forward — see the standing
+warning below)*. **§1–§6 all complete.** Working tree clean, branch
 `change/invite-only-authentication`. All four gates green at HEAD, verified by the Architect
 independently of both agents: build 0/0, **285 tests**, `--strict` valid, format clean.
 
-**Two tasks are deliberately unticked and are not forgotten work.** 6.1 and 6.2 are implemented,
-reviewed and green; what they lack is the Product Owner walking the recipe in a real browser across
-**both scripting states**. The recipe is in the `## 6.` thread. **Do not tick them on gates alone**,
-and do not treat §7 as blocked by them — §7 has no dependency on that confirmation.
+**6.1 and 6.2 confirmed by the Product Owner in a real browser (2026-07-28)** — "all worked okay" —
+walking the widened recipe across **both scripting states**: the identical page on a protected and a
+non-existent URL with no redirect, `returnUrl` round-tripping to `/invitations` with scripting on,
+the bare `/login` link landing on home with scripting off, `/login` fully styled, no About link, and
+the mid-session sign-out degrading to a clean full page load. §6 is complete.
 
 **§6 landed under AD21–AD23, which changed things §7 inherits:**
 
