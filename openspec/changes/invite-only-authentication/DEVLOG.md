@@ -246,6 +246,35 @@ Greenfield repo — this change scaffolds the whole solution. Binding calls made
   not name, link to, or otherwise identify the owning account — that is a separate disclosure the
   Product Owner has not been asked about and which no task here requires.
 
+- **AD25 — mutation testing is capped and scoped. Product Owner's decision (2026-07-28),** after §7's
+  harness repair grew disproportionate (agents were running single mutants out to 12–13 full-suite
+  passes). The rigour is not being withdrawn — it caught a live concurrency defect and a
+  half-working `BootstrapConcurrencyTests` — but **this is a wiki for a small trusted group**, and the
+  cost had stopped matching the stakes. Binding on every block from §7b on:
+
+  1. **Cap confirmation runs at 3.** A mutant that dies 3/3 with a consistent, understood failure
+     mode is confirmed. Exceed 3 **only** when results are genuinely flaky or nondeterministic and
+     the point is to characterise that variance — as with M1's 7/13, where the variance *was* the
+     finding.
+  2. **Mutation-test security- and correctness-critical paths only** — realistically
+     `BootstrapService.cs` and anything touching **auth, concurrency, or data integrity**. **Not**
+     general CRUD or wiki-page logic; ordinary unit tests with normal coverage are right there.
+  3. **No polling loops with sleep plus background processes.** If a run must be backgrounded, use a
+     bounded wait with a short timeout (~2 min) and report that it has not resolved.
+  4. **Stop and summarise when the mutant at hand is resolved.** Do not expand to other files without
+     an explicit go-ahead. A genuine finding is **not** licence to keep digging in the same area —
+     fix it and move on.
+
+  **Brief agents with these limits up front, in the block brief.** Reining an agent in afterwards is
+  what produced the overrun.
+
+  **Hazard learned the same day, and it is why this is a pinned decision rather than a note:** a
+  mutation worker stopped mid-run **leaves a live mutant in `src/`**. `BootstrapService.cs` was found
+  with `deferred: false` → `true` still applied after an agent was interrupted — the mutation that
+  breaks "exactly one administrator", sitting in production code with the working tree looking
+  ordinary. **Always `git diff -- src` before committing**, and mutation harnesses must revert via a
+  `trap`/`finally`, never a final step that a stop can skip.
+
 ## 1. Identity store
 
 _[architect] → @worker — Block 1 (tasks 1.1–1.4 + scaffolding). Brief posted; see thread below._
@@ -7352,12 +7381,41 @@ this list" reviewable as one statement.
 
 ---
 
-### ▶ RESUME HERE — §7 (git access tokens, account UI)
+### ▶ RESUME HERE — §7b (task 7.2, git emails)
 
 **State: 21/31 tasks ticked** *(counted from `tasks.md`, not carried forward — see the standing
-warning below)*. **§1–§6 all complete.** Working tree clean, branch
-`change/invite-only-authentication`. All four gates green at HEAD, verified by the Architect
-independently of both agents: build 0/0, **285 tests**, `--strict` valid, format clean.
+warning below)*. **§1–§6 complete. §7a (7.1) committed as `130629c`, deliberately unticked.**
+Working tree clean, branch `change/invite-only-authentication`, HEAD `130629c`. All four gates green
+at HEAD, verified by the Architect independently of both agents: build 0/0, **300 tests**,
+`--strict` valid, format clean. `BootstrapService.cs` and `GitTokenService.cs` both confirmed
+byte-identical to HEAD (see AD25's hazard note — this check is not ceremonial).
+
+**Two things to pick up, in either order — they do not block each other:**
+
+1. **7.1 awaits the Product Owner's browser check** and must not be ticked on gates alone, as 3.2,
+   5.3, 4.2 and 6.1/6.2 all did. The recipe is in the `## 7.` thread: port 5171 over HTTP,
+   `pkill -f ZeroWiki` first, `App_Data` untouched, generic about the username. Its headline step is
+   the browser **Back** button (where shown-once actually leaks), plus a sign-out/sign-in round trip,
+   `grep -F` against a `tee`'d log rather than eyeballing the console, and the 43-character figure
+   measured on the wire.
+2. **§7b = task 7.2 only** — manage the git emails associated with an account. **AD24 already
+   settles its one hard question** (an address claimed by another account is named as such, bounded
+   to *that* it is taken and never *whom* by). It inherits 7a's shape: Static SSR form POSTs,
+   protected by AD21's default-deny, and **no `Account` entity materialised** — 7a closed the §7
+   projection hazard by construction (list from a projection, username off the principal) and 7b must
+   not reopen it. `GitEmail`'s uniqueness is global (`NOCASE` unique index across all accounts),
+   which is what forces AD24.
+
+**Brief §7b with AD25's caps in the brief itself** — 3-run cap, mutation scoped to auth/concurrency/
+data-integrity paths, no polling loops, stop when the mutant resolves. Briefing them up front is the
+whole point of the decision.
+
+**Then §8 → §9.** §8 exposes credential verification and git-email lookup for the Smart HTTP remote;
+note the reviewer's condition that the moment §8 adds path-shaped exemptions, "new page = protected
+by default" stops being automatic and `[Authorize]` becomes load-bearing again. §9 is the test sweep
+— and it now has **measured** evidence, not a suspicion, that the log-secrecy sweep must move from
+`Messages` to `Written`: a token plaintext logged via `BeginScope` passed **298/298** under
+`Messages`, reproduced independently by both worker and reviewer.
 
 **6.1 and 6.2 confirmed by the Product Owner in a real browser (2026-07-28)** — "all worked okay" —
 walking the widened recipe across **both scripting states**: the identical page on a protected and a
