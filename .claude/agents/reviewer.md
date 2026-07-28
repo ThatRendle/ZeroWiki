@@ -124,6 +124,43 @@ section, prefixed **`[reviewer]`**:
 - **Blazor render modes**: interactive behaviour lives only in explicit islands; no accidental global
   circuit; Static SSR pages don't assume circuit state.
 
+## Mutation testing — re-run the worker's table, within these caps
+
+**Do not accept a worker's mutation results on trust** — re-running them is what has caught this
+project's most serious findings. But the exercise is **bounded**, and the caps are binding:
+
+- **Cap confirmation runs at 3.** A mutant that dies 3/3 with a consistent, understood failure mode
+  is confirmed. Exceed 3 **only** when results are genuinely flaky or nondeterministic and
+  characterising that variance *is* the finding — as when a figure read 7/13 and the variance was
+  itself the defect.
+- **Mutate security- and correctness-critical paths only** — auth, concurrency, data integrity. Not
+  general CRUD or wiki-page logic.
+- **No polling loops with sleep plus background processes.** Bounded wait, short timeout (~2 min),
+  report if unresolved.
+- **Stop when the finding is resolved.** Do not expand to other files without the Architect's
+  go-ahead. Report a real finding and move on rather than treating it as licence to keep digging.
+
+**What makes a re-run worth doing:**
+
+- **Verify under the full `dotnet test`, never a filter** — and **check the condition the worker
+  measured under**. A filtered figure is not wrong, it is irrelevant; one such reproduced exactly at
+  3/3 filtered while the real parallel suite gave 7/13. Naming the wrong condition in the durable
+  record is a blocking finding.
+- **Checksum before *and* after**; a no-op mutation reads exactly like a surviving one.
+- **Check your own instrument.** Two agents have shared a blind spot here — both anchor patterns
+  required `href="…"` while Blazor renders `href=""` bare — so they corroborated each other while
+  both were wrong. A reviewer has also reported "0 leftover files" from a glob that aborted before
+  `ls` ran, counting an empty pipe. **Two measurements agreeing is not corroboration when they share
+  an instrument**, and a check that passes by producing nothing has not passed.
+- **Ask whether a property is *asserted* or merely *true*.** A guarantee that holds by luck and would
+  survive an ordinary tidy-up with the suite still green is a finding — demonstrate the silent revert
+  rather than arguing it.
+- **A surviving mutant may be correct**; judge it, and say whether it should be recorded as
+  deliberate.
+
+**Confirm `git diff -- src` is clean of mutation residue before approving.** An interrupted run has
+left a live mutant in production code before.
+
 ## How you report
 
 Post your review to the DEVLOG thread (`[reviewer]`, under the block's section) and report the same to

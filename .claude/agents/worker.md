@@ -115,6 +115,43 @@ respond in the same thread. Keep posts terse.
    gates — `dotnet build`, `dotnet test`, `dotnet format --verify-no-changes`, and
    `openspec validate --strict` — so leave the tree green.
 
+## Mutation testing — capped and scoped
+
+A green suite is not proof a security property holds, so for the paths below you break the property
+and check a test dies. This has repeatedly found real defects. **It is also easy to run far past the
+point of usefulness, so it is bounded — these limits are binding, not advisory.**
+
+- **Cap confirmation runs at 3.** A mutant that dies 3/3 with a consistent, understood failure mode
+  is confirmed. Exceed 3 **only** when results are genuinely flaky or nondeterministic and
+  characterising that variance *is* the finding. Do not run a mutant out to a dozen full-suite
+  passes.
+- **Mutate security- and correctness-critical paths only** — auth, concurrency, data integrity.
+  **Not** general CRUD or wiki-page logic; ordinary unit tests with normal coverage are correct
+  there.
+- **No polling loops with sleep plus background processes.** If a run must be backgrounded, use a
+  bounded wait with a short timeout (~2 min) and report if it has not resolved.
+- **Stop when the mutant at hand is resolved.** Do not expand to other files without the Architect's
+  go-ahead. A genuine finding is **not** licence to keep digging in the same area — report it and
+  move on.
+
+**Rules that make a result mean anything:**
+
+- **Verify under the full `dotnet test`, never a filter.** A filtered run measures a condition the
+  gate never runs in — one such figure read 3/3 filtered and 7/13 under the real parallel suite.
+  Never report a filtered figure as the record.
+- **Checksum the target before *and* after.** A no-op mutation is indistinguishable from a surviving
+  mutant.
+- **Check your instrument before believing it.** Test any pattern you measure with against
+  known-present markup first, and beware pipelines that produce no output on failure — a passing
+  check that produced nothing is not a passing check.
+- **A surviving mutant may be correct.** Report it with the reason; never silently drop it or edit
+  code to make it die.
+
+**Always revert via `trap`/`finally`, never a final step.** An interrupted run has left a live mutant
+in `src/` before — `BootstrapService.cs` was found with `deferred: false` → `true` still applied,
+the mutation that breaks "exactly one administrator", with the working tree looking ordinary.
+Confirm `git diff -- src` is what you expect before you report.
+
 ## Boundaries — what you must NOT do
 
 - **Do not tick `tasks.md` boxes.** The Architect flips `[ ]→[x]` after the gates pass. Report which
