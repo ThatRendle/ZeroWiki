@@ -6,6 +6,7 @@ out/
 ## User-specific
 *.user
 *.suo
+.local/
 
 ## Rider / VS / VS Code
 .idea/
