@@ -7315,6 +7315,32 @@ corrected with it, and I would take the one-line comment at `BootstrapService.cs
 mutant-R numbers after the fix — R should stop being silent — and I will re-audit that one thing.
 Everything else in this round is approved. **7.1 remains unticked pending the Product Owner.**
 
+- **[architect]** **7.1 ✅ verified by the Product Owner in a real browser (2026-07-29) and ticked.**
+  Walked the revision-2 recipe end to end against the PO's own `App_Data/identity.db` on
+  `http://localhost:5171`, `src/` confirmed clean before and after (AD25's mutant-in-the-tree check).
+  Steps 1–4 confirmed by the PO directly — nav shows **Account**, the panel says shown **once** with a
+  43-character value, **the Back button does not re-present it**, F5 does not either, and a
+  sign-out/sign-in round trip cannot recover it. Step 6 confirmed: revoking flips the row to
+  **Revoked**, the button disappears, the row stays as history, and `RevokedAt` is stamped
+  `2026-07-29T16:25:44.4996950Z` — fixed-width ISO-8601 UTC, AD7's format holding on a write the PO
+  made by hand.
+
+  **Step 5 (secrecy) — and an instrument correction worth keeping.** Measured against token
+  `4E211569-…7D6E`: 0 occurrences of the plaintext in the server log (full token, plus a 12-char
+  prefix and suffix in case anything truncated it), and 0 in `identity.db`, `identity.db-wal` and
+  `identity.db-shm`. Stored `TokenHash` compared **equal** to `sha256(token)` in lowercase hex.
+
+  The correction: the first pass grepped `identity.db` alone and reported "plaintext absent" — but the
+  same grep could not find the **hash** either, because with the app running the row was still in the
+  **WAL**, uncheckpointed. That negative was measuring an empty file and meant nothing. Re-run across
+  all three files, the hash is found in `-wal` (2 hits) while the plaintext is 0 everywhere — now the
+  zero is evidence. This is CLAUDE.md's "check your instrument before believing it" landing on the
+  same rock a third time (after the `href=""` anchor regex and the password-blind hasher recorder):
+  **a secrecy check needs a positive control in the same instrument, or it proves nothing.** §9.4's
+  shown-once sweep should assert the hash is findable, not only that the plaintext isn't.
+
+  §7a is closed. Remaining in §7: **7.2 only**.
+
 ---
 
 ## NEXT
@@ -7383,22 +7409,28 @@ this list" reviewable as one statement.
 
 ### ▶ RESUME HERE — §7b (task 7.2, git emails)
 
-**State: 21/31 tasks ticked** *(counted from `tasks.md`, not carried forward — see the standing
-warning below)*. **§1–§6 complete. §7a (7.1) committed as `130629c`, deliberately unticked.**
-Working tree clean, branch `change/invite-only-authentication`, HEAD `130629c`. All four gates green
-at HEAD, verified by the Architect independently of both agents: build 0/0, **300 tests**,
-`--strict` valid, format clean. `BootstrapService.cs` and `GitTokenService.cs` both confirmed
-byte-identical to HEAD (see AD25's hazard note — this check is not ceremonial).
+**State: 22/31 tasks ticked** *(counted from `tasks.md`, not carried forward — see the standing
+warning below)*. **§1–§6 complete. §7a (7.1) committed as `130629c` and now ticked — the Product
+Owner verified it in a real browser on 2026-07-29 (see the `## 7.` thread for what was measured).**
+Branch `change/invite-only-authentication`. All four gates green as of the last commit, verified by
+the Architect independently of both agents: build 0/0, **300 tests**, `--strict` valid, format clean.
+`src/` confirmed clean after the verification run (see AD25's hazard note — this check is not
+ceremonial).
 
-**Two things to pick up, in either order — they do not block each other:**
+**Note the working tree carries an uncommitted docs-only change** — the dmons 0.3.0 workflow upgrade
+(`CLAUDE.md`, `.claude/agents/supervisor.md` new, `reviewer.md`/`worker.md`, and its `[architect]`
+post in the `## 7.` thread). No `src/` or `tests/` content in it. **Product Owner's call (2026-07-29):
+it lands *after* 7.2 has been implemented under the new shape** — the upgrade gets committed once it
+has been shown to work, not before. §7b is therefore the first block built under 0.3.0 while 0.3.0
+itself is still uncommitted; that is deliberate.
 
-1. **7.1 awaits the Product Owner's browser check** and must not be ticked on gates alone, as 3.2,
-   5.3, 4.2 and 6.1/6.2 all did. The recipe is in the `## 7.` thread: port 5171 over HTTP,
-   `pkill -f ZeroWiki` first, `App_Data` untouched, generic about the username. Its headline step is
-   the browser **Back** button (where shown-once actually leaks), plus a sign-out/sign-in round trip,
-   `grep -F` against a `tee`'d log rather than eyeballing the console, and the 43-character figure
-   measured on the wire.
-2. **§7b = task 7.2 only** — manage the git emails associated with an account. **AD24 already
+**Product Owner's call (2026-07-29) on the open §7 review question: yes — §7 gets the supervisor
+review, run once 7.2 is ticked.** Its range is reconstructed from `git log` (§7 work starts after the
+§6 close), since §7 has no `Base:` post. Reconstruct it and say so in the thread, per CLAUDE.md §1.4.
+
+**Next up:**
+
+1. **§7b = task 7.2 only** — manage the git emails associated with an account. **AD24 already
    settles its one hard question** (an address claimed by another account is named as such, bounded
    to *that* it is taken and never *whom* by). It inherits 7a's shape: Static SSR form POSTs,
    protected by AD21's default-deny, and **no `Account` entity materialised** — 7a closed the §7
