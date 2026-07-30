@@ -7341,6 +7341,309 @@ Everything else in this round is approved. **7.1 remains unticked pending the Pr
 
   §7a is closed. Remaining in §7: **7.2 only**.
 
+- **[architect]** **Base (reconstructed): `a7ed950` — §7 delivers the account page: git access tokens
+  (7.1) and the git emails associated with the account (7.2).** §7 opened before dmons 0.3.0 existed,
+  so it has no contemporaneous `Base:` post; the Product Owner's call (2026-07-29) is that §7 still
+  gets the section review, with its range reconstructed from `git log` per CLAUDE.md §1.4. **This post
+  is a reconstruction, not a record of what was known at the time** — that distinction matters, and is
+  why it says so.
+
+  Range for the supervisor: **`a7ed950..HEAD`**, `a7ed950` being the §6 browser-verification commit
+  that closed §6. One caveat to carry into the review: **`21adaa7` (AD20, the `UsernameTaken`
+  accepted risk) falls inside that range but is §6's business, not §7's** — it is context for the
+  reasoning AD24 deliberately declines to inherit, not section scope. §7's own work starts at
+  `130629c`.
+
+- **[architect]** **Brief — §7b (task 7.2 only): manage the git emails associated with an account.**
+  → @worker. This is the first block built under the 0.3.0 shape, and 0.3.0 is itself still
+  uncommitted in the working tree by the Product Owner's decision — the docs commit lands *after* this
+  block works. Do not commit `CLAUDE.md`, `.claude/agents/*`, or touch that pending diff.
+
+  **Scope: 7.2 and nothing else.** Not 8.2 — resolving a git email to an account is §8's task and has
+  its own spec requirement; this block only lets a member *manage* their own list. If you find
+  yourself writing the lookup primitive, stop: you have left the block.
+
+  **Spec basis, stated honestly because it is thinner than 7.1's.** `specs/user-accounts/spec.md`'s
+  **Account model** requirement is the only one that binds here — an account has "zero or more
+  associated git emails". There is **no requirement specifying the management behaviour itself**
+  (add/remove, what a taken address does, validation); that is carried by `tasks.md` 7.2 plus AD24.
+  Two consequences: "zero emails" is an explicitly legal state, so **removing the last email must be
+  allowed** — do not invent a must-keep-one rule the model contradicts; and where the spec is silent,
+  prefer the smallest thing that satisfies the task over inventing policy. If you hit a question the
+  spec, AD24 and this brief do not answer, **escalate in-thread rather than deciding it** — the
+  section review will ask whether §7 satisfies its spec, not whether it ticked its tasks.
+
+  **Binding decisions you must build to:**
+
+  - **AD24 (pinned, read it in full at the top of this file)** — an address already claimed by another
+    account is refused with the **real reason**: the address is already associated with another
+    account. Bounded hard: name *that it is taken*, **never whom by**. No name, no link, no display
+    name, no "belongs to a member since…". `GitEmail.Email` is globally unique via a `NOCASE` index,
+    which is what forces the question in the first place. AD24 is also explicit that it is **not**
+    precedent — do not extend its reasoning to any new surface you happen to add.
+  - **AD21 (from §6)** — the account page is protected by the `FallbackPolicy` + `AnonymousGate` and
+    needs no `[Authorize]`. **§7b adds nothing anonymous.** Do not add `[AllowAnonymous]` anywhere. If
+    you believe you need to, that is a design question for @architect, not a local fix.
+  - **AD7 + the §7 projection hazard, closed by 7a and not to be reopened** — **do not materialise the
+    `Account` entity.** A corrupt timestamp on one row throws on materialisation and poisons the page.
+    7a's shape is the pattern: list from a **projection**, take the username off the `ClaimsPrincipal`,
+    never `SingleOrDefault` the account to reach its collections. Match it.
+  - **AD22/AD23** — affordances read "Sign in"/"Sign out"; there is no layout header bar. Follow
+    `Account.razor`'s existing Static SSR form shape (POST + antiforgery), which is also what keeps
+    §6.3 true.
+
+  **One new decision, mine, because the repo has already been bitten here — AD26 (see below): no
+  regex email validation.** Trim, cap the length, require a single `@` with something either side, and
+  match case-insensitively through the existing `NOCASE` index. **No `[EmailAddress]`, no hand-rolled
+  pattern, no `Regex` on this path at all.** Reason: BL2 in Block 3 — AD11's validation regex was
+  quadratic and reinstated a DoS amplifier through an *earlier* door, because DataAnnotations runs
+  before `OnValidSubmit`. This is an authenticated path so the exposure is smaller, but the failure
+  mode is identical and the mitigation costs nothing. An address that is malformed but storable is a
+  self-inflicted wound by the member who typed it; an address that hangs the request is ours.
+
+  **AD25 — mutation testing is capped and scoped, and this is in the brief on purpose.** Cap
+  confirmation runs at **3**. Mutate **only** if you touch a security- or correctness-critical path —
+  here that means the AD24 uniqueness/ownership check and nothing else. **Not** the list rendering,
+  **not** ordinary CRUD. **No polling loops with sleep plus background processes**; bounded waits with
+  a ~2 min timeout. **Stop and summarise when the mutant at hand is resolved** — a genuine finding is
+  not licence to keep digging. Verify under the **full `dotnet test`**, never a filter, and
+  **checksum the target before and after**. And the hazard that made this a rule: an interrupted run
+  once left a live mutant in `src/` — revert via `trap`/`finally`, and `git diff -- src` before you
+  hand off.
+
+  **Also carry forward, from 7.1's verification an hour ago:** a secrecy check needs a **positive
+  control in the same instrument**. If you assert something is absent from a store or a log, assert in
+  the same breath that a thing you *know* is there is findable — a grep of `identity.db` while the row
+  sits in the uncheckpointed WAL is a green light measuring an empty file. Nothing in 7.2 is
+  shown-once, so this is a habit note, not a requirement of this block.
+
+  **Ownership is the security property of this block.** Adding and removing must be scoped to the
+  signed-in account: a member must not be able to remove an email off another account, nor add one to
+  it, by posting a crafted id. Take the account from the principal, never from the form. `RevokeAsync`
+  in `GitTokenService` is the ownership-scoped precedent — mirror it.
+
+  **Gates before handing off (all four, and a block commits green):** `dotnet build` clean,
+  `dotnet test` green — your new tests **and** all 300 existing, `openspec validate
+  invite-only-authentication --strict`, `dotnet format --verify-no-changes` clean.
+
+  **Then → @reviewer** for the block diff. Post progress here as you go; ask in-thread with
+  `❓ @architect` rather than guessing.
+
+- **[architect]** **AD26 — no regex validation on the git-email path. Architect's call (2026-07-29),
+  binding on §7.2.** Accept an address after trimming, a length cap, and a structural check that does
+  not backtrack (one `@`, non-empty either side); match case-insensitively via the existing `NOCASE`
+  unique index rather than normalising to lower-case in C#, so the database stays the single authority
+  on what "already taken" means. **No `[EmailAddress]`, no hand-rolled pattern, no `Regex`.**
+
+  Rationale, and it is a measurement rather than a preference: **BL2** (Block 3) found AD11's
+  validation regex was quadratic, and because DataAnnotations validation runs *before* `OnValidSubmit`,
+  it reinstated the 64 MiB/0.25 s amplifier the block had just removed — through an earlier door than
+  the one being guarded (500 in 0.253 s → 302 in 0.0023 s after the fix). §7.2 is authenticated, so the
+  exposure is genuinely smaller than §3's anonymous route and this is not a claim that it is equally
+  severe. But email regexes are the canonical home of catastrophic backtracking, the wiki gains nothing
+  from rejecting `alice@localhost`, and git itself does not validate author emails — so there is no
+  correctness argument on the other side of the ledger to weigh against it.
+
+  **What this decision does not do:** it does not say malformed addresses are harmless. An address
+  that never matches a real committer simply never attributes a commit — a §8 concern, visible to the
+  member who typed it, and fixable by editing the entry. That is the right place to bear the cost.
+
+- **[worker] Block 7b (7.2) — implemented, all four gates green.** Scope held to 7.2: no lookup
+  primitive, no `Account` materialisation, nothing anonymous added.
+
+  **What landed**
+
+  - `src/ZeroWiki/Identity/GitEmailService.cs` — `AddAsync`/`ListAsync`/`RemoveAsync`, same shape as
+    `GitTokenService`. `AddAsync` checks ownership before inserting (`FindOwnerAsync`, matched through
+    `GitEmails.Email`'s existing `NOCASE` index — no lower-casing in C#) and classifies the result as
+    `Added` / `AlreadyOnThisAccount` / `TakenByAnotherAccount` (AD24) / `Malformed`. If two identical
+    submissions still race past the pre-check, the resulting `DbUpdateException` is caught and the same
+    classification is re-derived rather than left to surface as a 500 — a double click or two open tabs
+    now gets a true answer instead of an error page. `RemoveAsync` is ownership-scoped exactly like
+    `RevokeAsync` and allows removing the last email (the account-model spec states "zero or more").
+  - `src/ZeroWiki/Identity/GitEmailAddOutcome.cs`, `GitEmailSummary.cs` — the outcome enum and list
+    projection. `GitEmailSummary` carries no account identifier, so AD24's bound (name that it is
+    taken, never to whom) has no field to leak from even by accident.
+  - **AD26, no regex:** `TryNormalize` in `GitEmailService` trims, caps at 320 (the column width), and
+    checks exactly one `@` with a character on each side via `IndexOf`/`LastIndexOf` — two linear scans,
+    no backtracking, no `[EmailAddress]`, no pattern at all.
+  - `src/ZeroWiki/Components/Pages/{AddGitEmailInput,RemoveGitEmailInput}.cs` and a new "Git emails"
+    section on `Account.razor` — two more Static SSR form POSTs (`add-git-email`, `remove-git-email`)
+    through the existing harness. No `Account` row is materialised (`LoadEmailsAsync` projects, the
+    username still comes off the principal); `CallerAccountId` is the one already on the page, reused
+    rather than re-derived. `Program.cs` registers `GitEmailService` alongside `GitTokenService`.
+
+  **Tests:** `tests/ZeroWiki.Tests/Identity/GitEmailServiceTests.cs` (service-level, 18 cases including
+  a 7-case malformed-input theory) and `AccountPageTests.cs` extended in place — it now documents both
+  surfaces the page owns, since they share the signed-in-caller machinery. Page-level coverage: add/
+  add-again/taken/malformed outcomes, remove/remove-unknown/remove-cross-account (no-oracle, mirroring
+  `A_member_cannot_revoke_another_members_token_or_learn_that_it_exists`), last-email removal, list
+  isolation between members, GET-and-missing-antiforgery on both new forms, and the corrupt-`Account`-
+  row test extended to also assert the email list still renders. The closed-field-set test
+  (renamed `The_page_posts_nothing_but_the_fields_its_forms_need`) now pins
+  `{AddEmailInput.Email, __RequestVerificationToken, _handler}` — the remove button stays a `<button>`
+  value like the revoke buttons, so it adds no new `<input>`.
+
+  **AD24 proved directly, not just asserted:** `An_email_already_on_another_account_is_refused_by_the
+  _real_reason_and_names_no_owner` submits as bob, asserts the taken-message text, and separately
+  asserts the string `"alice"` (the owning account's own username) does not appear anywhere in that
+  response — the disclosure bound checked positively against the whole page, not just against the
+  outcome sentence.
+
+  **Mutation testing (AD25 — capped at 3, scoped to the AD24 uniqueness/ownership check only):**
+  `shasum -a 256` before and after each mutant, full `dotnet test` (never filtered), reverted
+  immediately after each run, `git diff -- src` confirmed clean before reporting.
+
+  | # | Mutant | Checksum | Caught by | Result |
+  |---|---|---|---|---|
+  | M1 | `RemoveAsync` drops `&& e.AccountId == accountId` | `c6ff676…` → `472291d…` → `c6ff676…` | `An_address_owned_by_another_account_cannot_be_removed`, `A_member_cannot_remove_another_members_email_or_learn_that_it_exists` | **caught** 2/329, 1 run |
+  | M2 | `Outcome()` flips `==` to `!=` (the AD24 disclosure boundary) | `c6ff676…` → `91ef5bc…` → `c6ff676…` | 3 `GitEmailServiceTests` + 2 `AccountPageTests` | **caught** 5/329, 1 run |
+
+  Both died on the first run with a consistent, understood failure mode (wrong enum value / wrong
+  rendered message), so per AD25's cap neither was re-run. Stopped there — no third mutant, no
+  expansion to `ListAsync`/rendering/CRUD.
+
+  **Not touched:** 8.2 (the git-email→account lookup), any change to `GitTokenService`.
+
+  **Gates:** `dotnet build` **0 warnings / 0 errors** · `dotnet test` **329/329** (298 existing + 18
+  `GitEmailServiceTests` + 11 new `AccountPageTests`, plus 2 existing tests extended in place) ·
+  `openspec validate invite-only-authentication --strict` → *"Change 'invite-only-authentication' is
+  valid"* · `dotnet format --verify-no-changes` clean (exit 0).
+
+  Working tree left as the docs-only diff plus this block's files — `.claude/agents/*`, `CLAUDE.md`
+  untouched, per the brief.
+
+  → @reviewer
+
+- **[reviewer]** **Block 7b (7.2) — Approve with nits.** Audited every file in scope (the three
+  modified files plus all six untracked ones), re-ran the block under the full `dotnet build` /
+  `dotnet test` / `dotnet format --verify-no-changes` / `openspec validate --strict` myself (all
+  green, 329/329), and independently reproduced both reported mutants rather than taking the table
+  on trust.
+
+  **AD24 disclosure bound — holds.** `GitEmailSummary` is `(Guid Id, string Email)` and
+  `GitEmailAddOutcome` is a bare 4-member enum — structurally no field to leak an owner from, the
+  worker's claim checks out by inspection, not just assertion. `Outcome()` is the one place identity
+  could leak and it doesn't: it compares `owningAccountId == callerAccountId` and returns only
+  `AlreadyOnThisAccount`/`TakenByAnotherAccount`, never the owner. `AccountPageTests.
+  An_email_already_on_another_account_is_refused_by_the_real_reason_and_names_no_owner` asserts the
+  taken message *and* separately asserts `"alice"` is absent from the whole rendered body — a real
+  disclosure proof, not just a message-text check, and a positive control for that search mechanism
+  already exists elsewhere in the same file (the corrupt-row test asserts `"alice"` *is* found on
+  alice's own page).
+
+  **Ownership scoping — holds.** `AddAsync`/`RemoveAsync`/`ListAsync` all take `accountId` as a
+  parameter never present on `AddGitEmailInput`/`RemoveGitEmailInput` (`Email` and `EmailId` only —
+  no overposting vector), and `Account.razor` sources it from `CallerAccountId` off the
+  `ClaimsPrincipal`, never the form. `RemoveAsync`'s query
+  (`e.Id == emailId && e.AccountId == accountId`) is the `RevokeAsync` shape verbatim. I mutated it
+  myself (dropped the `&& e.AccountId == accountId` conjunct) and it died 2/329 on the first run,
+  matching the worker's table exactly; reverted, checksum back to `c6ff676…`, `git diff -- src`
+  confirmed clean afterward.
+
+  **`DbUpdateException` fallback — correct, but by re-verification rather than by distinguishing
+  the constraint.** `AddAsync`'s catch block doesn't inspect the SQLite error code or constraint
+  name — it catches any `DbUpdateException`, detaches the failed insert, and re-runs `FindOwnerAsync`.
+  If that comes back null (i.e. the failure wasn't the email unique index), it throws
+  `InvalidOperationException` rather than reporting `TakenByAnotherAccount` — so it can't
+  mis-classify an unrelated failure (e.g. a hypothetical FK violation) as "taken"; it just refuses to
+  guess. That's a sound way to get the same guarantee the brief asked for, even though it isn't
+  literally "distinguish which constraint was violated" — worth a one-line code comment saying so,
+  but not a blocker. I also re-ran `Outcome()`'s `==`→`!=` flip (the disclosure boundary shared by
+  both the pre-check and fallback paths) myself: died 5/329 on the first run, exactly matching the
+  worker's table; reverted, checksum verified, tree clean.
+
+  **AD26 — holds.** No `Regex`, `[EmailAddress]`, or any DataAnnotations attribute anywhere on this
+  path — checked `AddGitEmailInput`/`RemoveGitEmailInput` specifically (both are bare
+  property-only classes, no attributes at all), not just `GitEmailService`. `TryNormalize` is two
+  `IndexOf`/`LastIndexOf` scans, linear, no pattern.
+
+  **Projection hazard (AD7/§7) — not reopened.** `GitEmailService.cs` never references `db.Accounts`;
+  neither does `Account.razor`. `GitEmail.cs`/`GitEmailConfiguration.cs` are untouched (rightly
+  excluded from this block's scope, since they weren't touched). `ListAsync`/`LoadEmailsAsync` are
+  projections; the username stays off the principal.
+
+  **AD21 / §6.3 — holds.** No `[AllowAnonymous]` added anywhere in the diff (the only
+  `[AllowAnonymous]` hits in the repo are pre-existing, unrelated lines in `Program.cs`, confirmed
+  outside this block's one-line diff). No `@rendermode` introduced — both new forms are plain
+  `EditForm` + `OnValidSubmit` POSTs through the existing Static SSR + antiforgery harness, and the
+  GET-without-handler and POST-without-antiforgery-token tests for both new forms pass.
+
+  **Nits (non-blocking):**
+  1. `GitEmailServiceTests.cs:76` —
+     `Assert.DoesNotContain(alice.Id.ToString(), outcome.ToString(), StringComparison.OrdinalIgnoreCase)`
+     is vacuously true: `GitEmailAddOutcome.ToString()` can only ever return one of the four fixed
+     enum member names, so no mutation of production code could make this assertion fail. It reads as
+     an AD24 proof but isn't one — the real proof is the page-level HTML-absence test. Either drop
+     this line or replace it with something that actually varies (e.g. asserting the type's field
+     shape via reflection), so it doesn't sit next to the real proof looking like corroboration when
+     it's actually a no-op check.
+  2. The `DbUpdateException` catch branch in `AddAsync` (the genuine-race path) is not exercised by
+     any test — both reported mutants land in `RemoveAsync`'s filter and in `Outcome()`, which is
+     shared by the pre-check and fallback paths, but the fallback's own control flow (detach, re-query,
+     throw-if-inconsistent) has no test forcing a real race through it. I don't think this is worth
+     chasing under AD25's caps (forcing a genuine two-context race against SQLite for a narrow
+     defensive branch is disproportionate for this project), but it's worth recording as a known gap
+     rather than silently assuming it's covered.
+
+  **Architectural note (not blocking, for the supervisor/§8 worker's awareness):** `FindOwnerAsync`
+  (private, `Guid?` return, no entity materialised) is structurally an email→account-id lookup —
+  conceptually adjacent to §8's task 8.2. It's correctly scoped here (private, used only for the
+  AD24 uniqueness check, not exposed), so this is not a 7.2 scope violation, but §8 should
+  consciously decide whether to reuse this shape or build its own rather than drift into two
+  near-identical private lookups.
+
+  **Scope — held.** No lookup primitive resolving an arbitrary email to an account is exposed
+  publicly; `GitTokenService` untouched; nothing outside `## 7.` touched.
+
+  No blockers. → @architect
+
+- **[worker]** Addressed the architect's follow-up on the reviewer's nits.
+
+  **Nit 1 — fixed.** `GitEmailServiceTests.cs:76`'s `Assert.DoesNotContain(alice.Id.ToString(),
+  outcome.ToString(), …)` was vacuous, exactly as flagged: `GitEmailAddOutcome.ToString()` can only
+  ever return one of four fixed member names, so nothing production code does could make it fail. I
+  took the **structural** option, not the positive-control one: at this layer (the bare service call,
+  no page render) there is nothing reachable to assert against that *could* contain a GUID — the
+  return type is a 4-member enum and the only other observable is `ListAsync(bob.Id)`, already
+  asserted empty on the line above. Manufacturing something for a positive control to grip here would
+  be decoration, not evidence. Deleted the assertion; replaced it with a comment stating the bound is
+  structural (the enum's shape has no field to leak from) and pointing at
+  `AccountPageTests.An_email_already_on_another_account_is_refused_by_the_real_reason_and_names_no_owner`
+  as where the bound is actually exercised — that test already asserts `"alice"` absent from the full
+  rendered body bob receives, which *is* a surface a leak could reach, and the reviewer separately
+  confirmed a positive control for that same search mechanism already exists elsewhere in the file
+  (the corrupt-row test finds `"alice"` on alice's own page). No new test surface added, per the
+  instruction not to chase this beyond the one line.
+
+  **Nit 2 — accepted as-is, recorded so §9 doesn't rediscover it.** The `DbUpdateException` catch
+  branch in `GitEmailService.AddAsync` (detach → re-query `FindOwnerAsync` → classify, or throw
+  `InvalidOperationException` if the re-query can't explain the failure) is not exercised by any test.
+  Both landed mutants (`RemoveAsync`'s ownership filter, `Outcome()`'s disclosure boundary) hit paths
+  shared with or upstream of this branch, but nothing forces a genuine two-context race through the
+  catch itself. Forcing a real concurrent race against SQLite to cover a narrow defensive branch is
+  disproportionate under AD25 for this project. Left as a known, accepted gap — not silently assumed
+  covered.
+
+  **Also recorded, not a code change:** the mutation-hazard rule in `CLAUDE.md` (`git diff -- src`
+  before committing after a mutation run) is **blind to untracked files**, and every file I mutated in
+  this block — `GitEmailService.cs` — was untracked for the block's entire duration (it's a new file;
+  `git diff` only ever reports on tracked content). The safety net that exists specifically to catch a
+  live mutant left in `src/` structurally could not have covered the one file actually mutated here.
+  Nothing was in fact wrong — both mutants were confirmed reverted by checksum (`c6ff676…` before and
+  after each run) and the reviewer independently re-ran and re-verified both — but the rule has a gap
+  for any block that mutates a file created in that same block, and it should be closed (e.g.
+  `git status --porcelain` diffed against a pre-mutation snapshot, or an explicit untracked-file
+  checksum step) rather than left to be rediscovered. The architect noted this will fold into a later
+  docs commit.
+
+  **Gates, re-verified after the fix:** `dotnet build` 0/0 · `dotnet test` **329/329** · `openspec
+  validate invite-only-authentication --strict` valid · `dotnet format --verify-no-changes` clean.
+  Working tree unchanged from the block otherwise — only `GitEmailServiceTests.cs` touched by this
+  follow-up; the docs-only diff (`CLAUDE.md`, `.claude/agents/*`, the 0.3.0 DEVLOG post) is untouched.
+
+  → @architect
+
 ---
 
 ## NEXT

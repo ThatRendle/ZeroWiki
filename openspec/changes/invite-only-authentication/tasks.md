@@ -40,7 +40,7 @@
 ## 7. Git access tokens (account UI)
 
 - [x] 7.1 Account page: generate a git token (shown once), list existing tokens, revoke a token
-- [ ] 7.2 Manage associated git emails on the account (for email→account mapping)
+- [x] 7.2 Manage associated git emails on the account (for email→account mapping)
 
 ## 8. Primitives consumed by content-core
 

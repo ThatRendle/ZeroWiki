@@ -8,6 +8,7 @@
 @using ZeroWiki.Identity
 
 @inject GitTokenService GitTokenService
+@inject GitEmailService GitEmailService
 
 <PageTitle>Account</PageTitle>
 
@@ -89,6 +90,80 @@ else if (_revoked is false)
     }
 </EditForm>
 
+<h2>Git emails</h2>
+
+<p>
+    A pushed commit is attributed back to your account by matching its author email against the
+    addresses below. An account may have any number of them, including none.
+</p>
+
+@if (_addOutcome is GitEmailAddOutcome.Added)
+{
+    <p class="git-email-add-outcome" role="alert">Added.</p>
+}
+else if (_addOutcome is GitEmailAddOutcome.AlreadyOnThisAccount)
+{
+    <p class="git-email-add-outcome" role="alert">@EmailAlreadyOnAccountMessage</p>
+}
+else if (_addOutcome is GitEmailAddOutcome.TakenByAnotherAccount)
+{
+    <p class="git-email-add-outcome" role="alert">@EmailTakenMessage</p>
+}
+else if (_addOutcome is GitEmailAddOutcome.Malformed)
+{
+    <p class="git-email-add-outcome" role="alert">@EmailMalformedMessage</p>
+}
+
+@if (_emailRemoved is true)
+{
+    <p class="git-email-removal-outcome" role="alert">@EmailRemovedMessage</p>
+}
+else if (_emailRemoved is false)
+{
+    <p class="git-email-removal-outcome" role="alert">@NoSuchEmailMessage</p>
+}
+
+<EditForm Model="AddEmailInput" FormName="add-git-email" OnValidSubmit="AddEmailAsync">
+    <label>
+        Add a git email
+        <InputText @bind-Value="AddEmailInput.Email" autocomplete="email" />
+    </label>
+    <button type="submit">Add</button>
+</EditForm>
+
+@* Rendered whether or not there is a row to remove, for the same reason the token table's form
+   is: a resubmitted form must still find a handler to reach. *@
+<EditForm Model="RemoveEmailInput" FormName="remove-git-email" OnValidSubmit="RemoveEmailAsync">
+    @if (_emails.Count == 0)
+    {
+        <p>No git emails associated with your account.</p>
+    }
+    else
+    {
+        <table>
+            <thead>
+                <tr>
+                    <th scope="col">Email</th>
+                    <th scope="col"><span class="visually-hidden">Actions</span></th>
+                </tr>
+            </thead>
+            <tbody>
+                @foreach (var email in _emails)
+                {
+                    <tr>
+                        <td>@email.Email</td>
+                        <td>
+                            <button type="submit" name="RemoveEmailInput.EmailId" value="@email.Id">
+                                Remove
+                            </button>
+                        </td>
+                    </tr>
+                }
+            </tbody>
+        </table>
+    }
+</EditForm>
+
 @code {
     /// <summary>
     /// The one answer to a revoke this caller cannot carry out, whether the identifier names
@@ -106,9 +181,29 @@ else if (_revoked is false)
     /// </remarks>
     private const string NoSuchTokenMessage = "That token no longer exists.";
 
+    /// <summary>
+    /// AD24: the real reason, bounded to naming that the address is taken and never to whom.
+    /// </summary>
+    private const string EmailTakenMessage = "That address is already associated with another account.";
+
+    private const string EmailAlreadyOnAccountMessage = "That address is already on your account.";
+    private const string EmailMalformedMessage = "Enter a valid email address.";
+    private const string EmailRemovedMessage = "That email is no longer associated with your account.";
+
+    /// <summary>
+    /// The one answer to a removal this caller cannot carry out, whether the identifier names
+    /// nobody's git email or somebody else's — the same no-oracle shape as
+    /// <see cref="NoSuchTokenMessage"/>.
+    /// </summary>
+    private const string NoSuchEmailMessage = "That email no longer exists.";
+
     private IReadOnlyList<GitTokenSummary> _tokens = [];
     private string? _issuedToken;
     private bool? _revoked;
+
+    private IReadOnlyList<GitEmailSummary> _emails = [];
+    private GitEmailAddOutcome? _addOutcome;
+    private bool? _emailRemoved;
 
     [CascadingParameter]
     private HttpContext? HttpContext { get; set; }
@@ -120,6 +215,17 @@ else if (_revoked is false)
     private RevokeGitTokenInput? PostedRevokeInput { get; set; }
 
     private RevokeGitTokenInput RevokeInput => PostedRevokeInput ??= new();
+
+    // Same BL0008 reasoning as PostedRevokeInput above: no property initializer.
+    [SupplyParameterFromForm(Name = nameof(AddEmailInput))]
+    private AddGitEmailInput? PostedAddEmailInput { get; set; }
+
+    private AddGitEmailInput AddEmailInput => PostedAddEmailInput ??= new();
+
+    [SupplyParameterFromForm(Name = nameof(RemoveEmailInput))]
+    private RemoveGitEmailInput? PostedRemoveEmailInput { get; set; }
+
+    private RemoveGitEmailInput RemoveEmailInput => PostedRemoveEmailInput ??= new();
 
     private HttpContext Context => HttpContext
         ?? throw new InvalidOperationException("Managing git access tokens requires the static server-rendered HttpContext.");
@@ -135,6 +241,7 @@ else if (_revoked is false)
         ForbidCaching();
 
         await LoadAsync();
+        await LoadEmailsAsync();
     }
 
     /// <summary>
@@ -210,6 +317,29 @@ else if (_revoked is false)
 
         await LoadAsync();
     }
+
+    private async Task AddEmailAsync()
+    {
+        _addOutcome = await GitEmailService.AddAsync(CallerAccountId, AddEmailInput.Email);
+
+        await LoadEmailsAsync();
+    }
+
+    private async Task RemoveEmailAsync()
+    {
+        // The identifier came from the browser and authorises nothing: the service re-scopes it to
+        // this account's own emails, so a posted identifier naming somebody else's is simply not
+        // found — the same shape as RevokeAsync above.
+        _emailRemoved = await GitEmailService.RemoveAsync(CallerAccountId, RemoveEmailInput.EmailId);
+
+        await LoadEmailsAsync();
+    }
+
+    /// <remarks>
+    /// No <see cref="ZeroWiki.Data.Account"/> row is materialised here either — the same §7 shape
+    /// as <see cref="LoadAsync"/> below, applied to the other list this page owns.
+    /// </remarks>
+    private async Task LoadEmailsAsync() => _emails = await GitEmailService.ListAsync(CallerAccountId);
 
     /// <remarks>
     /// The list is a projection and the username above comes off the signed-in principal, so this

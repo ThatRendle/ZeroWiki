@@ -15,6 +15,7 @@ builder.Services.AddSingleton(TimeProvider.System);
 builder.Services.AddSingleton<IPasswordHasher, Argon2idPasswordHasher>();
 builder.Services.AddSingleton<ISecretTokenGenerator, SecretTokenGenerator>();
 builder.Services.AddScoped<GitTokenService>();
+builder.Services.AddScoped<GitEmailService>();
 builder.Services.AddScoped<BootstrapService>();
 builder.Services.AddScoped<LoginService>();
 builder.Services.AddScoped<InvitationService>();
