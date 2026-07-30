@@ -7701,6 +7701,140 @@ Everything else in this round is approved. **7.1 remains unticked pending the Pr
   No code changed. 7.2 stays ticked — this is a correction *within* the task (AD7's precedent), not new
   work.
 
+- **[supervisor]** **Section review — §7 (7.1, 7.2). Verdict: ✅ Approve.** Range `a7ed950..HEAD`
+  (`81379e3`), 8 commits, read as a sequence rather than as one cumulative diff. No blockers. Four
+  notes for `## NEXT`, one of which is a trap §7 is currently leaving §8 and which I would close in
+  §8's brief rather than here.
+
+  On the reconstructed base: `a7ed950` draws the boundary correctly. Everything §7 could have damaged
+  is inside it, and the four in-range non-§7 commits (`a534530`, `7113825`, `fd855ab`, `81379e3`) are
+  docs and a `.gitignore` line that leave no residue for §7 to be built on. I checked the one that
+  could have — the mid-block harness repair — separately, below.
+
+  **Does §7 satisfy its spec, or only its tasks?** Both. `authentication`'s *Per-user git access
+  tokens* is met end to end (generate → hashed at rest → plaintext exactly once → revoke → stops
+  authenticating), and `user-accounts`' new *Git email management* has a test at both the service and
+  rendered-page layer for every scenario. I walked a member's path through the page rather than the
+  blocks: sign in → nav offers Account → generate → copy → revoke → add an email → hit a taken one →
+  remove. It holds, and it reads as one page.
+
+  **The adversarial read of the post-hoc requirement, which is what I was asked for.** It earns its
+  place on three of its four clauses — the disclosure bound, the ownership clause and *"including when
+  it was the only one"* are each a real constraint that could plausibly have been legislated the other
+  way, so a future change has to amend a requirement rather than reinterpret a DEVLOG post. That is
+  obligation, not narration. The Architect's three stated choices check out and the admitted gap is
+  accurately described, though **undersold**: the "cannot add to another account's list" half is
+  structural *and* the structure is itself guarded — `AddGitEmailInput` carries only `Email`
+  (`AddGitEmailInput.cs:9`) and `The_page_posts_nothing_but_the_fields_its_forms_need`
+  (`AccountPageTests.cs:480`) pins a **closed** field set, so a future block that adds an account-id
+  field fails that test. That is the assertion the scenario actually rests on, and it is worth naming
+  as such.
+
+  **What the requirement omits is the one thing §8 consumes — see S1.**
+
+  **S1 (for `## NEXT`, and for §8's brief — the finding a block review structurally could not make).**
+  Three individually-correct decisions compose into a trap:
+  1. `GitEmailService.FindOwnerAsync` (`GitEmailService.cs:136`) is private and returns `Guid?` —
+     correct for 7.2, and correctly scoped (the reviewer flagged the adjacency).
+  2. **AD26 is scoped "binding on §7.2"** — including its load-bearing half, *"match case-insensitively
+     via the existing `NOCASE` unique index rather than normalising to lower-case in C#, so the
+     database stays the single authority on what 'already taken' means."* §8 is not bound by it.
+  3. The `Account lookup by git email` requirement (`specs/user-accounts/spec.md:55`) and the new
+     `Git email management` requirement are **both silent on comparison semantics**. *"A git email
+     SHALL be associated with at most one account"* is true only case-insensitively, and the spec never
+     says so.
+
+  §7 stores addresses **trimmed but case-preserved** (`GitEmailService.cs:169`); matching is the
+  column's collation (`GitEmailConfiguration.cs:15`). So an 8.2 lookup that lower-cases in C#, or
+  pulls the list and compares ordinally in memory, silently fails to attribute a commit whose author
+  email differs only in case from the stored one — **and every §7 test stays green**, because §7 never
+  exercises that path. The §8 worker has both an incentive to write its own lookup and no binding rule
+  telling it how. Close it by naming, in §8's brief: reuse `FindOwnerAsync` (promote it) or restate
+  AD26's collation rule as binding on §8, plus one test that `Alice@x.com` stored resolves for author
+  `alice@x.com`. A one-line spec sentence on comparison semantics would be better still.
+
+  **Cross-block coherence — checked rather than assumed; 7a and 7b are one page, not two stapled
+  blocks.** `CallerAccountId`/`HttpContext` derived once and reused; identical `EditForm` +
+  `[SupplyParameterFromForm]`/BL0008 shape; the two "form rendered even with no rows" comments
+  cross-reference each other (`Account.razor:55`, `:134`); `NoSuchEmailMessage`'s remark derives itself
+  from `NoSuchTokenMessage` rather than restating it; `GitEmailService`'s class remark names
+  `GitTokenService.RevokeAsync` as the pattern it mirrors. **No duplicated abstraction** —
+  `RevokeAsync`/`RemoveAsync` share a query shape but not semantics (soft, monotonic, idempotent vs
+  hard delete), so extracting a common helper would be the wrong move, not a missed one. **No dead
+  scaffolding** — every private helper and every generated regex in `AccountPageTests` has a live
+  caller; `git diff -- src` **and** `git status --short -- src` both empty (both forms, per the rule
+  amended this session). The asymmetries that exist are the right ones: list ordering differs because
+  the domains differ, and add returns a 4-member enum while remove/revoke return `bool` because add
+  has four outcomes.
+
+  **Design decisions across the section — all hold.** AD21: one route added, no `[AllowAnonymous]`
+  anywhere new, `[Authorize]` stated on the page as well as inherited. AD7/projection hazard: closed by
+  construction in 7a and **not reopened** by 7b — `GitEmailService` never touches `db.Accounts`, and
+  `The_page_still_renders_when_the_stored_account_row_cannot_be_read` (`AccountPageTests.cs:455`) was
+  extended to cover the email list too, which is the right way to keep a by-construction guarantee from
+  decaying. AD22/AD23: the nav item is inside `<Authorized>`, and §6's
+  `An_anonymously_reachable_page_links_nowhere_but_the_site_root` still bounds what a stranger sees.
+  §6.3: no `@rendermode` introduced — four Static SSR POSTs, all four with antiforgery tests and the two
+  mutating ones with GET-safety tests. AD26: no `Regex`, no `[EmailAddress]`, no DataAnnotations
+  attribute anywhere on the path. AD24: bounded correctly, and `GitEmailSummary` has no field to leak
+  from.
+
+  **The harness repair (in range, not a §7 task) left no damage, and the test estate did not fracture.**
+  `TestDatabase` is now the single source of the file-backed connection string, used by all three
+  file-backed sites (`BootstrapConcurrencyTests.cs:76`, `InvitationRedemptionConcurrencyTests.cs:67`,
+  `ZeroWikiAppFactory.cs:34`); every other class uses `Data Source=:memory:`, which is never pooled, so
+  there is no third shape and no divergence. The one deliberate bypass is documented at its site. B2
+  landed properly — the seam guard is at `BootstrapConcurrencyTests.cs:119-126` reported at `:162`, and
+  it is the *assertion* that closes mutant R. The reviewer's optional source-side note at
+  `BootstrapService.cs:121` was not added and I do not think it needs to be, now that the seam moving is
+  a loud, self-naming failure.
+
+  **S2 — what §7's tests would not catch (the evidence question).** They catch more than I expected:
+  ownership scoping and the AD24 boundary are both mutation-confirmed, the no-oracle property is
+  asserted as `refused == absent` rather than as two message strings, and the shown-once sweep has a
+  positive control. Three honest gaps, none worth AD25 budget:
+  1. **`AddAsync` was never mutated, and one mutant there would survive — correctly.** Delete the
+     pre-check early return (`GitEmailService.cs:56-60`) and the insert hits the unique index, the
+     catch re-derives through `FindOwnerAsync`, and `Outcome()` returns the same value. The fallback is
+     a genuine second implementation of the same decision, so its removal is behaviour-preserving.
+     **I reasoned this rather than measured it and say so** — it is a property, not a finding, and a
+     number would not change it. Recorded so a future reader does not read M1/M2 as covering
+     `AddAsync`'s pre-check; what covers that decision is `Outcome()`, which is shared.
+  2. **The uniqueness invariant is proved at the storage layer, not through the service.**
+     `IdentityDbContextTests.Duplicate_git_email_is_rejected[_case_insensitively]` is the right home for
+     it and I am not asking for a duplicate — but note the consequence: every `GitEmailService` and
+     `AccountPageTests` assertion would still pass with the unique index dropped, because the pre-check
+     absorbs it. The index is what makes the invariant true under concurrency, and nothing connects the
+     two test classes. One cross-reference comment, no more.
+  3. The `DbUpdateException` branch stays untested, as the reviewer recorded and the worker accepted. I
+     agree with the disposition and would sharpen the reason, which is not written down: the branch
+     cannot mis-classify, because it re-derives and throws rather than guesses
+     (`GitEmailService.cs:79-83`). Its failure mode is a 500, not a wrong answer — which is why this is
+     an availability gap and not a security one.
+
+  On AD25's cap: both §7b mutants died on a single run, which is **correct** and I would not have them
+  re-run. The variance the "3/3" standard exists to detect is a property of *concurrency* tests — M1's
+  7/13 is the case that earned the rule. These are deterministic service-level tests; a deterministic
+  mutant either dies or it does not, and the reviewer independently reproducing both is worth more than
+  a third self-run.
+
+  **S3 — the Product Owner's browser sign-off for 7.1 is stale, and only a section-level look shows
+  it.** 7.1 was verified in a real browser on 2026-07-29 against `130629c`. 7b (`e4bec3d`, 2026-07-30)
+  then added a heading and two more forms to **the same page**. 7.2 was never designated
+  human-in-the-loop and nothing was ticked improperly — the automated page tests cover the new forms
+  through the real pipeline, antiforgery included. But the page the Product Owner signed off is not the
+  page that shipped, and the outer loop exists to notice exactly that. **Recommendation, not a
+  blocker:** a sixty-second re-look at `/account` before §8 opens, or an explicit line in the thread
+  saying the page tests are considered sufficient for 7b. Either closes it; leaving it unsaid does not.
+
+  **S4 — a cosmetic asymmetry, listed only so it is not rediscovered.** 7b promoted its ordinary
+  outcome messages to named `const`s (`EmailRemovedMessage`, `EmailAlreadyOnAccountMessage`) while 7a's
+  equivalent stayed an inline literal (`Account.razor:44`). The convention 7a set — a `const` with a
+  remark where the *wording* is load-bearing, inline otherwise — is the better rule and 7b slightly
+  over-applied it. Nit; `## NEXT` at most, not a fix block.
+
+  → @architect. Section closed from my side; S1 belongs in §8's brief, S2/S3/S4 in `## NEXT`.
+
 ---
 
 ## NEXT
@@ -7767,47 +7901,86 @@ this list" reviewable as one statement.
 
 ---
 
-### ▶ RESUME HERE — §7b (task 7.2, git emails)
+### ▶ RESUME HERE — §8 (primitives consumed by content-core)
 
-**State: 22/31 tasks ticked** *(counted from `tasks.md`, not carried forward — see the standing
-warning below)*. **§1–§6 complete. §7a (7.1) committed as `130629c` and now ticked — the Product
-Owner verified it in a real browser on 2026-07-29 (see the `## 7.` thread for what was measured).**
-Branch `change/invite-only-authentication`. All four gates green as of the last commit, verified by
-the Architect independently of both agents: build 0/0, **300 tests**, `--strict` valid, format clean.
-`src/` confirmed clean after the verification run (see AD25's hazard note — this check is not
-ceremonial).
+**State: 23/31 tasks ticked** *(counted from `tasks.md`, not carried forward — see the standing
+warning below)*. **§1–§7 complete.** Branch `change/invite-only-authentication`, HEAD `81379e3`,
+**working tree clean**. All four gates verified by the Architect independently of both agents at
+`e4bec3d`: build 0/0, **329 tests**, `--strict` valid, format clean. Both §7b mutation targets
+confirmed unmutated in `src/` before commit, by the amended check (diff **and** status — see below).
 
-**Note the working tree carries an uncommitted docs-only change** — the dmons 0.3.0 workflow upgrade
-(`CLAUDE.md`, `.claude/agents/supervisor.md` new, `reviewer.md`/`worker.md`, and its `[architect]`
-post in the `## 7.` thread). No `src/` or `tests/` content in it. **Product Owner's call (2026-07-29):
-it lands *after* 7.2 has been implemented under the new shape** — the upgrade gets committed once it
-has been shown to work, not before. §7b is therefore the first block built under 0.3.0 while 0.3.0
-itself is still uncommitted; that is deliberate.
+**§7 is CLOSED — supervisor `Approve`, 2026-07-30**, over the reconstructed range `a7ed950..HEAD`.
+This was the project's **first section review**, and the shape earned its keep on the first outing:
+its one substantive finding (S1 below) is a cross-section composition defect that **no block review
+could have seen**, because each of the three decisions composing it is correct on its own. §1–§6
+were built before the outer loop existed and are not retro-fitted.
 
-**Product Owner's call (2026-07-29) on the open §7 review question: yes — §7 gets the supervisor
-review, run once 7.2 is ticked.** Its range is reconstructed from `git log` (§7 work starts after the
-§6 close), since §7 has no `Base:` post. Reconstruct it and say so in the thread, per CLAUDE.md §1.4.
+**Two open items §7 hands forward. Neither blocks §8 starting; the first must be settled inside it.**
 
-**Next up:**
+1. **S1 — §7 leaves §8 a real trap: the case-comparison semantics are nowhere binding.** Three
+   individually-correct decisions compose badly:
+   - `GitEmailService.FindOwnerAsync` is **private**, returns `Guid?` — right for 7.2.
+   - **AD26 is scoped "binding on §7.2"**, and that scoping carries its *load-bearing* half with it:
+     match case-insensitively **via the `NOCASE` collation, never normalise in C#**. §8 is not bound
+     by it.
+   - **Both** `Account lookup by git email` **and** the new `Git email management` requirement are
+     **silent on comparison semantics.** "A git email SHALL be associated with at most one account"
+     is only true case-insensitively, and no spec sentence says so.
 
-1. **§7b = task 7.2 only** — manage the git emails associated with an account. **AD24 already
-   settles its one hard question** (an address claimed by another account is named as such, bounded
-   to *that* it is taken and never *whom* by). It inherits 7a's shape: Static SSR form POSTs,
-   protected by AD21's default-deny, and **no `Account` entity materialised** — 7a closed the §7
-   projection hazard by construction (list from a projection, username off the principal) and 7b must
-   not reopen it. `GitEmail`'s uniqueness is global (`NOCASE` unique index across all accounts),
-   which is what forces AD24.
+   §7 stores addresses **trimmed but case-preserved**; matching is the column collation alone. An 8.2
+   lookup that lower-cases in C#, or compares ordinally in memory, **silently fails to attribute a
+   commit** whose author differs only in case — **and every §7 test stays green**, because §7 never
+   exercises that path. This is the failure mode this project keeps re-learning: a green suite
+   measuring a condition the defect does not live in.
 
-**Brief §7b with AD25's caps in the brief itself** — 3-run cap, mutation scoped to auth/concurrency/
-data-integrity paths, no polling loops, stop when the mutant resolves. Briefing them up front is the
-whole point of the decision.
+   **Close it in §8's brief.** Either promote `FindOwnerAsync` to the §8 primitive, or restate AD26's
+   collation rule as binding on §8 — **and either way add a test that an address stored as
+   `Alice@x.com` resolves for author `alice@x.com`.** The Architect should also consider stating the
+   comparison semantics in `specs/user-accounts/spec.md` itself, since it is the one semantic §8
+   consumes and the requirement was written without it.
 
-**Then §8 → §9.** §8 exposes credential verification and git-email lookup for the Smart HTTP remote;
-note the reviewer's condition that the moment §8 adds path-shaped exemptions, "new page = protected
-by default" stops being automatic and `[Authorize]` becomes load-bearing again. §9 is the test sweep
-— and it now has **measured** evidence, not a suspicion, that the log-secrecy sweep must move from
-`Messages` to `Written`: a token plaintext logged via `BeginScope` passed **298/298** under
-`Messages`, reproduced independently by both worker and reviewer.
+2. **S3 — the Product Owner's 7.1 browser sign-off is stale, and 7.1 stays ticked.** 7.1 was verified
+   on 2026-07-29 against `130629c`; 7b then added a heading and two forms **to the same page**
+   (`e4bec3d`, 2026-07-30). Nothing was ticked improperly — 7.2 was never designated
+   human-in-the-loop, and the page tests cover the new forms through the real pipeline. But **the page
+   the Product Owner signed off is not the page that shipped.** Either a sixty-second re-look at
+   `/account`, or an explicit line here recording that the page tests suffice for 7b. Put it to the
+   Product Owner; do not resolve it by assertion.
+
+**Recorded, no action (supervisor S2/S4):**
+
+- **`AddAsync`'s pre-check was never mutated, and a mutant there would survive — correctly.** Deleting
+  the early return is behaviour-preserving: the insert hits the unique index, the catch re-derives via
+  `FindOwnerAsync`, and `Outcome()` returns the same value. **The supervisor reasoned this rather than
+  measuring it, and said so.** Recorded so nobody reads §7b's M1/M2 as covering the pre-check.
+- **The uniqueness invariant is proved at the storage layer only** (`IdentityDbContextTests`). Every
+  service- and page-level assertion would still pass **with the unique index dropped**, because the
+  pre-check absorbs it, and nothing connects the two test classes. Relevant to §9's sweep.
+- The `DbUpdateException` branch stays untested — an availability gap, not a security one: it
+  **re-derives and throws rather than guessing**, so it cannot mis-classify.
+- **On AD25: both §7b mutants dying on a single run is correct, not a shortfall.** The variance the
+  3-run standard exists to detect is a property of *concurrency* tests (`BootstrapConcurrencyTests`'
+  7/13 is what earned the rule); these two are deterministic. Do not read "3" as a quota.
+- S4, cosmetic: 7b promoted ordinary outcome messages to named consts where 7a left equivalents
+  inline. 7a's rule is the better one; 7b over-applied it. Not worth a commit on its own.
+
+**The mutation-hazard rule was amended this session (`81379e3`), because §7b found a hole in it.**
+`git diff -- src` is **blind to untracked files** — a never-`git add`ed file is not reported as
+unchanged, it is not reported *at all*. §7b mutated `GitEmailService.cs` while it was brand new and
+untracked, so the mandated check came back clean over a file it had never looked at — and **a new file
+is the normal case for a block that adds a service**, which is exactly when mutation testing runs.
+CLAUDE.md now pairs the diff with `git status --short -- src`, and says plainly what that buys: a
+`??` entry means **read it or checksum it**, not "it's fine". Git offers *visibility* here, not
+verification — a new file has no baseline to diff against. **The checksum discipline is what actually
+caught it**, and that is the transferable lesson, not the command.
+
+**§8 then §9.** §8 exposes credential verification and git-email lookup for the Smart HTTP remote.
+Two conditions already on the record: the reviewer's — the moment §8 adds **path-shaped exemptions**,
+"new page = protected by default" stops being automatic and `[Authorize]` becomes load-bearing again;
+and the supervisor's S1 above. §9 is the test sweep — and it has **measured** evidence, not a
+suspicion, that the log-secrecy sweep must move from `Messages` to `Written`: a token plaintext logged
+via `BeginScope` passed **298/298** under `Messages`, reproduced independently by worker and reviewer.
+Add to §9's list the storage-layer/service-layer disconnect in S2 above.
 
 **6.1 and 6.2 confirmed by the Product Owner in a real browser (2026-07-28)** — "all worked okay" —
 walking the widened recipe across **both scripting states**: the identical page on a protected and a
