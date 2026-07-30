@@ -8134,6 +8134,321 @@ current logged-in identity.
 
   → @architect
 
+- **[supervisor]** Section review of **§8** over `3336f69..HEAD` (one commit, `2e63ead`).
+  **Verdict: Request changes.**
+
+  Two blockers, both cross-block by construction — neither is visible in §8's own diff alone, and
+  neither is a re-opening of anything @reviewer cleared. Everything else in the section is sound, and
+  I say so specifically below so the remediation stays small.
+
+  ### Blocker S2 — `AuthenticatedAccount` now means two incompatible things, and the section hands both to one consumer
+
+  `AuthenticatedAccount` (`src/ZeroWiki/Identity/AuthenticatedAccount.cs:6`) documents itself as *"the
+  identity established by a successful login… deliberately the projection the credential check reads
+  and nothing more"*. §5 minted it for exactly that. §8 now returns it from three places, and one of
+  them is not a credential check:
+
+  - `GitTokenService.VerifyAsync` (`src/ZeroWiki/Identity/GitTokenService.cs:59`) — a credential check.
+    Correct use.
+  - `CurrentUserAccessor.GetCurrent` (`src/ZeroWiki/Identity/CurrentUserAccessor.cs:24`) — that same
+    identity read back off the session. Correct use.
+  - `GitEmailService.FindByEmailAsync` (`src/ZeroWiki/Identity/GitEmailService.cs:150`) — **nothing has
+    been authenticated here.** This is "which account claims this string", where the string is an
+    author email lifted out of a commit object. `git config user.email` is writeable by whoever
+    authored the commit; the value is attacker-controlled by design.
+
+  Content-core's push path is the single consumer of all three, and it will hold both at once:
+
+  ```
+  var pusher = await gitTokens.VerifyAsync(username, token);        // AuthenticatedAccount? — trusted
+  var author = await gitEmails.FindByEmailAsync(commit.AuthorEmail); // AuthenticatedAccount? — a claim
+  ```
+
+  Two values, same type, same shape, same `IsAdministrator` field, one trusted and one not, flowing
+  through one function — and the type's own name and doc comment assert that both were authenticated.
+  That is a confused-deputy surface handed over pre-built. `IsAdministrator` in particular has **no
+  attribution use whatsoever**: commit attribution needs an account id (and a username to display), not
+  an authorization flag, and carrying one on a value derived from a commit's author line is surplus
+  authority sourced from untrusted input.
+
+  This is not a naming preference and not a §8.2 bug — `FindByEmailAsync` satisfies its spec
+  requirement exactly, which is why the block review passed it. It is the *composition*: §5's contract
+  for the type was silently widened by §8.2, and §8 exists precisely to be a coherent API handover.
+  The section review is the last look before content-core builds on it.
+
+  ### Blocker S3 — `GitEmailService`'s class-level ownership invariant is now false
+
+  `src/ZeroWiki/Identity/GitEmailService.cs:12-18` still reads:
+
+  > Every method is scoped by the caller's own account id, taken by the caller
+  > (`Components.Pages.Account`) from the signed-in principal and never from the request body…
+
+  After §8.2 that is untrue. `FindByEmailAsync` is public, is scoped by nothing, is not called by the
+  account page, and takes its only argument straight from a pushed commit. §7.2 wrote that remark as
+  the class's stated security invariant — it is the only prose statement of the rule that the
+  user-accounts scenario *"Member cannot modify another account's git emails"* leans on. §8 falsified
+  it, and the block diff never touched that hunk, so @reviewer had no reason to look at it. The class
+  summary directly above it *was* updated for §8; the invariant beneath it was not.
+
+  Worth stating plainly in the replacement text, because it is the thing a future caller needs to know:
+  `FindByEmailAsync` returns identity that §7's own spec forbids the *add* flow from revealing
+  (*"without identifying which account"*). `AddAsync` is fine — it reads only `.Id` and compares
+  (`GitEmailService.cs:56,79`) and the `TakenByAnotherAccount` outcome still carries no identity. But
+  the primitive is now broader than any UI in this change is permitted to surface, and that constraint
+  currently exists nowhere in writing.
+
+  ### Suggested remediation shape — one small block
+
+  1. Give the email lookup its own result type — e.g. `sealed record GitEmailOwner(Guid AccountId,
+     string Username)`, or narrower if content-core only needs the id — and **drop `IsAdministrator`
+     from it**. `AddAsync`'s two call sites change only in the property they read.
+  2. Add one sentence to `AuthenticatedAccount`'s doc pinning the narrowed contract: it is produced
+     only by a credential check or read back from an established session, and never by a lookup.
+  3. Rewrite `GitEmailService`'s class `<remarks>` so the caller-scoping invariant is stated as
+     applying to the account-page methods (`AddAsync` / `ListAsync` / `RemoveAsync`), and
+     `FindByEmailAsync` is called out as the deliberate exception: unscoped, untrusted input, and not
+     to be surfaced to a user.
+  4. Retype the four `FindByEmailAsync` tests (`GitEmailServiceTests.cs:194-228`). No new behaviour, no
+     new coverage needed — the case-insensitivity and no-match assertions carry over unchanged.
+
+  No new `N.M` numbers; nothing to tick.
+
+  ### Verified sound — do not re-litigate these in the fix block
+
+  - **Spec satisfied, both requirements, end to end.** Credential verification: valid username + token
+    resolves (`GitTokenService.cs:71-72`); the *real* login password is proven to succeed against
+    `LoginService` and then rejected as a git credential (`GitTokenServiceTests.cs:178-189`) — the
+    scenario as written, not a stand-in string; missing/unknown/revoked all return `null`. Account
+    lookup: known resolves, unknown returns `null` **as a value, not an exception**, and the
+    case-differing address resolves (`GitEmailServiceTests.cs:194-228`).
+  - **AD26 / S1 upheld in both new paths.** No `ToLower`, `ToUpperInvariant`, `StringComparison`, or
+    in-memory comparison on either; `NOCASE` is the sole authority at `GitTokenService.cs:71` and
+    `GitEmailService.cs:161`. S1 landed as intended.
+  - **AD7 upheld and a live hazard closed.** Both queries project straight into a record; `Account` is
+    never materialised. `VerifyAsync`'s old `.Select(t => t.Account)` — the 500-instead-of-rejection
+    shape §7's `## NEXT` flagged — is genuinely gone.
+  - **AD4 upheld by construction.** No `IPasswordHasher` reference anywhere on the git credential path;
+    there is still only a token door a password cannot enter.
+  - **`AddAsync`'s uniqueness semantics unchanged.** The promotion adds a join (`e.Account!.Id`) where
+    the old shape read `e.AccountId` off the row itself, so an orphaned `GitEmail` would flip a clean
+    `TakenByAnotherAccount` into the `InvalidOperationException` at `GitEmailService.cs:79-81`.
+    @reviewer's clearance holds: the FK is required with cascade delete, `Microsoft.Data.Sqlite` enables
+    `PRAGMA foreign_keys` per connection, and no account-deletion path exists in `src/`. Confirmed, not
+    re-opened — see the `## NEXT` note.
+  - **DI and reachability are coherent.** All three primitives are `AddScoped` (`Program.cs:17,18,23`)
+    plus `AddHttpContextAccessor()`; one lifetime, no overlapping registration, nothing content-core
+    would have to register for itself. Both `VerifyAsync` call sites were migrated to the new signature
+    — no stale two-arg call survives.
+  - **No dead scaffolding, no duplicated abstraction.** `FindOwnerAsync` was replaced, not left beside
+    its successor; `Outcome` moved without changing. The promote-don't-duplicate call was the right one
+    and is well argued in the code.
+  - **Scope and render-mode discipline intact.** §8 adds no routes, no components, no circuits, no
+    `AllowAnonymous` exemption, no Basic-auth parsing. The out-of-scope list was respected exactly.
+  - **Mutation record is clean and coherent.** `git diff -- src` and `git status --short` are both empty
+    at `HEAD`; `CurrentUserAccessor.cs` — untracked for the whole block, the §7b trap — is now committed
+    and I read all 41 lines: no residue. The posted figure is a **full-suite** result (342/342, "never
+    filtered"), the mutation is confined to 8.1, and 8.2/8.3 were correctly left to ordinary tests. The
+    test-strategy boundary was applied consistently. Not re-run, per the standard.
+  - **8.3 matches the PO's ruling exactly** — principal-only, no DB read, no new claims, no
+    `DisplayName`, no git email; anonymous and no-`HttpContext` both `null` and both tested.
+
+  ### ❓ @architect → for the Product Owner (a decision to take *now*, not a §8 defect)
+
+  The PO's 2026-07-30 ruling is respected and I am not questioning it. But walking the consumer's side,
+  the gap it leaves is more specific than "a later ask", and it is cheaper to settle before content-core
+  starts than during. A git author line is `Name <email>`. From these primitives content-core can get:
+
+  - the **email** side — `GitEmailService.ListAsync(accountId)` is public and already scoped by id, so
+    that half works today;
+  - the **name** side — `GetCurrent()` gives `Username`, and **nothing anywhere returns `DisplayName`
+    by account id.** AD7 forbids materialising `Account`, so content-core's only routes are to stamp
+    `Username <email>` or to reach into `IdentityDbContext` itself — which would couple content-core to
+    the identity entity and re-open the AD7 hazard §8 just closed.
+
+  `DisplayName` is a *spec-required* account field (`specs/user-accounts/spec.md:5`), so somebody
+  expected it to be displayed somewhere. The question for the PO is simply: **is the git author line
+  `Username <email>` or `DisplayName <email>`?** If the former, §8 is complete as it stands and
+  `DisplayName` is UI-only. If the latter, content-core needs a fourth primitive and it should be
+  scoped as a known follow-on rather than discovered mid-build.
+
+  → @architect
+
+- **[architect]** **Remediation block — supervisor S2 + S3.** → @worker
+
+  Both findings accepted without argument. S2 is the one I asked the supervisor to look for and it
+  came back sharper than I framed it: I suspected `AuthenticatedAccount` was being *stretched*; the
+  actual defect is that it is being **trusted**. A git author email comes from `git config user.email`
+  on somebody's laptop — self-asserted by design (content-core D5, and this change's own accepted risk
+  register). Returning the same type from a lookup keyed on that string as from a credential check
+  means content-core's push path holds an authenticated identity and an unverified claim in one type
+  whose own summary says both were "established by a successful login", carrying an `IsAdministrator`
+  field that attribution has no use for. That is surplus authority sourced from untrusted input.
+
+  **This is a remediation block: no new `N.M` numbers, and it ticks nothing** — every box in §8 is
+  already ticked. The findings and the fix live in this thread; that is the record.
+
+  **Four changes, and deliberately no new test coverage** — the behaviour is already covered and is not
+  changing:
+
+  1. **A dedicated result type for the email lookup.** `GitEmailService.FindByEmailAsync` returns a new
+     record — `GitEmailOwner` or similar — carrying the account id and username and **not**
+     `IsAdministrator`. Its doc must say what it is: the account that *claims* a self-asserted git
+     email, not an authenticated identity. Naming is yours; the property that matters is that a caller
+     cannot reach an authority bit from an attacker-supplied string.
+  2. **Pin `AuthenticatedAccount`'s contract.** One sentence in its doc restricting it to values
+     originating from a credential check or an established session, so the next producer that "just
+     fits" has something explicit to violate rather than a vacuum to drift into.
+  3. **Fix `GitEmailService`'s class `<remarks>`.** It still claims "Every method is scoped by the
+     caller's own account id … never from the request body". `FindByEmailAsync` is public and scoped by
+     nothing, so that invariant is now false as written. Scope it to the account-page methods and name
+     `FindByEmailAsync` as the deliberate exception, with why. Note §7's spec forbids the *add* flow
+     revealing which account holds an address ("without identifying which account") — `AddAsync` still
+     honours that, but the reason it does is unwritten. Write it down.
+  4. **Retype the four tests** at `GitEmailServiceTests.cs:194-228` to the new type. Mechanical.
+
+  **Do not** change any query, any comparison, or `AddAsync`'s semantics. AD26/S1, AD7 and AD4 were all
+  verified upheld and must stay that way — no C#-side case folding, no materialised `Account`. **No
+  mutation testing on this block**: it is a type and documentation change over behaviour that is already
+  covered, and mutation is scoped to security-critical *logic*.
+
+  Gates as ever, all four: `dotnet build` clean, `dotnet test` (342/342 — the count must not move,
+  since no coverage is being added), `openspec validate invite-only-authentication --strict`,
+  `dotnet format --verify-no-changes`. Do not commit and do not tick anything. → @reviewer when done.
+
+- **[worker]** Remediation for S2 + S3 done, all four changes as specced.
+
+  1. New `src/ZeroWiki/Identity/GitEmailOwner.cs` — `sealed record GitEmailOwner(Guid AccountId,
+     string Username)`. No `IsAdministrator`. Doc frames it explicitly as "not an authenticated
+     identity" and explains why (self-asserted `git config user.email` input).
+  2. `AuthenticatedAccount`'s doc gained a `<remarks>` pinning it to values from
+     `GitTokenService.VerifyAsync` or `CurrentUserAccessor.GetCurrent` only, pointing at
+     `GitEmailOwner` as where an unverified lookup result belongs instead.
+  3. `GitEmailService`'s class `<remarks>` split into two `<para>`s: the caller-scoping invariant is
+     now stated as applying to `AddAsync`/`ListAsync`/`RemoveAsync`, and `FindByEmailAsync` is named
+     as the deliberate, unscoped exception — untrusted input, output never to be surfaced to a user.
+     Wrote down why `AddAsync` still honours §7's "without identifying which account": it reads only
+     `owner.AccountId` to pick between the two `Outcome` branches and the identity itself never
+     leaves the class on that path.
+  4. `FindByEmailAsync`'s return type changed to `GitEmailOwner?`; its projection now selects
+     `new GitEmailOwner(e.Account!.Id, e.Account!.Username)` — the `IsAdministrator` read is gone
+     from the query, nothing else in the `Where`/`Select`/`SingleOrDefaultAsync` chain touched.
+     `AddAsync`'s two internal call sites changed only `owner.Id` → `owner.AccountId`; `Outcome`'s
+     own logic (`owningAccountId == callerAccountId`) is untouched. The four
+     `GitEmailServiceTests.cs:194-228` tests retyped mechanically (`resolved.Id` →
+     `resolved.AccountId`); no new tests, no assertion logic changed.
+
+  `git status --short -- src tests`: three modified files (`AuthenticatedAccount.cs`,
+  `GitEmailService.cs`, `GitEmailServiceTests.cs`) plus one new untracked file
+  (`GitEmailOwner.cs`, read in full above — no residue). No mutation testing run, per the brief.
+
+  Gates: `dotnet build` clean, 0 warnings. `dotnet test` 342/342 — count unchanged from the
+  pre-remediation baseline. `openspec validate invite-only-authentication --strict` passes.
+  `dotnet format --verify-no-changes` clean. Not committed, nothing ticked.
+
+  → @reviewer
+
+- **[architect]** **Product Owner decision (2026-07-30) — the browser-save commit author line is
+  `Username <email>`.** Answers the supervisor's `❓ @architect`. Put to the PO with the consequence
+  made concrete: `DisplayName` has no exit from the identity layer (nothing returns it by account id,
+  and AD7 forbids materialising `Account` to fetch it), so `DisplayName <email>` would have required
+  either a fourth §8 primitive or a direct `IdentityDbContext` read that re-opens the 500-hazard §8.1
+  just closed. A third option — minting `DisplayName` as a claim, reversing the earlier principal-only
+  ruling — was offered and also declined.
+
+  **Binding consequences:** **§8 is complete as scoped — no fourth primitive.** `DisplayName` stays
+  UI-only and never leaves the account page. Content-core stamps the **username**, and takes the email
+  side from `GitEmailService.ListAsync(accountId)`. Commits read `emmz <emmz@example.com>`, which is
+  also stable in a way a free-text display name is not — the username is unique and immutable-in-
+  practice, so `git log`/`blame` attribution cannot be retroactively muddied by an account rename.
+  This decision travels to `git-backed-content-core`; it is not a §8 implementation detail.
+
+- **[reviewer]** Audited the S2 + S3 remediation block, `git diff 2e63ead -- src tests` plus the new
+  untracked `GitEmailOwner.cs` (read in full). **Verdict: Approve with nits.**
+
+  Independently re-ran all four gates: `dotnet build` — 0 warnings/errors. `dotnet test` —
+  **342/342**, count unchanged from the pre-remediation baseline as required. `openspec validate
+  invite-only-authentication --strict` — valid. `dotnet format --verify-no-changes` — clean.
+  `git diff -- openspec/changes/invite-only-authentication/tasks.md` is empty and
+  `git status --short -- src tests` shows exactly the four files the worker reported, nothing more —
+  no mutation residue, consistent with "no mutation testing on this block."
+
+  **S2 — closed, not relocated.** `GitEmailOwner` (`src/ZeroWiki/Identity/GitEmailOwner.cs:12`) is
+  `sealed record GitEmailOwner(Guid AccountId, string Username)` — no `IsAdministrator` anywhere on
+  it. `FindByEmailAsync`'s projection (`GitEmailService.cs:182`) selects
+  `new GitEmailOwner(e.Account!.Id, e.Account!.Username)` — the `IsAdministrator` read that was on
+  the old `AuthenticatedAccount` projection is gone from the query entirely, not just from the
+  return type. Grepped the whole tree for `new AuthenticatedAccount(` — three hits, all legitimate
+  producers (`LoginService.cs:96`, `GitTokenService.cs:74`, `CurrentUserAccessor.cs:39`) — and for
+  `GitEmailOwner` — every reference is inside `GitEmailService.cs`, its own doc comment, or the test
+  file. No path converts a `GitEmailOwner` into an `AuthenticatedAccount` or otherwise re-widens it.
+  Structural half of S2 is genuinely closed.
+
+  `AuthenticatedAccount`'s new `<remarks>` (`AuthenticatedAccount.cs:7-12`) is precise enough to be
+  violable — it names the exact two allowed producers (`GitTokenService.VerifyAsync`,
+  `CurrentUserAccessor.GetCurrent`) rather than gesturing at "credential checks" in the abstract, so
+  a third producer added later has a concrete claim to breach, not a vacuum to drift into. This
+  closes S2's doc half as intended.
+
+  **S3 — the rewritten `<remarks>` is true against all four public methods**, and reads correctly as
+  a check against each: paragraph 1 (`GitEmailService.cs:14-20`) covers `AddAsync`, `ListAsync`,
+  `RemoveAsync` as caller-scoped — true, all three take `accountId` from the signed-in principal via
+  the account page and filter by it. Paragraph 2 (`GitEmailService.cs:21-32`) names
+  `FindByEmailAsync` as the deliberate unscoped exception — true, it takes no account id and its
+  `Where` clause filters only on `e.Email`. The brief's specific ask — writing down *why* `AddAsync`
+  still honours §7's "without identifying which account" — is now explicit: "it reads only
+  `owner.AccountId` to decide between `AlreadyOnThisAccount` and `TakenByAnotherAccount` — the
+  identity itself never leaves this class on that path" (`GitEmailService.cs:28-31`). Verified against
+  the actual code at `GitEmailService.cs:74,98`: both call sites read only `owner.AccountId` into
+  `Outcome(...)`, which returns an enum value — no account id or username crosses the method
+  boundary. Neither under- nor over-claims.
+
+  **Nothing else changed, confirmed mechanically.** `AddAsync`'s two call sites
+  (`GitEmailService.cs:74,98`) changed only `owner.Id` → `owner.AccountId`; the `Outcome` helper
+  (`GitEmailService.cs:186-189`) and its `owningAccountId == callerAccountId` comparison are
+  untouched — pure rename, same value, since `GitEmailOwner.AccountId` and the old
+  `AuthenticatedAccount.Id` were populated from the same `e.Account!.Id` projection. No `ToLower()`,
+  `ToUpperInvariant()`, `StringComparison`, or in-memory comparison was introduced anywhere in this
+  diff — AD26/S1 still rests solely on the `NOCASE` column. Projection-not-materialisation (AD7)
+  holds: `FindByEmailAsync` still selects straight into a record, never `.Select(e => e.Account)`.
+  AD4 is untouched by this diff (no `IPasswordHasher` reference here to begin with). The four
+  `GitEmailServiceTests.cs:194-228` tests are a pure retype — `resolved.Id` → `resolved.AccountId`,
+  same assertions, same scenarios (known-email resolves, unknown returns no match, case-differing
+  address resolves, missing/empty resolves to nothing); nothing weakened or dropped, and the 342
+  count proves no coverage moved. No evidence of a mutation run against this diff — the worker's
+  report and the clean `git diff`/`git status` agree, and the brief correctly scoped mutation out
+  (type/doc change over already-covered behaviour).
+
+  **Nit — `GitEmailOwner.cs:7`'s own summary misdescribes its own record.** It reads *"attribution
+  needs an account id and a display name, not a claim a credential check never verified"* — but the
+  record's second parameter is `Username` (`GitEmailOwner.cs:11-12`), not `DisplayName`. This
+  codebase has a real, distinct `Account.DisplayName` field (`src/ZeroWiki/Data/Account.cs:17`,
+  a spec-required column separate from `Username` — see the architect's PO-decision post just above
+  this one, which turns on that exact distinction: the commit author line is `Username <email>`,
+  *not* `DisplayName <email>`). A reader who takes "display name" literally here would come away
+  thinking `GitEmailOwner` carries the account's display name; it doesn't. Given the whole point of
+  this remediation block was tightening documentation precision so a violation is legible, this is
+  a small but real miss in the one file the block created from scratch — worth a one-word fix
+  (s/display name/username/) so the doc doesn't contradict the type immediately below it.
+
+  **Blockers:** none.
+
+  **Nits:**
+  - `GitEmailOwner.cs:7` — "a display name" should read "a username" (or similar), matching the
+    actual `Username` parameter and avoiding confusion with the distinct `Account.DisplayName` field.
+
+  → @architect
+
+- **[worker]** Fixed the nit: `GitEmailOwner.cs:7` now reads "an account id and a username" instead
+  of "a display name". Checked the rest of the file for the same slip (`grep -in display`) — no other
+  occurrence; the summary, `<param>` docs, and the sealed record itself were otherwise untouched.
+  Nothing else in the file changed.
+
+  Gates re-run: `dotnet build` clean, 0 warnings. `dotnet test` 342/342 — count unchanged.
+  `openspec validate invite-only-authentication --strict` passes. `dotnet format --verify-no-changes`
+  clean. Not committed, nothing ticked.
+
+  → @architect
+
 ---
 
 ## NEXT

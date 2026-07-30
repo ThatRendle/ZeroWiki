@@ -10,11 +10,26 @@ namespace ZeroWiki.Identity;
 /// concern and is not implemented here.
 /// </summary>
 /// <remarks>
-/// Every method is scoped by the caller's own account id, taken by the caller
+/// <para>
+/// The account-page methods — <see cref="AddAsync"/>, <see cref="ListAsync"/>, and
+/// <see cref="RemoveAsync"/> — are each scoped by the caller's own account id, taken by the caller
 /// (<see cref="Components.Pages.Account"/>) from the signed-in principal and never from the
 /// request body — the same shape as <see cref="GitTokenService.RevokeAsync"/>. "Zero associated
 /// emails" is an explicitly legal account state (the account-model spec), so nothing here stops
 /// the last one from being removed.
+/// </para>
+/// <para>
+/// <see cref="FindByEmailAsync"/> is the deliberate exception to that scoping: it takes no account
+/// id at all and resolves an arbitrary email to whichever account currently claims it. That is by
+/// design — §8's account-lookup requirement is unscoped by definition — but it means the method's
+/// input is untrusted (a commit's author email, self-asserted by the pusher) and its output must
+/// never be surfaced to a user the way <see cref="AddAsync"/>'s outcome is. §7's spec forbids the
+/// add flow from revealing which account holds an address ("without identifying which account");
+/// <see cref="AddAsync"/> still honours that because it reads only <c>owner.AccountId</c> to decide
+/// between <see cref="GitEmailAddOutcome.AlreadyOnThisAccount"/> and
+/// <see cref="GitEmailAddOutcome.TakenByAnotherAccount"/> — the identity itself never leaves this
+/// class on that path.
+/// </para>
 /// </remarks>
 public sealed class GitEmailService(IdentityDbContext db)
 {
@@ -56,7 +71,7 @@ public sealed class GitEmailService(IdentityDbContext db)
         var owner = await FindByEmailAsync(email, cancellationToken);
         if (owner is not null)
         {
-            return Outcome(owner.Id, accountId);
+            return Outcome(owner.AccountId, accountId);
         }
 
         var candidate = new GitEmail
@@ -80,7 +95,7 @@ public sealed class GitEmailService(IdentityDbContext db)
                 ?? throw new InvalidOperationException(
                     "The insert of a git email failed as a duplicate, but no row now claims that address.");
 
-            return Outcome(owner.Id, accountId);
+            return Outcome(owner.AccountId, accountId);
         }
 
         return GitEmailAddOutcome.Added;
@@ -123,8 +138,11 @@ public sealed class GitEmailService(IdentityDbContext db)
     }
 
     /// <summary>
-    /// Resolves a git email to the account it is associated with (§8), or <see langword="null"/>
-    /// when no account holds it — a value, not an exception, per the account-lookup requirement.
+    /// Resolves a git email to the account that claims it (§8), or <see langword="null"/> when no
+    /// account holds it — a value, not an exception, per the account-lookup requirement. This is a
+    /// lookup on self-asserted input, not a credential check: the caller has proven nothing about
+    /// the account this returns, only that some account's git-email list contains the string
+    /// passed in. See <see cref="GitEmailOwner"/>.
     /// </summary>
     /// <remarks>
     /// <para>
@@ -142,12 +160,14 @@ public sealed class GitEmailService(IdentityDbContext db)
     /// authority" to every place a git email is matched, including this one).
     /// </para>
     /// <para>
-    /// Projected into <see cref="AuthenticatedAccount"/> rather than materialised as an
+    /// Projected into <see cref="GitEmailOwner"/> rather than materialised as an
     /// <see cref="Account"/> (AD7) — a corrupt row elsewhere on the account must not turn this
-    /// lookup into a 500.
+    /// lookup into a 500 — and rather than into <see cref="AuthenticatedAccount"/> (§8 supervisor
+    /// finding S2): the result carries no <c>IsAdministrator</c> bit, because an authority flag
+    /// derived from a commit's author line would be surplus authority sourced from untrusted input.
     /// </para>
     /// </remarks>
-    public async Task<AuthenticatedAccount?> FindByEmailAsync(
+    public async Task<GitEmailOwner?> FindByEmailAsync(
         string? email,
         CancellationToken cancellationToken = default)
     {
@@ -159,7 +179,7 @@ public sealed class GitEmailService(IdentityDbContext db)
         return await db.GitEmails
             .AsNoTracking()
             .Where(e => e.Email == email)
-            .Select(e => new AuthenticatedAccount(e.Account!.Id, e.Account!.Username, e.Account!.IsAdministrator))
+            .Select(e => new GitEmailOwner(e.Account!.Id, e.Account!.Username))
             .SingleOrDefaultAsync(cancellationToken);
     }
 

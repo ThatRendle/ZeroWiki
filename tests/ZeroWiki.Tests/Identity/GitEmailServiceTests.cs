@@ -194,7 +194,7 @@ public sealed class GitEmailServiceTests : IDisposable
         var resolved = await _service.FindByEmailAsync("alice@example.com");
 
         Assert.NotNull(resolved);
-        Assert.Equal(alice.Id, resolved.Id);
+        Assert.Equal(alice.Id, resolved.AccountId);
         Assert.Equal("alice", resolved.Username);
     }
 
@@ -217,7 +217,7 @@ public sealed class GitEmailServiceTests : IDisposable
         var resolved = await _service.FindByEmailAsync("alice@x.com");
 
         Assert.NotNull(resolved);
-        Assert.Equal(alice.Id, resolved.Id);
+        Assert.Equal(alice.Id, resolved.AccountId);
     }
 
     [Theory]
