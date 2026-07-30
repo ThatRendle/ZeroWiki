@@ -44,9 +44,9 @@
 
 ## 8. Primitives consumed by content-core
 
-- [ ] 8.1 Expose credential verification: resolve a username + git token to an account; reject login-password-as-git-credential
-- [ ] 8.2 Expose account lookup by git email (match / no-match)
-- [ ] 8.3 Expose the current logged-in identity (for commit authorship in content-core)
+- [x] 8.1 Expose credential verification: resolve a username + git token to an account; reject login-password-as-git-credential
+- [x] 8.2 Expose account lookup by git email (match / no-match)
+- [x] 8.3 Expose the current logged-in identity (for commit authorship in content-core)
 
 ## 9. Tests
 

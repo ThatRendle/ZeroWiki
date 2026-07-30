@@ -19,6 +19,8 @@ builder.Services.AddScoped<GitEmailService>();
 builder.Services.AddScoped<BootstrapService>();
 builder.Services.AddScoped<LoginService>();
 builder.Services.AddScoped<InvitationService>();
+builder.Services.AddHttpContextAccessor();
+builder.Services.AddScoped<CurrentUserAccessor>();
 
 // Cookie authentication only — deliberately not ASP.NET Core Identity, whose deferred surface
 // (email confirmation, 2FA, external logins, role UI) is dead weight for an invite-only wiki.

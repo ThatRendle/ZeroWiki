@@ -36,17 +36,32 @@ public sealed class GitTokenService(
     }
 
     /// <summary>
-    /// Resolves a presented git token to its owning account, or <see langword="null"/> when
-    /// the token is missing, unknown, or revoked.
+    /// Resolves a git-remote credential — a username plus a presented token — to the account
+    /// that owns both, or <see langword="null"/> when the username is missing, the token is
+    /// missing/unknown/revoked, or the token belongs to a different account than the username
+    /// names.
     /// </summary>
     /// <remarks>
+    /// <para>
     /// The presented value is only ever hashed and looked up among issued git tokens, which
     /// is why a login password can never authenticate here — there is no password path to
     /// exclude, only a token path that a password cannot enter.
+    /// </para>
+    /// <para>
+    /// The username comparison relies on <c>Accounts.Username</c>'s <c>NOCASE</c> collation
+    /// rather than a C#-side <c>ToLower()</c> — the same comparison <see cref="LoginService"/>
+    /// uses — so this stays the single case-insensitive rule the column already enforces.
+    /// Projected into <see cref="AuthenticatedAccount"/> rather than materialised as an
+    /// <see cref="Account"/>: the entity carries value-converted timestamps, so a single corrupt
+    /// row would turn git authentication into a 500 instead of a clean rejection (AD7).
+    /// </para>
     /// </remarks>
-    public async Task<Account?> VerifyAsync(string? presentedToken, CancellationToken cancellationToken = default)
+    public async Task<AuthenticatedAccount?> VerifyAsync(
+        string? username,
+        string? presentedToken,
+        CancellationToken cancellationToken = default)
     {
-        if (string.IsNullOrEmpty(presentedToken))
+        if (string.IsNullOrEmpty(username) || string.IsNullOrEmpty(presentedToken))
         {
             return null;
         }
@@ -55,8 +70,8 @@ public sealed class GitTokenService(
 
         return await db.GitTokens
             .AsNoTracking()
-            .Where(t => t.TokenHash == tokenHash && t.RevokedAt == null)
-            .Select(t => t.Account)
+            .Where(t => t.TokenHash == tokenHash && t.RevokedAt == null && t.Account!.Username == username)
+            .Select(t => new AuthenticatedAccount(t.Account!.Id, t.Account!.Username, t.Account!.IsAdministrator))
             .SingleOrDefaultAsync(cancellationToken);
     }
 

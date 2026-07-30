@@ -7837,6 +7837,305 @@ Everything else in this round is approved. **7.1 remains unticked pending the Pr
 
 ---
 
+## 8. Primitives consumed by content-core
+
+**[architect]** Base: `3336f69` — the three primitives `git-backed-content-core` consumes from this
+change: git-remote credential verification (username + token), git-email → account resolution, and the
+current logged-in identity.
+
+- **[architect]** **Product Owner decision (2026-07-30) — 8.3 is a handle, not a commit author.**
+  Asked, because 8.3's task text says "for commit authorship" and a git author line is `Name <email>`
+  while the signed-in principal carries neither a display name nor an email. Three shapes were put:
+  principal-only handle / handle plus a new `DisplayName` claim / a DB-backed accessor returning a
+  usable author line. **The PO chose the principal-only handle.** Binding consequences: **no DB read in
+  the accessor, no new claims minted at login, and `DisplayName`/git email are explicitly *not* part of
+  8.3.** If content-core's author line needs them, that is a later ask from content-core against these
+  primitives — not something §8 anticipates. This closes the only open fork in the section.
+
+- **[architect]** **Block brief — §8.1–8.3 (the whole section, one block).** → @worker
+
+  The section is three small, cohesive primitives with one consumer. It builds and reviews as one
+  deliverable; splitting it would produce three trivial commits and no extra safety.
+
+  ### The tasks
+
+  - **8.1** Expose credential verification: resolve a username + git token to an account; reject
+    login-password-as-git-credential.
+  - **8.2** Expose account lookup by git email (match / no-match).
+  - **8.3** Expose the current logged-in identity (for commit authorship in content-core).
+
+  ### The spec that binds you
+
+  **`specs/authentication/spec.md` — Requirement: Credential verification for the git remote**
+
+  > The system SHALL verify a git-remote credential presented as a username plus a git access token,
+  > resolve it to the owning account, and reject the request when the token is missing, unknown, or
+  > revoked. The login password SHALL NOT be accepted as a git-remote credential.
+
+  Three scenarios: valid username + unrevoked token authenticates as that account; the account's login
+  password presented instead of a token is rejected; missing / unknown / revoked token is rejected and
+  no repository data is served.
+
+  **`specs/user-accounts/spec.md` — Requirement: Account lookup by git email**
+
+  > The system SHALL resolve a git email to the account it is associated with, and SHALL report no
+  > match when the email is not associated with any account.
+
+  Three scenarios: known email resolves; **unknown email returns no match *rather than an error***; and
+  an email differing only in letter case still resolves.
+
+  **`specs/user-accounts/spec.md:5` — Account model, the sentence added this session for you:**
+
+  > The system SHALL compare git emails case-insensitively wherever they are matched — for uniqueness
+  > and for lookup alike — so that addresses differing only in case denote the same identity.
+
+  ### Binding decisions
+
+  1. **8.1 binds the username — today's `VerifyAsync` does not.** `GitTokenService.VerifyAsync`
+     (`GitTokenService.cs:47`) resolves a *token alone*. The spec requires *username **plus** token*: a
+     presented token must belong to an account whose username matches the presented username, and
+     mismatch is a rejection. Compare the username the way login does — `a.Username == username`
+     against the `Accounts.Username` `NOCASE` collation, not an `ToLower()` in C#.
+
+  2. **8.1 must project. Today's `VerifyAsync` does not, and that is a live AD7 hazard.**
+     `.Select(t => t.Account)` materialises the `Account` entity, whose timestamps are value-converted —
+     so a single corrupt row turns git authentication into a 500 instead of a clean rejection. That is
+     the same differential-oracle shape as §5's AD7 addendum, and §7's `## NEXT` note ("project there
+     too") already anticipates it. **Project to the fields you need; never materialise `Account`.**
+     Return `AuthenticatedAccount`, not the entity — consistent with `LoginService`, and it keeps the
+     entity out of content-core's hands. Note this **changes the return type**: check and update the
+     existing callers and `GitTokenServiceTests`.
+
+  3. **The password must remain unable to authenticate *by construction*.** The existing remark is
+     right — there is no password path to exclude, only a token path a password cannot enter. Keep it
+     that way: **never reference `IPasswordHasher` from the git credential path.** Pin it with a test
+     that takes an account's *real login password* (the one that succeeds against `LoginService`) and
+     presents it as the git token — it must be rejected. A test using an arbitrary wrong string does
+     not assert this scenario.
+
+  4. **8.2 — this is supervisor S1, and it is the finding most likely to bite you.** Three
+     individually-correct decisions compose into a trap: `FindOwnerAsync` is private; AD26's
+     "the database is the single authority on matching, via the `NOCASE` index" was scoped *binding on
+     §7.2 only*; and §7 stores addresses **trimmed but case-preserved**. So a lookup that lower-cases in
+     C#, or pulls the list and compares ordinally in memory, silently fails to attribute a commit whose
+     author email differs only in case — **and every existing test stays green**, because nothing
+     exercises that path. Therefore:
+     - **The `NOCASE` collation is the authority for §8 too.** No `ToLower()`, no `ToUpperInvariant()`,
+       no in-memory comparison, no `StringComparison` argument.
+     - **Decide consciously between reusing `FindOwnerAsync`'s shape (promote it) and adding a public
+       method beside it — and say which you chose and why.** What you must not do is leave two
+       near-identical private lookups that can drift. §7's reviewer flagged this adjacency deliberately
+       and parked the call for you.
+     - **Required test:** an address stored as `Alice@x.com` resolves for a lookup of `alice@x.com`.
+     - **No-match is a value, not an exception** — the scenario says "rather than an error".
+     - **Project here too** (AD7) — do not materialise `Account`.
+
+  5. **8.3 — the PO's decision above is binding.** A **principal-only** accessor: read
+     `IHttpContextAccessor.HttpContext?.User` and return `AuthenticatedAccount?` — `Id`, `Username`,
+     `IsAdministrator`. **No DB read. No new claims. No `DisplayName`, no git email.** Anonymous (or no
+     `HttpContext`) returns `null` — test that. Use the existing
+     `ClaimsPrincipalExtensions.IsAdministrator` for the admin flag; it exists precisely so the
+     value-match is not re-derived per caller and read as `"false" == administrator`. You will need
+     `builder.Services.AddHttpContextAccessor()` in `Program.cs`. Keep the surface minimal.
+
+  ### Out of scope — do not build these
+
+  - **The git Smart HTTP remote itself**: no routes, no route group, no Basic-auth header parsing, no
+    `401`/`WWW-Authenticate`, no `git http-backend`. §8 exposes primitives; the remote is
+    `git-backed-content-core`'s. In particular **introduce no path-shaped `AllowAnonymous` exemptions** —
+    §6's supervisor noted that the moment those appear, `[Authorize]` on `/account` stops being
+    documentary. §8 must not be what makes that true.
+  - **Rate limiting / throttling / lockout** — Product Owner closed this as out of scope for the whole
+    change.
+  - **§9's test consolidation** — your block carries its own tests; §9 is a separate section.
+  - **Changing the claims minted at login** — see the PO decision above.
+
+  ### Mutation testing — 8.1 only, and read the caps first
+
+  8.1 is a security-critical auth path, so it is in scope. 8.2 and 8.3 are a lookup and an accessor —
+  **ordinary unit tests are correct there; do not mutate them.** Under this project's standing limits:
+
+  - **Cap confirmation runs at 3.** A mutant that dies 3/3 with a consistent, understood failure mode is
+    confirmed. Stop and summarise when the mutant at hand is resolved — a genuine finding is not licence
+    to keep digging.
+  - **Verify under the full `dotnet test`, never a filter.** A filtered figure is not evidence and must
+    not be posted as the record.
+  - **Checksum the target before *and* after** each mutation — a no-op mutation is indistinguishable
+    from a surviving mutant.
+  - **`git diff -- src` *and* `git status --short -- src` before committing.** The diff is blind to
+    untracked files, and §7b hit exactly this: it mutated a brand-new untracked `GitEmailService.cs`, so
+    the mandated diff came back clean over a file it had never looked at. **If 8.3's accessor is a new
+    file, `git diff` cannot verify it** — checksum the content instead.
+  - **Revert via `trap`/`finally`**, never a final step an interruption can skip. An interrupted run
+    once left a live mutant in `BootstrapService.cs` in production code.
+
+  ### Done-gates — all four, before anything is ticked
+
+  - `dotnet build` clean (no errors)
+  - `dotnet test` green — your new tests **and** all 329 existing ones
+  - `openspec validate invite-only-authentication --strict`
+  - `dotnet format --verify-no-changes` clean
+
+  Baseline at `3336f69`: build clean, **329/329**, `--strict` valid, format clean, tree clean.
+
+  Post to this thread as you go, and hand off to @reviewer when you are done.
+
+- **[worker]** Implemented §8.1–8.3.
+
+  - **8.1** `GitTokenService.VerifyAsync` now takes `(string? username, string? presentedToken)` and
+    returns `AuthenticatedAccount?`. The username binds via `t.Account!.Username == username` in the
+    same LINQ expression as the token/revocation check, translated to SQL against the `NOCASE`
+    column — no `ToLower()`. The whole query projects straight into `AuthenticatedAccount`; `Account`
+    is never materialised. Updated the two existing call sites
+    (`GitTokenServiceTests`, `AccountPageTests`' private `VerifyAsync` helper) to the new signature.
+    Added: a case-insensitive-username test, a "token doesn't authenticate under another account's
+    username" test, and missing-username tests. Strengthened the existing
+    `Login_password_is_not_accepted_as_a_git_credential` test to run the *same* password through a
+    real `LoginService` first and assert it succeeds there — so the rejection is pinned against an
+    actual login password, not an assumption.
+  - **8.2** — **decision:** promoted `GitEmailService`'s private `FindOwnerAsync` to public
+    `FindByEmailAsync(string? email) → Task<AuthenticatedAccount?>`, rather than adding a second
+    method beside it. `AddAsync`'s two call sites now use it and read `.Id` off the result. Chose
+    promotion over a second method because the two lookups were already the same query (same
+    `NOCASE`-collated equality, same table) — the only difference was projection shape
+    (`Guid?` vs. a fuller identity), and a fuller projection is one extra join with no behavioural
+    cost worth a second private method that could drift from it (that drift is exactly supervisor S1).
+    No `ToLower()`/in-memory comparison anywhere; no-match returns `null`. Added tests: known email
+    resolves, unknown email returns no match, an address stored as `Alice@x.com` resolves for a
+    lookup of `alice@x.com`, and missing/empty email resolves to nothing.
+  - **8.3** — new `CurrentUserAccessor` (`Identity/CurrentUserAccessor.cs`), a thin wrapper over
+    `IHttpContextAccessor`. `GetCurrent()` reads `ClaimTypes.NameIdentifier`/`ClaimTypes.Name` and
+    `ClaimsPrincipalExtensions.IsAdministrator()` off the current principal and returns
+    `AuthenticatedAccount?` — no DB read, no new claims, no `DisplayName`, no git email, per the PO's
+    principal-only-handle decision above. Anonymous/no-`HttpContext` returns `null`. Registered
+    `AddHttpContextAccessor()` + `AddScoped<CurrentUserAccessor>()` in `Program.cs`. Tests cover
+    anonymous, no-`HttpContext`, administrator, and non-administrator cases directly against a
+    `DefaultHttpContext`.
+
+  Nothing from the out-of-scope list was touched: no git remote routes, no Basic-auth parsing, no
+  `AllowAnonymous` path exemptions, no rate limiting, §9 untouched, no claims changed at login.
+
+  **Mutation testing (8.1 only).** Mutant: dropped `&& t.Account!.Username == username` from the
+  `Where` clause (the username-binding condition). Checksummed `GitTokenService.cs` before and after
+  each application. Ran the **full** `dotnet test` (never filtered) 3/3 times: each run failed exactly
+  one test, `A_token_does_not_authenticate_under_another_accounts_username`, with the same
+  `Assert.Null() Failure` — a consistent, understood failure mode. Reverted via a `trap ... EXIT` in
+  the same shell invocation as the mutation each time; checksum after revert matched the pre-mutation
+  baseline (`988ca2b4…`) all 3 times, and `git diff -- src` / `git status --short -- src` after the
+  last run show only the legitimate 8.1–8.3 changes plus the new untracked `CurrentUserAccessor.cs`.
+  Confirmed; stopping here per the cap.
+
+  **Gates, all four green:** `dotnet build` — 0 warnings, 0 errors. `dotnet test` — **342/342**
+  (329 baseline + 13 new: 4 in `GitTokenServiceTests`, 5 in `GitEmailServiceTests`, 4 in the new
+  `CurrentUserAccessorTests`). `openspec validate invite-only-authentication --strict` — valid.
+  `dotnet format --verify-no-changes` — clean.
+
+  Files touched: `src/ZeroWiki/Identity/GitTokenService.cs`, `src/ZeroWiki/Identity/GitEmailService.cs`,
+  `src/ZeroWiki/Identity/CurrentUserAccessor.cs` (new), `src/ZeroWiki/Program.cs`,
+  `tests/ZeroWiki.Tests/Identity/GitTokenServiceTests.cs`,
+  `tests/ZeroWiki.Tests/Identity/GitEmailServiceTests.cs`,
+  `tests/ZeroWiki.Tests/Identity/CurrentUserAccessorTests.cs` (new),
+  `tests/ZeroWiki.Tests/Web/AccountPageTests.cs`.
+
+  → @reviewer
+
+- **[reviewer]** Audited §8.1–8.3 against `3336f69`. **Verdict: Approve with nits.**
+
+  Independently re-ran all four gates: `dotnet build` — 0 warnings/errors. `dotnet test` —
+  **342/342**. `openspec validate invite-only-authentication --strict` — valid. `dotnet format
+  --verify-no-changes` — clean. `git diff -- src` and `git status --short -- src` are clean of any
+  mutation residue; `tasks.md` untouched by the diff.
+
+  **The eight specific checks:**
+
+  1. **S1's required test is real.** `An_email_stored_with_different_case_still_resolves`
+     (`GitEmailServiceTests.cs:207`) stores `Alice@x.com` and looks up `alice@x.com`. The code path
+     (`GitEmailService.cs:159-163`) has no `ToLower()`/`ToUpperInvariant()`/`StringComparison`
+     anywhere — the only case-folding is the `NOCASE` column. If the comparison were "moved into
+     C#" the realistic failure mode is exactly what would break this test: default C# `string ==`
+     is ordinal (case-sensitive), so any implementation that materialised rows first and filtered
+     in memory (e.g. `.ToListAsync()` then `.Where(e => e.Email == email)`, or EF falling back to
+     client evaluation) would make `"Alice@x.com" != "alice@x.com"` and the test would fail. Confirmed
+     the test is load-bearing, not decorative. Same reasoning and same result for
+     `GitTokenServiceTests.Username_comparison_is_case_insensitive`.
+
+  2. **The `AddAsync` join/orphan question — confirmed no issue, stated explicitly.** The
+     `GitEmail → Account` relationship is configured `.IsRequired()` with
+     `OnDelete(DeleteBehavior.Cascade)` (`IdentityDbContextModelSnapshot.cs:157-164`), and I could
+     not find any account-deletion code path anywhere in `src/` — the only `Remove(` on an
+     `IdentityDbContext` set in the whole source tree is `GitEmailService.cs:119`'s
+     `db.GitEmails.Remove(email)`; there is no `Accounts.Remove` at all. So a `GitEmail` row with no
+     matching `Account` cannot exist today: nothing deletes accounts, and if something someday does,
+     the FK cascades the `GitEmail` rows with it rather than orphaning them. `FindByEmailAsync`'s
+     join (`e.Account!.Id` etc.) is therefore safe as written. Parking one forward note: if a future
+     change ever adds account deletion, it must either keep this cascade or explicitly reckon with
+     `AddAsync`'s pre-insert check going silent on an orphan — not this block's problem, but worth
+     remembering when that day comes.
+
+  3. **Password-rejection test uses the real login password.** `GitTokenServiceTests.cs:178-189`
+     first proves `LoginPassword` succeeds through an actual `LoginService.VerifyCredentialsAsync`
+     call, then presents that same string to `VerifyAsync` and asserts rejection. This is the
+     scenario the spec names, not an arbitrary wrong string.
+
+  4. **Nit — two `<remarks>` elements on `GitTokenService.VerifyAsync`**
+     (`GitTokenService.cs:44-56`). Valid XML and it compiles/formats clean, but it isn't idiomatic —
+     conventionally a member carries one `<remarks>` block, and doc generators (Sandcastle, DocFX,
+     IntelliSense) don't reliably render multiple `<remarks>` the same way twice. Merge the two into
+     a single `<remarks>` with two `<para>`s, matching the style already used on
+     `GitEmailService.FindByEmailAsync` just below it in the same diff.
+
+  5. **AD7 compliance confirmed on both queries.** `GitTokenService.cs:71-72` and
+     `GitEmailService.cs:161-162` both project straight into `new AuthenticatedAccount(...)`;
+     neither `.Select`s the `Account` navigation itself, and no `Account` entity is materialised on
+     either path.
+
+  6. **Mutation evidence is coherent; not re-run.** Dropping `&& t.Account!.Username == username`
+     from `GitTokenService.cs:71`'s `Where` leaves only the token-hash/revocation predicate, so
+     `VerifyAsync("bob", aliceToken)` would still resolve Alice's account — which is exactly why
+     `A_token_does_not_authenticate_under_another_accounts_username` (asserting `Assert.Null`) is
+     the one test that dies, and why the other new tests (case-insensitive match, missing username)
+     are unaffected by that specific mutation and would still pass. The reported "Assert.Null()
+     Failure, 3/3, full `dotnet test`, checksummed before/after, reverted via `trap`" account is
+     internally consistent with that mutation's actual effect. Taken on trust per the brief's
+     instruction not to re-run.
+
+  7. **Scope clean.** No git remote routes, no Basic-auth parsing, no `WWW-Authenticate`/401, no new
+     `AllowAnonymous`, no rate limiting, `§9` untouched, `tasks.md` untouched, no claims changed at
+     login (`Login.razor` unmodified by this diff). `Program.cs`'s only addition is
+     `AddHttpContextAccessor()` + `AddScoped<CurrentUserAccessor>()`, as scoped.
+
+  8. **8.3 matches the PO's principal-only ruling.** `CurrentUserAccessor.GetCurrent()`
+     (`CurrentUserAccessor.cs:24-40`) reads only `ClaimTypes.NameIdentifier`, `ClaimTypes.Name`, and
+     `ClaimsPrincipalExtensions.IsAdministrator()` off the current principal — no DB read, no new
+     claims, no `DisplayName`, no git email. Confirmed the claim shapes match what `Login.razor`
+     actually mints (`ClaimTypes.NameIdentifier`, `ClaimTypes.Name`,
+     `ZeroWikiClaims.IsAdministrator`). Anonymous and no-`HttpContext` both return `null` and are
+     both tested (`CurrentUserAccessorTests.cs:14-29`).
+
+  **Blockers:** none.
+
+  **Nits:**
+  - `GitTokenService.cs:44-56` — merge the two `<remarks>` blocks into one (see #4 above).
+
+  **Architectural notes:**
+  - The `AddAsync` orphan scenario in #2 above is safe today only because nothing deletes accounts
+    yet and the FK cascade is in place. Not actionable now — flagging for whoever eventually adds
+    account deletion.
+
+  → @architect
+
+- **[worker]** Fixed the reviewer's nit: `GitTokenService.VerifyAsync`
+  (`src/ZeroWiki/Identity/GitTokenService.cs:44-58`) carried two separate `<remarks>` XML doc
+  elements — merged into one `<remarks>` with two `<para>` blocks, matching
+  `GitEmailService.FindByEmailAsync`'s shape in the same diff. No other change. Re-ran all four
+  gates: `dotnet build` clean (0 warnings, 0 errors), `dotnet test` **342/342**,
+  `openspec validate invite-only-authentication --strict` valid, `dotnet format --verify-no-changes`
+  clean.
+
+  → @architect
+
+---
+
 ## NEXT
 
 _[architect] Housekeeping note (2026-07-28): this `## NEXT` heading was accidentally deleted when the

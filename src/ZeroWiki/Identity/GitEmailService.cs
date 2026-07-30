@@ -4,10 +4,10 @@ using ZeroWiki.Data;
 namespace ZeroWiki.Identity;
 
 /// <summary>
-/// Manages the git emails a member associates with their own account — the addresses a pushed
-/// commit's author line will eventually be matched against to attribute it back to an account
-/// (§8). This service only manages the list; resolving an email to an account at push time is
-/// §8's own concern and is not implemented here.
+/// Manages the git emails a member associates with their own account, and resolves one back to
+/// its owning account (§8) — the addresses a pushed commit's author line is matched against to
+/// attribute it. Parsing the commit and driving the git remote is git-backed-content-core's own
+/// concern and is not implemented here.
 /// </summary>
 /// <remarks>
 /// Every method is scoped by the caller's own account id, taken by the caller
@@ -53,10 +53,10 @@ public sealed class GitEmailService(IdentityDbContext db)
             return GitEmailAddOutcome.Malformed;
         }
 
-        var owner = await FindOwnerAsync(email, cancellationToken);
+        var owner = await FindByEmailAsync(email, cancellationToken);
         if (owner is not null)
         {
-            return Outcome(owner.Value, accountId);
+            return Outcome(owner.Id, accountId);
         }
 
         var candidate = new GitEmail
@@ -76,11 +76,11 @@ public sealed class GitEmailService(IdentityDbContext db)
         {
             db.Entry(candidate).State = EntityState.Detached;
 
-            owner = await FindOwnerAsync(email, cancellationToken)
+            owner = await FindByEmailAsync(email, cancellationToken)
                 ?? throw new InvalidOperationException(
                     "The insert of a git email failed as a duplicate, but no row now claims that address.");
 
-            return Outcome(owner.Value, accountId);
+            return Outcome(owner.Id, accountId);
         }
 
         return GitEmailAddOutcome.Added;
@@ -122,23 +122,51 @@ public sealed class GitEmailService(IdentityDbContext db)
         return true;
     }
 
+    /// <summary>
+    /// Resolves a git email to the account it is associated with (§8), or <see langword="null"/>
+    /// when no account holds it — a value, not an exception, per the account-lookup requirement.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// This is <c>AddAsync</c>'s own uniqueness lookup, promoted rather than duplicated: §7's
+    /// reviewer flagged the adjacency of a private-only lookup here and §8's account-lookup
+    /// primitive, and a second near-identical private method would only let the two drift. The
+    /// one extra join this costs over the account-id-only shape <c>AddAsync</c> used before is
+    /// negligible against a single-row lookup by unique index.
+    /// </para>
+    /// <para>
+    /// The column collates <c>NOCASE</c>, so this equality comparison is already the
+    /// case-insensitive match the unique index enforces — there is no separate normalisation to
+    /// keep in step with it, and none is applied here on purpose (AD26 scoped that requirement to
+    /// §7.2's authority over storage; §8 supervisor finding S1 extends "the database is the
+    /// authority" to every place a git email is matched, including this one).
+    /// </para>
+    /// <para>
+    /// Projected into <see cref="AuthenticatedAccount"/> rather than materialised as an
+    /// <see cref="Account"/> (AD7) — a corrupt row elsewhere on the account must not turn this
+    /// lookup into a 500.
+    /// </para>
+    /// </remarks>
+    public async Task<AuthenticatedAccount?> FindByEmailAsync(
+        string? email,
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrEmpty(email))
+        {
+            return null;
+        }
+
+        return await db.GitEmails
+            .AsNoTracking()
+            .Where(e => e.Email == email)
+            .Select(e => new AuthenticatedAccount(e.Account!.Id, e.Account!.Username, e.Account!.IsAdministrator))
+            .SingleOrDefaultAsync(cancellationToken);
+    }
+
     private static GitEmailAddOutcome Outcome(Guid owningAccountId, Guid callerAccountId) =>
         owningAccountId == callerAccountId
             ? GitEmailAddOutcome.AlreadyOnThisAccount
             : GitEmailAddOutcome.TakenByAnotherAccount;
-
-    /// <summary>
-    /// The account that currently holds <paramref name="email"/>, or <see langword="null"/> when
-    /// none does. The column collates <c>NOCASE</c>, so this equality comparison is already the
-    /// case-insensitive match the unique index enforces — there is no separate normalisation to
-    /// keep in step with it.
-    /// </summary>
-    private async Task<Guid?> FindOwnerAsync(string email, CancellationToken cancellationToken) =>
-        await db.GitEmails
-            .AsNoTracking()
-            .Where(e => e.Email == email)
-            .Select(e => (Guid?)e.AccountId)
-            .SingleOrDefaultAsync(cancellationToken);
 
     /// <summary>
     /// Trims and structurally validates a candidate address without a regular expression

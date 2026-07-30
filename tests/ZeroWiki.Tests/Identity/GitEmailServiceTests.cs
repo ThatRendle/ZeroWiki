@@ -185,6 +185,49 @@ public sealed class GitEmailServiceTests : IDisposable
         Assert.Empty(await _service.ListAsync(bob.Id));
     }
 
+    [Fact]
+    public async Task A_known_email_resolves_to_its_owning_account()
+    {
+        var alice = await AddAccountAsync("alice");
+        await _service.AddAsync(alice.Id, "alice@example.com");
+
+        var resolved = await _service.FindByEmailAsync("alice@example.com");
+
+        Assert.NotNull(resolved);
+        Assert.Equal(alice.Id, resolved.Id);
+        Assert.Equal("alice", resolved.Username);
+    }
+
+    [Fact]
+    public async Task An_unknown_email_reports_no_match_rather_than_an_error()
+    {
+        var alice = await AddAccountAsync("alice");
+        await _service.AddAsync(alice.Id, "alice@example.com");
+
+        Assert.Null(await _service.FindByEmailAsync("nobody@example.com"));
+    }
+
+    [Fact]
+    public async Task An_email_stored_with_different_case_still_resolves()
+    {
+        // Supervisor finding S1: the NOCASE collation is the authority, not a C#-side ToLower().
+        var alice = await AddAccountAsync("alice");
+        await _service.AddAsync(alice.Id, "Alice@x.com");
+
+        var resolved = await _service.FindByEmailAsync("alice@x.com");
+
+        Assert.NotNull(resolved);
+        Assert.Equal(alice.Id, resolved.Id);
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    public async Task A_missing_email_resolves_to_nothing(string? email)
+    {
+        Assert.Null(await _service.FindByEmailAsync(email));
+    }
+
     private async Task<Account> AddAccountAsync(string username)
     {
         var account = new Account

@@ -114,7 +114,7 @@ public sealed partial class AccountPageTests : IDisposable
         // this exact value, and it resolves to this account through the path the git remote uses.
         var stored = Assert.Single(await GetTokensAsync());
         Assert.Equal(_tokenGenerator.ComputeHash(token), stored.TokenHash);
-        Assert.Equal(accountId, (await VerifyAsync(token))?.Id);
+        Assert.Equal(accountId, (await VerifyAsync("alice", token))?.Id);
 
         // Once — not once per element. A second copy in a hidden field is still a copy the next
         // request would carry, and would not be caught by looking for the value at all.
@@ -142,7 +142,7 @@ public sealed partial class AccountPageTests : IDisposable
         var client = await SignInAsync("alice");
 
         var token = await GenerateTokenAsync(client);
-        Assert.NotNull(await VerifyAsync(token));
+        Assert.NotNull(await VerifyAsync("alice", token));
 
         var stored = Assert.Single(await GetTokensAsync());
         Assert.Equal(RevokedMessage, await RevokeOutcomeAsync(client, stored.Id));
@@ -150,7 +150,7 @@ public sealed partial class AccountPageTests : IDisposable
         // Proved through the credential path rather than through the word the list prints. A token
         // reported as revoked on the page while still opening the git remote is the failure that
         // matters, and only this assertion can see it.
-        Assert.Null(await VerifyAsync(token));
+        Assert.Null(await VerifyAsync("alice", token));
         Assert.NotNull((await GetTokensAsync()).Single().RevokedAt);
     }
 
@@ -172,7 +172,7 @@ public sealed partial class AccountPageTests : IDisposable
         // Alice's token is untouched and still authenticates — the list view is not the thing being
         // trusted here either.
         Assert.Null(Assert.Single(await GetTokensAsync()).RevokedAt);
-        Assert.NotNull(await VerifyAsync(aliceToken));
+        Assert.NotNull(await VerifyAsync("alice", aliceToken));
 
         // Bob is told the same thing either way, so the form cannot be asked whether an identifier
         // names somebody's token — and he is told the *true* thing. Equality alone is also satisfied
@@ -282,7 +282,7 @@ public sealed partial class AccountPageTests : IDisposable
         await SubmitAsync(client, RevokeForm, ("RevokeInput.TokenId", tokenId.ToString()));
 
         Assert.Equal(revokedAt, Assert.Single(await GetTokensAsync()).RevokedAt);
-        Assert.Null(await VerifyAsync(token));
+        Assert.Null(await VerifyAsync("alice", token));
     }
 
     [Fact]
@@ -678,10 +678,10 @@ public sealed partial class AccountPageTests : IDisposable
         return client;
     }
 
-    /// <summary>Resolves a presented token the way the git remote will (§8).</summary>
-    private async Task<Account?> VerifyAsync(string token) =>
+    /// <summary>Resolves a presented username + token the way the git remote will (§8).</summary>
+    private async Task<AuthenticatedAccount?> VerifyAsync(string username, string token) =>
         await _app.WithDbAsync(db =>
-            new GitTokenService(db, _tokenGenerator, TimeProvider.System).VerifyAsync(token));
+            new GitTokenService(db, _tokenGenerator, TimeProvider.System).VerifyAsync(username, token));
 
     private async Task<IReadOnlyList<GitToken>> GetTokensAsync() =>
         await _app.WithDbAsync(db => db.GitTokens.AsNoTracking().ToListAsync());

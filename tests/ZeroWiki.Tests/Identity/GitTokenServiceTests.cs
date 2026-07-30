@@ -1,5 +1,6 @@
 using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Time.Testing;
 using ZeroWiki.Data;
 using ZeroWiki.Identity;
@@ -65,11 +66,33 @@ public sealed class GitTokenServiceTests : IDisposable
         var aliceToken = await _service.IssueAsync(alice.Id);
         await _service.IssueAsync(bob.Id);
 
-        var resolved = await _service.VerifyAsync(aliceToken.Token);
+        var resolved = await _service.VerifyAsync("alice", aliceToken.Token);
 
         Assert.NotNull(resolved);
         Assert.Equal(alice.Id, resolved.Id);
         Assert.Equal("alice", resolved.Username);
+    }
+
+    [Fact]
+    public async Task Username_comparison_is_case_insensitive()
+    {
+        var alice = await AddAccountAsync("alice");
+        var aliceToken = await _service.IssueAsync(alice.Id);
+
+        var resolved = await _service.VerifyAsync("ALICE", aliceToken.Token);
+
+        Assert.NotNull(resolved);
+        Assert.Equal(alice.Id, resolved.Id);
+    }
+
+    [Fact]
+    public async Task A_token_does_not_authenticate_under_another_accounts_username()
+    {
+        var alice = await AddAccountAsync("alice");
+        await AddAccountAsync("bob");
+        var aliceToken = await _service.IssueAsync(alice.Id);
+
+        Assert.Null(await _service.VerifyAsync("bob", aliceToken.Token));
     }
 
     [Theory]
@@ -81,7 +104,18 @@ public sealed class GitTokenServiceTests : IDisposable
         var account = await AddAccountAsync("alice");
         await _service.IssueAsync(account.Id);
 
-        Assert.Null(await _service.VerifyAsync(presented));
+        Assert.Null(await _service.VerifyAsync("alice", presented));
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    public async Task Missing_username_resolves_to_nothing(string? username)
+    {
+        var account = await AddAccountAsync("alice");
+        var issued = await _service.IssueAsync(account.Id);
+
+        Assert.Null(await _service.VerifyAsync(username, issued.Token));
     }
 
     [Fact]
@@ -89,12 +123,12 @@ public sealed class GitTokenServiceTests : IDisposable
     {
         var account = await AddAccountAsync("alice");
         var issued = await _service.IssueAsync(account.Id);
-        Assert.NotNull(await _service.VerifyAsync(issued.Token));
+        Assert.NotNull(await _service.VerifyAsync("alice", issued.Token));
 
         _time.Advance(TimeSpan.FromHours(1));
         Assert.True(await _service.RevokeAsync(account.Id, issued.Id));
 
-        Assert.Null(await _service.VerifyAsync(issued.Token));
+        Assert.Null(await _service.VerifyAsync("alice", issued.Token));
 
         var stored = await _db.GitTokens.AsNoTracking().SingleAsync(t => t.Id == issued.Id);
         Assert.Equal(IssuedAt.AddHours(1), stored.RevokedAt);
@@ -132,7 +166,7 @@ public sealed class GitTokenServiceTests : IDisposable
         var aliceToken = await _service.IssueAsync(alice.Id);
 
         Assert.False(await _service.RevokeAsync(bob.Id, aliceToken.Id));
-        Assert.NotNull(await _service.VerifyAsync(aliceToken.Token));
+        Assert.NotNull(await _service.VerifyAsync("alice", aliceToken.Token));
     }
 
     [Fact]
@@ -144,9 +178,15 @@ public sealed class GitTokenServiceTests : IDisposable
         var account = await AddAccountAsync("alice", hasher.Hash(LoginPassword));
         await _service.IssueAsync(account.Id);
 
-        // Neither the password nor its stored hash is a git token, so neither resolves.
-        Assert.Null(await _service.VerifyAsync(LoginPassword));
-        Assert.Null(await _service.VerifyAsync(account.PasswordHash));
+        // Pinned against the real login path, not just assumed: this is the exact password that
+        // succeeds through LoginService for this account.
+        var loginService = new LoginService(_db, hasher, NullLogger<LoginService>.Instance);
+        Assert.NotNull(await loginService.VerifyCredentialsAsync("alice", LoginPassword));
+
+        // That same real login password, presented as the git token, does not resolve — there is
+        // no password path into VerifyAsync, only a token path a password cannot enter.
+        Assert.Null(await _service.VerifyAsync("alice", LoginPassword));
+        Assert.Null(await _service.VerifyAsync("alice", account.PasswordHash));
     }
 
     [Fact]
