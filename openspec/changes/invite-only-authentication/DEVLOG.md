@@ -8449,6 +8449,107 @@ current logged-in identity.
 
   → @architect
 
+- **[supervisor]** Section re-review of **§8** over `3336f69..HEAD` — now two commits, `2e63ead`
+  (§8.1–8.3) and `c2a6473` (remediation). Round 2 of 2. **Verdict: Approve.**
+
+  Both blockers are closed. **No blockers remain.** Two notes for `## NEXT`, neither of which should
+  hold this section.
+
+  ### S2 — closed structurally, not relocated
+
+  I looked specifically for the conflation having *moved* rather than gone, and it hasn't:
+
+  - `GitEmailOwner` (`src/ZeroWiki/Identity/GitEmailOwner.cs:12`) is
+    `sealed record GitEmailOwner(Guid AccountId, string Username)`. No authority bit on the type.
+  - **The bit is gone from the query, not just the return type.** `GitEmailService.cs:182` projects
+    `new GitEmailOwner(e.Account!.Id, e.Account!.Username)` — the old projection's third read is
+    absent, so the generated SQL no longer selects `IsAdministrator` at all on this path. There is no
+    value to leak because none is fetched. That is the strong form of the fix, not the cosmetic one.
+  - **No conversion exists in either direction.** `GitEmailOwner` is referenced only in its own file,
+    `GitEmailService.cs` (`145`, `163`, `170`, `182`), `AuthenticatedAccount.cs:11`, and the test file;
+    nothing constructs an `AuthenticatedAccount` from one, and the two records are unrelated sealed
+    types with no shared ancestor or interface. Better still, `Id` → `AccountId` means a caller that
+    mixes them **fails to compile** rather than silently type-checking. The rename is load-bearing.
+  - **All three `AuthenticatedAccount` producers satisfy the narrowed contract** —
+    `LoginService.cs:96` (password credential check), `GitTokenService.cs:74` (token credential check),
+    `CurrentUserAccessor.cs:39` (read back off an authenticated principal). None is a lookup on
+    self-asserted input. The confused-deputy pair I described is no longer expressible: content-core's
+    push path now holds two distinguishable types, and only one of them carries authority.
+
+  ### S3 — the invariant is true again, and checked method by method
+
+  `GitEmailService.cs:13-20` scopes the caller-id rule to `AddAsync`/`ListAsync`/`RemoveAsync` — true
+  of all three. `GitEmailService.cs:21-32` names `FindByEmailAsync` as the deliberate exception with
+  its reason — true; it takes no account id and its `Where` filters on `e.Email` alone. The specific
+  thing I said was written nowhere is now written: `AddAsync` honours §7's *"without identifying which
+  account"* because it reads only `owner.AccountId` into `Outcome(...)`, which returns an enum
+  (`GitEmailService.cs:74,98,186-189`). I verified that against the code, not just the prose — no id
+  or username crosses the method boundary on the add path. The remark neither over- nor under-claims.
+
+  ### The remediation introduced nothing
+
+  Behaviour is byte-for-byte the same. `AddAsync`'s two call sites changed `owner.Id` → `owner.AccountId`
+  — same value, same `e.Account!.Id` source, `Outcome`'s comparison untouched. No `Where`, `Select`,
+  `SingleOrDefaultAsync`, or normalisation was altered. **AD26/S1 holds**: no `ToLower`,
+  `ToUpperInvariant`, `StringComparison`, or in-memory folding anywhere in `src/ZeroWiki/Identity/` —
+  the only hit is the word *ToLower* inside a doc comment explaining its absence
+  (`GitTokenService.cs:52`); `NOCASE` is still the sole authority. **AD7 holds**: still a projection
+  into a record, `Account` never materialised, on both new paths. **AD4 holds**: no `IPasswordHasher`
+  anywhere on the git credential path. Tests are a pure retype (`resolved.Id` → `resolved.AccountId`)
+  with every assertion, scenario, and the `Username` equality preserved; 342/342 unmoved confirms no
+  coverage moved sideways.
+
+  ### Spec, re-confirmed end to end after the type change
+
+  - **Credential verification for the git remote** — unaffected by the remediation and re-checked:
+    valid username + unrevoked token resolves (`GitTokenService.cs:71-74`); the real login password
+    succeeds against `LoginService` then is rejected as a git credential
+    (`GitTokenServiceTests.cs:178-189`); missing/unknown/revoked all return `null`. All three scenarios
+    hold.
+  - **Account lookup by git email** — all three scenarios re-verified against the new type. Known
+    resolves, and now asserts both `AccountId` **and** `Username`
+    (`GitEmailServiceTests.cs:189-200`); unknown returns `null` **as a value, not an error**
+    (`:203-209`); the case-differing address resolves (`:212-223`), plus null/empty as a bonus. The
+    Account model's *"compare git emails case-insensitively wherever they are matched — for uniqueness
+    and for lookup alike"* sentence is satisfied by one mechanism at both sites, which is exactly what
+    S1 asked for.
+  - **§8.3** unchanged and still matches the PO's principal-only ruling.
+
+  ### `src` hygiene
+
+  `git diff -- src` empty, `git status --short -- src tests` empty, and
+  `git status --short --untracked-files=all -- src tests` **also** empty — I ran the third explicitly
+  because `GitEmailOwner.cs` was untracked for the whole remediation block and that is the §7b trap.
+  It is committed in `c2a6473` and I read all 12 lines: no residue. No mutation run against this
+  block, correctly — a type-and-doc change over already-covered behaviour is outside the mutation
+  boundary, and the boundary has now been applied consistently across all of §8.
+
+  ### Notes for `## NEXT` — do not carve a block for these
+
+  1. **`AuthenticatedAccount`'s `<remarks>` cites two producers; there are three.**
+     `AuthenticatedAccount.cs:8-9` names `GitTokenService.VerifyAsync` and
+     `CurrentUserAccessor.GetCurrent`. `LoginService.VerifyCredentialsAsync` (`LoginService.cs:40,96`)
+     — the *primary* credential check — is unnamed. **The contract is not violated**: the sentence is a
+     category rule ("produced only by a credential check … or read back from an established session"),
+     and a password check is a credential check, so all three producers comply and S2's doc half stands.
+     But both the review and the brief above read it as an enumeration of two, and an enumeration
+     missing its principal member is the reading a future maintainer will take — the block's own stated
+     goal was a rule "precise enough to be violable". Adding `<see cref="LoginService.VerifyCredentialsAsync"/>`
+     alongside the token one would make it genuinely enumerable. Documentation only; no behaviour.
+  2. **For `git-backed-content-core`, falling out of the PO's `Username <email>` ruling** — not a §8
+     defect, and I am not re-raising the display-name question, which is settled. The browser-save
+     author line now composes `CurrentUserAccessor.GetCurrent().Username` with
+     `GitEmailService.ListAsync(accountId)`. `ListAsync` returns a **list**, and "zero associated
+     emails" is an explicitly legal account state (`GitEmailService.cs:118-119`, per the account-model
+     spec). So content-core must decide two things §8 deliberately does not: **which** email to stamp
+     when a member has several (the list is alphabetical, so "first" is deterministic but arbitrary),
+     and **what to stamp when the list is empty** — refuse the save, use a placeholder, or prompt.
+     §8's primitives are correct as scoped; this is a content-core design decision, and it is cheaper
+     to settle in that change's `design.md` than to discover at the first save by a member who never
+     added an email.
+
+  §8 is closed from my side. → @architect
+
 ---
 
 ## NEXT
@@ -8724,6 +8825,29 @@ carves it at brief time.
   measured to be the weaker instrument — a value passed via `BeginScope` reaches a structured sink
   while appearing in no message. Not a §5 regression (`LoginService` opens no scopes), but §9 should
   move it to `Written`.
+- **§8 closed (2026-07-30) — supervisor `Approve` on `3336f69..HEAD`, two commits.** `2e63ead` (the
+  three primitives) + `c2a6473` (S2/S3 remediation). 342/342, count deliberately unmoved by the fix.
+  **The section's durable lesson:** `AuthenticatedAccount` had quietly become the return type of a
+  lookup keyed on a *self-asserted* git author email, so an authenticated identity and an unverified
+  claim shared one type — carrying `IsAdministrator`, which attribution has no use for. Block review
+  approved it because each piece was individually correct; only the section-level lens saw it. Fixed
+  with a separate `GitEmailOwner`, and the fix is **structural, not documentary**: the authority column
+  left the SQL projection entirely, and `Id` → `AccountId` means mixing the two records now **fails to
+  compile** rather than silently type-checking.
+- **`AuthenticatedAccount`'s contract sentence cites two producers; there are three** (supervisor note,
+  documentation only, **not** a defect). The rule is a *category* — "produced only by a credential check
+  or read back from an established session" — and all three of `LoginService.VerifyCredentialsAsync`,
+  `GitTokenService.VerifyAsync` and `CurrentUserAccessor.GetCurrent()` comply. But it reads as an
+  enumeration, and the one it omits is `LoginService` — the *primary* credential check. Add the cref
+  whenever that file is next touched; an enumeration missing its principal member is the reading a
+  maintainer will take.
+- **For `git-backed-content-core`, not for this change** (supervisor note): the PO's `Username <email>`
+  ruling settles the *name* half of the author line, but the email half has two unmade decisions that
+  belong in that change's `design.md` rather than being discovered at somebody's first save.
+  `GitEmailService.ListAsync(accountId)` returns a **list**, so content-core must decide **which** email
+  to stamp when a member has several — and **what** to stamp when the list is empty, since "zero
+  associated git emails" is an explicitly legal account state. §8's primitives are correct as scoped;
+  this is a gap in the consumer's design, not in the producer.
 - **Open, unchanged:** AD9 (raising Argon2 constants owes rehash-on-verify), and Block 4b's declined
   notes — N2 (`OpenConnectionAsync` never closed, shared with `BootstrapService`, so it is a §3 change
   too), N3, N4 (a corrupt AD7 timestamp is a 500 rather than a uniform refusal — inside AD17's
