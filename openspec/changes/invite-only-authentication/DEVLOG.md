@@ -7644,6 +7644,44 @@ Everything else in this round is approved. **7.1 remains unticked pending the Pr
 
   → @architect
 
+- **[architect]** **Spec amended: `user-accounts` gains a "Git email management" requirement. Product
+  Owner's decision (2026-07-30).** Raised before the §7 supervisor review rather than in response to a
+  finding: 7.2 shipped answerable only to `tasks.md` plus AD24, because the `Account model`
+  requirement's "zero or more associated git emails" describes the *model* and the
+  `Account lookup by git email` requirement is §8's task 8.2. Nothing in the spec said a member could
+  manage the list at all. The section review asks whether a section satisfies its **spec**, not whether
+  it ticked its tasks, so the honest fix was to give 7.2 a requirement — not to argue the task implied
+  one.
+
+  Four scenarios: add to one's own account; an address held by another account refused **without
+  identifying which**; remove including when it is the only one; and a member cannot add to or remove
+  from another account's list. `--strict` valid (4 requirements, 10 scenarios in `user-accounts`).
+
+  **This is a requirement written after the code, which is the easiest place to accidentally describe
+  what was built instead of what is required.** So, stated explicitly:
+  - The **disclosure bound is now spec, not just AD24** — "reports that the address is already
+    associated with another account, without identifying which account". AD24 remains the *reasoning*
+    (and remains explicitly non-precedential); the spec now carries the *obligation*. A future change
+    that widens it has to amend a requirement rather than quietly reinterpret a DEVLOG post.
+  - **"including when it was the only one"** is in the removal scenario deliberately, so the
+    zero-emails state is a stated requirement rather than an inference from "zero or more".
+  - **Validation is deliberately absent.** AD26 (no regex, trim, length cap, structural check) is a
+    *design* decision about how to avoid BL2's backtracking hazard, not a product requirement. The spec
+    does not say malformed addresses are rejected, because the wiki does not actually care — git does
+    not validate author emails either. Do not read the absence as an oversight.
+
+  **Coverage, checked rather than assumed** — every scenario has a test at both the service layer and
+  the rendered-page layer (the mapping is in the §7b review round above). **One honest gap:** the
+  fourth scenario says a member cannot *add to* another account's list, and that half is **not
+  tested — it is not expressible.** `AccountId` comes from the `ClaimsPrincipal` and the form carries
+  no such field, so there is no crafted POST to write the test against. That is a structural guarantee,
+  which is stronger than a tested one, but it is not the same thing and should not be reported as
+  though a test proves it. If §8 ever introduces a path where an account id is supplied rather than
+  derived, this scenario stops being structural and needs a real test.
+
+  No code changed. 7.2 stays ticked — this is a correction *within* the task (AD7's precedent), not new
+  work.
+
 ---
 
 ## NEXT
