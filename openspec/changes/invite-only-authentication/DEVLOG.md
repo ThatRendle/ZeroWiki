@@ -8552,6 +8552,305 @@ current logged-in identity.
 
 ---
 
+## 9. Tests
+
+**[architect]** Base: `c313145` — the test sweep: prove each spec property is defended by a test that
+would actually fail if the property broke, close the gaps that finding exposes, and land the six items
+§5–§8 booked here.
+
+- **[architect]** **How §9 is being read, because it decides everything below.** 9.1–9.5 restate
+  properties §3–§8 already built tests for. §9 is therefore a **sweep, not a rewrite**: for each task,
+  find the existing coverage, establish whether it would *fail if the property broke*, and only then
+  either tick against it or close the gap. Re-testing what is already tested would inflate the suite
+  while proving nothing new — and this change's own standard is that a green suite is not evidence.
+  Two consequences I am ruling on now:
+  - **9.5 ticks against §6's `AnonymousAccessTests`** rather than a parallel suite. §6's reviewer asked
+    for this call at N7; duplicating a suite to make a box tickable is the exact "ticking tasks rather
+    than satisfying specs" failure the supervisor exists to catch. The sweep must still *verify* that
+    coverage is real, not merely present.
+  - **The `BootstrapConcurrencyTests` flake gets fixed, not accepted.** §7's reviewer offered three
+    options and took (b) — book it for §9 with the numbers attached. It is booked; §9 pays it. A
+    security assertion that is green 22 runs out of 23 is worth less than one that fails, because it
+    gets re-run rather than read, and AD19 exists precisely to reject a green suite that describes
+    something other than the system.
+
+- **[architect]** **Block brief — §9.1–9.3 (bootstrap, invitations, login).** → @worker
+
+  **The sweep method, for each of 9.1/9.2/9.3.** Locate the tests that defend the property. For each,
+  answer *in the DEVLOG*: which test, and what makes it load-bearing — i.e. what single production
+  change would turn it red. Where nothing would, that is a gap and you close it. Where the coverage is
+  real, say so and move on; do not add a second test that asserts the same thing differently.
+
+  - **9.1 Bootstrap** — first admin created only when the store is empty; inert afterwards.
+    Existing: `BootstrapServiceTests`, `BootstrapConcurrencyTests`, `BootstrapPageTests`.
+  - **9.2 Invitations** — single-use, expiry, revocation all reject; no open registration.
+    Existing: `InvitationServiceTests`, `InvitationRedemptionTests`,
+    `InvitationRedemptionConcurrencyTests`, `RedeemInvitationPageTests`, `NoOpenRegistrationTests`.
+  - **9.3 Login** — success, uniform failure, logout invalidation.
+    Existing: `LoginServiceTests`, `LoginPageTests`.
+
+  **Three booked items this block pays, all with their evidence already on the record — cite it, do not
+  re-derive it:**
+
+  1. **Move §5's log-secrecy sweep from `Messages` to `Written`** (`LoginServiceTests.cs:164` uses
+     `_logs.Messages`). This is **measured, twice, independently**: a token plaintext carried via
+     `BeginScope` reaches a structured sink while appearing in no message, and the full suite passed
+     **298/298** under `Messages` with a real leak live in the page. `CapturingLoggerProvider` already
+     exposes both and its own doc explains why `Written` is the correct instrument. Check whether any
+     other assertion in the suite reads `Messages` for a secrecy claim and move those too — the point
+     is the instrument, not the one call site.
+  2. **Fix the `BootstrapConcurrencyTests` flake** (green 22/23; the culprit named by §7's reviewer is
+     the global `SqliteConnection.ClearAllPools()` in `TestDatabase` racing the parallel web classes —
+     `TestDatabase.cs` documents the hazard already). Two candidate fixes were suggested: dispose the
+     factory's own connections instead of clearing the global pool, or pin the web classes into one
+     non-parallel collection. **Measure before choosing** — establish the flake reproduces, then take
+     the smallest change that removes it, and report which and why. Note both concurrency classes
+     already carry `ThreadPool.SetMinThreads` and a `CountdownEvent` starting line, so check what is
+     actually missing before rebuilding a rendezvous that may already be there.
+  3. **The storage/service disconnect** (supervisor S2, §7b): the uniqueness invariant is proved at the
+     storage layer only (`IdentityDbContextTests`). Every service- and page-level assertion would still
+     pass **with the unique index dropped**, because the service's pre-check absorbs it, and nothing
+     connects the two test classes. Close that — one assertion that fails if the index goes away. This
+     is 9.2-adjacent (invitations/accounts uniqueness); if you judge it belongs in the 9.4 block
+     instead, say so rather than doing it twice.
+
+  **Mutation testing:** in scope for this block under the standing caps — `BootstrapService`,
+  `InvitationService`, `LoginService` are all named in CLAUDE.md as security-critical. But the sweep's
+  own method (*what single change turns this test red?*) is often answerable by reading, and mutation
+  is the expensive way to ask it. **Use it where the answer is genuinely in doubt, not as a checklist.**
+  Caps as ever: 3 confirmation runs, **full `dotnet test` never a filter**, checksum before *and* after,
+  revert via `trap`/`finally`, and `git diff -- src` **plus** `git status --short -- src` before you
+  hand off — the diff is blind to untracked files.
+
+  **Out of scope:** 9.4/9.5 (the next block); any production behaviour change — this is a test sweep,
+  and if the sweep finds a *production* defect you stop and report it rather than fixing it inside a
+  test block; the `CancellationToken` plumbing item (N6) and the shown-once positive control, both
+  booked for the 9.4/9.5 block.
+
+  **Gates, all four:** `dotnet build` clean, `dotnet test` green (currently **342**; this block will
+  move it — report the new figure), `openspec validate invite-only-authentication --strict`,
+  `dotnet format --verify-no-changes` clean. Do not commit, do not tick. → @reviewer when done.
+
+---
+
+**[worker]** Block §9.1–9.3 done. Sweep method throughout: for each property, name the test and the
+one production change that would turn it red; only where nothing would is that a gap. No new test was
+added purely to restate existing coverage.
+
+**9.1 Bootstrap — solidly covered, no gap.**
+- `BootstrapServiceTests.Bootstrap_on_an_empty_store_creates_exactly_one_administrator` — red if
+  `CreateFirstAdministratorAsync` stopped inserting the `Account`.
+- `Bootstrap_creates_no_account_once_one_already_exists` / `Bootstrap_is_inert_against_a_non_administrator_account_too`
+  / `Second_bootstrap_attempt_after_a_successful_one_is_refused` — red if either `AnyAsync` guard
+  (pre-lock or under-lock) were removed or narrowed to admin-only.
+- `Gate_closes_the_moment_an_account_appears_without_a_restart` — red if `IsAvailableAsync` cached its
+  answer instead of re-querying every call.
+- `BootstrapConcurrencyTests.Concurrent_bootstrap_attempts_create_exactly_one_administrator` — red if
+  `BeginTransaction(deferred: false → true)`. **Cited, not re-derived:** after §7's B1′ conversion to a
+  positional rendezvous, this mutant was measured **13/13** under the full parallel suite (no other
+  test failing across those 13 runs) — DEVLOG L6839–6840, L7224, L7278. I did not re-mutate it.
+- `BootstrapPageTests.Submitting_the_form_creates_the_administrator_and_closes_the_path` — the
+  end-to-end HTTP proof; red if the page stopped calling the service or the inertness redirect broke.
+
+**9.2 Invitations — one real gap, closed.**
+- Single-use: `InvitationRedemptionTests.An_already_redeemed_invitation_creates_no_second_account` +
+  `InvitationRedemptionConcurrencyTests.Concurrent_redemptions_of_one_invitation_create_exactly_one_account`
+  — red if `BeginWriteLockedTransactionAsync` lost its `deferred: false`. Cited: §7's corrected
+  full-suite table, M2 killed **6/6** (L6791).
+- Expiry: `The_redeemability_predicate_is_evaluated_in_sql` / `The_expiry_comparison_reaches_sqlite_on_the_redemption_path_itself`
+  / `An_invitation_that_expires_while_the_caller_waits_for_the_lock_is_refused` — red if `Redeemable()`
+  dropped the `ExpiresAt` clause or the predicate moved client-side (AD7; mutation-confirmed earlier,
+  L3846/L4215/L4342).
+- Revocation: `An_unused_invitation_is_revoked_by_its_issuer`, `A_redeemed_invitation_cannot_be_revoked`,
+  `InvitationRedemptionConcurrencyTests.A_revocation_cannot_commit_over_a_redemption_that_lands_while_it_is_deciding`
+  — red if revocation went back to check-then-act.
+- No open registration: `NoOpenRegistrationTests.The_routes_an_anonymous_visitor_can_reach_are_exactly_the_ones_named`
+  enumerates the live routing table rather than a guessed list — red the moment any new anonymously
+  reachable route exists.
+- **The gap (booked item 3, storage/service disconnect, supervisor S2 §7b extended to accounts):**
+  `InvitationRedemptionTests.A_taken_username_refuses_without_consuming_the_invitation` and
+  `Usernames_that_differ_only_in_case_are_the_same_username` both go through `RedeemAsync`'s own
+  pre-insert `AnyAsync` check (`InvitationService.cs:286`), which refuses a clash whether or not
+  `AccountConfiguration`'s unique index on `Username` exists. **Verified, not assumed:** I mutated
+  `unique: true → false` in the baked migration (`20260725130232_InitialIdentitySchema.cs:97` — the
+  tests run `Database.Migrate()`, so `AccountConfiguration.cs` itself is not what they execute
+  against), ran the full suite once (deterministic mutant, no concurrency involved), and confirmed
+  **zero** `InvitationService`/page-level test noticed — only `IdentityDbContextTests`'s two duplicate-
+  username tests failed. Checksum before `5798…`, after mutation `0ca4…`, reverted and reconfirmed
+  `5798…` (byte-identical). Closed with one new test,
+  `InvitationRedemptionTests.The_account_table_itself_refuses_a_duplicate_username_independent_of_redemptions_own_check`,
+  which bypasses `RedeemAsync` and inserts directly — re-ran the same mutation afterward and it now
+  fails alongside the two storage-layer tests (3 failed, 340 passed), confirmed 1/1 (deterministic,
+  no concurrency — the §7 supervisor's own standard for when a single run is sufficient). Belongs in
+  9.2, not 9.4 — done here.
+
+**9.3 Login — covered, one instrument fix.**
+- `LoginServiceTests.Correct_credentials_resolve_to_the_account` / `Wrong_password_is_rejected` /
+  `Unknown_username_is_rejected` / `Unusable_stored_hash_is_rejected_rather_than_throwing` — red if
+  any of the three rejection paths diverged from the uniform `null`.
+- `Every_rejection_performs_exactly_one_verification` / `The_dummy_hash_is_a_constant_and_is_not_derived_per_request`
+  — red if the constant-time property broke (asserted as call count and argument, not wall clock).
+- `LoginPageTests.Signing_out_leaves_later_requests_unauthenticated` — red if logout stopped
+  invalidating the session (asserted via the AD21 landing-page shape, not a status code).
+- **Item 1 (booked, cited not re-derived):** `LoginServiceTests.cs:164`
+  (`No_password_or_hash_is_ever_written_to_the_log`) read `_logs.Messages`. Measured twice
+  independently in §7 against a real `BeginScope` leak in `Account.razor`: the worker's own mutant
+  (`MSG`, L6283) and the reviewer's independent re-run (L6294–6298) both passed the **full suite,
+  298/298**, with the leaked token reaching a structured sink and appearing in no rendered message.
+  Swapped to `_logs.Written`, matching `CapturingLoggerProvider`'s own documented instrument. Swept
+  the rest of the suite for the same shape: only two other `.Messages` reads exist
+  (`InvitationRedemptionTests.cs:467,491`), and both are presence checks ("the reason is named in the
+  log"), not secrecy claims — left alone.
+
+  _[architect] Line refs corrected from the worker's `442,466` — the new 9.2 test inserted 25 lines
+  above them in the same file, so the post's own citations went stale between writing and handoff. The
+  reviewer caught it; fixed here rather than round-tripping a worker for two numbers._
+
+**Item 2 — the BootstrapConcurrencyTests flake, reported honestly, not fixed.**
+
+I did not reproduce it. What follows is what that does and does not license, per the architect's
+correction mid-block (batch 2 was stopped by the architect at 8/8; not my call, noted for the record).
+
+*Numbers.* Batch 1: **15/15** full-suite runs green (runs 1–3 against the pre-edit tree at 342 tests,
+runs 4–15 against the tree with this block's two test edits, 343 tests — the edits landed mid-batch).
+Batch 2: **8/8** green at 343 before the architect truncated it. **23/23 total, zero failures, in
+either tree configuration.**
+
+*What 23 clean runs do not prove.* Against a live 1-in-23 defect, `P(23/23 clean) = (22/23)^23 ≈ 36%`
+— over a third of the time, a still-broken system produces exactly this result. Not reproducing the
+failure narrows the trigger; it does not disprove it. Saying otherwise would be the "green suite
+describing something other than the system" shape AD19 exists to catch.
+
+*What does support a conclusion: the named mechanism, checked mechanistically rather than
+statistically.* The brief's culprit — `SqliteConnection.ClearAllPools()` racing `Activate()` across
+parallel web test classes — is not merely unreproduced here, it **does not exist in the tree**: `grep`
+for `ClearAllPools` across `src` and `tests` returns zero call sites (only the historical explanation
+in `TestDatabase.cs`'s own `<remarks>`). It was removed in commit `130629c` — §7's own harness-repair
+block, which **predates this change's current base** — replaced by `Pooling=False` in
+`TestDatabase.cs`, used by every file-backed test class in the suite (`BootstrapConcurrencyTests`,
+`InvitationRedemptionConcurrencyTests`, `ZeroWikiAppFactory`; the two ad-hoc probe connections are
+explicitly `Pooling=false` too). That block's own evidence for the fix is far stronger than anything a
+few dozen full-suite runs could add: an isolated reproduction harness measured **24 failures across
+~43,662 pooled opens** vs **0 across ~71,925 non-pooled opens** (DEVLOG §7 harness-repair, table at
+"4. Evidence"), plus **35/35** full-suite runs clean afterward, plus **13/13** M1 mutation kills with
+no incidental failure in any of those 13 runs (L7278) — i.e. the fix has already survived far more
+scrutiny than this block could add without becoming the disproportionate verification the Product
+Owner capped this project against.
+
+*Position: no fix applied, because there is nothing left to fix at the named layer.* Both candidate
+fixes offered (dispose the factory's own connections; pin web classes into one non-parallel
+collection) are fixes for `ClearAllPools()` racing — which is already gone. Applying either now would
+be a speculative change against a mechanism with no live symptom, which is exactly what "measure
+before choosing a fix" warns against. I checked for a *different* remaining mechanism and found none:
+every file-backed `SqliteConnection` in `tests/` (checked by grep) is either `TestDatabase`-sourced or
+explicitly `Pooling=false`; §8's new classes (`GitTokenServiceTests`, `GitEmailServiceTests`,
+`DateTimeOffsetStorageTests`) are all `Data Source=:memory:`, never pooled. **Recommendation: record
+this as inherited, already-addressed risk — not a fix owed by this block — and accept the 23 clean
+runs as consistent-with, not proof-of, that holding.** If the architect wants a harder statistical
+bound later, more runs would need to be an explicit, budgeted decision, not something I resume
+unprompted.
+
+**Mutation testing used once, for genuine doubt (item 3's index-drop), not as a checklist** — the
+other properties above were answerable by reading the existing evidence already on the DEVLOG record,
+per the brief's own guidance not to re-derive what is cited.
+
+**Gates:** `dotnet build` 0 warnings/0 errors · `dotnet test` **343/343** (342 + 1 new) ·
+`openspec validate invite-only-authentication --strict` → valid · `dotnet format --verify-no-changes`
+clean. `git diff -- src` empty, `git status --short -- src` empty (confirmed after the mutation
+revert). Nothing ticked, nothing committed.
+
+Files touched: `tests/ZeroWiki.Tests/Identity/LoginServiceTests.cs` (item 1),
+`tests/ZeroWiki.Tests/Identity/InvitationRedemptionTests.cs` (item 3's new test). No other file in
+`tests/` or `src/` changed.
+
+→ @reviewer
+
+---
+
+**[reviewer]** Block §9.1–9.3 audited against `git diff c313145 -- src tests`. **Approve with nits.**
+
+**Gates — reproduced independently, not taken on trust:**
+- `dotnet build` → 0 warnings, 0 errors.
+- `dotnet test` → **343/343**, matches the reported figure exactly.
+- `openspec validate invite-only-authentication --strict` → valid.
+- `dotnet format --verify-no-changes` → clean.
+- `git diff -- src` → empty. `src` is untouched by this block (finding 6 closed) — the only two
+  changed files are the two test files named in the handoff.
+
+**Finding 1 — load-bearing claims spot-checked, not hand-waved.** Checked the property most likely to
+be incidental at each end of the claimed-load-bearing spread:
+- **9.1's weakest-looking claim**, `Gate_closes_the_moment_an_account_appears_without_a_restart`
+  (`BootstrapServiceTests.cs:97`) against `BootstrapService.IsAvailableAsync`
+  (`BootstrapService.cs:30-31`, `!await db.Accounts.AnyAsync(...)`): read the sequence
+  True → add account → **False** → delete → True against the *same service instance*. A cached
+  answer computed once would return `true` again after the account was added, failing the second
+  assertion. Genuinely load-bearing.
+- **9.3's constant-time claims**, `Every_rejection_performs_exactly_one_verification` and
+  `The_dummy_hash_is_a_constant_and_is_not_derived_per_request` (`LoginServiceTests.cs:96,144`):
+  confirmed `_recorder.VerifiedAgainst[0]` is asserted to start with `$argon2id$v=19$m=65536,t=3,p=1$`
+  and to be independently verifiable via `_hasher.CanVerify(...)` (`LoginServiceTests.cs:123-124`) —
+  i.e. the recorder wraps the real hasher against a genuine constant hash with live cost parameters,
+  not a stub short-circuit. The call-count/argument assertions are real, not incidental.
+No hand-waving found at either end of the spread; §9 delivers what it claims here.
+
+**Finding 2 — the new test genuinely bypasses the service pre-check.** Read
+`InvitationRedemptionTests.cs:349-372`: it calls `AddAccountAsync("alice")` (a direct
+`_db.Accounts.Add` + `SaveChangesAsync`, same as the production path skips), then constructs a
+second `Account` with the same username and calls `_db.Accounts.Add` + `SaveChangesAsync` directly —
+never touching `InvitationService.RedeemAsync` or its `AnyAsync` pre-check
+(`InvitationService.cs:286`). It asserts `DbUpdateException` from the raw insert. Confirmed this is
+exactly what it needs to be to close the storage/service disconnect.
+
+**Finding 3 — mutation hygiene independently reproduced, `src` clean.** Re-ran the worker's mutation
+myself rather than trusting the report: flipped `IX_Accounts_Username`'s `unique: true` → `false` in
+`20260725130232_InitialIdentitySchema.cs:97`, ran the **full** `dotnet test` (no filter) — **3 failed,
+340 passed**, the exact figure the worker reported (`IdentityDbContextTests.Duplicate_username_is_rejected`,
+`..._case_insensitively`, and the new
+`The_account_table_itself_refuses_a_duplicate_username_independent_of_redemptions_own_check`, all
+failing with "No exception was thrown"). Reverted from a separate on-disk backup taken before the
+edit; confirmed byte-identical via `git ls-tree HEAD` blob hash (`1d2b7f9…`) matching the working-tree
+blob hash after revert. `git diff -- src` and `git status --short -- src` both empty after my own run,
+independent of the worker's own confirmation. No live mutant.
+
+**Finding 4 — `Messages` → `Written` migration confirmed correct.** `LoginServiceTests.cs:164` now
+reads `_logs.Written`. Checked the two remaining `.Messages` reads in
+`InvitationRedemptionTests.cs` (now at lines 467 and 491 — the worker's cited 442/466 are stale by
+the 25 lines the new test inserted earlier in the same file; a documentation nit, not a defect, see
+below): both are presence checks (`"the reason is named in the log"`,
+`"records which account [...] it was used"`), not secrecy claims. The one secrecy claim in that file,
+`No_token_hash_or_password_ever_reaches_the_log` (`InvitationRedemptionTests.cs:494`), already reads
+`_logs.Written` and was untouched by this diff — consistent with it having been fixed earlier (§7).
+The sweep's conclusion is correct: no secrecy assertion is left on the weaker instrument anywhere in
+the suite.
+
+**Finding 5 — the flake disposition is correct.** Independently confirmed: `grep -rn ClearAllPools
+src tests` returns only the three `<remarks>` mentions in `TestDatabase.cs`'s doc comment, no call
+sites. `git merge-base --is-ancestor 130629c c313145` succeeds — `130629c` is an ancestor of this
+block's base and its diff touches `BootstrapConcurrencyTests.cs` and replaces the `ClearAllPools()`
+calls in `TestDatabase.cs` with `Pooling=false`. The named mechanism is provably gone before this
+block started, so there is nothing at that layer for this block to fix, and applying either candidate
+fix now would be a speculative change against a mechanism with no live symptom — exactly what the
+brief's "measure before choosing" warns against. **Agree with "record as already-addressed inherited
+risk."** The prior block's own evidence (24/43,662 pooled failures vs 0/71,925 non-pooled, 35/35 clean
+full-suite runs, 13/13 mutation kills) is stronger than anything this block's 23/23 could add, and the
+worker's probability argument (`P(23/23 clean | still broken) ≈ 36%`) is the right reason not to treat
+its own clean runs as proof either way. Nothing is owed here.
+
+**Blockers:** none.
+
+**Nits:**
+1. `DEVLOG.md` (worker's report, "Item 1"): cites the two remaining `.Messages` reads as
+   `InvitationRedemptionTests.cs:442,466`; they're actually at `467,491` in the file as committed to
+   this diff — the new test (item 3) was written earlier in the same file and pushed everything below
+   it down by 25 lines. Doesn't change the finding, just make the citation match the artifact if this
+   thread is read later without the file open.
+
+**Architectural notes:** none beyond what's already flagged for 9.4/9.5 in the brief.
+
+→ @architect
+
+---
+
 ## NEXT
 
 _[architect] Housekeeping note (2026-07-28): this `## NEXT` heading was accidentally deleted when the

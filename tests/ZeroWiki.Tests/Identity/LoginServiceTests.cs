@@ -161,7 +161,10 @@ public sealed class LoginServiceTests : IDisposable
         await _service.VerifyCredentialsAsync(Username, "the wrong passphrase");
         await _service.VerifyCredentialsAsync("nobody", Password);
 
-        var log = string.Join('\n', _logs.Messages);
+        // Written, not Messages. Measured rather than assumed: a value carried by a log *scope*
+        // (BeginScope) reaches a structured sink while appearing in no rendered message, so a
+        // message-only sweep passes the full suite with a real leak live — see CapturingLoggerProvider.
+        var log = string.Join('\n', _logs.Written);
         Assert.DoesNotContain(Password, log, StringComparison.Ordinal);
         Assert.DoesNotContain("the wrong passphrase", log, StringComparison.Ordinal);
         Assert.DoesNotContain(storedHash, log, StringComparison.Ordinal);

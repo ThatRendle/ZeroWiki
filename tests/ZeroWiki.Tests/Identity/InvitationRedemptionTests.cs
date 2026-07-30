@@ -345,6 +345,31 @@ public sealed class InvitationRedemptionTests : IDisposable
         Assert.Single(await _db.Accounts.AsNoTracking().ToListAsync());
     }
 
+    [Fact]
+    public async Task The_account_table_itself_refuses_a_duplicate_username_independent_of_redemptions_own_check()
+    {
+        // Every UsernameTaken assertion above goes through RedeemAsync's own pre-insert AnyAsync
+        // check (InvitationService.cs:286), which would refuse a clash whether or not
+        // AccountConfiguration's unique index on Username exists — so none of them would notice the
+        // index being dropped. This bypasses that check and writes straight to the store, which is
+        // what IdentityDbContextTests.Duplicate_username_is_rejected proves in isolation; the
+        // assertion belongs here too because nothing otherwise connects that proof to the schema
+        // this test class exercises the service against (supervisor S2, §7b, extended to accounts).
+        await AddAccountAsync("alice");
+
+        _db.Accounts.Add(new Account
+        {
+            Id = Guid.NewGuid(),
+            Username = "alice",
+            PasswordHash = "$argon2id$stub",
+            DisplayName = "alice",
+            CreatedAt = _time.GetUtcNow(),
+        });
+
+        await Assert.ThrowsAsync<DbUpdateException>(() => _db.SaveChangesAsync());
+        Assert.Equal("alice", Assert.Single(await _db.Accounts.AsNoTracking().ToListAsync()).Username);
+    }
+
     [Theory]
     [InlineData("has space")]
     [InlineData("colon:name")]
