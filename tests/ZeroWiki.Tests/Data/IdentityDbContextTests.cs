@@ -171,6 +171,35 @@ public sealed class IdentityDbContextTests : IDisposable
     }
 
     [Fact]
+    public async Task Duplicate_invitation_token_hash_is_rejected()
+    {
+        var issuer = NewAccount("alice");
+        _db.Accounts.Add(issuer);
+        await _db.SaveChangesAsync();
+
+        _db.Invitations.Add(new Invitation
+        {
+            Id = Guid.NewGuid(),
+            TokenHash = "same-invite-hash",
+            IssuerAccountId = issuer.Id,
+            CreatedAt = DateTimeOffset.UtcNow,
+            ExpiresAt = DateTimeOffset.UtcNow.AddDays(7),
+        });
+        await _db.SaveChangesAsync();
+
+        _db.Invitations.Add(new Invitation
+        {
+            Id = Guid.NewGuid(),
+            TokenHash = "same-invite-hash",
+            IssuerAccountId = issuer.Id,
+            CreatedAt = DateTimeOffset.UtcNow,
+            ExpiresAt = DateTimeOffset.UtcNow.AddDays(7),
+        });
+
+        await Assert.ThrowsAsync<DbUpdateException>(() => _db.SaveChangesAsync());
+    }
+
+    [Fact]
     public async Task Account_deletion_cascades_to_git_emails_and_tokens()
     {
         var account = NewAccount("alice");

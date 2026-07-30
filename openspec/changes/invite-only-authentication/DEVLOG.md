@@ -9091,6 +9091,232 @@ Architect's own section-level (supervisor) review of §9 as a whole per the stan
 
 ---
 
+**[supervisor]** Section §9 review — scope `git diff c313145..HEAD` (`ba56be5`, `0fb643b`).
+**Request changes.** One blocker, small and precisely scoped. Everything else in the section is
+verified and sound, and I want to be explicit that the sweep is genuine work rather than assertion —
+I checked, and it holds.
+
+**The sweep is real. What I verified independently, not by reading the thread:**
+
+1. **The storage/service fix does what it claims.**
+   `InvitationRedemptionTests.cs:349-372` inserts a second `Account` straight through `_db.Accounts`,
+   never touching `RedeemAsync`'s `AnyAsync` pre-check (`InvitationService.cs:286`). The row it
+   inserts differs from the first only in `Id`; `DisplayName` carries no unique index, so
+   `IX_Accounts_Username` is the *only* constraint that can raise the asserted `DbUpdateException` —
+   the "if and only if" holds by construction, not just by the worker's and reviewer's matching
+   `3 failed / 340 passed` runs. I also confirmed `IdentityDbContextTests` runs `Database.Migrate()`
+   (`:27`), so both classes execute against the same baked schema the mutation targeted.
+
+2. **Both positive controls read the same instrument as their negative.** Not "an equivalent
+   instrument" — the same local variable, one call:
+   - `GitTokenServiceTests.cs:57-64` — one `DumpGitTokenRowsAsync()` into `dumpedRows`, feeding
+     `Assert.Contains(stored.TokenHash, …)` then `Assert.DoesNotContain(issued.Token, …)`.
+   - `AccountPageTests.cs:127-131` — same shape via `DumpTokenRowsAsync()`.
+   The control is also non-trivial in both: `GitTokenServiceTests.cs:53` asserts
+   `NotEqual(issued.Token, stored.TokenHash)`, and in `AccountPageTests` a degenerate
+   `ComputeHash` would make the `DoesNotContain` fail rather than let the pair pass vacuously.
+
+3. **`Messages` → `Written` is complete.** Suite-wide, the only surviving `.Messages` reads are
+   `InvitationRedemptionTests.cs:467,491`, both presence checks. Every secrecy assertion —
+   `LoginServiceTests.cs:167`, `InvitationRedemptionTests.cs:511`, `AccountPageTests.cs:573` — reads
+   `Written`. No secrecy claim is left on the weaker instrument.
+
+4. **`src` is untouched and both mutation targets are byte-identical.** `git diff c313145..HEAD -- src`
+   empty across the whole range; working-tree `git diff -- src` and `git status --short -- src` both
+   empty, so `20260725130232_InitialIdentitySchema.cs` and `GitTokenService.cs` match their committed
+   blobs exactly. No mutation residue.
+
+5. **The load-bearing claims neither reviewer spot-checked also hold.** I took the two strongest:
+   `NoOpenRegistrationTests.RoutesAsync()` genuinely enumerates the live `EndpointDataSource` from the
+   started host, filters only asset plumbing, and deliberately does *not* restrict to component
+   endpoints — a `MapPost("/register", …)` would be caught. And it measures reachability by probing,
+   not by reading `[AllowAnonymous]` metadata, so it is not asserting the gate's input against itself.
+   `LoginPageTests.An_unknown_username_and_a_known_one_are_indistinguishable` compares status,
+   normalised body *and* `Set-Cookie` across three separate app instances (no account / account /
+   corrupt hash). Both are as strong as the sweep says.
+
+**Method did not drift between the blocks.** Same discipline in both: name the test, name the single
+production change that turns it red, mutate only where the answer was in genuine doubt (once each),
+checksum before and after, `git diff` plus `git status` on `src`. The only difference is the
+Architect's mid-section addition — "check whether a booked item is still true before you measure" —
+which is the section learning from itself, not divergence. No dead scaffolding; §9 introduced none.
+
+---
+
+**Blocker S1 — the section closed one instance of the unique-index gap and did not sweep the class;
+one of the four is still undefended.**
+
+§9's substantive finding was that a unique index can be dropped with the whole suite staying green,
+because the service pre-check absorbs it. That is a *class* of defect, and the schema has four unique
+indexes. Three are defended at the storage layer; one is not:
+
+| index | defending test |
+|---|---|
+| `IX_Accounts_Username` | `IdentityDbContextTests:93,104` + new `InvitationRedemptionTests:349` |
+| `IX_GitEmails_Email` | `IdentityDbContextTests:115,131` |
+| `IX_GitTokens_TokenHash` | `IdentityDbContextTests:147` |
+| **`IX_Invitations_TokenHash`** | **none** |
+
+Migration `20260725130232_InitialIdentitySchema.cs:127-130` declares it `unique: true`, and
+`InvitationConfiguration.cs:13` agrees — but nothing in the 343-test suite fails if that `unique: true`
+becomes `false`. `IdentityDbContextTests` touches `Invitation` only in the round-trip test (`:60-68`);
+no test anywhere inserts two invitations sharing a `TokenHash`.
+
+This is load-bearing, not decorative. `InvitationService` resolves invitations by token hash with
+`SingleOrDefaultAsync` in two places — the authoritative under-lock decision
+(`InvitationService.cs:271`) and the pre-lock state read (`InvitationService.cs:373`) — and
+`SingleOrDefaultAsync` throws on a second match. The unique index is a precondition of the redemption
+path, on the credential that *is* the invite-only gate, in a service CLAUDE.md names security-critical.
+
+I am raising this as a blocker rather than a `## NEXT` note for one reason: this is the last review
+before archive, and a note parked in `## NEXT` on a change that is about to be archived is a note that
+never gets paid. It is *not* a §9 task failure — 9.2's four named properties (single-use, expiry,
+revocation, no open registration) are all genuinely satisfied. It is a gap in the estate that only the
+cross-file lens surfaces, in exactly the class of defect this section made its business.
+
+**Suggested remediation shape** — one block, one test, no new task numbers:
+`IdentityDbContextTests.Duplicate_invitation_token_hash_is_rejected()`, mirroring
+`Duplicate_git_token_hash_is_rejected` (`:147-171`): seed an issuer account, add two `Invitation` rows
+sharing a `TokenHash`, assert `DbUpdateException` on the second `SaveChangesAsync`. No mutation run is
+owed — the sibling tests already establish the shape, and a mutation of
+`20260725130232_InitialIdentitySchema.cs:130` is optional confirmation, not a requirement. `src` stays
+untouched.
+
+❓ **@architect** — if the Product Owner judges even this disproportionate, the honest alternative is
+to record `IX_Invitations_TokenHash` in the archived DEVLOG as a *knowingly accepted* untested
+constraint, with the reasoning, rather than let it pass silently. Either route closes it; drifting
+into the archive unremarked is the only outcome I would object to. That is the PO's call, not mine.
+
+---
+
+**Notes — not blockers.**
+
+- **N6 (`CancellationToken`), for the Product Owner's decision.** I agree with the worker and reviewer
+  on substance and scope, and my view on priority: **low**. It is resource hygiene, not a correctness
+  or security property — no test that exists today would change, and no spec requirement depends on
+  it. It is also not confined to §9's two files, so it belongs to a later change alongside whatever
+  else touches the page/service boundary, not to a follow-up carved now.
+- **§9's sweep method was never applied to §8's primitives.** No §9 task names git email management or
+  account lookup by git email, so `GitEmailServiceTests` (16 tests) rests on §8's own supervisor
+  approve rather than on this section's "what single change turns this red" pass. That is correct per
+  the task breakdown and I am not asking for it — but it is the newest surface and the one
+  content-core will consume first, so the Product Owner should know it carries block-level and
+  section-level evidence, not §9-sweep evidence.
+- **The `BootstrapConcurrencyTests` disposition is framed honestly and I concur.** 23/23 clean runs
+  recorded as *consistent with* the mechanism being gone, not as proof, with the actual evidence being
+  `130629c`'s removal of `ClearAllPools()` before this section's base. That is the right epistemics
+  and the right amount of spend. Nothing owed.
+
+**Closing assessment of the change as a whole** (proportionate, not a re-review of eight sections).
+The delivered estate genuinely defends the spec's headline properties, and in several places by a
+better instrument than "a test exists": invite-only and no-open-registration are asserted against the
+enumerated live routing table rather than guessed URLs; uniform login failure is compared across three
+app configurations including a corrupt stored hash; anonymous non-disclosure compares actual status,
+body and header *values* between a protected and a non-existent URL, then checks the shared response is
+the right page; shown-once and revocation are both mutation-confirmed with positive controls in the
+same instrument. Argon2id is pinned by its real cost parameters, not by a stub. With S1 closed I see no
+spec requirement in `specs/authentication`, `specs/invitations` or `specs/user-accounts` that nothing
+meaningfully tests.
+
+→ @architect
+
+- **[architect]** **Remediation block — supervisor S1.** → @worker
+
+  Accepted. And answering the `❓ @architect` in the same breath: **I am not taking the "record it as
+  knowingly accepted" route, and I am not putting that choice to the Product Owner.** The alternative
+  exists to stop a disproportionate fix being forced through — but the fix here is one test mirroring
+  one that already exists twenty lines away, and the thing left undefended is the uniqueness of the
+  *invitation token hash*, which is the credential the entire invite-only gate rests on. Trading a
+  fifteen-line test for an accepted risk on that constraint is not a trade worth offering.
+
+  The supervisor is also right about *why* this is a blocker rather than a `## NEXT` note: a note
+  parked in `## NEXT` on a change that is about to be archived never gets paid.
+
+  **This is a remediation block: no new `N.M` numbers, and it ticks nothing** — every §9 box is already
+  ticked.
+
+  **One test.** `IdentityDbContextTests.Duplicate_invitation_token_hash_is_rejected()`, mirroring
+  `Duplicate_git_token_hash_is_rejected` (`IdentityDbContextTests.cs:147-171`) — same shape, same
+  class, adjacent to it. It must fail if and only if `unique: true` at
+  `20260725130232_InitialIdentitySchema.cs:130` becomes `false`, so construct it the way the
+  supervisor verified the accounts one: two rows differing only in fields that carry no other unique
+  constraint, so `IX_Invitations_TokenHash` is the only index that can raise the asserted
+  `DbUpdateException`. Check that by reading before you write the assertion — if some other column on
+  `Invitation` is also unique, the test would pass for the wrong reason.
+
+  **No mutation run is owed** and none is authorised — the deterministic index-drop was already run
+  twice this section, and re-running it here buys nothing. If you want to sanity-check the
+  if-and-only-if, reason it from the schema rather than measuring it. **`src` stays untouched.**
+
+  **Gates, all four:** `dotnet build` clean, `dotnet test` — expect **344** (343 + this one), report
+  the figure; `openspec validate invite-only-authentication --strict`; `dotnet format
+  --verify-no-changes` clean. Do not commit, do not tick. → @reviewer when done.
+
+- **[worker]** Remediation for S1 done. Added
+  `IdentityDbContextTests.Duplicate_invitation_token_hash_is_rejected()`
+  (`tests/ZeroWiki.Tests/Data/IdentityDbContextTests.cs`), placed immediately before
+  `Account_deletion_cascades_to_git_emails_and_tokens`, mirroring `Duplicate_git_token_hash_is_rejected`
+  exactly: seeds one issuer `Account`, adds two `Invitation` rows sharing `TokenHash =
+  "same-invite-hash"` and `IssuerAccountId`, asserts `DbUpdateException` on the second
+  `SaveChangesAsync`.
+
+  Checked the if-and-only-if from the schema before writing it, per the brief — no mutation run: read
+  `Invitation.cs` and `InvitationConfiguration.cs` (only `builder.HasIndex(i => i.TokenHash).IsUnique()`
+  beyond the `Id` PK) and the migration (`IX_Invitations_IssuerAccountId` at
+  `20260725130232_InitialIdentitySchema.cs:121-124` is a plain FK index, not unique). The two rows
+  differ only in `Id` (a fresh `Guid` each) and share every other field, so `IX_Invitations_TokenHash`
+  is the only index that can raise the asserted `DbUpdateException` — same construction the supervisor
+  verified for the accounts case.
+
+  **Gates:** `dotnet build` — 0 warnings, 0 errors. `dotnet test` — **344/344 passed** (343 + this
+  one), full unfiltered run. `openspec validate invite-only-authentication --strict` — valid. `dotnet
+  format --verify-no-changes` — clean. `git diff -- src` and `git status --short -- src` both empty —
+  `src` untouched, only the test file changed. No commit made, nothing ticked (every §9 box was already
+  ticked).
+
+  → @reviewer
+
+- **[reviewer]** **Remediation block — supervisor S1. Approve.**
+
+  Verified the if-and-only-if from the schema myself rather than trusting the worker's reading of it,
+  and confirmed the rest independently.
+
+  1. **If-and-only-if holds.** `InvitationConfiguration.cs:13` puts exactly one index-bearing
+     constraint on `Invitation` beyond the `Id` PK — `HasIndex(i => i.TokenHash).IsUnique()` — and the
+     migration agrees: `IX_Invitations_IssuerAccountId` (`20260725130232_InitialIdentitySchema.cs:121-124`)
+     has no `unique: true`, `IX_Invitations_TokenHash` (`:126-130`) does. The two rows in
+     `Duplicate_invitation_token_hash_is_rejected` (`IdentityDbContextTests.cs:174-200`) differ only in
+     `Id` (fresh `Guid` each) and share `TokenHash`, `IssuerAccountId`, `CreatedAt`, `ExpiresAt` — none
+     of which carries any other unique constraint. The FK to `Account` (`OnDelete(DeleteBehavior.Restrict)`)
+     only governs delete cascading, not insert; both rows point at the same live `issuer.Id`, which is
+     valid on both inserts. So `IX_Invitations_TokenHash` is the only thing that can raise the asserted
+     `DbUpdateException` — the test fails if and only if `unique: true` at
+     `20260725130232_InitialIdentitySchema.cs:130` is dropped. Confirmed by reading, not by re-running
+     the deterministic mutation — the brief was right that a third run buys nothing here.
+
+  2. **Mirrors `Duplicate_git_token_hash_is_rejected` exactly.** Same class, same construction: seed
+     one account, add a first row, `SaveChangesAsync`, add a second row sharing the unique field and
+     nothing else, assert `DbUpdateException` on the second `SaveChangesAsync`. No gratuitous
+     divergence — placement immediately after the git-token sibling (`:147-200`) is correct.
+
+  3. **Scope is exactly the brief.** `git diff 0fb643b -- src` and `git status --short -- src` both
+     empty — `src` untouched. Only `tests/ZeroWiki.Tests/Data/IdentityDbContextTests.cs` changed
+     (one new `[Fact]`, 29 lines) plus the DEVLOG thread itself. `tasks.md` diff against `0fb643b` is
+     empty — no boxes touched, correct for a remediation block.
+
+  4. **No mutation evidence, and none was owed.** No stray files, no modified migration, no residue —
+     `git status --short -- src` came back empty, which also rules out an untracked file the diff
+     wouldn't show. The worker's report is consistent with reasoning from the schema alone.
+
+  **Gates reproduced independently, full unfiltered runs:** `dotnet build` — 0 warnings, 0 errors.
+  `dotnet test` — **344/344 passed**. `dotnet format --verify-no-changes` — clean (no output).
+  `openspec validate invite-only-authentication --strict` — `Change 'invite-only-authentication' is
+  valid`. All match the worker's reported figures.
+
+  S1 is closed. → @architect
+
+---
+
 ## NEXT
 
 _[architect] Housekeeping note (2026-07-28): this `## NEXT` heading was accidentally deleted when the
