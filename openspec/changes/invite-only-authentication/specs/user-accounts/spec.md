@@ -2,7 +2,7 @@
 
 ### Requirement: Account model
 
-The system SHALL represent each user as an account with a unique username, a salted password hash, a display name, and zero or more associated git emails. The system SHALL NOT store passwords in plaintext or with a reversible transformation.
+The system SHALL represent each user as an account with a unique username, a salted password hash, a display name, and zero or more associated git emails. The system SHALL NOT store passwords in plaintext or with a reversible transformation. The system SHALL compare git emails case-insensitively wherever they are matched — for uniqueness and for lookup alike — so that addresses differing only in case denote the same identity.
 
 #### Scenario: Account has required identity fields
 
@@ -47,6 +47,11 @@ The system SHALL allow an authenticated member to add, list, and remove the git 
 - **WHEN** an authenticated member removes a git email associated with their own account
 - **THEN** the email is no longer associated with that account, including when it was the only one
 
+#### Scenario: Git email differing only in case is treated as the same address
+
+- **WHEN** an authenticated member adds a git email that differs only in letter case from one already associated with another account
+- **THEN** the system refuses it on the same terms as an exact match, and does not associate a second copy of the address
+
 #### Scenario: Member cannot modify another account's git emails
 
 - **WHEN** an authenticated member attempts to add to or remove from the git emails of an account that is not their own
@@ -65,3 +70,8 @@ The system SHALL resolve a git email to the account it is associated with, and S
 
 - **WHEN** a git email not associated with any account is looked up
 - **THEN** the system returns no match rather than an error
+
+#### Scenario: Git email resolves regardless of the case it was stored in
+
+- **WHEN** a git email is looked up that differs only in letter case from the address associated with an account
+- **THEN** the system returns that account, rather than reporting no match

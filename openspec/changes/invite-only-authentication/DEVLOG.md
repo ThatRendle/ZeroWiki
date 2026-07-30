@@ -7917,8 +7917,23 @@ were built before the outer loop existed and are not retro-fitted.
 
 **Two open items §7 hands forward. Neither blocks §8 starting; the first must be settled inside it.**
 
-1. **S1 — §7 leaves §8 a real trap: the case-comparison semantics are nowhere binding.** Three
-   individually-correct decisions compose badly:
+1. **S1 — ✅ CLOSED by spec amendment. Product Owner's decision (2026-07-30): put it in the spec.**
+   `specs/user-accounts/spec.md`'s **Account model** requirement now states it once, where it binds
+   both consumers: *"The system SHALL compare git emails case-insensitively wherever they are matched
+   — for uniqueness and for lookup alike — so that addresses differing only in case denote the same
+   identity."* Two scenarios were added to make it testable from both ends: a case-variant of an
+   address held by another account is refused on the same terms as an exact match (**already satisfied**
+   by `Matching_is_case_insensitive_through_the_stored_collation`), and — the one that matters —
+   **a git email resolves regardless of the case it was stored in**, which is a *forward obligation on
+   §8* and currently unsatisfied, exactly as an unticked 8.2 should be.
+
+   Chosen over binding AD26 onto §8 in a brief, because a brief binds one section and this semantic
+   binds every consumer of the store, present and future. **§8 no longer needs to be told; it needs to
+   pass.** `FindOwnerAsync` stays private — promoting it is now an implementation choice for 8.2, not
+   the mechanism protecting the invariant. The original finding is preserved below unedited, because
+   the composition it describes is the reason the amendment exists.
+
+   *Original finding — three individually-correct decisions composing badly:*
    - `GitEmailService.FindOwnerAsync` is **private**, returns `Guid?` — right for 7.2.
    - **AD26 is scoped "binding on §7.2"**, and that scoping carries its *load-bearing* half with it:
      match case-insensitively **via the `NOCASE` collation, never normalise in C#**. §8 is not bound
@@ -7933,19 +7948,24 @@ were built before the outer loop existed and are not retro-fitted.
    exercises that path. This is the failure mode this project keeps re-learning: a green suite
    measuring a condition the defect does not live in.
 
-   **Close it in §8's brief.** Either promote `FindOwnerAsync` to the §8 primitive, or restate AD26's
-   collation rule as binding on §8 — **and either way add a test that an address stored as
-   `Alice@x.com` resolves for author `alice@x.com`.** The Architect should also consider stating the
-   comparison semantics in `specs/user-accounts/spec.md` itself, since it is the one semantic §8
-   consumes and the requirement was written without it.
+   *(The finding's own recommendation was to close it in §8's brief, and to consider the spec instead.
+   The Product Owner took the spec.)* **§8 still owes the test** that an address stored as
+   `Alice@x.com` resolves for author `alice@x.com` — the scenario now exists to demand it.
 
-2. **S3 — the Product Owner's 7.1 browser sign-off is stale, and 7.1 stays ticked.** 7.1 was verified
-   on 2026-07-29 against `130629c`; 7b then added a heading and two forms **to the same page**
-   (`e4bec3d`, 2026-07-30). Nothing was ticked improperly — 7.2 was never designated
-   human-in-the-loop, and the page tests cover the new forms through the real pipeline. But **the page
-   the Product Owner signed off is not the page that shipped.** Either a sixty-second re-look at
-   `/account`, or an explicit line here recording that the page tests suffice for 7b. Put it to the
-   Product Owner; do not resolve it by assertion.
+2. **S3 — ✅ CLOSED. Product Owner's decision (2026-07-30): the page tests suffice for 7b; 7.1 stays
+   ticked and is not re-verified.** 7.1 was signed off in a browser on 2026-07-29 against `130629c`;
+   7b then added a heading and two forms **to the same page** (`e4bec3d`, 2026-07-30), so the page
+   signed off is not the page that shipped. The Product Owner's call is that the ten page-level tests
+   covering the new forms through the real pipeline — including antiforgery, GET-safety, and the
+   closed-field-set assertion — carry it, and that no second browser pass is warranted.
+
+   **Recorded rather than waved through**, because the supervisor was right that it was not mine to
+   assert. The precedent this sets is narrow and worth naming: **a human-verified page can be extended
+   by a later block without re-verification when the extension is covered by page-level tests through
+   the real pipeline.** It does *not* extend to a block that changes what was verified — 7b added a
+   section beside the token panel and touched nothing 7.1's recipe exercised, which is why the tests
+   can stand in. A block that altered the shown-once panel, the Back-button behaviour, or the token
+   table would need the human back.
 
 **Recorded, no action (supervisor S2/S4):**
 
