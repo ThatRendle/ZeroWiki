@@ -1,0 +1,25 @@
+## .NET
+bin/
+obj/
+out/
+
+## User-specific
+*.user
+*.suo
+.local/
+
+## Rider / VS / VS Code
+.idea/
+.vs/
+*.userosscache
+*.sln.docstates
+
+## Identity store & content data (never versioned — see design D6)
+*.db
+*.db-shm
+*.db-wal
+App_Data/
+
+## OS
+.DS_Store
+Thumbs.db

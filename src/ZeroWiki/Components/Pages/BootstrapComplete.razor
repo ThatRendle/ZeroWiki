@@ -1,0 +1,32 @@
+@page "/bootstrap/complete"
+@* Exempt for the same reason /bootstrap is: it is where the first administrator lands, and they
+   have not signed in yet. *@
+@attribute [AllowAnonymous]
+@using ZeroWiki.Identity
+@inject BootstrapService BootstrapService
+@inject NavigationManager Navigation
+
+<PageTitle>Administrator account created</PageTitle>
+
+<h1>Administrator account created</h1>
+
+<p>
+    The first administrator account now exists, so this wiki is no longer open to bootstrapping —
+    revisiting <code>/bootstrap</code> will not create another account.
+</p>
+
+<p>Signing in comes next; that page does not exist yet.</p>
+
+@code {
+    /// <summary>
+    /// This page asserts that an administrator exists, so it must not serve that claim while the
+    /// store is still empty. It is anonymously reachable for the same reason /bootstrap is.
+    /// </summary>
+    protected override async Task OnInitializedAsync()
+    {
+        if (await BootstrapService.IsAvailableAsync())
+        {
+            Navigation.NavigateTo("/bootstrap", replace: true);
+        }
+    }
+}

@@ -1,0 +1,171 @@
+@page "/invitations"
+@attribute [Authorize]
+@using System.Globalization
+@using System.Security.Claims
+@using ZeroWiki.Identity
+@inject InvitationService InvitationService
+@inject NavigationManager Navigation
+@inject TimeProvider TimeProvider
+
+<PageTitle>Invitations</PageTitle>
+
+<h1>Invitations</h1>
+
+<p>
+    This wiki is invite-only: an invitation is the only way a new account is created.
+    @InvitationPolicy.LifetimeRuleDescription It can be used once, and you can revoke it at any
+    time before it is used.
+</p>
+
+@if (_issuedLink is not null)
+{
+    <div class="issued-invitation" role="alert">
+        <h2>Invitation created</h2>
+        <p>
+            Copy this link and send it to the person you are inviting. It is shown
+            <strong>once</strong> — it is not stored anywhere and cannot be shown again.
+        </p>
+        <p><code class="invitation-link">@_issuedLink</code></p>
+    </div>
+}
+
+@if (_revocation is InvitationRevocation.Revoked)
+{
+    <p class="revocation-outcome" role="alert">That invitation is revoked and can no longer be used.</p>
+}
+else if (_revocation is InvitationRevocation.AlreadyRedeemed)
+{
+    <p class="revocation-outcome" role="alert">
+        That invitation has already been used to create an account, so there is nothing to revoke.
+    </p>
+}
+else if (_revocation is InvitationRevocation.NotFound)
+{
+    <p class="revocation-outcome" role="alert">That invitation no longer exists.</p>
+}
+
+<EditForm Model="this" FormName="issue-invitation" OnValidSubmit="IssueAsync">
+    <button type="submit">Create an invitation</button>
+</EditForm>
+
+@* Rendered whether or not there is a row to revoke: a form that disappears with the last row
+   would leave a submission naming it with no handler to reach. *@
+<EditForm Model="RevokeInput" FormName="revoke-invitation" OnValidSubmit="RevokeAsync">
+    @if (_invitations.Count == 0)
+    {
+        <p>No invitations yet.</p>
+    }
+    else
+    {
+        <table>
+            <thead>
+                <tr>
+                    @if (CallerIsAdministrator)
+                    {
+                        <th scope="col">Issued by</th>
+                    }
+                    <th scope="col">Issued</th>
+                    <th scope="col">Expires</th>
+                    <th scope="col">State</th>
+                    <th scope="col"><span class="visually-hidden">Actions</span></th>
+                </tr>
+            </thead>
+            <tbody>
+                @foreach (var invitation in _invitations)
+                {
+                    <tr>
+                        @if (CallerIsAdministrator)
+                        {
+                            <td>@invitation.IssuerUsername</td>
+                        }
+                        <td>@Format(invitation.CreatedAt)</td>
+                        <td>@Format(invitation.ExpiresAt)</td>
+                        <td>@Describe(invitation)</td>
+                        <td>
+                            @if (IsRevocable(invitation))
+                            {
+                                <button type="submit" name="RevokeInput.InvitationId" value="@invitation.Id">
+                                    Revoke
+                                </button>
+                            }
+                        </td>
+                    </tr>
+                }
+            </tbody>
+        </table>
+    }
+</EditForm>
+
+@code {
+    private IReadOnlyList<InvitationSummary> _invitations = [];
+    private string? _issuedLink;
+    private InvitationRevocation? _revocation;
+
+    [CascadingParameter]
+    private HttpContext? HttpContext { get; set; }
+
+    // No property initializer, because an initializer on a [SupplyParameterFromForm] property can
+    // be overwritten with null by a post (BL0008). The explicit Name is the binding prefix, and it
+    // has to match the field name the revoke buttons below are rendered with.
+    [SupplyParameterFromForm(Name = nameof(RevokeInput))]
+    private RevokeInvitationInput? PostedRevokeInput { get; set; }
+
+    private RevokeInvitationInput RevokeInput => PostedRevokeInput ??= new();
+
+    private ClaimsPrincipal User => HttpContext?.User
+        ?? throw new InvalidOperationException("Managing invitations requires the static server-rendered HttpContext.");
+
+    private Guid CallerAccountId => Guid.TryParse(User.FindFirstValue(ClaimTypes.NameIdentifier), out var accountId)
+        ? accountId
+        : throw new InvalidOperationException("The signed-in principal carries no account identifier.");
+
+    /// <remarks>
+    /// Deliberately not spelled out here: the value-matching comparison lives in one tested place,
+    /// because the presence-only form reads a claim of <c>"false"</c> as an administrator.
+    /// </remarks>
+    private bool CallerIsAdministrator => User.IsAdministrator();
+
+    protected override async Task OnInitializedAsync() => await LoadAsync();
+
+    private async Task IssueAsync()
+    {
+        var issued = await InvitationService.IssueAsync(CallerAccountId);
+
+        // The plaintext exists only for this render. It is deliberately not carried through a
+        // redirect, TempData or a session: a redemption link in a URL lands in browser history,
+        // server logs, and every proxy in between.
+        _issuedLink = Navigation
+            .ToAbsoluteUri($"{InvitationPolicy.RedemptionPath}/{Uri.EscapeDataString(issued.Token)}")
+            .ToString();
+
+        await LoadAsync();
+    }
+
+    private async Task RevokeAsync()
+    {
+        // The identifier came from the browser and grants nothing by itself: the service re-scopes
+        // it to the invitations this caller may act on.
+        _revocation = await InvitationService.RevokeAsync(
+            CallerAccountId,
+            CallerIsAdministrator,
+            RevokeInput.InvitationId);
+
+        await LoadAsync();
+    }
+
+    private async Task LoadAsync() =>
+        _invitations = await InvitationService.ListAsync(CallerAccountId, CallerIsAdministrator);
+
+    private bool IsRevocable(InvitationSummary invitation) => invitation.RedeemedAt is null;
+
+    private string Describe(InvitationSummary invitation) => invitation switch
+    {
+        { RedeemedAt: not null } => "Used",
+        { RevokedAt: not null } => "Revoked",
+        _ when invitation.ExpiresAt <= TimeProvider.GetUtcNow() => "Expired",
+        _ => "Waiting to be used",
+    };
+
+    private static string Format(DateTimeOffset value) =>
+        value.UtcDateTime.ToString("yyyy-MM-dd HH:mm 'UTC'", CultureInfo.InvariantCulture);
+}

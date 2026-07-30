@@ -1,0 +1,150 @@
+@page "/invite/{Token}"
+@* Load-bearing exemption (AD21): redemption is necessarily anonymous, because the invitee has no
+   account until this page creates one. The token, not a session, is what gates it. *@
+@attribute [AllowAnonymous]
+@using ZeroWiki.Identity
+@inject InvitationService InvitationService
+@inject NavigationManager Navigation
+
+<PageTitle>Accept your invitation</PageTitle>
+
+<h1>Accept your invitation</h1>
+
+@if (_outcome is { } outcome)
+{
+    <p class="invitation-rejected" role="alert">@Describe(outcome)</p>
+}
+
+@if (InvitationIsUsable)
+{
+    <p>
+        You have been invited to this wiki. Choose the username and password you will sign in with;
+        nobody else, including whoever invited you, ever sees the password.
+    </p>
+
+    <EditForm Model="Input" FormName="redeem-invitation" OnValidSubmit="SubmitAsync">
+        <DataAnnotationsValidator />
+
+        <p>
+            <label>
+                Username
+                <InputText @bind-Value="Input.Username" autocomplete="username" />
+            </label>
+            <ValidationMessage For="() => Input.Username" />
+        </p>
+
+        <p>
+            <label>
+                Password
+                <InputText @bind-Value="Input.Password" type="password" autocomplete="new-password" />
+            </label>
+            <ValidationMessage For="() => Input.Password" />
+        </p>
+
+        <p>
+            <label>
+                Confirm password
+                <InputText @bind-Value="Input.ConfirmPassword" type="password" autocomplete="new-password" />
+            </label>
+            <ValidationMessage For="() => Input.ConfirmPassword" />
+        </p>
+
+        <button type="submit">Create my account</button>
+    </EditForm>
+}
+
+@code {
+    /// <summary>
+    /// The one answer for a token that matches nothing — a mistyped link, a truncated one, or a
+    /// guess. AD17 permits naming the other reasons because reaching them requires possession of a
+    /// real token; this one is what an anonymous caller gets for anything else, so it says nothing
+    /// about whether any invitation exists.
+    /// </summary>
+    private const string NotValidMessage =
+        "This invitation link is not valid. Ask whoever invited you for a new one.";
+
+    private InvitationRedemption? _outcome;
+
+    [CascadingParameter]
+    private HttpContext? HttpContext { get; set; }
+
+    /// <remarks>
+    /// The token travels in the path, which is <c>design.md</c>'s resolved copy-a-link handoff and
+    /// therefore a known cost: it reaches browser history and any proxy log in between. What
+    /// bounds that exposure is redemption consuming it. Do not make it worse — it is never logged,
+    /// and it is not carried into the redirect that follows a successful redemption.
+    /// </remarks>
+    [Parameter]
+    public string? Token { get; set; }
+
+    // No property initializer, because an initializer on a [SupplyParameterFromForm] property can
+    // be overwritten with null by a post (BL0008). The explicit Name is the binding prefix, and it
+    // has to match the field names the inputs above are rendered with.
+    [SupplyParameterFromForm(Name = nameof(Input))]
+    private RedeemInvitationInput? PostedInput { get; set; }
+
+    private RedeemInvitationInput Input => PostedInput ??= new();
+
+    /// <summary>
+    /// Whether the invitation itself can still create an account. A taken username is the one
+    /// outcome that says nothing about the invitation, so the form stays up for another attempt —
+    /// otherwise a name clash would burn a link that is still perfectly good.
+    /// </summary>
+    private bool InvitationIsUsable => _outcome is null or InvitationRedemption.UsernameTaken;
+
+    /// <summary>
+    /// A courtesy only: it saves the invitee filling in a form that was never going to work. The
+    /// check that counts is inside the service, under the store's write lock, since a hand-crafted
+    /// POST never does this GET.
+    /// </summary>
+    /// <remarks>
+    /// It is deliberately confined to the GET, and that is load-bearing rather than an
+    /// optimisation. A rejection here hides the form, and a form that is not in the render tree has
+    /// no submit handler for the framework to dispatch a POST to — so running this on the POST as
+    /// well would answer 400 for an invitation that expired while the invitee was typing, instead
+    /// of letting <see cref="InvitationService.RedeemAsync"/> decide and say why. The advisory
+    /// check must never be what refuses a submission.
+    /// </remarks>
+    protected override async Task OnInitializedAsync()
+    {
+        if (HttpContext is null || HttpMethods.IsGet(HttpContext.Request.Method))
+        {
+            _outcome = await InvitationService.ValidateAsync(Token);
+        }
+    }
+
+    private async Task SubmitAsync()
+    {
+        var outcome = await InvitationService.RedeemAsync(Token, Input.Username, Input.Password);
+
+        if (outcome is InvitationRedemption.Redeemed)
+        {
+            // AD18: redemption creates the account, it does not establish a session. Login stays
+            // the only route in the system that mints one, which is where the uniform-failure
+            // behaviour and the timing equalisation live. The token is deliberately not carried
+            // into this target — it has just been consumed and has no business in another URL.
+            Navigation.NavigateTo("/login", replace: true);
+            return;
+        }
+
+        _outcome = outcome;
+    }
+
+    /// <remarks>
+    /// <see cref="InvitationRedemption.Redeemed"/> never reaches here — it redirects — and the
+    /// default arm is deliberately the uniform message, so a member added to the enum without a
+    /// message of its own reveals nothing rather than falling through to something friendlier.
+    /// </remarks>
+    private static string Describe(InvitationRedemption outcome) => outcome switch
+    {
+        InvitationRedemption.Expired =>
+            "This invitation has expired. Ask whoever invited you for a new one.",
+        InvitationRedemption.AlreadyRedeemed =>
+            "This invitation has already been used to create an account. If that was you, sign in instead.",
+        InvitationRedemption.Revoked =>
+            "This invitation was withdrawn. Ask whoever invited you for a new one.",
+        InvitationRedemption.UsernameTaken =>
+            "That username is already taken. Your invitation is still good — choose another name and try again.",
+        _ => NotValidMessage,
+    };
+}

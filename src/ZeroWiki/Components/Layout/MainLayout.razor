@@ -1,0 +1,18 @@
+﻿@inherits LayoutComponentBase
+
+<div class="page">
+    <div class="sidebar">
+        <NavMenu />
+    </div>
+
+    @* No header bar. It existed to hold the project template's "About" link to the ASP.NET Core
+       docs, which is not ZeroWiki navigation and rendered on every page an anonymous visitor can
+       reach — making "SHALL NOT expose … navigation to anonymous visitors" false on /login,
+       /bootstrap, /Error and the redemption page. Removing it settles that unconditionally, and
+       takes the unaccompanied target="_blank" with it. *@
+    <main>
+        <article class="content px-4">
+            @Body
+        </article>
+    </main>
+</div>

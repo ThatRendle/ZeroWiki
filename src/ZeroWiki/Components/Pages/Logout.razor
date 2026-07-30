@@ -1,0 +1,46 @@
+@page "/logout"
+@using Microsoft.AspNetCore.Authentication
+@using Microsoft.AspNetCore.Authentication.Cookies
+@inject NavigationManager Navigation
+
+<PageTitle>Sign out</PageTitle>
+
+@if (_signedInAs is null)
+{
+    <h1>Signed out</h1>
+    <p>You are not signed in.</p>
+}
+else
+{
+    <h1>Sign out</h1>
+    <p>You are signed in as <strong>@_signedInAs</strong>.</p>
+
+    <EditForm Model="this" FormName="logout" OnValidSubmit="SubmitAsync">
+        <button type="submit">Sign out</button>
+    </EditForm>
+}
+
+@code {
+    private string? _signedInAs;
+
+    [CascadingParameter]
+    private HttpContext? HttpContext { get; set; }
+
+    /// <remarks>
+    /// Signing out happens on the POST only, and the framework validates the antiforgery token
+    /// on it. A GET that signed the user out would be triggerable by any page that could get the
+    /// browser to fetch this URL — an image tag is enough.
+    /// </remarks>
+    protected override void OnInitialized() =>
+        _signedInAs = HttpContext?.User.Identity is { IsAuthenticated: true, Name: { } name } ? name : null;
+
+    private async Task SubmitAsync()
+    {
+        var context = HttpContext
+            ?? throw new InvalidOperationException("Signing out requires the static server-rendered HttpContext.");
+
+        await context.SignOutAsync(CookieAuthenticationDefaults.AuthenticationScheme);
+
+        Navigation.NavigateTo("/", replace: true);
+    }
+}
