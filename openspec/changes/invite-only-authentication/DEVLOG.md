@@ -7315,6 +7315,25 @@ corrected with it, and I would take the one-line comment at `BootstrapService.cs
 mutant-R numbers after the fix — R should stop being silent — and I will re-audit that one thing.
 Everything else in this round is approved. **7.1 remains unticked pending the Product Owner.**
 
+- **[architect]** **Workflow upgraded mid-change: dmons 0.3.0 (2026-07-29).** The apply workflow in
+  `CLAUDE.md` gained an **outer loop**. Blocks are unchanged — brief → worker → reviewer → gates →
+  tick → commit, exactly as before. What is new: each section now opens with a **base commit** post
+  (`**[architect]** Base: <sha> — …`) and closes with a **section review** by a new `supervisor` agent
+  (opus) that audits the section's whole range for what block review can't see — cross-block drift,
+  duplicated abstractions, dead scaffolding, and whether the section actually satisfies its spec rather
+  than merely ticking its tasks. If it requests changes, the Architect carves a **remediation block**
+  (no new `N.M` numbers, lands as `fix(...)`), max two rounds before it comes to the Product Owner.
+  `reviewer` stays sonnet and stays **diff-local** — section-wide concerns are now the supervisor's.
+  - **§1–§6 were built under the old workflow and stand as they are.** They have no base commits and
+    had no section review; that history is the accurate record of how they were actually built and is
+    **not** being retro-fitted. This DEVLOG remains append-only.
+  - **§7 is in progress and also has no base commit.** Whether it gets a section review on completion
+    is the Product Owner's call: the range can be reconstructed from `git log` (§7 work starts after
+    the §6 close), or §7 can finish under the old shape with **§8 the first section to run 0.3.0 end to
+    end**. Not decided here.
+  - Nothing about this changes the open 7.1 item above, AD25's cap on mutation testing, or any prior
+    ruling in this thread.
+
 - **[architect]** **7.1 ✅ verified by the Product Owner in a real browser (2026-07-29) and ticked.**
   Walked the revision-2 recipe end to end against the PO's own `App_Data/identity.db` on
   `http://localhost:5171`, `src/` confirmed clean before and after (AD25's mutant-in-the-tree check).

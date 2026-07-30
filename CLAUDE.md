@@ -14,7 +14,10 @@ room. Conventions:
 
 - Organised by `## N.` **section** (mirroring `tasks.md`), with a pinned `## NEXT` at the bottom.
 - Each post is **attributed** — prefixed with the author's role: `[architect]`, `[worker]`,
-  `[reviewer]` — and references the **block** (`N.1–N.3`) it concerns.
+  `[reviewer]`, `[supervisor]` — and references the **block** (`N.1–N.3`) it concerns.
+- **The first post under each `## N.` heading is the section's base commit** —
+  `**[architect]** Base: <sha> — <what this section delivers>`. The supervisor's review scope is
+  `git diff <sha>..HEAD`, so this post is load-bearing, not ceremony.
 - **Questions** are addressed in-thread: `❓ @architect — spec says X but design says Y; which?`, and
   answered by the addressee. Handoffs read `→ @reviewer`. The whole review loop lives here.
 - **Append-only** — posts persist forever; only `## NEXT` is rewritten. The DEVLOG is committed with
@@ -38,6 +41,7 @@ DEVLOG.md file to Meko.
 ---
 
 ## OpenSpec Workflow
+<!-- dmons-scaffold: 0.3.0 -->
 
 **This section is authoritative.** If a skill's behavior ever conflicts with what's written here,
 **follow this document.**
@@ -48,8 +52,9 @@ the third in full:
 - **Explore** (`opsx:explore`) — **Analyst** hat. Work with the Product Owner to shape *what* to build.
 - **Propose** (`opsx:propose`) — **Architect** hat. Shape *how*: the proposal, `design.md`, and
   `tasks.md`.
-- **Apply** (`opsx:apply`) — **Architect** hat. Everything below: implement the change **block by
-  block** via the `worker`/`reviewer` split.
+- **Apply** (`opsx:apply`) — **Architect** hat. Everything below: implement the change **section by
+  section, block by block** via the `worker`/`reviewer` split, with a `supervisor` auditing each
+  finished section.
 
 ### Roles — the Product Owner owns the vision; the main thread never writes feature code
 
@@ -64,6 +69,14 @@ the third in full:
     **You do not implement feature code directly.**
 - **`worker`** agent — implements each block.
 - **`reviewer`** agent — audits each block's diff (one reviewer for the whole change, every stack).
+- **`supervisor`** agent — audits each finished `## N.` section as a whole, once all its blocks have
+  landed (one supervisor for the whole change, every stack).
+
+**The two auditors have different jobs and must not be swapped.** The `reviewer` is **diff-local** and
+runs per block; the `supervisor` is the only agent that ever sees more than one block at a time, and
+looks for what block reviews structurally cannot catch — cross-block drift, duplicated abstractions,
+dead scaffolding, and whether the section genuinely satisfies its spec rather than merely ticking its
+tasks. Neither ever edits code: both report, and a worker fixes.
 
 All agents are defined for this repo. Delegate; don't shortcut by writing the implementation yourself.
 
@@ -73,6 +86,11 @@ All agents are defined for this repo. Delegate; don't shortcut by writing the im
 2. **Always ask the Product Owner which change to apply**, even when there is exactly one. If there are
    none, say so and stop.
 3. Resume point = the **first unticked `- [ ]` task** in that change's `tasks.md`.
+4. **Check the preceding section closed.** Ticked boxes are not proof a section passed its supervisor
+   review — a session can end after the last block commits and before the review runs. Before starting
+   the resume point's section, read the DEVLOG: if the previous `## N.` has no `[supervisor]` `Approve`
+   under it, run that review first (§3c). If it never got a `Base:` post either, reconstruct the range
+   from `git log` and say so in the DEVLOG.
 
 ### 2. Pre-flight (Architect, before the first block)
 
@@ -83,15 +101,40 @@ All agents are defined for this repo. Delegate; don't shortcut by writing the im
 4. **Be on the change branch** `change/<change-name>`. Create it from the default branch if missing:
    `git switch -c change/<change-name>`.
 
-### 3. Implement — block by block
+### 3. Implement — section by section, block by block
 
-Walk the change's sections (`## N.` sections) in order from the resume point. **The unit of work is
-not the whole section — it is a *block*:** a coherent run of tasks within one section (e.g. `N.1–N.3`)
-that makes sense to build and review as one deliverable and land as one commit. You (Architect) carve
-each section into blocks; a section is one or more blocks, and **a block never spans sections** — if a
-block wants to, the section breakdown is wrong.
+Walk the change's `## N.` sections in order from the resume point. There are **two nested loops**:
 
-For each block:
+```
+OUTER — for each ## N. section, in order
+  ├─ post the section's base commit to the DEVLOG
+  ├─ INNER — for each block in the section
+  │    brief worker → worker implements → reviewer audits → loop until Approve
+  │    → gates pass → tick boxes → commit
+  └─ SECTION REVIEW — supervisor audits the whole section
+       Approve → next section
+       Request changes → carve a remediation block, re-enter INNER
+```
+
+**The unit of work is not the whole section — it is a *block*:** a coherent run of tasks within one
+section (e.g. `N.1–N.3`) that makes sense to build and review as one deliverable and land as one commit.
+You (Architect) carve each section into blocks; a section is one or more blocks, and **a block never
+spans sections** — if a block wants to, the section breakdown is wrong.
+
+#### 3a. Opening a section (outer loop)
+
+Before briefing the first block of a `## N.` section, post its **base commit** to the DEVLOG as the
+first entry under that heading:
+
+```
+**[architect]** Base: <sha> — <one line: what this section delivers>
+```
+
+`<sha>` is the current `HEAD` (`git rev-parse --short HEAD`). This is what gives the supervisor its
+review scope at the end of the section (`git diff <sha>..HEAD`); without it, it has no reliable way to
+see the section as a whole. Post it **before** any block of the section is committed.
+
+#### 3b. Each block (inner loop)
 
 1. **Brief the worker.** Post the brief to the DEVLOG (`[architect]`, under the block's `## N.`
    section): the block's tasks (`N.1`…`N.k`), the relevant spec excerpts, the binding design decisions
@@ -120,9 +163,44 @@ For each block:
    - N.2 <task summary>
    ...
 
-   Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+   Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
    ```
    Commit the DEVLOG with the block.
+
+#### 3c. Closing a section — the supervisor review
+
+When the **last block of a `## N.` section** has landed (reviewer approved, gates green, boxes ticked,
+committed), the section is not done yet. Run the section review before opening the next one.
+
+1. **Spawn `supervisor`** on the section's full range — `git diff <base-sha>..HEAD`, where `<base-sha>`
+   is the one you posted in 3a. Point it at the section's spec requirements, not just its tasks. It
+   posts its verdict to the DEVLOG under the section's heading as `[supervisor]`.
+   - Run it for **every** section, including a single-block one — the lens is different from the
+     reviewer's, not merely wider.
+2. **`Approve`** → the section is closed. Roll any architectural notes into `## NEXT` and move to the
+   next section.
+3. **`Request changes`** → carve a **remediation block** from the findings and re-enter the inner loop
+   (3b) with it: brief a worker, `reviewer` audits it, gates, commit.
+   - The remediation block gets **no new `N.M` numbers** and ticks nothing — every box in the section
+     is already ticked. The findings and the fix live in the DEVLOG; that is the record.
+   - Commit it as a fix, not a feature:
+     ```
+     fix(<change-name>): address supervisor findings (section N)
+
+     - <finding> — <what changed>
+     ...
+
+     Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+     ```
+   - Then **re-run the supervisor** on the same `<base-sha>..HEAD` range (now including the fix).
+4. **Two rounds, then stop.** If the supervisor still requests changes after one remediation block,
+   **do not carve a third** — stop and put it to the Product Owner (§4). A section that won't converge
+   in two rounds usually means the section breakdown or the spec is wrong, and more fixing won't
+   resolve either.
+
+**Do not open the next section until the current one has a supervisor `Approve`** (or the Product Owner
+has explicitly waved it on). The whole point of the outer loop is that drift is caught before it is
+built on.
 
 ### 4. Stop and ask — do not push on
 
@@ -138,7 +216,9 @@ fix) when:
   clones-pulls-pushes against the Smart HTTP git remote, or checking the first-run admin bootstrap UX.
   Implement and self-test as far as possible, then hand the Product Owner a precise, copy-pasteable way
   to verify (exact command, what to do, what they should see) and **wait for their confirmation before
-  ticking that task**.
+  ticking that task**;
+- the **supervisor still requests changes after one remediation block** (§3c.4) — report its findings
+  and ask whether to remediate again, re-cut the section, or fix the spec.
 
 **On stopping mid-block:** leave the WIP **uncommitted**, do **not** tick the block, do **not** revert.
 Log the stop in the DEVLOG and report the **exact task (`N.M`)** that stopped you and why. The WIP stays
@@ -146,9 +226,10 @@ in the working tree for the Product Owner to inspect.
 
 ### 5. Done
 
-When every task in the change is ticked and the final review is clean:
+When every task in the change is ticked and the **final section has a supervisor `Approve`**:
 
-1. Report status to the Product Owner: blocks landed, commits made, test summary.
+1. Report status to the Product Owner: sections closed, blocks landed, commits made, test summary, and
+   any architectural notes the supervisor parked in `## NEXT`.
 2. **Propose archiving** — offer to run `/opsx:archive` and **wait for the Product Owner's
    confirmation**. Do not archive automatically.
 
@@ -200,6 +281,19 @@ with the working tree looking entirely ordinary.
 
 - **Always `git diff -- src` before committing** anything that followed a mutation run. This is not
   ceremony.
+- **Run `git status --short -- src` alongside it — the diff is blind to untracked files.** `git diff`
+  reports only on files git already tracks; a file that has never been `git add`ed is not shown as
+  unchanged, it is not shown *at all*. §7b mutated `GitEmailService.cs`, which was brand new and
+  untracked for the whole block, so the mandated diff came back clean over a file it had never looked
+  at. A new file is the *normal* case for a block that adds a service, which is exactly when mutation
+  testing is most likely to run.
+- **A `??` entry means "read it or checksum it", not "it's fine".** `git status` surfaces that an
+  untracked file exists; it cannot show content, and for a new file git has no baseline to diff
+  against, so **no git command can verify a mutant inside it**. Git gives you visibility here, not
+  verification.
+- **The content check is what actually protects you** — checksum the target before *and* after each
+  mutation (already required above), revert via the harness, and have a second pair of eyes re-read or
+  re-run the mutants. In §7b that discipline, not git, is what confirmed the file was clean.
 - **Mutation harnesses must revert via `trap`/`finally`**, never a final step that an interruption
   can skip.
 
