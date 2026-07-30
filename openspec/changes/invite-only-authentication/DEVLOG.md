@@ -9317,6 +9317,107 @@ meaningfully tests.
 
 ---
 
+**[supervisor]** Section §9 re-review (round 2 of 2) — scope `git diff c313145..HEAD` (`ba56be5`,
+`0fb643b`, `5f5580c`). **Approve.** S1 is closed, the remediation disturbed nothing, and the class is
+swept rather than the instance patched. §9 is closed and, with it, the change.
+
+**1. S1 is genuinely closed — the if-and-only-if verified from the schema, not from the thread.**
+Both the worker and the reviewer reasoned this rather than measured it, so I re-derived it against
+the migration text itself. `Invitations` carries exactly three constraints
+(`20260725130232_InitialIdentitySchema.cs:70-90,121-130`): `PK_Invitations` on `Id`,
+`FK_Invitations_Accounts_IssuerAccountId` (`Restrict`), and two indexes — `IX_Invitations_IssuerAccountId`
+plain, `IX_Invitations_TokenHash` `unique: true`. No check constraint, no second unique index, and
+SQLite does not enforce `maxLength`, so the declared widths cannot raise anything.
+`Duplicate_invitation_token_hash_is_rejected` (`IdentityDbContextTests.cs:174-200`) inserts two rows
+differing only in `Id` (fresh `Guid` each), both pointing at an issuer already committed by a prior
+`SaveChangesAsync`, with every non-nullable column populated. That leaves exactly one constraint able
+to raise the asserted `DbUpdateException`.
+
+Two things I checked beyond the reviewer's reading, because a false pass here is indistinguishable
+from a real one:
+
+- **The instrument is a real database.** `IdentityDbContextTests` runs `Database.Migrate()` against an
+  open in-memory `SqliteConnection` (`:19-27`) — not `EnsureCreated`, not the InMemory provider, which
+  would ignore unique indexes entirely and make the test pass for the worst possible reason.
+- **A wrong-reason pass cannot hide in the arrange.** The issuer insert and the first invitation insert
+  are each awaited on their own line (`:178`, `:188`), *outside* `Assert.ThrowsAsync`. Had either
+  failed — bad FK, null column — the test would error at that line rather than satisfy the assertion.
+  The only exception the assertion can absorb is the one raised by the second insert.
+
+Drop `unique: true` at `:130` and the second insert succeeds, no exception is raised, and
+`Assert.ThrowsAsync` fails. The biconditional holds. I concur that a third run of the deterministic
+index-drop mutation would have bought nothing, and I note the Architect declined the "knowingly
+accepted" route on the merits and recorded the reasoning — that is the right call and it is now on the
+record either way, which is all I asked for.
+
+**2. The remediation introduced nothing and disturbed nothing.** `git diff c313145..HEAD -- src` empty
+across all three commits; working-tree `git diff -- src` and `git status --short -- src` both empty, so
+no mutation residue and no untracked file the diff would not have shown. `5f5580c` touches exactly two
+files — `IdentityDbContextTests.cs` (+29, one `[Fact]`) and the DEVLOG. `tasks.md` is untouched by the
+remediation, correct for a block that ticks nothing. Placement is right: the new test sits with its four
+siblings in the storage-constraint class, not off in the invitation service tests.
+
+**3. The class is swept, and the adjacent classes hold.** All four unique indexes are now defended at
+the storage layer: `IX_Accounts_Username` (`IdentityDbContextTests:93`), `IX_GitEmails_Email` (`:115`),
+`IX_GitTokens_TokenHash` (`:147`), `IX_Invitations_TokenHash` (`:174`). I then looked for the other
+silent-constraint classes the Architect asked about, and they are in better shape than the unique
+indexes were:
+
+- **Collation** — `NOCASE` on `Accounts.Username` and `GitEmails.Email` is load-bearing (it is what makes
+  "same user, different case" impossible) and is defended by a dedicated case-insensitive duplicate test
+  for each (`IdentityDbContextTests:104`, `:131`).
+- **Storage format** — the closest structural analogue to S1, and the one I expected to find bare.
+  `InvitationService.cs:354` filters `i.ExpiresAt > asOf` **in SQL**, and `GitTokenService.cs:88` orders
+  by `CreatedAt` **in SQL**, both over AD7's fixed-width ISO-8601 UTC text. Change that representation
+  and every constraint still holds while expiry and ordering silently stop meaning what they say. It is
+  defended, and thoroughly: `DateTimeOffsetStorageTests` pins the fixed width, normalises non-UTC input,
+  and asserts the SQL-side predicate excludes an expired invitation, keeps a live one written with a
+  *negative offset*, and orders chronologically across the whole range (`:33-190`).
+- **Cascade** — `GitEmails`/`GitTokens` cascade from `Account` is covered by
+  `Account_deletion_cascades_to_git_emails_and_tokens` (`:203`).
+- **The one undefended constraint left, and why I am not asking for it.** `FK_Invitations_Accounts_IssuerAccountId`
+  uses `Restrict` (`:85-89`), and nothing tests either the FK's insert-time existence check or the
+  restrict-on-delete behaviour. It is not load-bearing in any shipped path: the only delete in the whole
+  of `src` is `GitEmailService.cs:134`, and no account-deletion path exists in this change, so the rule
+  governs a scenario the application cannot currently reach. If a later change adds account deletion,
+  that change must bring the test with it — the deleter will discover the `Restrict` the moment it tries
+  to delete an issuer, which is the point at which the constraint becomes real. Recorded in `## NEXT`
+  as a condition on future work, not as debt owed by this one. This is a wiki for a small trusted group;
+  defending a rule no code can trigger is where this stops being proportionate.
+
+No check constraints exist anywhere in the schema, so that class is empty rather than undefended.
+
+---
+
+**Closing note on the change — not a re-review.** My round-one assessment stands unchanged: the
+delivered test estate genuinely defends the spec's headline properties, and in several places by a
+better instrument than "a test exists" — invite-only and no-open-registration asserted against the
+enumerated live routing table rather than guessed URLs; uniform login failure compared across three app
+configurations including a corrupt stored hash; anonymous non-disclosure compared as actual status, body
+and header values; shown-once and revocation mutation-confirmed with positive controls read through the
+same instrument as their negative; Argon2id pinned by its real cost parameters. With S1 closed I see no
+requirement in `specs/authentication`, `specs/invitations` or `specs/user-accounts` that nothing
+meaningfully tests.
+
+**For the Product Owner, before archiving** — three things to know, none blocking:
+
+1. **N6 (`CancellationToken` plumbing)** — priority **low**. Resource hygiene, not correctness or
+   security; no existing test would change and no spec requirement depends on it. It spans more than
+   §9's two files, so it belongs to a later change alongside whatever else touches the page/service
+   boundary, not to a follow-up carved now.
+2. **§8's primitives carry block- and section-level evidence, not §9-sweep evidence.** No §9 task names
+   git email management or account lookup by git email, so `GitEmailServiceTests` (16 tests) rests on
+   §8's own supervisor approve. Correct per the task breakdown and I am not asking for more — but it is
+   the newest surface and the first one `git-backed-content-core` will consume, so it is worth knowing
+   which evidence it stands on.
+3. **`FK_Invitations_Accounts_IssuerAccountId` (`Restrict`) is untested and inert today** — a condition
+   on any future change that introduces account deletion, per §3 above.
+
+Every §9 box is ticked, the section satisfies the requirements it claims, and this is the final section
+of the change. → @architect — §9 closed; the change is ready to go to the Product Owner for archiving.
+
+---
+
 ## NEXT
 
 _[architect] Housekeeping note (2026-07-28): this `## NEXT` heading was accidentally deleted when the
@@ -9606,6 +9707,33 @@ carves it at brief time.
   enumeration, and the one it omits is `LoginService` — the *primary* credential check. Add the cref
   whenever that file is next touched; an enumeration missing its principal member is the reading a
   maintainer will take.
+- **§9 closed (2026-07-30) — supervisor `Approve` on `c313145..HEAD`, three commits.** `ba56be5`
+  (9.1–9.3) + `0fb643b` (9.4–9.5) + `5f5580c` (S1 remediation). **344/344. Every task in the change is
+  ticked and every section has a supervisor `Approve`.**
+  **The section's durable lesson:** §9's method — *for each property, which test defends it, and what
+  single production change would turn it red?* — is worth more than the tests it produced. It added one
+  test and strengthened two across five tasks, and that low count is the point: the estate was largely
+  sound, and the sweep's value was establishing that rather than assuming it. The two things it did
+  find were both **silent-green** defects, invisible to a passing suite: a unique index that could be
+  dropped with 343 tests still green, and a secrecy assertion whose instrument had never been shown
+  capable of finding anything.
+- **The class of defect worth carrying forward: a constraint that fails silently.** §9's finding
+  generalised into a sweep of every constraint class in the schema, and the result is worth recording
+  because it is the map a future change should check itself against. **Unique indexes** — all four
+  defended (`IdentityDbContextTests.cs:93,115,147,174`). **Collation** (`NOCASE`) — defended by a
+  case-insensitive duplicate test each. **Storage format** — the class the supervisor expected to find
+  bare, and did not: `InvitationService.cs:354` filters `ExpiresAt > asOf` in SQL and
+  `GitTokenService.cs:88` orders by `CreatedAt` in SQL, both over AD7's fixed-width ISO-8601 text, so a
+  change of representation would leave every constraint intact while **expiry silently stopped meaning
+  what it says** — defended thoroughly by `DateTimeOffsetStorageTests`, including a live invitation
+  written with a negative offset. **Check constraints** — none exist, so the class is empty rather than
+  undefended.
+- **One constraint is knowingly undefended, and deliberately so:**
+  `FK_Invitations_Accounts_IssuerAccountId` (`Restrict`) has no test. The only delete anywhere in `src`
+  is `GitEmailService.cs:134`; **no account-deletion path exists**, so the rule governs a scenario the
+  application cannot currently reach. This is **a condition on any future change that adds account
+  deletion**, not debt owed by this one — whoever adds it owes this FK a test in the same change,
+  because the moment deletion exists the rule becomes reachable and nothing goes red if it is wrong.
 - **For `git-backed-content-core`, not for this change** (supervisor note): the PO's `Username <email>`
   ruling settles the *name* half of the author line, but the email half has two unmade decisions that
   belong in that change's `design.md` rather than being discovered at somebody's first save.
