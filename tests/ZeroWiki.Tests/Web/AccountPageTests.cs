@@ -120,8 +120,15 @@ public sealed partial class AccountPageTests : IDisposable
         // request would carry, and would not be caught by looking for the value at all.
         Assert.Equal(1, Occurrences(body, token));
 
+        // A positive control in the same instrument: the dump can find the hash it is expected to
+        // contain, so the plaintext's absence below means absence, not an instrument that was never
+        // capable of finding anything (§7a) — the store-secrecy analogue of AssertNeverLogged's own
+        // "the request log did capture something" check.
+        var dumpedRows = await DumpTokenRowsAsync();
+        Assert.Contains(stored.TokenHash, dumpedRows, StringComparison.Ordinal);
+
         // Nowhere in the store, in any column.
-        Assert.DoesNotContain(token, await DumpTokenRowsAsync(), StringComparison.Ordinal);
+        Assert.DoesNotContain(token, dumpedRows, StringComparison.Ordinal);
 
         // Not on the page when it is fetched again — a refresh must not reproduce it.
         Assert.DoesNotContain(token, await client.GetStringAsync(Page), StringComparison.Ordinal);

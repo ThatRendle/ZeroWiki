@@ -53,5 +53,5 @@
 - [x] 9.1 Bootstrap: creates first admin only when store empty; inert afterward
 - [x] 9.2 Invitations: single-use, expiry, and revocation all reject correctly; no open registration
 - [x] 9.3 Login: success, uniform failure, logout invalidation
-- [ ] 9.4 Git tokens: shown-once, verification success, revocation stops auth, login password rejected for git
-- [ ] 9.5 Anonymous: home shows only Login; direct content access denied
+- [x] 9.4 Git tokens: shown-once, verification success, revocation stops auth, login password rejected for git
+- [x] 9.5 Anonymous: home shows only Login; direct content access denied

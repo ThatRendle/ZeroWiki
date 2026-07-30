@@ -8849,6 +8849,246 @@ its own clean runs as proof either way. Nothing is owed here.
 
 → @architect
 
+- **[architect]** **Block brief — §9.4–9.5 (git tokens, anonymous). The last block of the change.**
+  → @worker
+
+  Same sweep method as 9.1–9.3, and it worked: for each task, find the tests that defend the property
+  and establish **what single production change would turn them red**. Close only genuine gaps. The
+  previous block added exactly one test and that was the right number — do not treat a low count as
+  under-delivery, and do not pad.
+
+  - **9.4 Git tokens** — shown-once, verification success, revocation stops auth, login password
+    rejected for git. Existing: `GitTokenServiceTests`, `AccountPageTests`, and §8's credential-
+    verification tests.
+  - **9.5 Anonymous** — home shows only Login; direct content access denied. Existing:
+    `AnonymousAccessTests`, `AnonymousGate`, `AnonymousLandingPage`.
+
+  **Two rulings already made, so you don't re-open them:**
+
+  1. **9.5 ticks against §6's `AnonymousAccessTests`** rather than a parallel suite — §6's reviewer
+     asked for this call at N7 and I made it when opening §9. Duplicating a suite to make a box
+     tickable is the failure the supervisor exists to catch. **But verify the coverage is real**, not
+     merely present: §6's central assertion is that anonymous `GET /invitations` and anonymous
+     `GET /definitely-not-a-page` return the *same status, same body, same headers*. Confirm it asserts
+     equality of actual values rather than "both are 200".
+  2. **§9 is a test sweep.** If you find a *production* defect, **stop and report it** — do not fix it
+     inside a test block.
+
+  **Two booked items this block pays:**
+
+  - **The shown-once positive control (9.4).** §7a's finding, and the third time this project has hit
+    the same rock (after the `href=""` anchor regex and the password-blind hasher recorder): **a
+    secrecy check needs a positive control in the same instrument, or it proves nothing.** A sweep that
+    only asserts "the token plaintext does not appear in the database files" cannot distinguish a
+    genuine absence from an instrument that was never capable of finding anything. §7a already
+    established the shape that works — the *hash* is findable in the `-wal` (2 hits) while the
+    plaintext is 0 everywhere, and it is that contrast that makes the zero evidence. Assert both halves.
+  - **N6 — no `CancellationToken` reaches the services from the pages.** `Account.razor` and
+    `Invitations.razor` both call services that accept a `CancellationToken` while
+    `HttpContext.RequestAborted` sits on the cascading parameter. Booked as a codebase-wide §9 sweep
+    item, explicitly *not* a §7 regression. **Judge it and report — do not fix it here.** Threading
+    cancellation through the page layer is a production change, and this is a test block. If it is
+    worth doing, it is worth doing as its own decision; say so and I will put it to the Product Owner.
+
+  **Mutation testing:** in scope for 9.4 only (`GitTokenService` and the anonymous gate are both named
+  security-critical in CLAUDE.md). Standing caps, and I am tightening the wording after this section's
+  experience: **3 confirmation runs, and no second batch.** If you want more runs than that, ask me
+  first and say what the extra runs would decide. Full `dotnet test` never a filter; checksum before
+  *and* after; revert via `trap`/`finally`; `git diff -- src` **and** `git status --short -- src`
+  before handoff.
+
+  **Before you measure anything, check whether it is still true.** This section booked a flake fix that
+  had already been paid two sections earlier, and ~10 minutes of test execution went into measuring a
+  mechanism that was no longer in the tree. Verify a booked item is still outstanding before you spend
+  on it.
+
+  **Gates, all four:** `dotnet build` clean, `dotnet test` green (currently **343** — report the new
+  figure), `openspec validate invite-only-authentication --strict`, `dotnet format --verify-no-changes`
+  clean. `src` must be untouched. Do not commit, do not tick. → @reviewer when done.
+
+---
+
+**[worker]** Block §9.4–9.5 done, and this is the last block of the change. Same sweep method: name
+the test, name the single production change that would turn it red.
+
+**9.4 Git tokens — three of four properties solidly covered by reading; the fourth (shown-once) had
+the booked gap, now closed.**
+- Verification success: `GitTokenServiceTests.Valid_token_resolves_to_its_owning_account` and
+  `A_token_does_not_authenticate_under_another_accounts_username` — read `GitTokenService.cs:73`,
+  `.Where(t => t.TokenHash == tokenHash && t.RevokedAt == null && t.Account!.Username == username)`.
+  Removing the username clause would let alice's token authenticate as bob; the existing test presents
+  exactly that and asserts null. Load-bearing by reading; not mutated.
+- Login password rejected: `GitTokenServiceTests.Login_password_is_not_accepted_as_a_git_credential` —
+  pins against the *real* login password (verified to succeed through `LoginService` first), then
+  shows it does not resolve through `VerifyAsync`. By construction there is no password path to
+  remove; nothing to mutate.
+- Revocation stops auth: `GitTokenServiceTests.Revoked_token_no_longer_verifies` and
+  `AccountPageTests.Revoking_a_token_stops_it_authenticating` / `Revoking_a_token_twice_leaves_the_first_revocation_standing`.
+  This is the one property in this block genuinely worth spending the mutation budget on — the sweep
+  is asking exactly "what single change turns this red", and I wanted the answer measured rather than
+  read alone. **Mutated:** dropped `t.RevokedAt == null &&` from `GitTokenService.cs:73`. Checksum
+  before `53cb120…`, after `ffb2fe1…`. Full `dotnet test` (no filter): **3 failed, 340 passed** — the
+  three tests named above, all "expected null, got the account back." Deterministic, no concurrency
+  involved, so one run is sufficient evidence (the §7 supervisor's own standard, applied again in
+  9.1–9.3's item 3). Reverted via `trap`/`finally`; `git diff -- src` and
+  `git status --short -- src` both empty after revert, checksum back to `53cb120…`; re-ran the full
+  suite clean at 343/343 post-revert. 1/1 confirmation run, within the tightened 3-run cap and no
+  second batch needed.
+- **The shown-once gap, closed (booked item).** Both places that assert store-secrecy —
+  `GitTokenServiceTests.Issued_token_is_stored_only_as_a_hash` and
+  `AccountPageTests.A_generated_token_is_shown_once_and_cannot_be_recovered_afterwards` — already
+  asserted the hash **was** stored (via an EF query) and the plaintext **was not** in the raw-SQL row
+  dump (`DumpGitTokenRowsAsync`/`DumpTokenRowsAsync`), but those were two different instruments: the
+  positive half never went through the same dump the negative half used. That is exactly §7a's finding
+  — a negative in an unproven instrument is not evidence. Closed in both files with one added line
+  each: `Assert.Contains(stored.TokenHash, dumpedRows, StringComparison.Ordinal)` immediately before
+  the existing `DoesNotContain`, same `dumpedRows` value feeding both assertions. No new `[Fact]` —
+  this strengthens two existing tests, so the count stays at 343, consistent with 9.1–9.3's "a low
+  count is not under-delivery."
+
+**9.5 Anonymous — ruling 1 verified, no gap, no new test.** Read
+`AnonymousAccessTests.A_protected_url_and_a_url_that_does_not_exist_are_identical`
+(`AnonymousAccessTests.cs:41-63`): it asserts `Assert.Equal(guarded.StatusCode, absent.StatusCode)`,
+`Assert.Equal(await guarded.Content.ReadAsStringAsync(), await absent.Content.ReadAsStringAsync())`
+(actual body strings, not lengths), and `Assert.Equal(ComparableHeaders(guarded), ComparableHeaders(absent))`
+where `ComparableHeaders` (`:365`) extracts the real header key/value pairs (excluding `Date`) rather
+than just names or counts — genuine equality of actual values, not "both are 200." It also asserts the
+shared response actually *is* the anonymous landing page (`AssertIsAnonymousLandingPageAsync`), so
+identical-to-each-other is checked against identical-to-the-right-thing too. The rest of the file
+(`Every_non_exempt_url_answers_an_anonymous_visitor_with_the_same_page` across nine routes,
+`The_anonymous_response_carries_exactly_the_headers_it_declares`,
+`No_anonymous_request_is_redirected_to_login`, member-side twins per AD16) covers "direct content
+access denied" and the AD16 both-sides-of-the-gate hazard. Coverage is real; ticking against it per the
+architect's ruling, no parallel suite written.
+
+**N6 — CancellationToken not threaded from pages to services. Confirmed real, not fixed.**
+`grep -rln RequestAborted src` returns exactly one file, `AnonymousLandingPage.cs` — neither
+`Account.razor` nor `Invitations.razor` (nor, checked while I was in there, any other `@page` razor
+file: `Login.razor`, `Bootstrap.razor`, `RedeemInvitation.razor`) ever reads the cascading
+`HttpContext.RequestAborted` and passes it to a service call. Both files declare `[CascadingParameter]
+HttpContext? HttpContext` and use it for `User`/antiforgery purposes, but every `Async` call —
+`GitTokenService.IssueAsync/RevokeAsync/ListAsync`, `GitEmailService.AddAsync/RemoveAsync/ListAsync`,
+`InvitationService.IssueAsync/RevokeAsync/ListAsync` — takes the default `CancellationToken =
+default` overload instead. Production change that would fix it: pass `HttpContext.RequestAborted` (or
+`Context.RequestAborted`, per each file's existing accessor) at each of those ~9 call sites. **Judgment
+only, not fixed here** — this is a production change and the block is a test sweep, plus the pattern is
+codebase-wide rather than confined to these two files, which is more surface than a remediation block
+should absorb without the architect scoping it. Worth doing (an abandoned browser tab currently leaves
+a save/revoke/issue running to completion server-side with no cancellation), but it's the architect's
+call whether that goes to the Product Owner as its own follow-up.
+
+**Booked-item check before spending:** re-verified neither of §9.1–9.3's two prior flake concerns had
+resurfaced and confirmed the two rulings above still held (per the brief's "check it's still true before
+measuring") — no re-litigation needed for either.
+
+**Gates:** `dotnet build` 0 warnings/0 errors · `dotnet test` **343/343** (unchanged — two existing
+tests strengthened, no test added or removed) · `openspec validate invite-only-authentication --strict`
+→ valid · `dotnet format --verify-no-changes` clean. `git diff -- src` empty, `git status --short --
+src` empty (confirmed after the mutation revert, and again after the final full-suite run).
+
+Files touched: `tests/ZeroWiki.Tests/Identity/GitTokenServiceTests.cs`,
+`tests/ZeroWiki.Tests/Web/AccountPageTests.cs`. No other file in `tests/` or `src/` changed. Nothing
+committed, nothing ticked.
+
+→ @reviewer
+
+---
+
+**[reviewer]** Block §9.4–9.5 audited against `git diff ba56be5 -- src tests`. **Approve.** This is the
+final block of the change — no blockers found on any of the six checks I ran.
+
+**Gates — reproduced independently, not taken on trust:**
+- `dotnet build` → 0 warnings, 0 errors.
+- `dotnet test` → **343/343**, matches exactly.
+- `openspec validate invite-only-authentication --strict` → valid.
+- `dotnet format --verify-no-changes` → clean (no output).
+- `git diff -- src` and `git status --short -- src` → both empty before I touched anything.
+
+**Finding 1 — the shown-once positive control genuinely closes the gap, same instrument both halves.**
+Read both diffs directly rather than trusting the summary:
+- `GitTokenServiceTests.cs:57-64` — `var dumpedRows = await DumpGitTokenRowsAsync();` feeds both
+  `Assert.Contains(stored.TokenHash, dumpedRows, ...)` and the pre-existing
+  `Assert.DoesNotContain(issued.Token, dumpedRows, ...)`. Same variable, same SQL row dump
+  (`SELECT Id || '|' || TokenHash || ... FROM GitTokens`), one call.
+- `AccountPageTests.cs:123-131` — identical shape: `var dumpedRows = await DumpTokenRowsAsync();` feeds
+  both the new `Contains` and the existing `DoesNotContain`.
+- Checked this isn't trivially satisfied: `Issued_token_is_stored_only_as_a_hash` already asserts
+  `Assert.NotEqual(issued.Token, stored.TokenHash)` two lines above, so the hash the positive control
+  looks for is provably not the plaintext string it must then fail to find.
+- Note the instrument itself differs from §7a's original finding (§7a scanned raw `identity.db`/
+  `-wal`/`-shm` bytes by hand in a real browser-verification run; these are automated tests that query
+  the same live SQLite connection/DbContext via SQL, never touching raw file bytes). That's the right
+  call for an automated unit/integration test — the principle §7a established ("a secrecy check needs
+  a positive control in the *same instrument*") is what's binding, not the specific file-scanning
+  mechanism, and the worker's own comments say so. Both halves now go through one dump in both files.
+  Gap closed, not just moved.
+
+**Finding 2 — the 9.5 verification claim holds.** Read
+`AnonymousAccessTests.cs:41-63` directly: `Assert.Equal(guarded.StatusCode, absent.StatusCode)`,
+`Assert.Equal(await guarded.Content.ReadAsStringAsync(), await absent.Content.ReadAsStringAsync())`
+(actual body strings), and `Assert.Equal(ComparableHeaders(guarded), ComparableHeaders(absent))`.
+`ComparableHeaders` (`:363-369`) concatenates real response + content headers, drops only `Date`, and
+compares actual key/value pairs sorted by key — not counts, not "both are 200." The test also asserts
+the shared response actually *is* the anonymous landing page via `AssertIsAnonymousLandingPageAsync`,
+so identical-to-each-other is checked against identical-to-the-right-thing too, exactly as claimed.
+9.5 is ticking against real coverage.
+
+**Finding 3 — the two 9.4 read-only claims spot-checked, both solid.**
+- Verification success (`GitTokenService.cs:71-75`): the `Where` clause is
+  `t.TokenHash == tokenHash && t.RevokedAt == null && t.Account!.Username == username`.
+  `A_token_does_not_authenticate_under_another_accounts_username` (`GitTokenServiceTests.cs:95-102`)
+  issues alice's token and asserts `VerifyAsync("bob", aliceToken.Token)` is null — dropping the
+  username clause would turn this green test red. Load-bearing as claimed.
+- Login password rejected (`GitTokenServiceTests.cs:179-196`): this is the one I checked hardest for
+  being a strawman, and it isn't — it constructs a real `LoginService` against the same hasher and
+  account, asserts `VerifyCredentialsAsync("alice", LoginPassword)` **succeeds** first (so the pinned
+  password is genuinely the one that works), then asserts the same string fails `VerifyAsync` as a git
+  token, and separately asserts the stored `PasswordHash` itself doesn't work either. Both rejections
+  are meaningful because the positive control (successful login) precedes them.
+
+**Finding 4 — mutation hygiene independently re-run, not just diff-checked.** Reproduced the mutation
+myself end-to-end (mutate → test → revert in one shell invocation, to avoid a trap-timing mistake I
+made on a first attempt where the revert fired before the test ran and silently tested the unmutated
+tree — worth naming since it's exactly the kind of instrument error CLAUDE.md warns about): dropped
+`t.RevokedAt == null &&` from `GitTokenService.cs:73`. Checksum before `53cb1207…`, after
+`ffb2fe1ea5…` — matches the worker's reported checksums exactly. Full `dotnet test`, no filter:
+**3 failed, 340 passed** — the same three tests (`Revoked_token_no_longer_verifies`,
+`Revoking_a_token_twice_leaves_the_first_revocation_standing`,
+`Revoking_a_token_stops_it_authenticating`), same failure mode (`Assert.Null` receiving a resolved
+`AuthenticatedAccount`). Reverted, checksum back to `53cb1207…` (byte-identical). `git diff -- src` and
+`git status --short -- src` both empty after my own run. No live mutant. 1/1 confirmation, consistent
+with the tightened cap for a deterministic, no-concurrency mutant.
+
+**Finding 5 — N6 correctly judged, not fixed, and the judgement is sound.** `git diff -- src` for this
+whole block is empty and `git status --short -- src` shows nothing untracked — confirmed independently,
+not just re-stated. `grep -rln RequestAborted src` returns exactly one file
+(`AnonymousLandingPage.cs`), matching the worker's claim that no page routes `HttpContext.RequestAborted`
+into a service call. My own view, for the Product Owner: worth doing, not urgent. It's a resource-
+hygiene improvement (an abandoned browser tab currently lets a save/revoke/issue finish server-side
+with no way to cut it short) rather than a correctness or security gap — CLAUDE.md scopes mutation-
+grade scrutiny to auth/concurrency/data-integrity paths, and this isn't one of those. The worker is
+right that threading it through ~9 call sites across `Account.razor`, `Invitations.razor`, and
+whichever other pages call these services is a small, mechanical, low-risk change, but it touches
+every page that calls a service method — exactly the kind of surface that shouldn't be folded into a
+"test sweep" remediation block without the Architect scoping it as its own change. Deferring to the
+Product Owner as a follow-up item is the right call, not an evasion.
+
+**Finding 6 — `src` untouched, confirmed twice.** Once before I started (matching the worker's report)
+and once after my own mutation-and-revert cycle. `tests/` shows exactly the two files the worker named;
+nothing else changed.
+
+**Blockers:** none.
+
+**Nits:** none.
+
+**Architectural notes:** none beyond N6, already captured in Finding 5 for the Product Owner's
+attention when this change is wrapped up.
+
+This closes the block, and with it every task in §9 — the last section of the change, pending the
+Architect's own section-level (supervisor) review of §9 as a whole per the standard workflow.
+
+→ @architect
+
 ---
 
 ## NEXT

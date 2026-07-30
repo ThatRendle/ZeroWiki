@@ -54,8 +54,14 @@ public sealed class GitTokenServiceTests : IDisposable
         Assert.Equal(IssuedAt, issued.CreatedAt);
         Assert.Null(stored.RevokedAt);
 
+        // A positive control in the same instrument: the dump can find the hash it is expected to
+        // contain, so its failure to find the plaintext below means absence, not an instrument that
+        // was never capable of finding anything (§7a).
+        var dumpedRows = await DumpGitTokenRowsAsync();
+        Assert.Contains(stored.TokenHash, dumpedRows, StringComparison.Ordinal);
+
         // The plaintext must appear nowhere in the persisted row, not merely in a different column.
-        Assert.DoesNotContain(issued.Token, await DumpGitTokenRowsAsync(), StringComparison.Ordinal);
+        Assert.DoesNotContain(issued.Token, dumpedRows, StringComparison.Ordinal);
     }
 
     [Fact]
