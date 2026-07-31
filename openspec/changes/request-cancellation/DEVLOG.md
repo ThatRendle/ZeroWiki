@@ -604,62 +604,244 @@ new.
 
 → @architect
 
+### Section review — §2 (`0a38e46..HEAD`)
+
+**[supervisor]** Scope read: `git log --oneline 0a38e46..HEAD` (`1eaa13f` is the block; `2eead9c`
+touches `.claude/agents/worker.md` only and is not section work) and `git diff 0a38e46..HEAD`. Six
+pages, `+35/-13`. Read `design.md` D1–D3 and the corrected Risks item, `specs/request-lifecycle/spec.md`,
+`proposal.md`, `tasks.md`, and this whole thread including §1's carried-forward notes. I have not leaned
+on the reviewer's conclusions; every claim below is re-derived, and I say by what means.
+
+**1. The de-authorisation hazard — clean, verified two ways that do not share an instrument.**
+Enumerated every identity-service call in `src` *at HEAD*, independently of the diff:
+`grep -rnE '\.(IsAvailableAsync|CreateFirstAdministratorAsync|VerifyCredentialsAsync|IssueAsync|ListAsync|RevokeAsync|ValidateAsync|RedeemAsync|AddAsync|RemoveAsync|VerifyAsync|FindByEmailAsync)\('`
+over `src` minus `Identity/` — a pattern that catches a call even when the receiver is on another line,
+which the `Service.Method`-on-one-line survey would miss. Fifteen sites. The three de-authorisation
+calls carry **no** cancellation argument: `Account.razor:316` `RevokeAsync(CallerAccountId,
+RevokeInput.TokenId)`, `Account.razor:333` `RemoveAsync(CallerAccountId, RemoveEmailInput.EmailId)`,
+`Invitations.razor:150–153` `RevokeAsync(CallerAccountId, CallerIsAdministrator,
+RevokeInput.InvitationId)`. Second means: none of the three appears in any `@@` hunk of
+`git diff 0a38e46..HEAD -- src`, so all three are byte-identical to the base. D1's inversion did not
+happen. This was the one way the block could do real harm and it did not.
+
+**2. The partition holds exactly — 12 + 3 = 15, none missed, none double-covered.** From the same
+HEAD-side enumeration: token flowed at `Bootstrap.razor:73,83`, `BootstrapComplete.razor:33`,
+`Login.razor:70`, `RedeemInvitation.razor:116,124`, `Invitations.razor:134,159`,
+`Account.razor:300,323,342,350` — twelve. Mapped against D1's own lists: every read
+(`IsAvailableAsync` ×2, `ValidateAsync`, `VerifyCredentialsAsync`, three `ListAsync`) and every create
+(`CreateFirstAdministratorAsync`, `RedeemAsync`, both `IssueAsync`, `AddAsync`) is covered. Nothing fell
+between the six task boundaries.
+
+**3. Null-`HttpContext` handling — coherent, not drift. `Bootstrap` vs `BootstrapComplete` is a
+non-issue.** There are not three behaviours across six pages; there are **two behaviours and two
+spellings of one of them**. The behaviour is *throw* on five pages and *tolerate* on one. The two
+spellings — a `Context` property when the page has more than one call site, an inline
+`var context = HttpContext ?? throw …` when it has exactly one — are the codebase's pre-existing
+convention, not something this block invented: `Account.razor:231` and `Login.razor:67` already
+demonstrated both, at `d90b00e`. `Bootstrap.razor` has two call sites and got the property;
+`BootstrapComplete.razor` has one and got the local. That is the rule being *followed* within a single
+block, and unifying them would break the convention rather than fix an inconsistency. `RedeemInvitation`
+is the one genuine exception, its tolerance is pre-existing and load-bearing (the guard at `:111` does
+double duty as the GET/POST discriminator), and the Architect's ❓ correctly forced it to be legible
+rather than inferred. I would have raised the uncommented `?? default` myself; it is already fixed.
+
+**4. §4.4 is reachable, and §2 left the wiring but not a seam. This is the one thing §4's brief must
+carry.** What §2 delivered is exactly what the property needed: `Bootstrap.razor:73` now hands the gate
+a real request token (before this block the gate was uncancellable, so the property was vacuously safe
+for the wrong reason), and the throw-on-null decision means there is no path where the gate silently
+degrades to `CancellationToken.None`. So the property now exists to be asserted. What §2 could not
+leave behind, and §4 will hit:
+
+- **There is no substitution seam at the page level.** `BootstrapService` is `sealed`
+  (`BootstrapService.cs:13`) and registered by concrete type (`Program.cs:19`); the test project
+  references only `Microsoft.AspNetCore.Mvc.Testing` — no mocking library, no component-render harness.
+  A test cannot decorate or fake the service to hold the check open long enough to cancel mid-flight, or
+  to record which token the page passed.
+- **Over HTTP there is nothing to assert on.** If a test cancels `client.GetAsync("/bootstrap", ct)` it
+  observes a `TaskCanceledException` and no response — you cannot assert "it did not serve the bootstrap
+  form", because there is no response in either the correct or the incorrect case. The scenario's
+  wording ("**the request** fails rather than proceeding as though the store were empty") reads
+  page-level but is not observable through the only harness this suite has.
+- **What *is* assertable, and where.** Service level, in `tests/ZeroWiki.Tests/Identity/BootstrapServiceTests.cs`:
+  against an **empty** store, `IsAvailableAsync(new CancellationToken(canceled: true))` must throw rather
+  than return. Use the empty store deliberately — that is the setup where a dropped token returns `true`,
+  the fail-open value the corrected Risks item names, so the assertion distinguishes *throw* from
+  *fail open* rather than from *fail closed*. An assertion written against `false` passes while proving
+  nothing. §4's worker should also confirm the throw comes from the token (EF's `AnyAsync` honouring it)
+  rather than assume it, per the same "assert it, don't assume it" the task text already carries.
+
+**5. Composition check §2 activated, and which I verified because no block review would.** This block
+made `CreateFirstAdministratorAsync` genuinely cancellable for the first time, so I read its transaction
+path rather than trust that "creates roll back". `BootstrapService.cs:104–128`: `SaveChangesAsync(ct)`
+then `CommitAsync(ct)` inside `await using (transaction)`. A cancellation between the two throws before
+the commit and the `await using` disposes into a rollback that takes no token — the same shape §1 found
+in `InvitationService.WriteLock.DisposeAsync`. "A cancelled create leaves nothing behind" therefore still
+holds after §2 made the path live. Nothing to change; recorded because §4.1 rests on it.
+
+**6. Scope, scaffolding, residue.** `git diff --stat 0a38e46..HEAD -- src/ZeroWiki/Identity tests` is
+empty — nothing under `Identity/` or `tests/` changed. `git status --short --untracked-files=all --
+src tests` is empty, so no untracked file is hiding anything and there is no mutation residue (none was
+run here). No stub, flag, TODO or shim added; nothing for §3 or §4 to undo.
+
+The `Invitations.razor` `User`→`Context` refactor is **necessary, and convergent rather than novel**.
+The page needed `HttpContext` itself at two sites and its only accessor was `User => HttpContext?.User ??
+throw`. The alternatives were worse: duplicate the throw inline twice, or reach for
+`HttpContext?.RequestAborted ?? default` and thereby import `RedeemInvitation`'s tolerance onto a page
+whose idiom is throw — which *would* have been the drift I am here to catch. What landed instead is
+character-for-character the shape `Account.razor:231–233` already had (`Context` property, then
+`User => Context.User`), so the block reduced the number of distinct shapes on these pages rather than
+adding one. One semantic nuance, not a defect: the old `??` also fired if `HttpContext.User` were null,
+the new one only if `HttpContext` is; `HttpContext.User` is a non-nullable framework property that
+`DefaultHttpContext` materialises on demand, so no realisable case changes.
+
+**7. The behaviour change was verified, not assumed — and I used three means, none of them the one
+worker and reviewer shared.** They both read `BootstrapPageTests.cs` and reasoned about the pipeline;
+that is one measurement, not two, and CLAUDE.md's shared-blind-spot warning applies. Their conclusion is
+right, by:
+
+- **Production reachability, which neither checked.** `Program.cs:12` is a bare `AddRazorComponents()`
+  and `Program.cs:121` a bare `MapRazorComponents<App>()` — **no interactive render mode is registered
+  at all**; `Routes.razor` sets no `@rendermode`, and `grep -rnE 'rendermode|RenderMode'` over
+  `src/ZeroWiki` returns only the `@using static …RenderMode` in `_Imports.razor`. Every component
+  renders statically inside the request pipeline, where the framework cascades a real `HttpContext`.
+  `StaticSsrRenderModeTests` enforces this (`/_blazor` 404, no interactive markers). So the new throw is
+  unreachable in production, not merely untested.
+- **Compiled metadata, not test sources.** `strings -a
+  tests/ZeroWiki.Tests/bin/Debug/net10.0/ZeroWiki.Tests.dll` grepped for
+  `HtmlRenderer|RenderComponentAsync|ComponentBase|CascadingValue|RenderTreeBuilder|Bunit|IComponentRenderMode`
+  → zero hits, i.e. the test assembly references no component-rendering API through which a null cascade
+  could be supplied. **Instrument checked before it was believed**: the same scan for
+  `WebApplicationFactory|ZeroWikiAppFactory|CreateHttpClient` returns 8 hits, so the empty result is a
+  real negative. (`git diff 0a38e46..HEAD -- tests` is empty, so that assembly is unchanged by this
+  block whatever its build timestamp.) The csproj carries no component-test package, and a whole-tree
+  scan of all 30 test sources — not just `BootstrapPageTests.cs` — for the same symbols is likewise
+  empty.
+- **The decisive one: positive evidence, not absence.** `BootstrapPageTests.cs:26` asserts
+  `GET /bootstrap` returns **200**, and `:143` asserts `GET /bootstrap/complete` returns **200**, with
+  `:138` asserting the redirect to `/bootstrap` on an empty store. Every one of those requires
+  `OnInitializedAsync` to run to completion *past* the new `?? throw`. The block landed with the guards
+  in place and the whole suite green at 344/344. The cascaded `HttpContext` is therefore **proven
+  non-null** on both pages — entailed by the tests passing, not inferred from what they appear to do.
+  Worker and reviewer both argued an absence ("no test exercises the null path"); the same tests
+  demonstrate a presence, which is the stronger and shorter argument, and the one that does not depend
+  on having read the file correctly.
+
+**On the process note.** Recording only that it mattered less than it might have: the two independent
+instruments above (metadata scan, render-mode registration) were reached without the worker's or
+reviewer's framing, and both agree with them. The amendment in `2eead9c` is the right fix; nothing in
+this section needs re-doing on account of it.
+
+**Verdict: `Approve`.** No blockers. §2 delivers what it claimed: twelve read/create sites flow
+`RequestAborted`, the three de-authorisation sites are untouched and byte-identical to the base, the
+bootstrap pages acquired the cascading parameter in the shape their sibling pages already use, and
+nothing outside the six pages moved. The items for `## NEXT` are below — the §4.4 seam is the only one
+that needs an answer before §4 opens.
+
+**For `## NEXT`:**
+
+- **§4.4 has no page-level seam** (item 4 above). `BootstrapService` is `sealed` and DI-registered by
+  concrete type; the test project has no mocking or component-render harness; and a cancelled HTTP
+  request yields no response to assert against. Assert §4.4 at the service level, against an **empty**
+  store, that `IsAvailableAsync(cancelled)` throws — the empty store is what makes the assertion
+  distinguish *throw* from *fail open* (`true`) rather than from *fail closed* (`false`). If the Product
+  Owner wants the page-level composition asserted instead, that needs a seam (an interface, or unsealing)
+  and is a proposal-level decision, not §4's to invent.
+- **§3.3's sweep: `Logout.razor:44` is withdrawal-shaped and is not a D1 site.**
+  `context.SignOutAsync(CookieAuthenticationDefaults.AuthenticationScheme)` withdraws a session, but it
+  takes no `CancellationToken` and touches no identity service or store row, so there is nothing for a
+  request-scoped token to reach. Recorded so the sweep does not trip over it, exactly as §1 recorded
+  `LogBootstrapStateAsync`.
+- **§2 added two throw expressions that no test can reach** (`Bootstrap.razor:64–65`,
+  `BootstrapComplete.razor:30–31`), matching three pre-existing unreachable ones. Deliberate, correct,
+  and — per item 7 — unreachable in production too. The same reasoning makes `RedeemInvitation`'s
+  null-tolerance branch unreachable today: its `?? default` documents a case that cannot occur while the
+  app registers no interactive render mode. All of this is right as it stands; the note exists so a later
+  "tidy the unreachable branches" pass has to argue with it rather than silently remove it, which is D2's
+  own reasoning applied one level up.
+
 ## NEXT
 
-**§1 closed** — block 1.1–1.2 landed as `ff14989`; reviewer `Approve`, supervisor `Approve`, no
-findings and no remediation block. 2/16 tasks ticked.
+**Resume point: §3, block 3.1–3.3** (`## 3. Hold the line at de-authorisation`). §1 and §2 are both
+closed with a supervisor `Approve`. 8/16 tasks ticked.
 
-**BLOCKED — Product Owner decision needed before §4 opens.** ❓ @product-owner — `design.md`'s
-Risks section has the bootstrap-gate polarity inverted, on the one assertion in this change that is
-security-critical. Found by the supervisor, verified independently by the Architect at
-`BootstrapService.cs:30–31`:
+| Section | Block | Commit | Reviewer | Supervisor |
+|---|---|---|---|---|
+| §1 The rule | 1.1–1.2 | `ff14989` | Approve | Approve |
+| §2 Reads and creates | 2.1–2.6 | `1eaa13f` | Approve | Approve |
 
-- `IsAvailableAsync` is `!await db.Accounts.AnyAsync(cancellationToken)` — so `true` means *the store
-  is empty and the bootstrap is open*, and `false` means *closed*. `Bootstrap.razor:67` redirects
-  away on `false`; `BootstrapComplete.razor:27` sends you to `/bootstrap` on `true`. `true` is the
-  permissive value at every consumer.
-- Failing **open** therefore means returning `true` when the store is populated.
-- `design.md` Risks says: "a cancelled check throws rather than returning `false`, so it cannot fail
-  *open* and re-admit a bootstrap that should be closed." It names `false` as the fail-open value.
-  Returning `false` fails **closed**. The concern is stated correctly; the value is inverted.
+Out-of-band commits on the branch: `f24c9ab` (§1 close), `0a38e46` (`design.md` polarity fix, §2's
+base), `2eead9c` (`.claude/agents/worker.md`, process — see below).
 
-Scope of the error: `design.md` prose only. **Task 4.4 is correct as written** ("fails rather than
-reporting the store empty" — reporting the store empty *is* returning `true`), and the spec
-requirement is correct and polarity-neutral ("SHALL NOT treat a cancelled availability check as
-evidence that the bootstrap is closed or open"). The hazard is concrete rather than cosmetic: a §4
-worker briefed from `design.md` could write an assertion against the wrong return value, and it would
-pass — a green test proving nothing about the property it names, on the fail-open path. Per
-`CLAUDE.md` §4 this is a Product Owner call (the binding document is wrong), so it is not being
-repaired by the Architect.
+### Before briefing §3's worker
 
-**Open for §2 — Product Owner decision.** Whether to split §2 into 2.1–2.2 (the two bootstrap pages,
-which need `[CascadingParameter] HttpContext` added first) and 2.3–2.6 (the four pages that already
-hold it), or run all six pages as one block.
+- **Restate in the brief: the worker must not spawn its own `reviewer`, or any other agent.** §2's
+  block came back with a verdict already attached because its worker commissioned its own review — an
+  audit the audited party arranged. `.claude/agents/worker.md` was amended in `2eead9c` to forbid it,
+  but **do not rely on the agent definition alone**: whether a running session re-reads
+  `.claude/agents/*.md` per spawn or caches them at startup was not established. Put the constraint in
+  the brief, where blocks 1 and 2 both showed constraints are reliably followed. The handoff is the
+  `→ @reviewer` line in this DEVLOG; the Architect reads it and commissions the review.
+- **§3 is where D2 is actually cashed in.** 3.1 and 3.2 make the three de-authorisation calls'
+  `CancellationToken.None` explicit *with the comment saying why*. The calls are currently untouched
+  (no argument at all, inheriting the service default) — which is exactly the shape D2 rejects as
+  "indistinguishable from an oversight". §2's `RedeemInvitation` comments are a usable precedent for
+  voice and length.
+- **§3.3's sweep — two known non-findings**, both confirmed by supervisors, so the sweep should not
+  trip over them or report them as gaps:
+  - `BootstrapStartupExtensions.LogBootstrapStateAsync` (`Program.cs:74`) takes no token, but is a
+    startup path, not de-authorisation. (§1 supervisor.)
+  - `Logout.razor:44` `context.SignOutAsync(...)` is withdrawal-*shaped* but takes no token and
+    touches no store row. (§2 supervisor.)
 
-**Carried into §2:**
+### Before §4 opens — one item needing an Architect decision
 
-- `Bootstrap.razor` and `BootstrapComplete.razor` hold no `[CascadingParameter] HttpContext` and must
-  acquire one before 2.1–2.2 can pass anything.
-- **§2/§4.4 coupling, not mentioned in either task's text** (supervisor). The cascading parameter the
-  other four pages hold is `HttpContext?` — *nullable* — and each resolves null differently:
-  `Account.razor:230`, `Login.razor:67` and `Invitations.razor:115` throw; `RedeemInvitation.razor:110`
-  treats null as not-a-GET. §2's worker must decide what the bootstrap pages do when it is null, and
-  **that choice determines whether the gate is cancellable at all** — which is exactly what §4.4
-  asserts. Decide it deliberately in §2's brief rather than leaving it to the worker.
-
-**Carried into §3/§4:**
-
-- Call sites counted independently by the supervisor: **15**, matching the proposal. Tasks 2.1–2.6
-  plus 3.1–3.2 partition them exactly — none omitted, none double-covered.
-- `BootstrapStartupExtensions.LogBootstrapStateAsync` (`Program.cs:74`) takes no token but is a
-  startup path, not de-authorisation — §3.3's and §4.5's sweeps should not trip over it.
+- **§4.4 has no page-level seam, and the §2 supervisor established why.** `BootstrapService` is
+  `sealed` (`BootstrapService.cs:13`) and DI-registered by concrete type (`Program.cs:19`); the test
+  project has no mocking library and no component-render harness; and a cancelled HTTP request yields
+  no response to assert against. **Assert §4.4 at the service level in `BootstrapServiceTests.cs`,
+  against an empty store.** The empty-store setup is load-bearing: it is what makes the assertion
+  distinguish *throw* from *fail open* (`true`) rather than merely from *fail closed* (`false`).
+  Asserting at the page level would need an interface or unsealing `BootstrapService` — a
+  proposal-level call, not §4's to invent. If page-level coverage is wanted, that is a Product Owner
+  question before §4 starts, not a worker's improvisation.
+- **Mind the polarity when briefing §4.4.** `IsAvailableAsync` is `!AnyAsync(…)`, so `true` = store
+  empty = bootstrap **open**, and failing open is returning `true`. `design.md`'s Risks section stated
+  this backwards until `0a38e46`; task 4.4's own wording was always correct. An assertion written
+  against the wrong value passes while proving nothing.
+- **§4.1 rests on solid ground** — verified rather than assumed. §2 made
+  `CreateFirstAdministratorAsync` genuinely cancellable for the first time, and `BootstrapService.cs:104–128`
+  still rolls back safely: cancellation between `SaveChangesAsync(ct)` and `CommitAsync(ct)` throws
+  pre-commit into a token-less `await using` rollback. (§2 supervisor; a composition no block review
+  would have looked at.)
 - `InvitationService.WriteLock.DisposeAsync()` (`InvitationService.cs:436–440`) takes no token and
-  **must not**: it is the rollback path, which is *why* §4.1/§4.2's "a cancelled create leaves nothing
-  behind" holds. Not a 1.2 counter-example.
+  **must not** — it is the rollback path, which is *why* §4.1/§4.2's "a cancelled create leaves
+  nothing behind" holds. Not a 1.2 counter-example.
 
-**Architectural note, no action now** (supervisor, on D3). The Product Owner's three-not-five ruling
-stands and was not reversed. The residual gap is slightly wider than previously logged: what landed is
-three *instructions to callers*, not D1's *criterion*. The rule that generates them — fail-safe
-direction, not read-vs-write — appears nowhere in `src`, so a seventh-service author must still
-recognise unaided that their method is withdrawal-shaped. Closing it would need one sentence of
-criterion, not two more remarks. A decision for when that service arrives.
+### Architectural notes — no action, recorded so they are not rediscovered as surprises
+
+- **D1 is discoverable in `src` only from the de-authorisation side.** The Product Owner ruled the
+  §1 remarks go on three methods, not five, and that ruling stands. What landed is three *instructions
+  to callers*, not D1's *criterion* — the fail-safe-direction rule that generates them appears nowhere
+  in `src`, so a seventh-service author must still recognise unaided that their method is
+  withdrawal-shaped. Closing it would need one sentence of criterion, not two more remarks. A decision
+  for when that service arrives.
+- **Five unreachable throws now, up from three.** `Bootstrap.razor:64–65` and
+  `BootstrapComplete.razor:30–31` joined the three pre-existing ones, and `RedeemInvitation`'s
+  null-tolerance branch is unreachable for the same reason: no interactive render mode is registered
+  anywhere (`Program.cs:12` is a bare `AddRazorComponents()`, `:121` a bare
+  `MapRazorComponents<App>()`, and `Routes.razor` sets no `@rendermode`), so a Static SSR page always
+  has an `HttpContext`. All correct as they stand — recorded so a later "tidy the unreachable
+  branches" pass has to argue with it rather than silently remove it, which is D2's own reasoning one
+  level up.
+- **Null-`HttpContext` handling across the six pages is two behaviours, not three** — *throw* on five
+  pages, *tolerate* on `RedeemInvitation` alone — with two spellings of the throw (a `Context` property
+  where there is more than one call site, an inline `var context = … ?? throw` where there is exactly
+  one). Both spellings pre-date this change. `Bootstrap` and `BootstrapComplete` diverging is that
+  convention being followed, not drift.
+
+### Not in this change
+
+Cancellation in the git Smart HTTP remote and the content write path belong to
+`git-backed-content-core`, which should adopt D1 rather than invent its own split. Timeouts, request
+deadlines, and any server-side cancellation not originating from the client disconnecting are out of
+scope entirely.
