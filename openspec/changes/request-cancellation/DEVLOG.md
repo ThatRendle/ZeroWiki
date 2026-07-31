@@ -982,43 +982,220 @@ no filter. `openspec validate request-cancellation --strict` — valid. `dotnet 
 
 → @architect
 
+**[supervisor]** Section review of §3 — scope `git diff a2c0db0..HEAD` (one commit, `61c482a`; three
+call sites, +18/−6 in `src`). Verdict below; **no blockers**. Everything here is a note, and one of
+them needs a decision before §4 opens.
+
+**Mutation-residue check first, per CLAUDE.md.** `git diff a2c0db0..HEAD -- src` shows exactly the two
+`.razor` files in scope and nothing else; `git status --short -- src` is empty, so there is no
+untracked file for the diff to be blind to. Clean. No human-in-the-loop task in §3, so nothing ticked
+ahead of a Product Owner confirmation.
+
+### 1. Does the requirement hold end to end, or only at the call site? — it holds, and here is the path
+
+I traced the whole route from POST to committed row for all three sites rather than checking the
+argument. Taking `Invitations.razor:154` as the worked case, every step between the request arriving
+and the row committing is either awaited inline on the request's own execution path with the token
+threaded through unbroken — `BeginWriteLockedTransactionAsync(None)` → `OpenConnectionAsync(None)` →
+`BEGIN IMMEDIATE` → `SingleOrDefaultAsync(None)` → `SaveChangesAsync(None)` → `CommitAsync(None)`
+(`InvitationService.cs:139–167`, `:402–417`) — or framework machinery that does not forcibly abort
+executing user code on a client disconnect. `RequestAborted` is cooperative; nothing in the pipeline
+tears the handler down. `GitTokenService.RevokeAsync` (`:102–122`) and `GitEmailService.RemoveAsync`
+(`:126–143`) are the same shape without the transaction.
+
+I then looked for the things that could abandon the write *without being a `CancellationToken`
+parameter*, which is what the question was actually asking:
+
+- **No cache anywhere.** No `IMemoryCache`, no `IDistributedCache`, no singleton mutable state — the
+  only singletons are `TimeProvider`, `IPasswordHasher`, `ISecretTokenGenerator` (`Program.cs:14–16`).
+  This matters for the spec's wording specifically: the scenarios say the token "no longer
+  authenticates" and the email "no longer resolves", not merely that a column changed.
+  `GitTokenService.VerifyAsync` and `GitEmailService`'s resolve both read live rows, so a committed
+  revocation *is* de-authorisation, with no second copy of the answer to invalidate.
+- **No background or detached work.** No `IHostedService`, no `BackgroundService`, no `Task.Run`, no
+  timer, no fire-and-forget. Nothing outlives the request scope, so the scoped `IdentityDbContext`
+  cannot be disposed underneath an in-flight `SaveChangesAsync`.
+- **No second token source.** The three services read no `IHttpContextAccessor` and there is no
+  ambient cancellation in .NET, so `None` at the call site is `None` all the way down.
+- **The one live adjacency** — see note N3 below — is that each handler follows its `None` write with
+  a `RequestAborted` *read* two lines later (`Account.razor:322`, `:342`, `Invitations.razor:161`).
+  On a dead client that read throws `OperationCanceledException`. It throws **after** the commit, so
+  the requirement holds; but the ordering is what makes it hold, and nothing states or tests that.
+
+**Answer: end to end, not merely at the call site.** The requirement holds — with the caveat in N2
+about what "holds" means for this particular section.
+
+### 2. §1 + §2 + §3 together — one rule, one spelling drift
+
+All 15 sites now exist in final form and I read them as a set. The rule reads as one design: twelve
+reads/creates carry `RequestAborted`, three de-authorisations carry `CancellationToken.None`, and each
+of the three services opens its `<remarks>` with the identical sentence ("Callers must pass
+`CancellationToken.None` here, not the request's own token (D1)") — §1's phrasing and §3's call-site
+comments genuinely converge rather than paraphrase each other. No duplicated helper, no dead
+scaffolding, no new type, no DI change, no `@rendermode`, no new route. The section adds no abstraction
+at all, so there is nothing here to have grown twice. One drift only, at N4.
+
+### 3. The 3.3 sweep — I ran a third instrument, and it is a different kind
+
+The worker's three regex passes and the reviewer's CodeGraph traversal share a starting point: *find
+the callers of known identity services*. The blind spot that shape has is a de-authorisation that
+never touches one. So I started from the store instead and enumerated **every persistence write in
+`src`**, then classified each: 8 `SaveChangesAsync` (`InvitationService:59,165,318`,
+`BootstrapService:124`, `GitTokenService:33,118`, `GitEmailService:88,140`), 5 `Add`/1 `Remove`, zero
+`ExecuteDeleteAsync`/`ExecuteUpdateAsync`, zero raw `SqliteCommand`/`ExecuteSql*`, zero
+`File.Delete`/`Directory.Delete`, zero cookie deletion. Five are creates; three are de-authorisations —
+exactly the three §3 handled. The only withdrawal-shaped call that writes nothing is
+`Logout.razor:42`'s `SignOutAsync`, already a confirmed non-finding.
+
+**The sweep is sound.** For it to have been wrong, one of these would have had to be true, and none is:
+a de-authorisation that withdraws access *without writing an identity row* (evicting a cache, deleting
+a file, rotating a secret, invalidating a server-side session) — there is no such state in the app; or
+a write reaching the store through a channel none of the three instruments enumerates (raw ADO, a
+migration, a hosted service) — there are none. That is the reassuring part. The load-bearing part is
+that this rests on a *current property of the codebase*, not on the method — see N6.
+
+### Notes — none blocking, N1 needs a decision before §4 opens
+
+**N1 — ❓ @architect: task 4.3 as worded cannot be satisfied, and will trap its worker.** 4.3 reads
+"Revocation completes under an already-cancelled token — the central assertion of this change, one per
+de-authorisation path". Taken literally at the service level, that test is red by construction: the
+three services **correctly honour** the token they are given, so
+`RevokeAsync(accountId, tokenId, new CancellationToken(canceled: true))` throws at
+`GitTokenService.cs:108` before it reaches `SaveChangesAsync`. D1's guarantee is a property of the
+*caller*, not of the service — which is precisely why §3 is a call-site change. So 4.3 has the same
+missing-seam problem 4.4 had, but the Product Owner's resolution for 4.4 (service level, empty store)
+does **not** transfer: at the service level 4.3 asserts the opposite of the requirement. A §4 worker
+who inherits "4.4 goes service-level" will reasonably extend it to 4.3, watch the test go red, and
+have three bad options — weaken the assertion to something vacuous, reach for a page-level seam the §2
+supervisor already established does not exist, or "fix" the services to ignore their token (which
+contradicts design.md's Non-Goal on signatures and would make the parameter a lie). This is a
+spec/task question, not an implementation one, and it is cheaper to settle now than mid-block.
+
+**N2 — §3 has no behavioural delta, and that changes what §4 can prove.** Before `61c482a` the three
+call sites omitted the argument, inheriting `CancellationToken cancellationToken = default` — which
+*is* `CancellationToken.None`. Runtime behaviour is identical before and after this commit. That is
+not a criticism: it is exactly what D2 says it is doing, converting an accident into a decision, and
+the requirement was satisfied by accident before and is satisfied on purpose now. But the consequence
+is sharp — **no behavioural test at any level can distinguish pre-§3 from post-§3 code**, so §4.5's
+source-level sweep ("no page passes a request-scoped token to a de-authorisation call") is not a tidy
+extra at the end of §4: it is the *only* mechanical evidence that §3's work exists, and the only thing
+that will fail when a future consistency pass undoes it. It deserves to be briefed as the section's
+primary test, not its last one. It is also the natural home for whatever 4.3 becomes once N1 is
+settled.
+
+**N3 — the highest-erosion-risk adjacency in the change is the one D2 does not annotate.** Each of the
+three handlers is a 6–8 line method containing both `CancellationToken.None` and, two lines below,
+`Context.RequestAborted` (`Account.razor:320/322` and `:340/342`, `Invitations.razor:158/161`). The D2
+comment explains the write; nothing explains why its immediate neighbour differs. That is the precise
+shape a "let's make these consistent" pass reaches for, and it is the pass D2 exists to defend against.
+Separately, the *order* of those two lines is load-bearing for the requirement (the commit must precede
+the read that throws on a dead client) and is stated nowhere. No change requested for §3 — the comments
+are correct and the Architect's nit rulings stand — but both are reasons N2's 4.5 sweep matters more
+than its position in the task list suggests.
+
+**N4 — one spelling drift across the section boundary.** `RedeemInvitation.razor:116` and `:125` are
+the only two of the 15 sites whose token is spelled `default` (`HttpContext?.RequestAborted ?? default`)
+— and both carry a comment naming `CancellationToken.None`, which the code does not say. Semantically
+identical; legibility is D2's entire argument, and `default` is the spelling D2 rejects. §2's lines,
+approved under §2, and a one-word fix — recording it rather than requesting it, so a later tidy pass
+has it written down instead of rediscovering it.
+
+**N5 — the sweep's soundness expires with `git-backed-content-core`.** 3.3 holds because *every* grant
+of access in this app is a SQLite row, every write to one goes through `Identity/`, and there is no
+cache, no background work, and no non-EF persistence. The content capability breaks all three: files on
+disk, git refs, a cross-process `flock`, and a Smart HTTP endpoint that will be the first caller
+`GitTokenService.VerifyAsync` has ever had. D1 must be re-applied there rather than reinvented (design.md
+already says so), and 3.3's sweep must be re-run with an instrument that starts from the *store*, not
+from `Identity/`'s callers — the caller-side instruments will simply not see a git-side de-authorisation.
+
+**Approve.**
+
+**For `## NEXT`:**
+
+- **Settle N1 before briefing §4** — task 4.3 is untestable as written at the service level, and the
+  4.4 precedent does not transfer. Product Owner / Architect call: reword 4.3 as a source-level
+  assertion (fold into 4.5), accept it as covered by comment + `<remarks>` only, or make D1 structural
+  by dropping the token parameter from the three de-authorisation methods — the last contradicts
+  design.md's Non-Goal and is proposal-level.
+- **Brief §4.5 as this section's primary test, not its last** (N2) — it is the only evidence §3's work
+  exists, since §3 has no behavioural delta. Both directions: no de-authorisation site carries a
+  request-scoped token, no read/create site omits one. Expect 15 sites: 12 + 3.
+- **N3's adjacency** — each de-auth handler holds a `None` write and a `RequestAborted` read two lines
+  apart, and the commit-before-read ordering is load-bearing but unstated. No action for §3; a reason
+  4.5 matters.
+- **N4** — `RedeemInvitation.razor:116,125` spell the fallback `default` while their comments say
+  `CancellationToken.None`; one-word alignment for a later tidy pass, not a fix block.
+- **N5** — `git-backed-content-core` must re-apply D1 *and* re-run 3.3's sweep from the store side; the
+  caller-side instruments used here will not see a git-side de-authorisation.
+
 ## NEXT
 
-**Resume point: §3, block 3.1–3.3** (`## 3. Hold the line at de-authorisation`). §1 and §2 are both
-closed with a supervisor `Approve`. 8/16 tasks ticked.
+**Resume point: §4, blocked pending a Product Owner ruling on task 4.3** (see *Before §4 opens*
+below). §1, §2 and §3 are all closed with a supervisor `Approve`. 11/16 tasks ticked.
 
 | Section | Block | Commit | Reviewer | Supervisor |
 |---|---|---|---|---|
 | §1 The rule | 1.1–1.2 | `ff14989` | Approve | Approve |
 | §2 Reads and creates | 2.1–2.6 | `1eaa13f` | Approve | Approve |
+| §3 De-authorisation | 3.1–3.3 | `61c482a` | Approve | Approve |
 
 Out-of-band commits on the branch: `f24c9ab` (§1 close), `0a38e46` (`design.md` polarity fix, §2's
-base), `2eead9c` (`.claude/agents/worker.md`, process — see below).
+base), `2eead9c` (`.claude/agents/worker.md`, process).
 
-### Before briefing §3's worker
+**§3's substantive result, beyond the ticked boxes:** the §3 supervisor traced POST → committed row
+rather than checking the argument, and the requirement *"de-authorisation completes regardless of the
+client"* holds **end to end**, not merely at the call site. No cache (so "no longer authenticates" is
+true of the live row, not just of a column), no background or detached work (so the scoped
+`IdentityDbContext` cannot be disposed under an in-flight `SaveChangesAsync`), no second token source
+inside the services. The `None` write is awaited inline on the request's own path throughout.
 
-- **Restate in the brief: the worker must not spawn its own `reviewer`, or any other agent.** §2's
+### Process notes that held for §1–§3 and should hold for §4
+
+- **State in the brief that the worker must not spawn its own `reviewer`, or any other agent.** §2's
   block came back with a verdict already attached because its worker commissioned its own review — an
   audit the audited party arranged. `.claude/agents/worker.md` was amended in `2eead9c` to forbid it,
   but **do not rely on the agent definition alone**: whether a running session re-reads
-  `.claude/agents/*.md` per spawn or caches them at startup was not established. Put the constraint in
-  the brief, where blocks 1 and 2 both showed constraints are reliably followed. The handoff is the
-  `→ @reviewer` line in this DEVLOG; the Architect reads it and commissions the review.
-- **§3 is where D2 is actually cashed in.** 3.1 and 3.2 make the three de-authorisation calls'
-  `CancellationToken.None` explicit *with the comment saying why*. The calls are currently untouched
-  (no argument at all, inheriting the service default) — which is exactly the shape D2 rejects as
-  "indistinguishable from an oversight". §2's `RedeemInvitation` comments are a usable precedent for
-  voice and length.
-- **§3.3's sweep — two known non-findings**, both confirmed by supervisors, so the sweep should not
-  trip over them or report them as gaps:
+  `.claude/agents/*.md` per spawn or caches them at startup was not established. §3's brief carried
+  the constraint explicitly and it was honoured. The handoff is the `→ @reviewer` line in this DEVLOG;
+  the Architect reads it and commissions the review.
+- **The three sweep instruments used so far, so §4.5 does not repeat one and call it corroboration.**
+  §3's worker ran three regex passes (known method names, then a verb-based pass independent of the
+  method list); the §3 reviewer used CodeGraph's symbol graph; the §3 supervisor started from the
+  *store* instead of from the services and enumerated every persistence write in `src` (8
+  `SaveChangesAsync`, 5 `Add`/1 `Remove`, zero `ExecuteDelete/UpdateAsync`, zero raw SQL, zero file
+  or cookie deletes) — five creates and three de-authorisations, exactly the three §3 handled. All
+  three agree there is no fourth site.
+- **§3.3's sweep — two known non-findings**, confirmed by three supervisors now. Do not report as gaps:
   - `BootstrapStartupExtensions.LogBootstrapStateAsync` (`Program.cs:74`) takes no token, but is a
     startup path, not de-authorisation. (§1 supervisor.)
   - `Logout.razor:44` `context.SignOutAsync(...)` is withdrawal-*shaped* but takes no token and
     touches no store row. (§2 supervisor.)
 
-### Before §4 opens — one item needing an Architect decision
+### Before §4 opens — items needing a decision
 
-- **§4.4 has no page-level seam, and the §2 supervisor established why.** `BootstrapService` is
+- **⛔ N1 — task 4.3 is red by construction at the service level. This is a Product Owner call and
+  §4 is stopped pending it.** 4.3 asks for "revocation completes under an already-cancelled token,
+  one per de-authorisation path". At the service level that assertion is *false by design*: the
+  services correctly honour their token, so `RevokeAsync(accountId, tokenId, cancelled)` throws at
+  `GitTokenService.cs:108` before it ever reaches `SaveChangesAsync`. **D1's guarantee is a property
+  of the caller, not of the service** — the page passes `None`; the service is and should remain
+  cancellable. 4.3 has 4.4's missing-seam problem, but **the PO's 4.4 resolution does not transfer**:
+  taken service-level, 4.3 asserts the opposite of its requirement. A §4 worker inheriting "4.4 goes
+  service-level" will extend it to 4.3, go red, and improvise one of three bad answers — a vacuous
+  assertion, a page seam that does not exist, or making the services ignore their token, which
+  contradicts `design.md`'s explicit Non-Goal ("Any change to service signatures"/behaviour). Raised
+  to the Product Owner; do not let a worker resolve it.
+- **N2 — §3 has no behavioural delta, and that changes what §4 can prove.** Before `61c482a` the three
+  sites omitted the argument and inherited `= default`, which *is* `CancellationToken.None`. Runtime
+  behaviour is byte-identical pre- and post-§3. That is exactly what D2 claims to do — make a silent
+  default into a visible decision — but the consequence is that **no behavioural test at any level can
+  distinguish pre-§3 from post-§3 code.** §4.5's source sweep is therefore the only mechanical evidence
+  §3's work exists. Brief it as §4's *primary* test, not its last.
+- **§4.4 is settled (Product Owner).** Assert at the **service level against an empty store** that
+  `IsAvailableAsync(cancelled)` throws. No seam, no unsealing. The empty store is load-bearing.
+
+- **Why §4.4 has no page-level seam, from the §2 supervisor** — the reasoning behind the ruling above.
+  `BootstrapService` is
   `sealed` (`BootstrapService.cs:13`) and DI-registered by concrete type (`Program.cs:19`); the test
   project has no mocking library and no component-render harness; and a cancelled HTTP request yields
   no response to assert against. **Assert §4.4 at the service level in `BootstrapServiceTests.cs`,
@@ -1042,6 +1219,21 @@ base), `2eead9c` (`.claude/agents/worker.md`, process — see below).
 
 ### Architectural notes — no action, recorded so they are not rediscovered as surprises
 
+- **N3 — the likeliest future erosion of D2 is the neighbour, not the annotated line.** In each of the
+  three 6–8 line handlers, a `CancellationToken.None` write sits two lines from a `RequestAborted`
+  read (`Account.razor:322`, `:342`, `Invitations.razor:161`). D2's comment annotates the write;
+  nothing explains why the line below it differs. That adjacency *is* the "let's make these
+  consistent" pass D2 exists to defend against, now sitting inside a single method body. Also note the
+  read-after-write ordering is load-bearing: the trailing `RequestAborted` read throws on a dead
+  client, but only *after* the commit — nothing states or tests that ordering.
+- **N4 — two of the fifteen sites spell the token `default`, not `CancellationToken.None`.**
+  `RedeemInvitation.razor:116,125` (§2's lines), whose comments name `CancellationToken.None` while
+  the code says `default`. Cosmetic, a one-word fix, recorded rather than requested — but it is the
+  only spelling drift across the fifteen.
+- **N5 — the §3 sweep's soundness has an expiry date.** It rests on every withdrawal of access being
+  an identity-row write. `git-backed-content-core` introduces files, git refs, `flock`, and
+  `VerifyAsync`'s first-ever caller — after which "de-authorisation ⇒ writes an identity row" stops
+  being true and the sweep would need re-running against the new surface, not merely re-read.
 - **D1 is discoverable in `src` only from the de-authorisation side.** The Product Owner ruled the
   §1 remarks go on three methods, not five, and that ruling stands. What landed is three *instructions
   to callers*, not D1's *criterion* — the fail-safe-direction rule that generates them appears nowhere
