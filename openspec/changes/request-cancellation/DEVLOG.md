@@ -2959,6 +2959,95 @@ the Architect posts explicitly that it was verified without one.** Both times th
 both times a supervisor had to find the hole. The DEVLOG is meant to be the durable record of *how*
 this was built; a hole in it is a defect in the deliverable, not merely in process hygiene.
 
+**[reviewer]** Audit of the N12 spec-text edit — `openspec/changes/request-cancellation/specs/request-lifecycle/spec.md`, uncommitted. Traced against code, not prose.
+
+**1. The five-create split, verified line by line.**
+
+- `BootstrapService.CreateFirstAdministratorAsync` (`BootstrapService.cs:98–128`) — `BEGIN IMMEDIATE`
+  via `connection.BeginTransaction(deferred: false)`, enlisted, `SaveChangesAsync` then
+  `transaction.CommitAsync` inside `await using (transaction)`. Cancellation before commit disposes
+  the transaction without committing → rollback. **Matches "transactional, rolls back through
+  commit."**
+- `InvitationService.RedeemAsync` (`InvitationService.cs:267–319`) — same shape via
+  `BeginWriteLockedTransactionAsync`/`WriteLock`, `SaveChangesAsync` then `writeLock.CommitAsync`
+  inside `await using`. **Matches.**
+- `InvitationService.IssueAsync` (`InvitationService.cs:58–59`) — `db.Invitations.Add(...)` then a
+  bare `await db.SaveChangesAsync(cancellationToken)`, no transaction, no check after. **Matches
+  "single statement, no post-write check."**
+- `GitTokenService.IssueAsync` (`GitTokenService.cs:32–33`) — identical shape. **Matches.**
+- `GitEmailService.AddAsync` (`GitEmailService.cs:84–101`) — the write itself is a bare `Add` +
+  `SaveChangesAsync` with no transaction, so the cancellation-property claim holds. But the method
+  also has a preceding `FindByEmailAsync` uniqueness read and a `catch (DbUpdateException)` race-guard
+  around the write, so "write in a single statement" is loose in exactly the way N14 already flagged
+  for `design.md`'s D1 wording. The `DbUpdateException` catch cannot swallow a cancellation (EF
+  surfaces `OperationCanceledException` directly, never wrapped), so the property is still true — the
+  looseness is descriptive, not factual. **Nit**, not a blocker, but this text is now durable law where
+  D1 was narrative; worth tightening (e.g. "a bare insert with no cancellation check after the write")
+  if the paragraph is touched again.
+
+All five match the split the spec now asserts. No mischaracterisation found.
+
+**2. New scenario vs. its test.** `GitTokenServiceTests.A_cancellation_observed_after_the_write_commits_does_not_remove_the_token`
+(`GitTokenServiceTests.cs:199–226`) uses `CancelAfterSaveInterceptor`, which cancels the linked token
+inside EF's `SavedChangesAsync` callback — after the single `INSERT` has executed and (SQLite,
+no ambient transaction) autocommitted, before `IssueAsync` returns. The call completes normally
+(`cancellationTokenSource.IsCancellationRequested` is asserted true) and `VerifyAsync` afterward proves
+the token exists. That is exactly the scenario's WHEN ("disconnects after ... committed the write")
+and THEN ("the record remains"). **Match confirmed.**
+
+One gap worth naming: only `GitTokenService` has this post-commit test. `InvitationService.IssueAsync`
+and `GitEmailService.AddAsync` have only the pre-write ("already-cancelled token throws, leaves no
+row") tests. The scenario's WHEN names all three record types, but only one third of it is backed by
+an executable proof — the other two rest on code-shape parity (identical bare-`Add`+`SaveChangesAsync`,
+no transaction) rather than their own test. Consistent with this project's mutation-testing
+proportionality (don't triple a redundant instrument), and N11 already flags the one test that exists
+needs an exit clause — so I'm not asking for two more tests. Flagging only so nobody reads the DEVLOG
+later as "the new scenario is proven three ways" when it's proven one way and inferred twice.
+
+**3. Qualification did not overshoot.** All three pre-write tests
+(`InvitationServiceTests.Issuing_under_an_already_cancelled_token_throws_and_leaves_no_invitation`,
+`GitTokenServiceTests.Issuing_under_an_already_cancelled_token_throws_and_leaves_no_token`,
+`GitEmailServiceTests.Adding_under_an_already_cancelled_token_throws_and_leaves_no_email`) assert
+against the store (`Assert.Empty(...)` / `Assert.Empty(await ...ListAsync(...))`), not just the thrown
+exception. A pre-commit cancellation genuinely leaves nothing, for all five creates — the qualifier
+narrows the guarantee to what commits, it does not license a row surviving an abandoned pre-commit
+write.
+
+**4. Consistency with the untouched requirements.** Confirmed via `git diff` that only Requirement 1
+and its scenarios changed — De-authorisation and the bootstrap-gate requirement are byte-identical.
+The new scenario's WHEN is scoped to "creates an invitation, a git access token, or a git email
+association" — it cannot be read as touching revocation/removal, which live under a separate
+Requirement heading with their own distinct verbs ("Revoking ...", "Removing ..."). No contradiction,
+no licence for de-authorisation to be abandoned.
+
+Architectural note (not blocking): the new scenario omits account creation (bootstrap/redemption) from
+its WHEN, even though those two are equally non-reversible once their transaction actually commits.
+That's a defensible scoping choice — post-commit durability for a committed transaction is a trivial DB
+property, not the narrower-guarantee finding N12 exists to document — but it's the kind of omission a
+future editor could misread as "accounts are exempt from this limit." Worth a half-sentence if the
+paragraph is revisited.
+
+**5. OpenSpec conformance.** Heading levels and scenario formatting match the surrounding file exactly
+(`#### Scenario:`, `- **WHEN**` / `- **THEN**` with the established continuation-line indent). Explanatory
+prose after a SHALL statement is already this file's convention (see the de-authorisation requirement's
+own paragraph) — not a new pattern being introduced. `openspec validate request-cancellation --strict`
+→ **valid**.
+
+**6. Stranger-reading.** Clear, not a hedge bolted on. The requirement states the guarantee and its
+boundary in one sentence ("...where the cancellation is observed before the operation's write
+commits"), then the very next paragraph names which two creates are transactional and which three
+are not, in domain language (no method names) consistent with the rest of the file's voice. A reader
+with no DEVLOG in front of them gets the rule and the reason in two paragraphs, and the new third
+scenario makes the limit an assertable fact rather than something they'd have to infer from the
+requirement text alone. The "where" clause is slightly informal for a normative SHALL sentence — "provided
+that" or a second sentence would read marginally more like a legal requirement — but it is not
+ambiguous and I would not hold up an approval for it.
+
+**Verdict: Approve.** No blockers. Two nits (GitEmailService's "single statement" phrasing; the
+1-of-3 test coverage of the new scenario, noted so it isn't over-read later) and one architectural
+note (the new scenario's account-creation omission) — none change the truth of what's promoted, and
+none need a re-audit. → @architect, clear to promote on archive per the Product Owner's N12 ruling.
+
 ## NEXT
 
 **Resume point: COMPLETE — all four sections closed with a supervisor `Approve`. 16/16 tasks, 385/385
