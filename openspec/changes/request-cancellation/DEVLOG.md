@@ -2652,48 +2652,364 @@ mutation testing, no commit, nothing ticked.
 
 → @architect
 
+**[supervisor]** Second and final section review of §4 — same scope, `git diff 7a4d6e1..HEAD`, now
+four commits (`7d4e20b`, `10b3b78`, `7bed029`, `0393752`). **Approve.**
+
+`git diff 7a4d6e1..HEAD -- src` is exactly `LoginService.cs`, `+8/-0`, a pure insertion — no line
+moved, nothing reordered. `git status --short` is empty: no untracked file anywhere, so no mutation
+residue is possible and none is hiding from the diff. `git diff 7a4d6e1..HEAD --
+openspec/changes/request-cancellation/specs` and `-- openspec/specs` are both empty. `tests/
+ZeroWiki.Tests/Web` is untouched by the remediation (0 files), so the 4.5 sweep and its 15 pinned
+sites are exactly as block B left them. `RedeemInvitation.razor` is untouched, so N4's two `default`
+spellings were left alone as instructed. `tasks.md` across the whole range is five boxes ticked and
+nothing else — the remediation ticked nothing, correctly.
+
+---
+
+**F1 — discharged. Not in appearance: I re-traced all five method bodies before reading the prose.**
+
+| Create | Shape in `src` | D1's corrected claim | Match |
+|---|---|---|---|
+| `BootstrapService.CreateFirstAdministratorAsync` | `BeginTransaction(deferred: false)` → `UseTransactionAsync` → `await using (transaction)` → `SaveChangesAsync(ct)` → `CommitAsync(ct)` | transactional, rolls back | ✅ |
+| `InvitationService.RedeemAsync` | `await using var writeLock = await BeginWriteLockedTransactionAsync(ct)` (`:267`) → `SaveChangesAsync(ct)` → `writeLock.CommitAsync(ct)` | transactional, rolls back | ✅ |
+| `InvitationService.IssueAsync` | `db.Invitations.Add(...)` → `SaveChangesAsync(ct)`, nothing else | bare `Add` + save, no post-write check | ✅ |
+| `GitTokenService.IssueAsync` | `db.GitTokens.Add(token)` → `SaveChangesAsync(ct)`, nothing else | bare `Add` + save, no post-write check | ✅ |
+| `GitEmailService.AddAsync` | `FindByEmailAsync(ct)` → `Add` → `SaveChangesAsync(ct)` in `try`/`catch DbUpdateException` (race re-read, not a rollback) | bare `Add` + save, no post-write check | ✅ **on the load-bearing claim** |
+
+The last row is the only imprecision left: D1 calls `AddAsync` "a bare `Add` followed by
+`SaveChangesAsync(ct)`", and it is not quite bare — a uniqueness read precedes it and a
+`DbUpdateException` race-guard follows it. Neither is a transaction and neither is a post-write
+cancellation check, so **every claim D1 actually rests on is true**, and the guarantee it states for
+that method is the right one. Recording the wording for `## NEXT`, not blocking on it: the sentence
+that was false is now true, which is what F1 asked for.
+
+Also verified the correction did not quietly rewrite the decision: the read/create-vs-de-authorisation
+split and the `GitTokenService.IssueAsync` shown-once argument both survive, the latter genuinely
+downgraded from "this is already covered" to "this is why the narrower guarantee matters." That is the
+honest reframing, not a softening.
+
+**F1b coverage — and `AsNoTracking()` is load-bearing, which I checked rather than assumed.** All
+three new tests assert the *store*: `_db.Invitations.AsNoTracking()`, `_db.GitTokens.AsNoTracking()`,
+and `_service.ListAsync(alice.Id)`. For `InvitationService.IssueAsync` and `GitTokenService.IssueAsync`
+the entity has already been `Add`ed into the change tracker by the time the cancellation throws, so a
+tracked query would have been at risk of returning it from the identity map; `AsNoTracking()` forces
+the round-trip that makes `Assert.Empty` mean "the database is empty." `GitEmailService.AddAsync`
+throws at `FindByEmailAsync`, before the `Add`, so its tracker is clean either way. Each comment says
+plainly it covers the pre-write window only. None overclaims.
+
+**S2's status, asked directly: from `Partial — 2 of 5 create sites` to `Held`.**
+
+Five of five create sites, four of four record types named in S2 (account, invitation, git access
+token, git email), each with a cancellation test asserting against the store. The post-write window is
+now *documented* rather than merely absent: transactional-and-rolls-back for the two, explicitly
+narrower for the three, corrected in D1 and made executable on the sharpest of them. Held **under the
+Product Owner's ruled reading** — that "while a request is creating" ends when the INSERT commits.
+That reading is coherent and it was theirs to make; F1 asked for the ruling and got it. See the note
+to the Product Owner below on the one thing the ruling does not reach.
+
+---
+
+**F2 — discharged, and I satisfied myself independently on the enumeration question. The reviewer's
+argument is correct, but it is the second line of defence, not the first.**
+
+I checked the reviewer's chain and it holds: `Login.razor:70` is the only production caller (`grep`
+over `src` returns exactly one hit) and it threads `context.RequestAborted`; `Program.cs` registers no
+`RequestTimeouts` middleware, so `RequestAborted` really is an abort token and not a timeout token; no
+logging statement in `VerifyCredentialsAsync` sits before the throw point (`:78`, `:88`, `:96`, `:102`
+are all downstream of `:74`); and `CanVerify` is `storedHash is not null && TryParse(storedHash, out
+_)` — a `$`-split, three tagged-int parses, two base64 decodes, no crypto
+(`Argon2idPasswordHasher.cs:110`, `:139–181`).
+
+**But the argument I would actually stake the change on is simpler and does not depend on the caller
+at all:**
+
+1. **The fix is a no-op on every path that produces a response.** `ThrowIfCancellationRequested()` on
+   an uncancelled token is one volatile read, identical on both branches. The diff is a pure insertion
+   at `:66–73`; `:61`'s `CanVerify` short-circuit is pre-existing and unmoved. So the timing profile
+   of every response-producing login is byte-for-byte what it was before this change. **A change that
+   cannot alter the response path cannot introduce a response-timing oracle**, whatever token is
+   passed.
+2. **On the cancelled path, both branches throw the identical exception from the identical line.**
+   Same type, same message, same token, same stack frame (`:70`). So there is no differential in logs,
+   in `UseExceptionHandler`'s handling, or in any telemetry — not merely "no log line distinguishes
+   them", but *nothing downstream can*, because the two branches are indistinguishable at the point
+   they diverge from normal flow.
+3. **Only then** does `RequestAborted` matter: it closes the residual case where an attacker might try
+   to measure the cancelled path itself. There is no response to time, and the sub-microsecond
+   `CanVerify` delta sits under a SQLite round-trip's own jitter.
+
+**Verified, not refuted. It is not an enumeration oracle.** One qualification, because point 3 is the
+part that could decay: the residual asymmetry is real (`CanVerify` runs only when `candidate is not
+null`), and points 1–2 are what make it unobservable. If a future change ever passed a *timeout* token
+here — `RequestTimeouts`, a `CancelAfter`, a linked deadline — point 3 fails and a 504's latency would
+carry that asymmetry. That is cheap to retire permanently, and the fix is strictly better than the
+current placement: **move the check up one statement, to immediately after `SingleOrDefaultAsync` at
+`:59` and before `:61`.** It is still unconditional, still fires on both branches, still declines the
+Argon2id run — and neither branch reaches `CanVerify` first, so the asymmetry ceases to exist rather
+than being argued unobservable. Not a blocker; the current line is correct today. `## NEXT`.
+
+**F2's tests discriminate — I checked both, and they discriminate for different reasons.**
+
+- Known-username (`LoginServiceTests.cs:229–248`): `Assert.Equal(0, hasher.VerifyCallCount)`. Delete
+  `:70` and `Verify` runs once — `VerifyCredentialsAsync` has no other cancellation-observing point
+  after the query (`Argon2idPasswordHasher.Verify` takes no token). Fails. Discriminating.
+- Unknown-username (`:251–286`): `Assert.ThrowsAnyAsync` **plus** `Assert.Empty(recorder.Verifications)`.
+  Delete `:70`, or move it inside a `candidate is not null` branch, and this call does not throw at
+  all — it returns `null` after one dummy verify. Fails on the throw assertion *and* the count. This
+  is the branch the first test cannot reach, and it is the exact regression the brief warned against.
+
+Between them the two tests pin unconditionality on both branches, which is the property that actually
+prevents the oracle. Good instrument design, and the second test is the one that makes the pair worth
+having.
+
+---
+
+**All seven scenarios, re-run after the remediation.**
+
+| # | Scenario | What pins it now | Verdict |
+|---|---|---|---|
+| S1 | A read is abandoned when the client disconnects | 4.4 `BootstrapServiceTests.cs:166–183` + 4.5's `Read_and_create_calls_flow_a_request_scoped_token` × 12 sites — **and now** both new `LoginServiceTests` cases, which abandon the login lookup and prove the work behind it is declined | **Held, and strengthened.** The gap I named last round — the *specific* read the proposal was written about — is closed on both branches. |
+| S2 | A cancelled create leaves nothing behind | 4.1 `BootstrapServiceTests.cs:113–159`, 4.2 `InvitationRedemptionTests.cs:82–155`, **+ F1b** `InvitationServiceTests.cs:280–298`, `GitTokenServiceTests.cs:178–196`, `GitEmailServiceTests.cs:152–170`, **+** the post-write limit pinned at `GitTokenServiceTests.cs:198–225` | **Held** (was *Partial — 2 of 5*). 5/5 create sites, 4/4 record types. Post-write window: rolls back for the two transactional, deliberately narrower for the three, per the Product Owner's ruling. |
+| S3 | A cancelled redemption leaves the invitation usable | 4.2's two tests, both going past "not redeemed" to a *successful subsequent redemption* under a live token | **Held.** Unchanged, and still the strongest evidence in the section. |
+| S4 | Revoking a git access token survives a disconnect | 4.3 `GitTokenServiceTests.cs:179–197` + 4.5 exact-text on `Account.razor:320` + pre-existing `Revoked_token_no_longer_verifies` | **Held by inference.** Unchanged by the remediation; links (a) and (b) discharged, (c) traced not tested. N7. |
+| S5 | Revoking an invitation survives a disconnect | 4.3 `InvitationServiceTests.cs:281–300` + 4.5 on `Invitations.razor:154–158` + pre-existing `A_revoked_invitation_cannot_be_redeemed_and_creates_no_account` | **Held by inference.** As S4. |
+| S6 | Removing a git email survives a disconnect | 4.3 `GitEmailServiceTests.cs:153–171` + 4.5 on `Account.razor:340` + pre-existing `Removing_an_email_frees_the_address_for_another_account` | **Held by inference.** As S4. |
+| S7 | A cancelled bootstrap check does not admit a bootstrap | 4.4, against an **empty** store, polarity correct per `0a38e46` | **Held.** Still the single sharpest assertion in the change. |
+
+Two changed rows, both in the direction the remediation was carved for; five unchanged. Beyond the
+seven: the **proposal's stated Why** — "an Argon2id verify at 64 MiB continues to completion for a
+response nobody will read" — is delivered for the first time by `LoginService.cs:70`. It is not a spec
+scenario, and F2 was never an S1 violation; it was the change failing to buy the thing it was proposed
+to buy. It now buys it.
+
+---
+
+**Your five direct questions, answered.**
+
+**4. The limit-documenting test — honest and well-marked, and pinning it was right.** It was item 2 of
+my own suggested remediation shape and I would take it again: it converts F1a's corrected prose into
+something a regression can fail, and it is the mirror of the pre-write test — the two together are
+what "narrower guarantee" means operationally. Determinism confirmed: `CancelAfterSaveInterceptor`
+fires at `SavedChangesAsync`, after the write has committed, and `IssueAsync` then executes only
+`return new IssuedGitToken(...)` — nothing left that observes the token, so the call cannot
+intermittently throw. `_service.VerifyAsync` reads through the same `_connection`, so the assertion
+sees the committed row.
+
+**One wording flaw, for `## NEXT`.** The comment opens *"do not `fix` IssueAsync to make this fail."*
+That is accurate as a statement of the current ruling and it names the ruling, which is the right
+instinct. But it gives a future reader no exit: if a later change makes `IssueAsync` transactional —
+a strict improvement, and exactly the outcome the reviewer wanted this test to make *visible* — the
+test fails, and the comment as written reads as an instruction to revert the improvement. Add one
+sentence: *"if this fails because `IssueAsync` became transactional, that is a strengthening — delete
+this test, do not revert the code."* Docs-only, one line. It is the difference between a test that
+documents a limit and a test that defends one.
+
+**5. The helpers — `DataReaderDisposing` does discriminate; three helpers is *reducible to two*, and
+the reason is build order.**
+
+`DataReaderDisposing` fires from the reader's disposal, in the `finally` after enumeration has already
+resolved the result; `SingleOrDefaultAsync` has captured its value by then and re-checks nothing on
+the way out. That matches the worker's spike, and it is corroborated structurally rather than only by
+the spike: the test passes today (385/385) and the *only* cancellation-observing point between the
+query and `Verify` is `:70`, so a throw with zero verifications can have come from nowhere else. The
+`ReaderExecutedAsync` non-finding is exactly right and recording it in the type's `<remarks>` was the
+correct call — that is a genuine instrument-blindness trap of the kind CLAUDE.md already warns about,
+and it is now written down where the next person will hit it.
+
+On sprawl: the three are not duplicates — each lands a cancellation in a different window (post-write/
+pre-commit; post-query/pre-caller-code; post-lookup/pre-verify) and all three are live. But
+`CancelOnCanVerifyPasswordHasher` is **reducible**: `CancelOnReaderDisposingInterceptor` lands the
+cancellation after the lookup on *both* branches, so the known-username test could be written with it
+and assert `Assert.Empty(recorder.Verifications)` identically. The hasher decorator exists only
+because it was built in round 1, before the more general instrument was built in round 2 to close the
+gap round 1's reviewer found. That is the ordinary signature of an abstraction that grew twice across
+rounds, and it is my remit to name it — but it is 39 lines behind a passing test, not dead
+scaffolding, and it retires naturally alongside the `:59` placement change above (which would break it
+anyway, since `CanVerify` would no longer be reached). Both belong in the same small follow-up.
+`## NEXT`.
+
+**6. Nothing already approved was disturbed.** Verified above: `src` outside `LoginService.cs`
+untouched across the whole range, `spec.md` byte-identical, `tests/ZeroWiki.Tests/Web` untouched so the
+15 pinned sites and the sweep instrument are as block B left them, `RedeemInvitation.razor`'s N4
+spellings untouched. §1–§3 are outside this range and unaffected.
+
+**7. Standard remit.** No drift between the remediation and blocks A/B: the three F1b tests match the
+`Revoking_under_an_already_cancelled_token_throws` naming and shape already established in those
+files, and the post-commit test reuses block A's interceptor unchanged and by the same locally-built-
+`IdentityDbContext`-on-the-shared-`_connection` pattern as `BootstrapServiceTests`. No dead
+scaffolding, no superseded stub, no eroded decision — the remediation touches no design decision
+except to make D1's prose true. One cosmetic spelling inconsistency: the round-1 F2 test uses `using
+var cts`, while block A and both round-2 tests use `var cancellationTokenSource = new
+CancellationTokenSource()` without `using`. The section's established convention is the latter; the
+`using` is the better spelling. Nit either way.
+
+---
+
+**The record repair, and the same gap recreated three posts below it.**
+
+`7bed029`'s `[architect]` post states block B's gap accurately: the reviewer's `Approve with nits` at
+line 1759 does predate the depth-aware hardening at line 1887, there is no reviewer post after it, and
+owning that as a deliberate trade rather than an oversight is the right way to close it.
+
+**But the same thing then happened inside the remediation block.** The reviewer's `Approve` (line
+2375) was given on a **383-test** state. The `[worker]` post below it (line 2564) landed two further
+tests **and a new file**, `CancelOnReaderDisposingInterceptor.cs`, taking the suite to **385**, and
+there is no reviewer post beneath it. Both additions were reviewer-*recommended*, so the substance was
+reviewed; the *implementation* was not — including a new type whose justification rests on a throwaway
+spike run outside the repo and since deleted, i.e. the one artefact in this block that a second pair of
+eyes was most warranted on. I have read all of it in that pass's place and it is correct (above), so
+again the gap is in the record, not the code. Recording it because a post that repairs a record gap
+while the same gap is being recreated below it is not yet a repair.
+
+**Before archive, three record items are still missing**, and they are cheap to post:
+
+1. An `[architect]` close for **block B** — the repair owns the skipped review but does not close the
+   block.
+2. An `[architect]` gates-and-commit post for the **remediation block** (`0393752`): build 0/0, `dotnet
+   test` 385/385 full suite, `openspec validate --strict` valid, `dotnet format` clean, and `git diff
+   -- src` = `LoginService.cs` `+8/-0`. Those figures currently exist only in the worker's post and in
+   the brief to me; the DEVLOG has no Architect verification of them.
+3. `## NEXT` still reads **"STOPPED … Do not archive"** with §4 marked `Request changes` in the
+   table. Stale as of this post.
+
+---
+
+**To the Product Owner, before archiving — one thing, and it is the only one.**
+
+`specs/request-lifecycle/spec.md` was correctly left untouched, but it is what gets promoted into
+`openspec/specs/` at archive and becomes durable law. Its Requirement text reads: *"A cancelled
+operation of this kind SHALL leave the store exactly as it was before the request arrived"*, and S2:
+*"the operation is abandoned and no such record exists afterwards"* — both unqualified. `design.md`
+D1 now correctly says that for three of the five creates the guarantee stops at the commit. **The
+change ships with its committed spec stating something stronger than its design says the code does.**
+
+Your F1 ruling settles the *behaviour* (it stays as it is) and it settles the *reading* (creating ends
+at the INSERT). It does not settle whether the promoted spec should carry that qualification. Under
+your reading the two documents are consistent; a reader who has only the spec will read it more
+strongly. One clarifying clause in S2 at archive time — or a deliberate decision to leave it — is your
+call, not mine, and it is worth thirty seconds now because after archive it is a new change.
+
+Everything else below is `## NEXT` material and none of it blocks.
+
+**Approve.** §4 is closed. All 16 tasks ticked, four sections with supervisor approval, and the change
+now delivers the benefit its proposal was written for — which, before `0393752`, it did not.
+
+**For `## NEXT`:**
+
+- **N6 — the 4.5 sweep is bounded to six named files** (carried forward). A seventh page, or a
+  de-authorisation moved into a shared component, layout or endpoint, is invisible to it. Same expiry
+  date as N5; the two should be re-run together against `git-backed-content-core`'s new surface, which
+  per N5 these caller-side instruments will not see at all once de-authorisation stops being an
+  identity-row write.
+- **N7 — the harness premise** (carried forward). `ZeroWikiAppFactory.WithDbAsync` makes store-level
+  assertions after an aborted request reachable; "no response to assert against" was never the
+  obstacle for S4/S5/S6. Re-examine before the next change reuses the 4.3 re-cut as precedent.
+- **N9 — hoist `LoginService.cs:70` above `:61`.** One statement earlier, immediately after the
+  `SingleOrDefaultAsync` await. Retires the `CanVerify` branch asymmetry outright instead of arguing it
+  unobservable, and removes the dependency on the caller's token being an abort token rather than a
+  timeout token. Do it together with N10.
+- **N10 — `CancelOnCanVerifyPasswordHasher` is reducible to `CancelOnReaderDisposingInterceptor`.**
+  The latter lands the cancellation after the lookup on both branches; the former exists only because
+  it was built a round earlier. N9 breaks it anyway (`CanVerify` would no longer be reached), so
+  collapse the two tests onto one instrument and delete the decorator when N9 lands.
+- **N11 — the limit-documenting test needs an exit clause.**
+  `GitTokenServiceTests.A_cancellation_observed_after_the_write_commits_does_not_remove_the_token`
+  says *"do not `fix` IssueAsync to make this fail"*. Add: *"if this fails because `IssueAsync` became
+  transactional, that is a strengthening — delete this test, do not revert the code."*
+- **N12 — `spec.md` S2 and Requirement 1 are unqualified where D1 is now qualified.** Product Owner
+  call at archive: add a clause, or accept the tension deliberately.
+- **N13 — process, recurring.** Two blocks in this change committed work that landed *after* the
+  reviewer's approving post: block B's depth-aware hardening (`10b3b78`) and the remediation's final
+  two tests plus `CancelOnReaderDisposingInterceptor.cs` (`0393752`). Both times the code was correct;
+  both times the archived record shows an approval that does not cover the shipped state. A reviewer
+  re-pass is cheap when the addition is small — cheaper than the DEVLOG post explaining why it was
+  skipped.
+- **N14 — D1's `GitEmailService.AddAsync` wording.** Called "a bare `Add` followed by
+  `SaveChangesAsync(ct)`"; it has a preceding uniqueness read and a following `DbUpdateException`
+  race-guard. Every claim D1 rests on is true; the description is loose. Fix if D1 is ever edited
+  again.
+- **Nit** — `ServiceCallSweepInstrumentTests.cs:142–154` is entailed by the test above it (carried
+  forward, unaddressed and correctly so).
+- **Nit** — CTS spelling drift: `using var cts` in `LoginServiceTests.cs:239` against the section's
+  established `var cancellationTokenSource = new CancellationTokenSource()` in the other four sites.
+- **Note for the archive** (carried forward) — the pre-existing revoke/remove tests call the services
+  with the token **omitted** (`= default`), the very spelling D2 rejects at call sites. Behaviourally
+  identical, so not a defect; but the suite does not follow the convention the suite now enforces.
+
+**[architect]** Closing §4 and the change's build record. Three posts owed, per N13 and the
+supervisor's archive list — written now rather than left for the archive to inherit.
+
+**Block B close (owed since `10b3b78`).** Reviewer `Approve with nits` → nit 1 (depth-aware argument
+splitting) taken, nit on the redundant self-test left. Gates re-run by me: build 0/0, 379/379 full
+suite, validate valid, format clean. 4.3/4.5 ticked; committed `10b3b78`. The hardening itself shipped
+without a reviewer pass — owned separately above.
+
+**Remediation close (`0393752`).** Reviewer `Approve` at the 383-test state; I then commissioned two
+further additions (the post-write limit test, and the unknown-username coverage) taking it to 385, and
+**did not send those back for a reviewer pass**. Gates re-run by me: build 0/0, **385/385** full suite,
+validate valid, format clean. `git diff -- src` across the whole remediation is `LoginService.cs`
+`+8/-0`. Nothing ticked — a remediation block ticks nothing.
+
+**N13 is fair and I am recording it as a pattern, not an incident.** I repaired the block B record gap
+in `7bed029` and then recreated the same gap three posts later: an `Approve` given on one state, more
+code added after it, no re-review, and my own close post missing. Twice is a habit. The specific
+lesson for the next change: **a reviewer's `Approve` certifies the state it was given, and any code
+added after it — however small, however well-briefed — is uncertified until it is either re-reviewed or
+the Architect posts explicitly that it was verified without one.** Both times the code was fine and
+both times a supervisor had to find the hole. The DEVLOG is meant to be the durable record of *how*
+this was built; a hole in it is a defect in the deliverable, not merely in process hygiene.
+
 ## NEXT
 
-**Resume point: STOPPED — 16/16 tasks ticked, but §4's supervisor returned `Request changes` with two
-blockers that are Product Owner calls, not remediation-block material.** Per CLAUDE.md §4 ("stop and
-ask"), no remediation block has been carved: F1 says a `design.md` decision states something false
-about the code, and F2 says the change does not deliver the benefit its proposal was written for.
-Both need a PO ruling before any more code moves. **Do not archive until they are resolved.**
+**Resume point: COMPLETE — all four sections closed with a supervisor `Approve`. 16/16 tasks, 385/385
+tests.** One Product Owner decision remains before archiving (**N12**, below): whether the promoted
+spec text carries the qualification D1 now states. Everything else is `## NEXT` material for later
+changes, not work outstanding on this one.
 
 | Section | Block | Commit | Reviewer | Supervisor |
 |---|---|---|---|---|
 | §1 The rule | 1.1–1.2 | `ff14989` | Approve | Approve |
 | §2 Reads and creates | 2.1–2.6 | `1eaa13f` | Approve | Approve |
 | §3 De-authorisation | 3.1–3.3 | `61c482a` | Approve | Approve |
-| §4 Tests | A 4.1/4.2/4.4 | `7d4e20b` | Approve | **Request changes** |
-| §4 Tests | B 4.3/4.5 | `10b3b78` | Approve w/ nits | **Request changes** |
+| §4 Tests | A 4.1/4.2/4.4 | `7d4e20b` | Approve | Request changes → **Approve** |
+| §4 Tests | B 4.3/4.5 | `10b3b78` | Approve w/ nits | Request changes → **Approve** |
+| §4 Tests | remediation F1+F2 | `0393752` | Approve | **Approve** |
 
-Out-of-band commits on the branch: `f24c9ab` (§1 close), `0a38e46` (`design.md` polarity fix, §2's
-base), `2eead9c` (`.claude/agents/worker.md`, process), `7f63128` (§3 close), `7a4d6e1` (4.3 re-cut).
+Out-of-band commits: `f24c9ab` (§1 close), `0a38e46` (`design.md` polarity fix, §2's base), `2eead9c`
+(`.claude/agents/worker.md`, process), `7f63128` (§3 close), `7a4d6e1` (4.3 re-cut), `7bed029` (§4
+supervisor verdict + record repair).
 
-### ⛔ The two blockers — both Product Owner calls
+**Tests 344 → 385.** Single production change across the whole change: `LoginService.cs`, `+8/-0`.
 
-**F1 — `design.md`'s D1 states something false about the code, and §4 tested only where it is true.**
-D1 says of the five creates: "**Every one is transactional**, so cancelling rolls back and *nothing
-happens*". Three are not. `InvitationService.IssueAsync`, `GitTokenService.IssueAsync` and
-`GitEmailService.AddAsync` are each a bare `Add` + `SaveChangesAsync(ct)` with **no post-write token
-check**, so once the INSERT commits no later cancellation removes the row. The two that *are*
-transactional (`BootstrapService.cs:124–125`, `InvitationService.cs:318–319`) are exactly the two §4
-tested. Consequences: spec scenario S2 names four record types and three have **zero** coverage; and
-the case D1 headlines as its best argument — shown-once `GitTokenService.IssueAsync`, where a
-committed-but-unseen token is a credential the owner can never use — is the **least** supported claim
-in the change. Whether the post-write window actually violates S2 turns on reading "while a request is
-creating"; that reading is the PO's. The false sentence and the coverage gap are not ambiguous.
+### The seven spec scenarios, as finally delivered
 
-**F2 — the change does not deliver the benefit it was proposed for.**
-`LoginService.VerifyCredentialsAsync` has exactly one cancellable await — the `SingleOrDefaultAsync`
-lookup — and it sits **before** `passwordHasher.Verify`. The proposal's Why and task 2.3 both name the
-64 MiB Argon2id verify as the motivating cost ("the single most expensive thing this application does
-for a client that may already be gone"). A disconnect landing after the sub-millisecond lookup — which
-is nearly the entire window — still burns the full verify. This is *not* an S1 violation: the read
-genuinely cancels, so the spec is satisfied. The change simply bought almost nothing against the cost
-it was written to address. The fix is one line in `src`, which the proposal's Impact excludes — so it
-is a scope call, not an implementation detail.
+| # | Scenario | Verdict |
+|---|---|---|
+| S1 | A read is abandoned on disconnect | Held, strengthened by F2 |
+| S2 | A cancelled create leaves nothing behind | Held (was Partial — 2 of 5 sites) |
+| S3 | A cancelled redemption leaves the invitation usable | Held — strongest evidence in the change |
+| S4 | Git token revocation survives a disconnect | Held **by inference** (see N7) |
+| S5 | Invitation revocation survives a disconnect | Held **by inference** |
+| S6 | Git email removal survives a disconnect | Held **by inference** |
+| S7 | The bootstrap gate cannot fail open | Held — sharpest assertion in the change |
+
+**S4/S5/S6 are held by inference, and that is worth stating plainly** rather than letting the table
+read as seven equal ticks. 4.5 proves the callers pass an uncancellable token; 4.3 proves the services
+honour a token that *is* cancellable; the pre-existing revoke tests prove revocation takes effect. What
+is traced but not tested is that nothing else in the pipeline abandons the work between them — that is
+N7, and it is the only link where the scenarios' literal *WHEN a client disconnects* enters.
+
+### The two supervisor blockers — both resolved
+
+**F1** — `design.md`'s D1 falsely claimed all five creates were transactional; three are not. Product
+Owner ruled: correct the doc, add the coverage, **do not** make the three transactional. Landed in
+`0393752`. S2 moved Partial → Held, 5/5 create sites, under the PO's reading that "while a request is
+creating" ends at the INSERT.
+
+**F2** — the change did not deliver the benefit it was proposed for: `LoginService`'s only cancellable
+await preceded the Argon2id verify. Product Owner approved a one-line `src` fix as a deliberate scope
+expansion beyond the proposal's Impact. The proposal's stated Why is delivered for the first time by
+`LoginService.cs:70`.
 
 ### A premise this change acted on turned out to be wrong
 
