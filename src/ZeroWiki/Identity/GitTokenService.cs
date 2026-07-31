@@ -94,6 +94,11 @@ public sealed class GitTokenService(
     /// token leaves the original revocation time in place and succeeds. Returns
     /// <see langword="false"/> only when the account has no token with that id.
     /// </summary>
+    /// <remarks>
+    /// Callers must pass <see cref="CancellationToken.None"/> here, not the request's own token
+    /// (D1): a revocation abandoned on disconnect would leave the owner believing a git token they
+    /// think compromised is dead, while it stays live and able to authenticate.
+    /// </remarks>
     public async Task<bool> RevokeAsync(
         Guid accountId,
         Guid tokenId,

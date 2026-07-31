@@ -1,7 +1,7 @@
 ## 1. The rule
 
-- [ ] 1.1 Record D1's split (reads and creates cancel; de-authorisation does not) as a short XML doc remark where a reader adding a new service will meet the question, per D3
-- [ ] 1.2 Confirm every identity service method already accepts a `CancellationToken`, so no service signature changes in this change
+- [x] 1.1 Record D1's split (reads and creates cancel; de-authorisation does not) as a short XML doc remark where a reader adding a new service will meet the question, per D3
+- [x] 1.2 Confirm every identity service method already accepts a `CancellationToken`, so no service signature changes in this change
 
 ## 2. Flow cancellation into reads and creates
 

@@ -115,12 +115,20 @@ public sealed class InvitationService(
     /// administrator (AD15). Idempotent: re-revoking leaves the original revocation time in place.
     /// </summary>
     /// <remarks>
+    /// <para>
     /// The read and the write are one transaction, and the transaction takes the store's write lock
     /// up front. Without that this is check-then-act: a redemption committing between the
     /// <c>RedeemedAt is not null</c> test and the write would leave a row carrying <em>both</em>
     /// timestamps, and would tell the revoker <see cref="InvitationRevocation.Revoked"/> about an
     /// invitation that had already created an account — the exact confusion
     /// <see cref="InvitationRevocation.AlreadyRedeemed"/> exists to prevent.
+    /// </para>
+    /// <para>
+    /// Callers must pass <see cref="CancellationToken.None"/> here, not the request's own token
+    /// (D1). Someone revoking an invitation they believe compromised cannot tell a failed request
+    /// from a click that never registered, and will not retry — abandoning this write on disconnect
+    /// would leave them believing a live invitation is dead.
+    /// </para>
     /// </remarks>
     public async Task<InvitationRevocation> RevokeAsync(
         Guid callerAccountId,
