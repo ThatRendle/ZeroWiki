@@ -82,8 +82,17 @@ The rule gets a short XML doc remark at the point a reader will be standing when
 - **The split has to be learned.** Mitigated by D2 and D3 — the code states it where the question
   arises, so it cannot be inferred wrongly from a glance at neighbouring calls.
 - **`IsAvailableAsync` on the bootstrap gate is a read that guards a write.** Flowing cancellation into
-  it is still safe: a cancelled check throws rather than returning `false`, so it cannot fail *open* and
-  re-admit a bootstrap that should be closed. Worth asserting rather than assuming — see tasks.
+  it is still safe: a cancelled check throws rather than returning a verdict at all, so it cannot fail
+  *open* and re-admit a bootstrap that should be closed. Worth asserting rather than assuming — see
+  tasks.
+
+  Mind the polarity, because it is the reverse of what the method name suggests to a reader in a
+  hurry. `IsAvailableAsync` is `!await db.Accounts.AnyAsync(…)`, so **`true` means the store is empty
+  and the bootstrap is _open_**; `false` means it is closed, and every consumer treats `true` as the
+  permissive value (`Bootstrap.razor` redirects away on `false`; `BootstrapComplete.razor` sends the
+  visitor to `/bootstrap` on `true`). Failing *open* is therefore returning **`true`** for a populated
+  store — returning `false` fails closed. An assertion written against the wrong value here passes
+  while proving nothing, on the one fail-open path in this change.
 
 ## Migration Plan
 
