@@ -5,12 +5,12 @@
 
 ## 2. Flow cancellation into reads and creates
 
-- [ ] 2.1 `Bootstrap.razor` — pass `RequestAborted` to `IsAvailableAsync` and `CreateFirstAdministratorAsync`
-- [ ] 2.2 `BootstrapComplete.razor` — pass `RequestAborted` to `IsAvailableAsync`
-- [ ] 2.3 `Login.razor` — pass `RequestAborted` to `VerifyCredentialsAsync` (the 64 MiB Argon2id verify is the single most expensive thing this application does for a client that may already be gone)
-- [ ] 2.4 `RedeemInvitation.razor` — pass `RequestAborted` to `ValidateAsync` and `RedeemAsync`
-- [ ] 2.5 `Invitations.razor` — pass `RequestAborted` to `IssueAsync` and `ListAsync`
-- [ ] 2.6 `Account.razor` — pass `RequestAborted` to both `ListAsync` calls, `IssueAsync`, and `AddAsync`
+- [x] 2.1 `Bootstrap.razor` — pass `RequestAborted` to `IsAvailableAsync` and `CreateFirstAdministratorAsync`
+- [x] 2.2 `BootstrapComplete.razor` — pass `RequestAborted` to `IsAvailableAsync`
+- [x] 2.3 `Login.razor` — pass `RequestAborted` to `VerifyCredentialsAsync` (the 64 MiB Argon2id verify is the single most expensive thing this application does for a client that may already be gone)
+- [x] 2.4 `RedeemInvitation.razor` — pass `RequestAborted` to `ValidateAsync` and `RedeemAsync`
+- [x] 2.5 `Invitations.razor` — pass `RequestAborted` to `IssueAsync` and `ListAsync`
+- [x] 2.6 `Account.razor` — pass `RequestAborted` to both `ListAsync` calls, `IssueAsync`, and `AddAsync`
 
 ## 3. Hold the line at de-authorisation
 

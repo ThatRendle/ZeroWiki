@@ -297,7 +297,7 @@ else if (_emailRemoved is false)
 
     private async Task GenerateAsync()
     {
-        var issued = await GitTokenService.IssueAsync(CallerAccountId);
+        var issued = await GitTokenService.IssueAsync(CallerAccountId, Context.RequestAborted);
 
         // The plaintext exists only for this render. It is deliberately not carried through a
         // redirect, a query string, TempData or a session: every one of those puts the credential
@@ -320,7 +320,7 @@ else if (_emailRemoved is false)
 
     private async Task AddEmailAsync()
     {
-        _addOutcome = await GitEmailService.AddAsync(CallerAccountId, AddEmailInput.Email);
+        _addOutcome = await GitEmailService.AddAsync(CallerAccountId, AddEmailInput.Email, Context.RequestAborted);
 
         await LoadEmailsAsync();
     }
@@ -339,7 +339,7 @@ else if (_emailRemoved is false)
     /// No <see cref="ZeroWiki.Data.Account"/> row is materialised here either — the same §7 shape
     /// as <see cref="LoadAsync"/> below, applied to the other list this page owns.
     /// </remarks>
-    private async Task LoadEmailsAsync() => _emails = await GitEmailService.ListAsync(CallerAccountId);
+    private async Task LoadEmailsAsync() => _emails = await GitEmailService.ListAsync(CallerAccountId, Context.RequestAborted);
 
     /// <remarks>
     /// The list is a projection and the username above comes off the signed-in principal, so this
@@ -347,7 +347,7 @@ else if (_emailRemoved is false)
     /// designed out rather than survived: an account whose value-converted timestamp cannot be read
     /// would otherwise take down a page it has no business appearing on.
     /// </remarks>
-    private async Task LoadAsync() => _tokens = await GitTokenService.ListAsync(CallerAccountId);
+    private async Task LoadAsync() => _tokens = await GitTokenService.ListAsync(CallerAccountId, Context.RequestAborted);
 
     private static string Describe(GitTokenSummary token) =>
         token.RevokedAt is null ? "Active" : "Revoked";

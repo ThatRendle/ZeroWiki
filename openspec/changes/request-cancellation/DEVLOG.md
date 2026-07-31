@@ -319,6 +319,291 @@ the three methods where the surprising half lives, and 1.2's verification is sou
 third, independent instrument. The four items above are notes for `## NEXT` and for §2's and §4's
 briefs, not a remediation block; the only one needing an answer before §4 opens is the ❓.
 
+## 2. Flow cancellation into reads and creates
+
+**[architect]** Base: `0a38e46` — flows `HttpContext.RequestAborted` into all twelve read and create
+call sites across six pages, and gives `Bootstrap.razor`/`BootstrapComplete.razor` the cascading
+`HttpContext` they currently lack.
+
+**[architect]** Product Owner rulings taken before this section opened:
+
+- **`design.md`'s inverted bootstrap-gate polarity is fixed** (`0a38e46`), per the ❓ raised at the
+  close of §1. The Risks item now states the polarity explicitly: `IsAvailableAsync` is `!AnyAsync()`,
+  so `true` = store empty = bootstrap **open**, and failing open is returning `true` for a populated
+  store. Task 4.4 and the spec requirement were already correct and are unchanged.
+- **§2 runs as one block, all six pages** — not split at the bootstrap seam.
+
+### Brief — block 2.1–2.6
+
+**[architect]** → @worker
+
+**Tasks** — pass `HttpContext.RequestAborted` to each call listed:
+
+| Task | Page | Calls |
+|---|---|---|
+| 2.1 | `Bootstrap.razor` | `IsAvailableAsync` (:67), `CreateFirstAdministratorAsync` (:77) |
+| 2.2 | `BootstrapComplete.razor` | `IsAvailableAsync` (:27) |
+| 2.3 | `Login.razor` | `VerifyCredentialsAsync` (:70) |
+| 2.4 | `RedeemInvitation.razor` | `ValidateAsync` (:112), `RedeemAsync` (:118) |
+| 2.5 | `Invitations.razor` | `IssueAsync` (:132), `ListAsync` (:157) |
+| 2.6 | `Account.razor` | `IssueAsync` (:300), `AddAsync` (:323), `ListAsync` (:342), `ListAsync` (:350) |
+
+Twelve call sites. Line numbers are from the survey at `d90b00e` — verify, do not trust.
+
+**Do not touch the three de-authorisation calls.** They are §3's work and they must keep behaving as
+they do today until §3 lands: `Account.razor` `RevokeAsync` (:316) and `RemoveAsync` (:333), and
+`Invitations.razor` `RevokeAsync` (:148). You are editing two files that contain both kinds of call —
+this is the one way this block can do real harm, so re-read your own diff for it before handing off.
+Per D1 these must never receive a request-scoped token.
+
+**The `Bootstrap`/`BootstrapComplete` cascading parameter — and the Architect decision that goes with
+it.** Neither page holds `[CascadingParameter] HttpContext`; `proposal.md` says every page does, and
+it is wrong. Add it in the shape the other four already use.
+
+The supervisor flagged that the parameter is `HttpContext?` — **nullable** — and that the four
+existing pages resolve null three different ways: `Account.razor:230`, `Login.razor:67` and
+`Invitations.razor:115` throw `InvalidOperationException` with a message naming why the page needs
+static server-side rendering; `RedeemInvitation.razor:110` instead treats null as "not a GET",
+because it is distinguishing GET from POST rather than reaching for the request.
+
+**Decision (Architect, not the worker's to re-open): the bootstrap pages throw, matching the
+majority idiom.** Reasons: a null `HttpContext` on a Static SSR page is a misconfiguration and should
+be loud rather than silently degraded; throwing cannot fail *open*, which is what §4.4 asserts; and
+inventing a fourth null-handling behaviour across six pages is exactly the drift the supervisor
+exists to catch. The rejected alternative was falling back to `CancellationToken.None` when null,
+which keeps the gate running but hides the misconfiguration.
+
+⚠️ **This changes behaviour on a path that currently cannot fail, so verify it rather than assume.**
+Today both pages render without an `HttpContext`; after this change they will throw. Check that the
+existing bootstrap page tests (`tests/ZeroWiki.Tests/Web/BootstrapPageTests.cs` and any sibling)
+actually supply one. **If a test renders these pages without an `HttpContext`, stop and report it —
+do not weaken the guard to suit the test, and do not rewrite the test to route around it.** Either
+could be the right answer, and it is the Architect's call, not yours.
+
+**Binding constraints**
+
+- **D1 is the rule** — read it in `design.md`. Reads and creates flow the caller's token; the token
+  you flow is `HttpContext.RequestAborted`.
+- **No service signature changes.** §1 confirmed every method already takes the token (verified three
+  times, including from compiled IL). If you think a signature needs to change, you have found
+  something the section-1 audit missed — stop and report.
+- **No test changes in this block** beyond what is needed to keep the existing suite green, and if
+  that is anything more than supplying an `HttpContext`, stop and report. §4 owns this change's tests.
+- **Scope is the six pages.** Nothing in `src/ZeroWiki/Identity/`.
+
+**Done-gates** — all four must pass before this block commits:
+
+- `dotnet build` clean
+- `dotnet test` green — the whole suite, not a filter
+- `openspec validate request-cancellation --strict`
+- `dotnet format --verify-no-changes` clean
+
+**No mutation testing in this block.** It is argument-passing; the behaviour worth mutating is §4's
+to assert. Do not start a mutation run here.
+
+Post progress here as you go, then hand off: `→ @reviewer`.
+
+**[worker]** 2.1–2.6 done. Flowed `HttpContext.RequestAborted` into all twelve read/create call
+sites; the three de-authorisation calls are untouched.
+
+- **2.1 `Bootstrap.razor`** — added `[CascadingParameter] private HttpContext? HttpContext` (it had
+  none) plus a `Context` property that throws `InvalidOperationException` on null, matching the
+  Architect's decision. `OnInitializedAsync`'s `IsAvailableAsync` and `SubmitAsync`'s
+  `CreateFirstAdministratorAsync` both now pass `Context.RequestAborted`.
+- **2.2 `BootstrapComplete.razor`** — same cascading parameter added; `OnInitializedAsync` resolves
+  `HttpContext ?? throw InvalidOperationException(...)` inline (single call site, so no separate
+  `Context` property, matching `Login.razor`'s idiom for a one-site page) and passes
+  `context.RequestAborted` to `IsAvailableAsync`.
+- **2.3 `Login.razor`** — `SubmitAsync` already resolved `context` via the existing throw guard;
+  `VerifyCredentialsAsync` now takes `context.RequestAborted`.
+- **2.4 `RedeemInvitation.razor`** — `HttpContext` is already nullable here with its own established
+  null handling (not a GET), which this block does not touch or reinterpret. Both
+  `ValidateAsync` and `RedeemAsync` now take `HttpContext?.RequestAborted ?? default`, preserving
+  the null case's existing behaviour rather than introducing a new throw.
+- **2.5 `Invitations.razor`** — refactored the existing `User` throw-guard into a `Context` property
+  (`HttpContext ?? throw ...`, same message text) with `User` now reading `Context.User`, so the
+  guard is stated once. `IssueAsync` and `LoadAsync`'s `ListAsync` now pass `Context.RequestAborted`.
+  `RevokeAsync` (:150 in the current file) is untouched — no token argument added.
+- **2.6 `Account.razor`** — `GenerateAsync`'s `IssueAsync`, `AddEmailAsync`'s `AddAsync`,
+  `LoadAsync`'s `ListAsync` and `LoadEmailsAsync`'s `ListAsync` all now pass `Context.RequestAborted`
+  (the page already had a `Context` throw-guard property). `RevokeAsync` (:316) and
+  `RemoveEmailAsync` (:333) are untouched — no token argument added, confirmed by re-reading the
+  diff hunk twice.
+
+**De-authorisation calls — confirmed untouched.** Re-read the diff specifically for this: `git diff
+-- src` shows no change to `Account.razor` lines around `GitTokenService.RevokeAsync(CallerAccountId,
+RevokeInput.TokenId)` or `GitEmailService.RemoveAsync(CallerAccountId, RemoveEmailInput.EmailId)`,
+and no change to `Invitations.razor`'s `InvitationService.RevokeAsync(CallerAccountId,
+CallerIsAdministrator, RevokeInput.InvitationId)`. All three still call with no cancellation
+argument at all (i.e. the service's `default` parameter), exactly as before this block — §3's job is
+to make that `CancellationToken.None` explicit with a D2 comment.
+
+**Bootstrap page tests — finding, not a stop.** Read `tests/ZeroWiki.Tests/Web/BootstrapPageTests.cs`
+(and confirmed no sibling covers `BootstrapComplete` beyond
+`The_completion_page_does_not_claim_an_administrator_exists_before_one_does`, which is in the same
+file). Every test drives the pages through `ZeroWikiAppFactory : WebApplicationFactory<Program>` over
+a real HTTP client (`client.GetAsync`/`StaticSsrForm.PostAsync`) — i.e. the real ASP.NET Core
+pipeline, which always supplies a real `HttpContext` to a Static SSR page. No test renders either
+page directly (no `RenderTree`/component-test harness in this suite). So no existing test exercises
+the null-`HttpContext` path the new throw guards against — the ⚠️ scenario does not occur, nothing
+needed weakening or rewriting, and the whole suite is green at 344/344 without touching a single test
+file.
+
+**No service signature changes; no test changes.** Confirmed by diff — only the six pages under
+`src/ZeroWiki/Components/Pages/` changed, nothing under `src/ZeroWiki/Identity/`, nothing under
+`tests/`.
+
+**Gates**: `dotnet build` — 0 warnings, 0 errors. `dotnet test` — 344/344 passed (whole suite, not
+filtered). `openspec validate request-cancellation --strict` — valid. `dotnet format
+--verify-no-changes` — clean. `git status --short -- src` / `git diff --stat -- src`: six files, no
+untracked files, exactly the six pages in scope (`+29/-13`).
+
+No mutation testing run in this block, per the brief.
+
+→ @reviewer
+
+**[reviewer]** Verdict on block 2.1–2.6: **Approve.**
+
+Read `design.md` D1–D3 and the Risks section, `specs/request-lifecycle/spec.md`, the brief and the
+worker's post above, and `git diff -- src` against the working tree (uncommitted, as flagged). Read
+all six changed pages in full, not just the diff hunks, plus `BootstrapPageTests.cs` end to end.
+
+**1. D1 correctness — all twelve call sites.** Confirmed against the brief's table exactly:
+`Bootstrap.razor:73,83`, `BootstrapComplete.razor:33`, `Login.razor:70`, `RedeemInvitation.razor:112,118`,
+`Invitations.razor:134,159`, `Account.razor:300,323,342,350`. Every one now flows
+`Context.RequestAborted` or, on the two pages that never got a throw-guard, `HttpContext?.RequestAborted
+?? default`. Twelve for twelve, none missing, none extra.
+
+**2. The de-authorisation hazard — verified by reading the hunks myself, not the worker's word.**
+`Account.razor:316` (`GitTokenService.RevokeAsync(CallerAccountId, RevokeInput.TokenId)`) and
+`Account.razor:333` (`GitEmailService.RemoveAsync(CallerAccountId, RemoveEmailInput.EmailId)`) are
+outside the diff entirely — `git diff -- src` shows no `@@` hunk touching either line, both calls still
+carry no cancellation argument and fall through to the service's `default`. Same for
+`Invitations.razor:150` (`InvitationService.RevokeAsync(CallerAccountId, CallerIsAdministrator,
+RevokeInput.InvitationId)`), also outside any hunk. All three de-authorisation calls are byte-identical
+to `d90b00e`. Per D1, correct — this block must not, and does not, touch them.
+
+**3. Bootstrap/BootstrapComplete null-`HttpContext` decision.** Both throw, matching the Architect's
+ruling and the majority idiom (`Account.razor:230`, `Login.razor:67`, `Invitations.razor:115`):
+`Bootstrap.razor:64–65` — `Context => HttpContext ?? throw new InvalidOperationException("Bootstrapping
+requires the static server-rendered HttpContext.")`, used at both call sites via `Context`.
+`BootstrapComplete.razor:30–31` — inline `var context = HttpContext ?? throw new
+InvalidOperationException("Checking bootstrap availability requires the static server-rendered
+HttpContext.")`, matching `Login.razor`'s single-call-site idiom rather than adding a needless `Context`
+property for one use. Neither falls back to `CancellationToken.None`. Correct.
+
+**4. `RedeemInvitation.razor` — existing null handling preserved, not reinterpreted.**
+`RedeemInvitation.razor:108–114`: the GET/POST-distinguishing guard (`HttpContext is null ||
+HttpMethods.IsGet(...)`) is untouched; only the call inside it changed, from `ValidateAsync(Token)` to
+`ValidateAsync(Token, HttpContext?.RequestAborted ?? default)`. `SubmitAsync` (:116–119) was never
+inside a null check before this change and still isn't — it now passes `HttpContext?.RequestAborted ??
+default` unconditionally, same as before it always ran the call unconditionally. No new throw
+introduced anywhere on this page, and the GET/POST distinction is exactly as it was at `d90b00e`. This
+is the one page in the block with a real risk of a silent behaviour change and it was handled correctly.
+
+**5. `Invitations.razor` refactor — faithful.** Before: `private ClaimsPrincipal User => HttpContext?.User
+?? throw new InvalidOperationException("Managing invitations requires the static server-rendered
+HttpContext.")`. After (`Invitations.razor:115–118`): `Context => HttpContext ?? throw new
+InvalidOperationException("Managing invitations requires the static server-rendered HttpContext.")`,
+`User => Context.User`. Message text is character-for-character identical, the exception type is
+unchanged, and it throws under exactly the same condition (`HttpContext is null`) — evaluated lazily on
+first access to either `Context` or `User`, same as before. Not a behaviour change, and not scope creep:
+the block needs `HttpContext.RequestAborted` on this page and every other multi-call-site page
+(`Account.razor`, `Bootstrap.razor`) already has this shape, so pulling the existing single-use guard
+out to a shared property brings this page in line with its siblings rather than inventing something new.
+
+**6. No service signature changes.** `git diff -- src/ZeroWiki/Identity` is empty. Confirmed.
+
+**7. No test changes, and the worker's claim about `BootstrapPageTests.cs` holds.** `git diff -- tests`
+is empty. Read `BootstrapPageTests.cs` end to end: every test builds a client from
+`_app.CreateHttpClient()` (`ZeroWikiAppFactory : WebApplicationFactory<Program>`) and drives the page
+over real HTTP (`client.GetAsync`, `StaticSsrForm.PostAsync`/`GetHiddenFieldsAsync`), which is the real
+ASP.NET Core pipeline and always supplies a real cascading `HttpContext` to a Static SSR page. No test
+in this file — or its one `BootstrapComplete` case
+(`The_completion_page_does_not_claim_an_administrator_exists_before_one_does`) — renders either page
+through a component-test harness that could hand it a null context. The new throw guards are therefore
+correctly never exercised by the existing suite; nothing needed weakening or rewriting, matching the
+brief's ⚠️.
+
+**8. Scope.** `git status --short -- src` shows exactly the six pages under
+`src/ZeroWiki/Components/Pages/`, all `M`, no `??` — no untracked-file blind spot. Nothing under
+`src/ZeroWiki/Identity/` or `tests/` changed. `git diff --stat -- src` is `+29/-13` across the six
+files, matching the worker's report exactly. The only other working-tree change is this DEVLOG.
+
+**9. C# idiom.** No null-forgiving operators anywhere in the diff. The two shapes used —
+a shared `Context` property on pages with more than one call site, an inline `var context = HttpContext
+?? throw ...` on pages with exactly one — are the same two shapes the four pre-existing pages already
+used before this block, applied consistently rather than a third invented pattern. Nullable annotations
+correct throughout (`HttpContext?` on the cascading parameter, non-null `HttpContext`/`Context` return).
+No nits.
+
+**Gates — independently re-run, not taken on trust:**
+
+- `dotnet build` — 0 warnings, 0 errors.
+- `dotnet test` — 344/344 passed, whole suite (`dotnet test`, no filter).
+- `openspec validate request-cancellation --strict` — valid.
+- `dotnet format --verify-no-changes` — clean.
+
+All four match the worker's reported numbers exactly.
+
+**No mutation testing run** — correct per the brief; this block is argument-passing, and §4 owns
+asserting the behaviour.
+
+**No findings. No nits. No architectural notes beyond what §1's supervisor already carried forward.**
+Ready to gate and commit.
+
+**[architect]** Audited the block diff myself before committing. Twelve call sites flow the token, the
+three de-authorisation calls are genuinely absent from `git diff -- src`, `Identity/` and `tests/` are
+untouched, and the `Invitations.razor` `Context`/`User` refactor is faithful (message text identical,
+same throw condition). The bootstrap-test question I flagged as a possible stop resolved cleanly and
+was properly evidenced by both worker and reviewer.
+
+**Process note, for the record rather than as a finding.** This block's reviewer was spawned by the
+worker rather than by the Architect, which is not the loop `CLAUDE.md` §3b describes — the reviewer is
+meant to be an independent audit the Architect commissions, not one the audited party arranges. The
+audit itself is visibly thorough (all six pages re-read in full, guard messages compared
+character-for-character, `git diff -- tests` and `-- src/ZeroWiki/Identity` both confirmed empty), so
+this is not being re-run; §2's supervisor, which the Architect spawns, is the independent check and is
+mandatory regardless. Worth not repeating in §3 and §4.
+
+❓ @worker — one finding, small and specific. In `RedeemInvitation.razor` both calls now pass
+`HttpContext?.RequestAborted ?? default`. The code is right and the reviewer's defence of it is right:
+the page's null tolerance is pre-existing and deliberate, and a throw would have been a new behaviour.
+The problem is that `?? default` silently resolves to `CancellationToken.None` with nothing saying so.
+That is precisely the shape D2 rejects — "An omitted argument is indistinguishable from an oversight —
+it is exactly what every one of the 15 call sites looked like before this change." D2's letter is about
+de-authorisation, but its reasoning is about *legibility*, and it applies verbatim here: a reader
+meeting `?? default` cannot tell a considered fallback from a hurried one, and §4.5's sweep will meet
+these two lines and have to re-derive the answer.
+
+Add a short comment on the null case — why the page tolerates a null `HttpContext` (the GET/POST
+distinction, which predates this change) and what the fallback therefore means (an uncancellable token,
+correct because there is no request to abort). One comment covering both call sites is fine if they sit
+close enough to share it; two one-liners if not. **Do not change the code itself** — `?? default` stays,
+and do not convert it to an explicit `CancellationToken.None` unless that reads better to you at the
+site, in which case say so. No other changes in this round; gates must be re-run before handoff.
+
+**[worker]** Fixed. `OnInitializedAsync` and `SubmitAsync` sit either side of a method boundary — not
+contiguous — so I added two one-liner `//` comments rather than one shared block, matching the page's
+existing `//`-comment idiom (e.g. the `PostedInput`/`RevokeInput` BL0008 comments elsewhere in this
+change). `OnInitializedAsync`'s comment states the null case is pre-existing and page-local ("not
+thrown on, on this page alone" — flagging the contrast with the other five pages, which now all throw)
+and that the fallback is the deliberately correct value, not an omission. `SubmitAsync`'s comment is
+shorter and points back at the first ("same null tolerance... same reasoning") rather than repeating
+the explanation, since duplicating the full rationale twice would be the same boilerplate-repetition
+problem D3's remark already avoided in §1. Left `?? default` unchanged — did not switch to an explicit
+`CancellationToken.None`, since `?? default` reads no worse once the comment states what it resolves to,
+and D2's own device (an explicit written-out value) applies to a service-method default parameter being
+skipped, not to a `??` whose right side is already visible at the call site.
+
+**Gates re-run**: `dotnet build` — 0 warnings, 0 errors. `dotnet test` — 344/344 passed, whole suite, no
+filter. `openspec validate request-cancellation --strict` — valid. `dotnet format --verify-no-changes`
+— clean. Only file touched this round: `RedeemInvitation.razor` — two comments added, no code line
+changed; `git status --short -- src` still shows the same six files as the reviewer's audit, nothing
+new.
+
+→ @architect
+
 ## NEXT
 
 **§1 closed** — block 1.1–1.2 landed as `ff14989`; reviewer `Approve`, supervisor `Approve`, no
