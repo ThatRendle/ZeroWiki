@@ -29,14 +29,23 @@ This is the whole design, and the reason this change is not a five-minute find-a
 waiting for the answer. There is no state to leave half-finished. This case is unambiguous.
 
 **Creates** (`CreateFirstAdministratorAsync`, `RedeemAsync`, both `IssueAsync`, `AddAsync`) — flow the
-token. Every one is transactional, so cancelling rolls back and *nothing happens*: the invitation stays
-valid, the bootstrap stays open, no token is issued. The user reconnects and retries. Rollback is the
-fail-safe direction for a create.
+token. The five split into two groups, not one:
 
-It is actively better than the alternative for `GitTokenService.IssueAsync`, which is shown-once: a
-token committed to the database while the client is gone is a credential the owner can never see and
-never use, sitting in their account looking valid. Cancelling before commit is precisely the outcome
-you want.
+- `BootstrapService.CreateFirstAdministratorAsync` and `InvitationService.RedeemAsync` are
+  transactional (`SaveChangesAsync` then `CommitAsync`, inside `await using (transaction)`), so a
+  cancellation landing anywhere up to and including the commit rolls back and *nothing happens*: the
+  bootstrap stays open, the invitation stays redeemable. The user reconnects and retries.
+- `InvitationService.IssueAsync`, `GitTokenService.IssueAsync`, and `GitEmailService.AddAsync` are
+  each a bare `Add` followed by `SaveChangesAsync(ct)` — there is no transaction and no check after
+  the write. The guarantee for these three is narrower: cancellation observed *before* the write
+  leaves nothing, exactly like the other two; cancellation observed *after* the write has committed
+  does not undo it. The row exists whether or not the client is still there to see it.
+
+That narrower guarantee is exactly why `GitTokenService.IssueAsync`'s shown-once nature matters: a
+token that commits while the client is gone is a credential the owner can never see and never use,
+sitting in their account looking valid — the case the cancellation check is trying to prevent, and the
+case that remains possible in the post-write window for this method. It is a reason the guarantee's
+narrowness is worth knowing, not a claim that the guarantee is already total.
 
 **De-authorisation** (`GitTokenService.RevokeAsync`, `InvitationService.RevokeAsync`,
 `GitEmailService.RemoveAsync`) — **do not flow the request's token.** The fail-safe direction inverts

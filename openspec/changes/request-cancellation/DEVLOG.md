@@ -2176,6 +2176,482 @@ re-read that logic in the missing pass's place and found it correct, so the code
 in the durable record, which is what this post repairs. Noting it plainly because a DEVLOG that quietly
 omits a skipped gate is worse than one that records the skip.
 
+**[architect]** Product Owner rulings on F1 and F2. **Remediation block for §4** — per §3c.3 it takes
+**no new task numbers and ticks nothing**; every box in the section is already ticked. The findings and
+the fix are the record.
+
+- **F1 → correct `design.md` and add the missing coverage.** The three creates are **not** to be made
+  transactional; production behaviour stays as it is. D1's false sentence gets corrected to describe
+  what the code actually does, and the three untested creates get tests asserting what is genuinely
+  true of them.
+- **F2 → add the check before the verify.** A one-line `src` change so a client that disconnected
+  during the lookup does not cost a full 64 MiB Argon2id run. **This is a deliberate scope expansion
+  beyond the proposal's Impact, approved by the Product Owner** — recorded here because a later reader
+  will otherwise find a `src/ZeroWiki/Identity/LoginService.cs` edit that the proposal does not cover.
+
+**[architect]** Brief — remediation block (§4, F1 + F2) → @worker.
+
+**F1a — correct `design.md`'s D1.** It currently claims of the five creates: *"Every one is
+transactional, so cancelling rolls back and nothing happens."* That is false for three of them.
+`InvitationService.IssueAsync`, `GitTokenService.IssueAsync` and `GitEmailService.AddAsync` are each a
+bare `Add` + `SaveChangesAsync(ct)` with **no post-write token check**, so once the INSERT commits, a
+later cancellation does not remove the row. Rewrite the passage to state the split accurately: two
+creates (`BootstrapService.CreateFirstAdministratorAsync`, `InvitationService.RedeemAsync`) are
+transactional and roll back; three are not, and for those the guarantee is narrower — cancellation
+observed *before* the write leaves nothing, cancellation after the commit does not undo it.
+
+**Do not weaken D1's actual decision while correcting its factual claim.** The read/create-vs-
+de-authorisation split is unchanged and still right; what was wrong is one sentence's description of
+the creates' mechanics. Keep the `GitTokenService.IssueAsync` shown-once argument but state it
+honestly — it is now a *reason the narrower guarantee matters*, not a claim that the guarantee is
+already total.
+
+**F1b — cover the three untested creates.** One test each for `InvitationService.IssueAsync`,
+`GitTokenService.IssueAsync`, `GitEmailService.AddAsync`. **Assert what is true, not what we wish were
+true.** These services honour their token before the write, so an already-cancelled token throws and
+leaves no row — assert that, against the store. **Do not write a test that implies the post-commit
+window is covered when it is not.** If you judge that the honest thing is also to pin the *limit* —
+a test showing a post-commit cancellation does **not** remove the row — propose it in the DEVLOG with
+your reasoning rather than just adding it; that test documents a weakness deliberately and I want the
+decision visible, not buried in a diff.
+
+**F2 — `LoginService.VerifyCredentialsAsync`, one line, and a hazard attached to it.**
+
+The only cancellable await is the `SingleOrDefaultAsync` at `:59`; `passwordHasher.Verify` at `:66` is
+CPU-bound and synchronous, so it cannot be interrupted — only declined. Add a cancellation check
+immediately before `:66` so a client that vanished during the lookup does not buy a full Argon2id run.
+
+**The hazard — do not erode the timing-attack defence.** `:61–64` deliberately verifies against
+`DummyPasswordHash` when no account matches, so response time does not reveal whether a username
+exists. Your check must sit where it fires **identically for both branches** — before `:66`, outside
+any `candidate is null` conditional. A check placed inside a branch, or after the branch-dependent
+work, would make cancellation timing leak account existence, which trades a CPU saving for an
+enumeration oracle. Existing test `The_dummy_hash_is_a_constant_and_is_not_derived_per_request` guards
+part of this; it must stay green, and so must every other `LoginServiceTests` case.
+
+Add a test that a cancellation observed after the lookup but before the verify throws rather than
+hashing. State in the DEVLOG how your test distinguishes "threw before verifying" from "threw at some
+point" — a test that cannot tell those apart does not pin F2's fix.
+
+**Scope.** `design.md`, `tests/ZeroWiki.Tests`, and exactly one production file:
+`src/ZeroWiki/Identity/LoginService.cs`. **No other `src` file.** Do not touch the three create
+services — the PO ruled explicitly against making them transactional. Do not touch `spec.md`; no
+requirement changed. Do not tidy N4's `default` spellings.
+
+**Constraints.**
+
+- **Do not spawn a `reviewer` or any other agent.** Handoff is `→ @reviewer` here.
+- **No mutation testing.** Both fixes are directly assertable.
+- **Do not commit. Do not tick boxes** — a remediation block ticks nothing.
+- **`git diff -- src` will be non-empty this time** (one file, by design). Verify before handing off
+  that it contains `LoginService.cs` **and nothing else**, and run `git status --short -- src`
+  alongside it, since the diff is blind to untracked files.
+- Post to this DEVLOG as `**[worker]**`, referencing `F1/F2`.
+
+**Done-gates** — all four, actual output: `dotnet build`; `dotnet test` **full suite, no filter**
+(currently 379 — report the new total); `openspec validate request-cancellation --strict`;
+`dotnet format --verify-no-changes`.
+
+**[worker]** F1/F2 remediation done. `git diff -- src` is exactly `LoginService.cs`, `+8/-0`, nothing
+else; `git status --short -- src` confirms — no untracked file in `src`.
+
+**F1a — `design.md` D1 corrected.** Replaced the false "every one is transactional" sentence with the
+real split: `CreateFirstAdministratorAsync`/`RedeemAsync` are transactional and roll back through
+commit; `InvitationService.IssueAsync`, `GitTokenService.IssueAsync`, `GitEmailService.AddAsync` are a
+bare `Add` + `SaveChangesAsync(ct)` with no post-write check, so their guarantee is narrower —
+pre-write cancellation leaves nothing, post-commit cancellation does not undo it. Kept the
+shown-once argument for `GitTokenService.IssueAsync` but reframed it as the reason the narrower
+guarantee matters (a token that commits while the client is gone is exactly the outcome the check is
+trying to prevent, and remains possible in the post-write window for this method) rather than a claim
+the guarantee is total. The read/create-vs-de-authorisation split itself is untouched — only the one
+sentence's mechanics were wrong.
+
+**F1b — three tests, one per untested create, in each service's existing test file, matching the
+`Revoking_under_an_already_cancelled_token_throws` / `Removing_under_an_already_cancelled_token_throws`
+naming and shape already in these files:**
+
+- `InvitationServiceTests.Issuing_under_an_already_cancelled_token_throws_and_leaves_no_invitation` —
+  pre-cancelled `IssueAsync` throws `OperationCanceledException`, asserts against the store
+  (`_db.Invitations` empty), not the discarded return value.
+- `GitTokenServiceTests.Issuing_under_an_already_cancelled_token_throws_and_leaves_no_token` — same
+  shape against `_db.GitTokens`.
+- `GitEmailServiceTests.Adding_under_an_already_cancelled_token_throws_and_leaves_no_email` — same
+  shape, asserted via `_service.ListAsync` (no `GitEmails` `DbSet` direct-query precedent in that file;
+  `ListAsync` is the store-facing read the file already uses elsewhere).
+
+Each test's comment says plainly what it does and does not cover: the pre-write window only, nothing
+about a cancellation observed after the write commits. Traced each method by hand first to confirm the
+pre-cancelled token throws where claimed: `InvitationService.IssueAsync`'s only cancellable await is
+`SaveChangesAsync` itself (no read precedes it, but EF checks the token before issuing SQL, so nothing
+is written); `GitTokenService.IssueAsync` is the same shape; `GitEmailService.AddAsync`'s first
+cancellable await is `FindByEmailAsync`'s uniqueness read, ahead of the insert.
+
+**Proposing, not adding, a test that pins the post-commit limit.** `CancelAfterSaveInterceptor`
+(`tests/ZeroWiki.Tests/Identity/CancelAfterSaveInterceptor.cs`, from block A) cancels its linked token
+the instant `SaveChangesAsync` finishes writing. For a *transactional* create that lands the
+cancellation before `CommitAsync` and proves the rollback. For `GitTokenService.IssueAsync` — no
+`CommitAsync` follows `SaveChangesAsync` at all — registering the same interceptor would cancel the
+token only *after* SQLite's implicit autocommit for that `SaveChangesAsync` call has already durably
+committed the row. The call would therefore return normally (`IssuedGitToken`, no throw), and the row
+would still be present in `_db.GitTokens` afterward. I'd propose this as
+`GitTokenServiceTests.A_cancellation_observed_after_the_write_commits_does_not_remove_the_token` (the
+service D1 singles out for the shown-once argument, so it's the sharpest place to make the limit
+concrete), asserting no throw and the row present — the mirror image of the F1b test above, deliberately
+documenting the weakness rather than a regression. Not added: the brief asked for a proposal with
+reasoning here, not code, so this is that proposal — Architect/Product Owner call on whether to land it.
+
+**F2 — one line in `LoginService.cs`, placed before `passwordHasher.CanVerify`'s branch, not after.**
+
+```csharp
+var storedHashIsUsable = candidate is not null && passwordHasher.CanVerify(candidate.PasswordHash);
+var hashToVerify = storedHashIsUsable && candidate is not null
+    ? candidate.PasswordHash
+    : DummyPasswordHash;
+
+cancellationToken.ThrowIfCancellationRequested();
+
+var verified = passwordHasher.Verify(password, hashToVerify);
+```
+
+**Placement, and why it cannot leak account existence.** The check sits after `hashToVerify` is
+computed — the point where the known-username and unknown-username paths have already converged onto
+one value — and before `Verify`, with no `candidate is null` branch anywhere between the lookup and
+this line. Both paths reach the exact same line of code doing the exact same thing before either one
+does anything that takes a different amount of time. There is no branch for a check placed *inside* to
+diverge by, because both branches already merged upstream of it. Placing it later (after `Verify`)
+would have satisfied the letter of "before the hash" only if I'd misread the line numbers; placing it
+inside the `storedHashIsUsable` ternary, or inside either of the two `if (candidate ...)` blocks further
+down, would have been the actual hazard the brief warned about — this sits outside all of them.
+
+**F2 test — `LoginServiceTests.A_cancellation_observed_after_the_lookup_throws_before_verifying`,**
+plus a new test-only `IPasswordHasher` decorator,
+`tests/ZeroWiki.Tests/Identity/CancelOnCanVerifyPasswordHasher.cs`. Its `CanVerify` cancels a linked
+`CancellationTokenSource` and delegates; its `Verify` increments a call counter and delegates. The test
+adds one account, swaps in this hasher, calls `VerifyCredentialsAsync` with the linked token, and
+asserts both the throw **and** `hasher.VerifyCallCount == 0`.
+
+**How this distinguishes "threw before verifying" from "threw at some point"**, since a bare
+`Assert.ThrowsAnyAsync<OperationCanceledException>` cannot: `VerifyCredentialsAsync` always calls
+`CanVerify` strictly after the account lookup completes and strictly before `Verify` runs (`CanVerify`
+feeds `hashToVerify`, which `Verify` then consumes) — so cancelling inside `CanVerify` lands the
+cancellation in exactly that window on every run, not merely "somewhere before the method returns". If
+the new check were missing entirely, the call would *still* throw eventually — either from
+`SingleOrDefaultAsync` re-observing the (by-then-cancelled) token on a subsequent enumeration, or not at
+all, since nothing downstream re-checks it — so a throw-only assertion would not have caught F2's actual
+bug. `VerifyCallCount == 0` is the part that can only be true if the throw happened *before* the Argon2id
+call specifically, which is the property F2 exists to guarantee. Confirmed by tracing: with the fix
+removed (checked by hand, not by mutating `src`, since the brief caps this block to no mutation testing),
+`Verify` would run to completion and `VerifyCallCount` would be `1`, failing the assertion — so the test
+has the discriminating power the brief asked for.
+
+**The dummy-hash timing-attack test stays green, and every other `LoginServiceTests` case does too** —
+confirmed by the full suite run below, not merely by inspection.
+
+**Scope.** Read `design.md`, `tests/ZeroWiki.Tests`, and exactly one production file. Did not touch the
+three create services (`InvitationService.cs`, `GitTokenService.cs`, `GitEmailService.cs`) — the
+Product Owner ruled explicitly against making them transactional, and F1b's tests assert the store, not
+`src`. Did not touch `spec.md`. Did not touch `RedeemInvitation.razor`'s N4 `default` spellings.
+
+**Did not spawn a `reviewer` or any other agent.** No mutation testing run — both fixes are directly
+assertable, per the brief. Did not commit. Did not tick any boxes — this is a remediation block, and
+every box in §4 is already ticked.
+
+**Gates**:
+
+- `dotnet build` — 0 warnings, 0 errors.
+- `dotnet test` — **383/383 passed**, full suite, no filter (was 379; +4 — the three F1b tests and one
+  F2 test).
+- `openspec validate request-cancellation --strict` — valid.
+- `dotnet format --verify-no-changes` — clean (exit 0, no output).
+
+`git diff -- src` is exactly `src/ZeroWiki/Identity/LoginService.cs`, `+8/-0`, nothing else.
+`git status --short -- src` shows only that file as `M`. Also touched (in scope):
+`openspec/changes/request-cancellation/design.md`,
+`tests/ZeroWiki.Tests/Identity/{InvitationServiceTests.cs,GitTokenServiceTests.cs,GitEmailServiceTests.cs,LoginServiceTests.cs}`,
+and one new untracked file, `tests/ZeroWiki.Tests/Identity/CancelOnCanVerifyPasswordHasher.cs`.
+
+→ @reviewer
+
+**[reviewer]** Verdict on the §4 remediation block (F1/F2): **Approve, with one nit worth recording
+in `## NEXT`.**
+
+Re-ran all four gates myself, not on trust: `dotnet build` 0/0; `dotnet test` **383/383**, full suite,
+no filter; `openspec validate request-cancellation --strict` valid; `dotnet format --verify-no-changes`
+clean (exit 0). `git diff --stat -- src` is exactly `LoginService.cs`, `+8/-0`; `git status --short --
+src` shows only that file as `M`. `git diff -- openspec/changes/request-cancellation/specs` and `git
+diff -- openspec/specs` are both empty — `spec.md` genuinely untouched. `git diff -- src/ZeroWiki/
+Components/Pages/RedeemInvitation.razor` is empty — N4's two `default` spellings correctly left alone.
+Read `CancelOnCanVerifyPasswordHasher.cs` directly (new, untracked, 39 lines) rather than trusting the
+`??`, per CLAUDE.md's new-file hazard.
+
+**1. The timing-oracle argument — verified, not merely accepted.**
+
+Traced `LoginService.cs:49–74` in full. `hashToVerify` (`:62–64`) is the point where the known- and
+unknown-username paths converge onto one value; `ThrowIfCancellationRequested()` (`:70`) sits after
+that merge and before `Verify` (`:74`), outside every `candidate is null` conditional — confirmed by
+reading the method top to bottom, not by trusting the worker's comment.
+
+The asymmetry is real: `storedHashIsUsable` (`:61`) short-circuits, so `CanVerify` — a `TryParse` over
+a `$`-delimited string, no crypto (`Argon2idPasswordHasher.cs:110,139–181`) — runs only when
+`candidate is not null`. That is genuine, sub-microsecond, extra work on the known-username path
+before the throw point.
+
+**Why it is still not an oracle: the only caller threads `context.RequestAborted`
+(`Login.razor:70`), not a generic timeout token.** `HttpContext.RequestAborted` fires on client
+disconnect (or server shutdown), so the *only* way to land a request on this new throw path is for the
+client to have already closed the connection — at which point there is no HTTP response for the
+attacker to receive or time. A remote timing oracle needs an observable response; this path
+categorically produces none. I checked the two side-channels worth checking and both are clean:
+
+- **No differential log line.** `VerifyCredentialsAsync` has no `try`/`catch` around the new check or
+  around `Verify`; `OperationCanceledException` propagates unhandled out of `Login.razor`'s
+  `SubmitAsync`, with no logging call anywhere on that path. The existing `LogInformation`/`LogError`
+  calls (`:78–98`) sit *after* the throw point and are never reached once cancelled, on either branch —
+  so no log entry distinguishes "cancelled after a known username" from "cancelled after an unknown
+  one."
+- **No HTTP/2-multiplexing angle.** Aborting one request stream while keeping the TCP connection open
+  and timing a *second* request on the same connection would only surface thread-pool/GC-level noise
+  common to every async operation in the app, not a signal specific to this check — and that generic
+  ambient noise already exists on every cancellable read/create §2 added, not something this block
+  introduces.
+
+**Conclusion: refutation attempted, argument holds.** Not an oracle, for the standard remote-timing
+threat model, and specifically because `RequestAborted` (not a timeout token) gates the whole path.
+
+**`DummyPasswordHash` defence on the non-cancelled path — confirmed intact.** Read
+`Every_rejection_performs_exactly_one_verification` (`LoginServiceTests.cs:96–129`) and
+`The_dummy_hash_is_a_constant_and_is_not_derived_per_request` (`:144–152`) — both are outside the
+diff (`git diff` shows no touch to either), both still pass under the 383/383 run above, and both
+still assert the same constant, same call count as before F2. F2 sits strictly upstream of `Verify`
+and does not change what `Verify` is called with or how often on the non-cancelled path.
+
+**2. Does the new test cover the fix, or only half of it? Confirmed: only the known-username half —
+and the gap has real teeth, but closing it costs more than this block should spend.**
+
+`CancelOnCanVerifyPasswordHasher.CanVerify` (`CancelOnCanVerifyPasswordHasher.cs:26–31`) cancels on
+entry, but `CanVerify` is only invoked when `candidate is not null` (`LoginService.cs:61`). The one
+new test (`LoginServiceTests.cs:229–248`) adds an account first, so it exercises the known-username
+branch exclusively. The unknown-username branch — where `hashToVerify` resolves to `DummyPasswordHash`
+without ever calling `CanVerify` — has no dedicated cancellation test.
+
+I worked through whether this is a real gap or a harmless one, and it is real: **a regression that
+moved the check inside `if (candidate is not null)` — exactly the hazard the brief warned against —
+would slip past the current suite entirely.** The known-username test would still pass (the check
+still fires on that branch); nothing else in `LoginServiceTests.cs` asserts cancellation behaviour on
+the unknown-username branch at all. That is the one regression this test exists to guard against, and
+half of it is unguarded.
+
+I also checked whether a cheap second test could close it, and it can't, for the same reason `VerifyCallCount`
+was needed in the first place: the only cancellable operation before the check is
+`SingleOrDefaultAsync` (`:59`) itself. A plain pre-cancelled token on an unknown username throws
+*there*, before ever reaching `:70` — indistinguishable from "no fix at all" and provably so (delete
+`:70` and that hypothetical test would still pass). A discriminating test for this branch needs a seam
+*after* the query returns and *before* the branch decision — an EF query/reader-level interceptor,
+not a password-hasher decorator, since `CanVerify` is never invoked on this branch. That is a
+materially heavier instrument than this remediation block's one-line fix warrants, and CLAUDE.md's
+proportionality direction ("ZeroWiki is a wiki for a small trusted group, not a system that warrants
+unbounded verification") points at not building it here.
+
+**Recommendation: not a blocker for this block; record it in `## NEXT` as a known coverage gap.** The
+production code is unconditional by direct inspection (one line, no enclosing branch — I traced it,
+not merely trusted the comment), which is the property that actually prevents the oracle; the test
+suite's job is to be a regression guard against someone later making it conditional, and today that
+guard only covers one of the two branches it should. Worth a follow-up test using a query-level
+interceptor if this file is touched again, not worth reopening this block for.
+
+**3. F1a — `design.md`'s corrected D1: accurate, and the decision itself is preserved.**
+
+Traced all five methods directly (not re-derived from the worker's report):
+
+- `BootstrapService.CreateFirstAdministratorAsync` (`BootstrapService.cs:104–125`) —
+  `SaveChangesAsync(ct)` then `await transaction.CommitAsync(ct)` inside `await using (transaction)`.
+  Transactional, confirmed.
+- `InvitationService.RedeemAsync` (`InvitationService.cs:316–318`) — same shape,
+  `SaveChangesAsync(ct)` then `await writeLock.CommitAsync(ct)`. Transactional, confirmed.
+- `InvitationService.IssueAsync` (`:38–61`) — `db.Invitations.Add(...)` then bare
+  `SaveChangesAsync(ct)`, nothing else. No transaction, confirmed.
+- `GitTokenService.IssueAsync` (`GitTokenService.cs:20–36`) — same bare-`Add`-plus-`SaveChangesAsync`
+  shape. No transaction, confirmed.
+- `GitEmailService.AddAsync` (`GitEmailService.cs:61–90`) — a uniqueness read
+  (`FindByEmailAsync`) then `Add` then `SaveChangesAsync(ct)` inside a `try`/`catch DbUpdateException`
+  (a race guard, not a rollback transaction). No transaction, confirmed.
+
+The rewritten passage states this split correctly and does not overreach in either direction — it
+still says the pre-write window is safe for all five, and correctly narrows the claim only for the
+post-write window on the three non-transactional ones. **The read/create-vs-de-authorisation decision
+itself is untouched**: D1's actual governing rule (flow the token into reads/creates, never into
+de-authorisation) is not what was wrong, and the correction doesn't touch it — only the one factual
+sentence about transactionality changed, exactly as the brief asked. The `GitTokenService.IssueAsync`
+shown-once argument survives, correctly reframed from "this is already covered" to "this is why the
+narrower guarantee matters" — a real downgrade of a claim, not a softening of the decision.
+
+**4. F1b — three tests, all store-level, none overclaiming.**
+
+Traced the first cancellable await in each of the three methods by hand before trusting the worker's
+claim:
+
+- `InvitationService.IssueAsync` — no read precedes the `Add`; `SaveChangesAsync(ct)` is the only
+  cancellable operation, and EF Core checks the token before issuing SQL, so a pre-cancelled token
+  throws before the INSERT. Confirmed against `InvitationServiceTests.cs:280–298`, which asserts
+  `Assert.Empty(await _db.Invitations.AsNoTracking().ToListAsync())` — the store, not the discarded
+  exception.
+- `GitTokenService.IssueAsync` — identical shape. Confirmed against `GitTokenServiceTests.cs:178–196`,
+  asserting `Assert.Empty(await _db.GitTokens.AsNoTracking().ToListAsync())`.
+- `GitEmailService.AddAsync` — `FindByEmailAsync`'s uniqueness read precedes the `Add`, so the
+  pre-cancelled token throws there, before the insert is even constructed. Confirmed against
+  `GitEmailServiceTests.cs:152–170`, asserting `Assert.Empty(await _service.ListAsync(alice.Id))` — no
+  `GitEmails` `DbSet` queried directly elsewhere in this file, so routing through the service's own
+  read method matches the file's existing convention rather than inventing a new one.
+
+All three comments state plainly that they cover the pre-write window only and say nothing about a
+cancellation observed after the write commits — none implies coverage it doesn't have. **None of the
+three touches `src`** beyond the one permitted file, confirmed by the `git diff --stat -- src` above.
+
+**5. F2 placement and test — re-confirmed independently.** `LoginService.cs:70` sits exactly where
+the brief demanded: after the branch merge, before `Verify`. `A_cancellation_observed_after_the_lookup_throws_before_verifying`
+(`LoginServiceTests.cs:228–248`) asserts both the throw *and* `hasher.VerifyCallCount == 0`, and I
+worked through why that pair — not the throw alone — is what proves "threw before verifying" rather
+than "threw at some point": traced the call graph and confirmed `CanVerify` always runs strictly
+between the account lookup and `Verify` (it feeds `hashToVerify`, which `Verify` then consumes), so
+cancelling inside it lands the cancellation in exactly that window on every run. If `:70` were deleted,
+`SingleOrDefaultAsync` (`:59`) has already completed by the time `CanVerify` cancels the token — the
+next cancellation-observing point would be `Verify` itself, which does not check its token (it's
+CPU-bound and synchronous), so the call would run to completion, `Verify` would execute once, and
+`VerifyCallCount` would read `1`, failing the assertion. Confirmed by reading `Verify`
+(`Argon2idPasswordHasher.cs:72–108`) directly — it takes no `CancellationToken` parameter at all, so
+there is no other mechanism that could make a deleted `:70` still produce a `0` count. **Not vacuous.**
+
+**6. Standard lens.** No sync-over-async, no `async void`, `CancellationToken`s threaded correctly
+throughout the new lines, no `IDisposable` leaks (`using var cts` in the new test), nullable enabled
+and no `!` anywhere in the diff. `CancelOnCanVerifyPasswordHasher` is `sealed`, file-scoped namespace,
+file name matches the type, primary-constructor style matching the codebase's existing convention
+(`RecordingPasswordHasher`, `CancelAfterSaveInterceptor`). Test naming matches each file's existing
+sentence-style convention. No auth/crypto hazard beyond what's addressed above; no enumeration
+regression on the non-cancelled path (confirmed §1 above); Argon2id parameters and the constant-dummy
+mechanism are untouched by this diff.
+
+**On the proposed post-commit-limit test (not added, proposed in-thread) — recommend taking it.**
+`GitTokenServiceTests.A_cancellation_observed_after_the_write_commits_does_not_remove_the_token`, using
+the existing `CancelAfterSaveInterceptor` from block A against `GitTokenService.IssueAsync`, asserting
+no throw and the row present, is worth having rather than noise:
+
+- It converts F1a's corrected prose into an executable, regression-catching fact, in the same spirit
+  CLAUDE.md already endorses for a deliberately-kept surviving mutant ("record it deliberately with
+  the reason"): this is a deliberately *accepted* narrower guarantee, and a test is the durable record
+  of that acceptance, not merely the DEVLOG post.
+- It's cheap: the interceptor already exists, already proven reachable and non-leaking by two review
+  passes in block A, and `GitTokenService.IssueAsync`'s bare-`Add`-plus-`SaveChangesAsync` shape means
+  no new mechanism is needed — SQLite's implicit per-statement autocommit outside an explicit
+  transaction is deterministic, so the test would not be flaky.
+- It's the sharpest of the three untested creates to pin, per the worker's own reasoning — it's the
+  one D1 singles out for the shown-once argument, so a future refactor that accidentally added
+  transactionality (silently strengthening the guarantee, which would be *welcome* but should be
+  *noticed*) or one that broke the pre-write throw (weakening it further, which would not be welcome)
+  would both show up here.
+- Not noise: it doesn't duplicate F1b's three new tests (those pin the pre-write window; this pins the
+  post-write window — the two together are what "narrower guarantee" actually means operationally),
+  and it doesn't touch `src`.
+
+I'd take it as a small follow-on to this remediation, or fold it into whatever next touches
+`GitTokenService.cs`; either way, record the decision in `## NEXT` rather than let the proposal expire
+silently in this thread.
+
+**No blockers.** `git diff -- src` confirmed clean of anything beyond the one permitted line-range in
+`LoginService.cs` — no mutation residue, no drive-by change. **Approve.**
+
+→ @architect
+
+**[worker]** Both additions done. No further `src` changes — `git diff -- src` is still exactly
+`LoginService.cs`, `+8/-0`.
+
+**1. Post-commit-limit test — added, `GitTokenServiceTests.cs`.**
+
+```csharp
+[Fact]
+public async Task A_cancellation_observed_after_the_write_commits_does_not_remove_the_token()
+{
+    // This pins a KNOWN LIMIT, not a guarantee — do not "fix" IssueAsync to make this fail.
+    // IssueAsync has no transaction (design.md D1, corrected): it is a bare Add followed by a
+    // single SaveChangesAsync, which SQLite autocommits immediately once it completes. Landing
+    // the cancellation after that write — via CancelAfterSaveInterceptor, the same instrument
+    // block A used to prove the *transactional* creates roll back — lands it after the row is
+    // already durably committed, with nothing left to roll back. The Product Owner ruled
+    // explicitly against making these three creates transactional (§4 remediation), so this is
+    // the accepted boundary of the guarantee, deliberately made executable rather than left as
+    // prose: the call returns normally, and the token exists whether or not the client that
+    // requested it is still there to receive it.
+    ...
+    var issued = await interceptingService.IssueAsync(account.Id, cancellationTokenSource.Token);
+
+    Assert.True(cancellationTokenSource.IsCancellationRequested);
+    Assert.NotNull(await _service.VerifyAsync("alice", issued.Token));
+}
+```
+
+Same shape as block A's `CancelAfterSaveInterceptor` usage in `BootstrapServiceTests.cs` — a locally
+built, interceptor-carrying `IdentityDbContext` sharing the class's `_connection`, its own
+`GitTokenService` instance, class-level fixtures untouched. Deterministic per the Architect's read:
+`GitTokenService.IssueAsync` has no transaction, so `SaveChangesAsync` autocommits on `Microsoft.Data.Sqlite`'s
+default (implicit, no explicit `BeginTransaction`) — nothing races. Asserts *no throw* (the call
+completes normally) and the token is live via `VerifyAsync`, the mirror image of the F1b test's *throw,
+no row*. Comment leads with "KNOWN LIMIT, not a guarantee" and names the Product Owner ruling, so a
+future reader can't mistake it for a desirable behaviour or "fix" the production code to make it fail.
+
+**2. Unknown-username coverage — attempted, and it worked, but not via the mechanism suggested.**
+
+The suggested `ReaderExecutedAsync` doesn't discriminate — checked empirically before writing anything
+into the test project, not assumed. I built a throwaway console spike outside the repo (`ProjectReference`d
+read-only against `src/ZeroWiki`, deleted after; never touched a tracked file) and ran the real
+`SingleOrDefaultAsync` shape from `VerifyCredentialsAsync` against an empty store with a
+`ReaderExecutedAsync`-cancelling interceptor:
+
+```
+[interceptor] ReaderExecutedAsync fired -- cancelling now
+THREW from inside SingleOrDefaultAsync itself: TaskCanceledException. IsCancellationRequested: True
+```
+
+`SingleOrDefaultAsync` throws from its *own* internal read — Microsoft.Data.Sqlite's `ReadAsync`
+checks `IsCancellationRequested` and short-circuits before reading, so the query throws before
+`candidate` is ever assigned, regardless of where any downstream check sits. That is exactly the
+non-discriminating failure mode flagged in the brief: it would pass whether or not the fix exists.
+
+Tried `DataReaderDisposing` instead (still a `DbCommandInterceptor` override, same family as
+`ReaderExecutedAsync`, no new machinery) — fires after the row (or its absence) is already resolved,
+on the way out of the query rather than mid-read:
+
+```
+[interceptor] DataReaderDisposing fired -- cancelling now
+NO THROW. candidate == null: True. IsCancellationRequested: True
+```
+
+Confirmed this actually discriminates before trusting it, the same spike, two scenarios: the real
+`LoginService.VerifyCredentialsAsync` (fixed code) against an unknown username under this interceptor
+threw with 0 `Verify` calls; a hand-written copy with the check moved inside
+`if (candidate is not null)` — the exact regression the brief named — did **not** throw and made 1
+`Verify` call, same interceptor, same token. Two runs, opposite outcomes, isolating exactly the one
+line that moved. That's the discriminating power the brief asked me to state.
+
+**Landed as `tests/ZeroWiki.Tests/Identity/CancelOnReaderDisposingInterceptor.cs`** (new, same
+one-class-per-file convention as `CancelAfterSaveInterceptor.cs`, with the `ReaderExecutedAsync`
+non-finding recorded in its `<remarks>` so nobody rediscovers it the hard way) and
+`LoginServiceTests.A_cancellation_observed_after_the_lookup_on_the_unknown_username_path_throws_before_verifying`.
+Builds its own intercepting `IdentityDbContext` on the shared `_connection` and a local
+`RecordingPasswordHasher`, calls `VerifyCredentialsAsync("nobody", ...)` against the (default-empty)
+store, asserts the throw and `Assert.Empty(recorder.Verifications)` — the same "zero calls, not just a
+throw" discipline as the known-username test, and the property the spike's Scenario 2 shows fails
+exactly when the regression the brief named is present.
+
+**Gates re-run**: `dotnet build` — 0 warnings, 0 errors. `dotnet test` — **385/385 passed**, full
+suite, no filter (was 383; +2 — the post-commit `GitTokenService` test and the unknown-username `F2`
+test). `openspec validate request-cancellation --strict` — valid. `dotnet format --verify-no-changes`
+— clean (exit 0). `git diff --stat -- src` unchanged: `LoginService.cs`, `+8/-0`, nothing else;
+`git status --short -- src` confirms. New files this round:
+`tests/ZeroWiki.Tests/Identity/CancelOnReaderDisposingInterceptor.cs`; modified:
+`tests/ZeroWiki.Tests/Identity/{GitTokenServiceTests.cs,LoginServiceTests.cs}`. No agent spawned, no
+mutation testing, no commit, nothing ticked.
+
+→ @architect
+
 ## NEXT
 
 **Resume point: STOPPED — 16/16 tasks ticked, but §4's supervisor returned `Request changes` with two
