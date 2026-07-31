@@ -111,6 +111,74 @@ public sealed class BootstrapServiceTests : IDisposable
     }
 
     [Fact]
+    public async Task A_cancelled_bootstrap_leaves_no_administrator_behind()
+    {
+        // Pre-cancelled, not mid-flight. The first cancellable await here is the pre-filter
+        // `AnyAsync` on an empty store (BootstrapService.cs:81), which throws before any
+        // connection, transaction, or row is touched — so this proves the method is cancellable
+        // at all and that an early cancel leaves nothing behind, and no more than that. It is
+        // the *weakest* form of "leaves nothing behind": the transactional rollback between
+        // SaveChangesAsync and CommitAsync (:124-125) is never entered, so this test cannot fail
+        // if that rollback were broken. See the mid-flight test below for the property this one
+        // cannot reach.
+        var cancellationToken = new CancellationToken(canceled: true);
+
+        var thrown = await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => _service.CreateFirstAdministratorAsync("alice", "a good long passphrase", cancellationToken));
+
+        Assert.True(thrown.CancellationToken.IsCancellationRequested);
+
+        // The store, not the return value: a cancelled call throws and has no return value to
+        // assert against at all. The absence of the row is the only evidence that means anything.
+        Assert.Empty(await _db.Accounts.AsNoTracking().ToListAsync());
+    }
+
+    [Fact]
+    public async Task A_cancellation_between_the_write_and_the_commit_still_rolls_back()
+    {
+        // Reaches the window the pre-cancelled test above cannot: cancel the token only once
+        // SaveChangesAsync has finished writing into the still-uncommitted transaction, so the
+        // token is live through the whole first check-then-act and only goes cancelled right
+        // before CommitAsync (BootstrapService.cs:124-125) runs. If that rollback were broken —
+        // if the row survived a cancelled commit — this test, unlike the pre-cancelled one,
+        // would see it and fail.
+        var cancellationTokenSource = new CancellationTokenSource();
+
+        await using var interceptingDb = new IdentityDbContext(
+            new DbContextOptionsBuilder<IdentityDbContext>()
+                .UseSqlite(_connection)
+                .AddInterceptors(new CancelAfterSaveInterceptor(cancellationTokenSource))
+                .Options);
+        var interceptingService = new BootstrapService(interceptingDb, _hasher, _time);
+
+        var thrown = await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => interceptingService.CreateFirstAdministratorAsync(
+                "alice", "a good long passphrase", cancellationTokenSource.Token));
+
+        Assert.True(thrown.CancellationToken.IsCancellationRequested);
+        Assert.Empty(await _db.Accounts.AsNoTracking().ToListAsync());
+    }
+
+    [Fact]
+    public async Task A_cancelled_availability_check_throws_rather_than_reporting_the_store_empty()
+    {
+        // Empty store is load-bearing (design.md Risks): IsAvailableAsync is !AnyAsync, so
+        // against an empty store the honest, uncancelled answer is `true` — the fail-open value.
+        // Asserting the cancelled call throws therefore distinguishes throw from fail-open.
+        // Against a populated store the same assertion would only distinguish throw from
+        // fail-closed (`false`), which the requirement does not forbid and would pass while
+        // proving nothing about the one fail-open path in this change.
+        var cancellationToken = new CancellationToken(canceled: true);
+
+        var thrown = await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => _service.IsAvailableAsync(cancellationToken));
+
+        // Confirms the throw comes from the token being honoured (EF's AnyAsync respecting
+        // cancellation), not assumed from some other failure that happened to also throw.
+        Assert.True(thrown.CancellationToken.IsCancellationRequested);
+    }
+
+    [Fact]
     public async Task Second_bootstrap_attempt_after_a_successful_one_is_refused()
     {
         Assert.Equal(

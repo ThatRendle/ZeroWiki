@@ -1128,6 +1128,440 @@ from `Identity/`'s callers — the caller-side instruments will simply not see a
 - **N5** — `git-backed-content-core` must re-apply D1 *and* re-run 3.3's sweep from the store side; the
   caller-side instruments used here will not see a git-side de-authorisation.
 
+## 4. Tests
+
+**[architect]** Base: `7a4d6e1` — the change's evidence: that cancellation is honoured where D1 says
+it should be, and that the de-authorisation split is real rather than decorative.
+
+**[architect]** Product Owner rulings opening §4, both taken before any code was written.
+
+**Task 4.3 is re-cut** (committed `7a4d6e1`; `spec.md` untouched). The §3 supervisor found 4.3 red by
+construction: at the service level, `RevokeAsync(accountId, tokenId, cancelled)` correctly throws at
+`GitTokenService.cs:108` before `SaveChangesAsync`, so asserting "revocation completes under an
+already-cancelled token" there asserts the *opposite* of the requirement. D1's guarantee is a property
+of the **caller**. The requirement itself is unchanged and does hold end to end — the §3 supervisor
+traced POST → committed row. What changed is how it is proven, into two halves:
+
+- **4.3** — each service *throws* under a cancelled token, proving the parameter is live.
+- **4.5** — every caller passes `CancellationToken.None`, proving the callers use it correctly.
+
+Neither half means much alone. 4.3 without 4.5 proves a parameter nobody uses correctly; 4.5 without
+4.3 proves callers pass `None` to a parameter that might be ignored. **That is why they are one
+block.**
+
+**§4 is two blocks** (PO): **A = 4.1, 4.2, 4.4** — cancellation *is* honoured on reads and creates,
+the §2 side. **B = 4.3 + 4.5** — the de-authorisation split, the §3 side.
+
+**[architect]** Brief — block A, tasks 4.1/4.2/4.4 → @worker.
+
+**The tasks.**
+
+- **4.1** A cancelled create leaves no record — **assert against the store, not the return value.**
+  The return value of a cancelled call is not evidence; the absence of the row is.
+- **4.2** A cancelled redemption leaves the invitation still redeemable — not merely "not redeemed",
+  but *usable*: a subsequent redemption under a live token must succeed.
+- **4.4** A cancelled bootstrap availability check *fails* rather than reporting the store empty.
+
+**4.4 — the seam and the polarity, both already settled. Do not re-open either.**
+
+*Seam (PO ruling):* assert at the **service level** in `BootstrapServiceTests.cs`, against an
+**empty** store. No interface, no unsealing — `BootstrapService` is `sealed` (`BootstrapService.cs:13`)
+and DI-registered by concrete type (`Program.cs:19`), the test project has no mocking or
+component-render harness, and a cancelled HTTP request yields no response to assert against. A
+page-level seam is a proposal-level change and is not §4's to invent.
+
+*Polarity — read this twice, it is the one fail-open path in the change.* `IsAvailableAsync` is
+`!await db.Accounts.AnyAsync(…)`. So **`true` = store empty = bootstrap OPEN** (the permissive value),
+`false` = closed. **Failing open is returning `true`.** The empty-store setup is load-bearing: against
+an empty store the honest answer *is* `true`, so an assertion that the cancelled call **throws**
+distinguishes *throw* from *fail open*. Against a populated store it would only distinguish throw from
+*fail closed* — passing while proving nothing. `design.md` stated this backwards until `0a38e46`;
+task 4.4's own wording was always right.
+
+**4.1 rests on ground the §2 supervisor already verified**, so trust it rather than re-deriving:
+`BootstrapService.cs:104–128` rolls back safely because cancellation between `SaveChangesAsync(ct)`
+and `CommitAsync(ct)` throws *pre-commit* into a **token-less** `await using` rollback. Relatedly,
+`InvitationService.WriteLock.DisposeAsync()` (`InvitationService.cs:436–440`) takes no token and
+**must not** — that rollback path is *why* 4.1 and 4.2 hold. It is not a §1.2 counter-example.
+
+**Scope.** Tests only — `tests/ZeroWiki.Tests`. **No production code changes at all.** If a test cannot
+be written without touching `src`, that is a finding: **stop and report it, do not add a seam.** Block
+B (4.3 + 4.5) is not yours; do not write it or pre-empt it.
+
+**Constraints.**
+
+- **Do not spawn a `reviewer`, or any other agent.** Your handoff is a `→ @reviewer` line here; the
+  Architect commissions the review. (§2's worker commissioned its own — an audit the audited party
+  arranged.)
+- **No mutation testing in this block.** CLAUDE.md caps it to security- and correctness-critical paths
+  and it is easy to run past usefulness. 4.4 is the one assertion where it could be argued — and the
+  answer is still no for now. If you believe a specific mutant is the only way to settle a specific
+  doubt, **say so and stop**; do not run it.
+- **Do not commit. Do not tick boxes in `tasks.md`.** The Architect does both.
+- Post to this DEVLOG as you go, attributed `**[worker]**`, referencing `4.1/4.2/4.4`.
+
+**Done-gates** — run all four and report actual output: `dotnet build` clean; `dotnet test` green,
+**full suite, never a filter** (currently 344 — yours should raise it); `openspec validate
+request-cancellation --strict`; `dotnet format --verify-no-changes`.
+
+**[worker]** 4.1/4.2/4.4 done. Tests only — `git diff --stat -- src tests` touches exactly
+`tests/ZeroWiki.Tests/Identity/BootstrapServiceTests.cs` (+40) and
+`tests/ZeroWiki.Tests/Identity/InvitationRedemptionTests.cs` (+30); nothing under `src`. Did not
+need to touch production code — no seam was missing for any of the three.
+
+All three tests use an **already-cancelled token** (`new CancellationToken(canceled: true)`)
+rather than an injected mid-flight cancel. Traced each method by hand first: in all three, the
+first cancellable `await` (`AnyAsync`/`SingleOrDefaultAsync`) sits before any connection, write
+lock, or row is touched, so a pre-cancelled token throws before anything begins — a stronger
+"leaves nothing behind" than a mid-flight cancel would prove, not a weaker one. Each assertion
+also checks `thrown.CancellationToken.IsCancellationRequested` to confirm the throw came from the
+token being honoured, not merely from something else that happened to also throw. Confirmed the
+whole suite went 344 → 347 green, not just the three new tests in isolation.
+
+- **4.1 `BootstrapServiceTests.cs` — `A_cancelled_bootstrap_leaves_no_administrator_behind`.**
+  Calls `CreateFirstAdministratorAsync` with a cancelled token, asserts it throws
+  `OperationCanceledException`, then asserts `_db.Accounts.AsNoTracking().ToListAsync()` is
+  **empty** — the store, not the discarded exception or a return value that doesn't exist for a
+  throwing call. Rests on `BootstrapService.cs:104–128`'s already-verified rollback (§2
+  supervisor) rather than re-deriving it; this test proves the store-level outcome the spec
+  scenario actually asks for.
+- **4.2 `InvitationRedemptionTests.cs` — `A_cancelled_redemption_leaves_the_invitation_still_redeemable`.**
+  Issues an invitation, calls `RedeemAsync` with a cancelled token, asserts the throw, then
+  asserts against the store: no account beyond the issuer, and the invitation's `RedeemedAt`
+  **and** `RevokedAt` are both still null. Then goes one step further than "untouched" — it
+  **redeems the same token again** with a live token and asserts `InvitationRedemption.Redeemed`,
+  a fresh "bob" account existing, and `RedeemedAt` now set. That second call is what proves
+  *usable*, not merely *not consumed*: a store-only assertion after the cancelled call couldn't
+  rule out some invisible poisoning (e.g. a half-tracked entity) that only a real subsequent
+  redemption would surface.
+- **4.4 `BootstrapServiceTests.cs` — `A_cancelled_availability_check_throws_rather_than_reporting_the_store_empty`.**
+  Runs `IsAvailableAsync` against the **empty** store the constructor gives every test (no
+  `AddAccountAsync` call), with a cancelled token, and asserts it throws
+  `OperationCanceledException`. The empty store is what makes this mean something: against an
+  empty store the honest, uncancelled answer is `true` (`IsAvailableAsync` is `!AnyAsync`, and
+  `true` = store empty = bootstrap **open** — the fail-open value per `design.md`'s corrected
+  Risks item). A throw here therefore distinguishes *throw* from *fail open* (`true`). Had this
+  been asserted against a populated store instead, the same assertion would only distinguish
+  *throw* from *fail closed* (`false`) — passing while proving nothing about the one fail-open
+  path in the change. Did not touch the polarity language or re-litigate it; used it as given.
+
+**No mutation testing run**, per the brief — 4.4 was the one place it could have been argued for,
+and the brief's own answer (no, for now) stood; no specific mutant seemed like the only way to
+settle a doubt, so none was proposed.
+
+**Gates**: `dotnet build` — 0 warnings, 0 errors. `dotnet test` — **347/347 passed**, full suite,
+no filter (was 344; +3). `openspec validate request-cancellation --strict` — valid. `dotnet format
+--verify-no-changes` — clean. `git status --short -- src` empty; `git diff --stat -- src tests`
+confirms exactly the two test files above.
+
+→ @reviewer
+
+**[reviewer]** Verdict on block A (4.1/4.2/4.4): **Request changes** — 4.1 and 4.2. 4.4 is
+correct as written.
+
+Read `git diff 7a4d6e1 -- tests` (confirmed `git diff 7a4d6e1 -- src` is empty — tests-only, as
+claimed), `design.md` D1 and the Risks item, `specs/request-lifecycle/spec.md`'s bootstrap and
+invitation scenarios, the §4 brief and worker's post above, `BootstrapService.cs` and
+`InvitationService.cs` in full, and the test conventions in `BootstrapServiceTests.cs` /
+`InvitationRedemptionTests.cs`.
+
+**Central question, traced by hand rather than taken on the worker's word: does each test fail
+when the property it exists to guard is broken?**
+
+**4.4 — confirmed sound, no changes.** `IsAvailableAsync` (`BootstrapService.cs:30–31`) has
+exactly one cancellable operation — `!await db.Accounts.AnyAsync(cancellationToken)` — so there is
+no "before" distinct from "during" for this method; pre-cancelling is the only meaningful way to
+test it, not a weaker substitute for a mid-flight cancel. The empty-store setup is load-bearing,
+and I re-derived why independently rather than trusting the brief: against a populated store the
+honest answer is already `false` (closed) whether or not cancellation is honoured, so the
+*dangerous* value (`true` = open) is only reachable at all when the store is empty — only there
+does "assert it throws" actually distinguish *throw* from *fail open* rather than merely from
+*fail closed*. This is a real mutant-killing assertion: if `AnyAsync`'s cancellation token were
+dropped (a realistic regression — e.g. someone "simplifies" the query and forgets to pass it
+through), the call would run to completion against the empty store and return `true`; the test
+would then see no throw and fail correctly. Confirmed by tracing the method, not by running a
+mutant (per the block's brief and CLAUDE.md's cap, no mutation testing was run). **Approve, no
+changes.**
+
+**4.1 and 4.2 — the worker's comment has the polarity of its own claim backward, and the tests as
+written cannot fail when the property they cite is broken.**
+
+Traced both methods by hand:
+
+- `BootstrapService.CreateFirstAdministratorAsync` (`BootstrapService.cs:66–128`): the first
+  cancellable await is the advisory pre-filter `await db.Accounts.AnyAsync(cancellationToken)`
+  (`:81`) — before `passwordHasher.Hash`, before `OpenConnectionAsync`, before the transaction is
+  even opened. A pre-cancelled token throws there.
+- `InvitationService.RedeemAsync` (`:219–…`): the first cancellable await is
+  `RejectionAsync(tokenHash, now, cancellationToken)` (`:260`), an `AsNoTracking()` read — before
+  `passwordHasher.Hash`, before `BeginWriteLockedTransactionAsync`. A pre-cancelled token throws
+  there.
+
+In both cases the transactional path — `SaveChangesAsync(ct)` → `CommitAsync(ct)` inside
+`await using (transaction)`, whose disposal is what rolls back on an early exit
+(`WriteLock.DisposeAsync`, `InvitationService.cs:436–440`, takes no token and must not) — is never
+entered. `Assert.Empty(await _db.Accounts...)` in 4.1, and the untouched-invitation assertions in
+4.2, are therefore true by construction: nothing ran that could have written a row, so nothing
+needed to be rolled back for the assertion to pass. **I verified this is not a hypothetical
+concern by testing the actual mechanism** (see below) — the transactional rollback these tests
+cite as their evidence is provably outside the code path a pre-cancelled token exercises.
+
+`BootstrapServiceTests.cs:116–121`'s comment claims the opposite: "this also exercises the
+'leaves nothing behind' claim in its strongest form: nothing was ever begun." That has the
+direction backward. A case where nothing was ever begun is the *weakest* form of the claim — it is
+vacuously true and requires no mechanism to hold. The claim is at its *strongest*, and the only
+place it is actually at risk, when something *was* begun and had to be undone — i.e. mid-flight,
+between `SaveChangesAsync` and `CommitAsync`. `InvitationRedemptionTests.cs:82–84`'s comment makes
+the same claim in gentler language ("nothing about redemption is begun") but doesn't assert the
+"strongest form" framing, so it is descriptively accurate even though the test built on it has the
+same evidentiary gap.
+
+**Concretely: would 4.1 catch a broken rollback?** No. If the `await using (transaction)` block's
+disposal path in `CreateFirstAdministratorAsync` silently committed instead of rolling back on a
+cancelled `CommitAsync` — or if `CommitAsync` didn't propagate the token at all — this test would
+still pass 3/3, because it never reaches that code. The task text (4.1: "assert against the store,
+not the return value") and the spec scenario ("WHEN a client disconnects **while** a request is
+creating an account … THEN the operation is abandoned") are both about a request that was in
+flight, not one that never left the gate. The current test proves the pre-filter's cancellation is
+honoured (a real, useful, but different property) and nothing about the rollback the comment
+credits it with.
+
+**Feasibility spike — a mid-flight test is achievable without touching `src`, and I built and ran
+one to confirm rather than assert it in the abstract.** Both test classes already construct their
+own `DbContextOptionsBuilder<IdentityDbContext>()` locally (`BootstrapServiceTests.cs:28–29`,
+`InvitationRedemptionTests.cs:39–43`) — `IdentityDbContext` has no `OnConfiguring` override to
+fight, so nothing stops a test from calling `.AddInterceptors(...)` on its own builder. I wrote a
+throwaway console spike (outside this repo, `ProjectReference`d against `src/ZeroWiki`, never
+touching any tracked file) implementing an `ISaveChangesInterceptor` whose `SavedChangesAsync`
+override calls `cts.Cancel()` on the `CancellationTokenSource` supplying the token passed into
+`CreateFirstAdministratorAsync`. `SavedChangesAsync` fires after `SaveChangesAsync` has written the
+row into the (uncommitted) transaction but before the production code's subsequent
+`await transaction.CommitAsync(cancellationToken)` runs. Result, empirically observed:
+
+```
+[interceptor] SavedChangesAsync (write committed to txn, not yet COMMITted) -- cancelling now
+THREW: System.Threading.Tasks.TaskCanceledException: A task was canceled.
+Account rows after cancellation attempt: 0
+Result: MID-FLIGHT CANCEL SIMULATED SUCCESSFULLY, ROLLED BACK
+```
+
+`CommitAsync(cancellationToken)` sees the token already cancelled and throws before actually
+committing (SQLite `DbTransaction.CommitAsync`'s default cancellation check, not overridden by
+Microsoft.Data.Sqlite), so `await using` disposes into the same rollback path 4.1 currently never
+reaches — and the row count confirms it rolled back. **This is a genuine yes, with a concrete
+mechanism**, not "write a better test" hand-waved: a per-test-local `IdentityDbContext` +
+`SaveChangesInterceptor`, armed only for that one test (each test class already builds a fresh
+instance per xUnit test, so a shared always-on interceptor isn't needed — the new test can build
+its own local connection/context/service the way the class constructor already does, scoped to
+just that method). The same shape applies to 4.2: `InvitationService.RedeemAsync` has the
+identical `SaveChangesAsync(ct)` → `writeLock.CommitAsync(ct)` shape (around `:316–317`), so the
+same interceptor cancels between the same two calls.
+
+Given that this is achievable, the honest fix is not merely to soften the comment — the comment
+*and* the test are both weaker than the evidence standard this change has held itself to
+elsewhere (§2's and §3's supervisors traced code paths and verified mechanisms rather than
+asserting from the shape of the code). I'd rather see the mid-flight variant added.
+
+**Findings.**
+
+1. `BootstrapServiceTests.cs:114–132` (`A_cancelled_bootstrap_leaves_no_administrator_behind`) —
+   add a second case (or replace this one) that cancels **between `SaveChangesAsync` and
+   `CommitAsync`** via a `SaveChangesInterceptor` on a locally-built `IdentityDbContext`, asserting
+   the same throw + empty-store outcome. This is the only case where the assertion can actually
+   fail if the rollback breaks. If the pre-cancelled variant is kept alongside it (reasonable — it
+   does cover the pre-filter's own cancellation-honouring, a real if smaller property), rewrite the
+   comment: it is the *weakest*, not the *strongest*, form of the claim, and say so plainly rather
+   than asserting the opposite.
+2. `InvitationRedemptionTests.cs:81–107` (`A_cancelled_redemption_leaves_the_invitation_still_redeemable`)
+   — same fix: add the mid-flight variant using the same interceptor mechanism against
+   `RedeemAsync`'s `SaveChangesAsync`/`writeLock.CommitAsync` pair, and correct the comment's
+   "nothing about redemption is begun" framing so it doesn't stand in as evidence for the
+   transactional claim the task (4.2) and spec scenario are actually asking about.
+
+**Not blocking, confirmed clean:**
+
+- **Scope.** `git diff 7a4d6e1 -- src` is empty — tests only, exactly as claimed.
+  `git status --short -- src` is also empty, so there's no untracked-file blind spot on the `src`
+  side either.
+- **Block B not pre-empted.** Only the three named tests were added; nothing touches
+  `GitTokenService.RevokeAsync`, `GitEmailService.RemoveAsync`, or
+  `InvitationService.RevokeAsync` (4.3/4.5's territory), and `RedeemInvitation`/de-authorisation
+  page code is untouched (`git diff -- src` empty confirms this too).
+- **No `reviewer`/other agent spawned by the worker** — the handoff is a plain `→ @reviewer` line,
+  correctly.
+- **No mutation testing run** — correct per the brief; my feasibility spike above is not a
+  mutation run (no mutant was introduced into `src` or reverted, nothing was "broken to see if a
+  test dies" — it's a throwaway console program outside the repo, `ProjectReference`d read-only
+  against `src/ZeroWiki`, verifying an *instrument* for the worker to use, not exercising one
+  against a mutated property). Flagging this distinction explicitly since CLAUDE.md caps mutation
+  testing tightly: this spike answered "is the seam reachable at all," not "does a specific mutant
+  survive."
+- **Idiom/convention.** Test naming (`A_cancelled_..._...`) matches the file's existing
+  sentence-style convention; `Assert.ThrowsAnyAsync<OperationCanceledException>` plus asserting
+  `thrown.CancellationToken.IsCancellationRequested` is a reasonable, if slightly unusual for this
+  file, way to confirm the throw came from the token rather than an unrelated failure — no
+  objection. 4.2 correctly reuses the existing `IssueAsync()`/`AssertNoAccountBeyondTheIssuerAsync()`
+  helpers rather than inventing new setup.
+- **No design-decision violations** — D1's split (reads/creates cancel) is what's under test; D2
+  (de-authorisation) is untouched, correctly, by this block.
+
+**Verdict: Request changes** on 4.1 and 4.2 per the two findings above. 4.4 stands as-is.
+
+→ @worker
+
+**[worker]** Addressed both findings — 4.4 untouched, per the verdict.
+
+**Agreed with the finding.** The pre-cancelled tests' comments claimed the "strongest form" of
+"leaves nothing behind"; that was backwards. Re-traced both methods: `CreateFirstAdministratorAsync`'s
+first cancellable await is the pre-filter `AnyAsync` (`BootstrapService.cs:81`), `RedeemAsync`'s is
+`RejectionAsync`'s read (`:260`) — both before any connection or write lock, so a pre-cancelled
+token never reaches the `SaveChangesAsync → CommitAsync` window and neither test could have failed
+if that rollback were broken. Kept both pre-cancelled tests — they still establish something true
+(cancellable at all; an early cancel leaves nothing behind) — but rewrote the comments to say
+exactly that and no more, and to point at the new mid-flight test that reaches what they cannot.
+
+**New shared test helper**: `tests/ZeroWiki.Tests/Identity/CancelAfterSaveInterceptor.cs` — a
+`SaveChangesInterceptor` whose `SavedChangesAsync` override cancels a `CancellationTokenSource` the
+instant `SaveChangesAsync` finishes writing into the still-open transaction, landing the
+cancellation right before the production code's own `CommitAsync(cancellationToken)` call — the
+same mechanism the reviewer's spike confirmed reachable. One file, matching this folder's existing
+convention of a small standalone test-helper class per file (`SteppingTimeProvider.cs`,
+`CountingPasswordHasher.cs`, `CapturingLoggerProvider.cs`) rather than duplicating it in both test
+classes.
+
+**Two new mid-flight tests, one per path**, each building its own `IdentityDbContext` on the
+class's shared `_connection` with the interceptor registered on that context's own
+`DbContextOptionsBuilder`, and its own service instance constructed against it — the class-level
+`_db`/`_service` fixtures are untouched, so no other test in either file is affected:
+
+- **`BootstrapServiceTests.A_cancellation_between_the_write_and_the_commit_still_rolls_back`** —
+  cancels between `SaveChangesAsync` and `CommitAsync` (`BootstrapService.cs:124–125`). Asserts the
+  call throws `OperationCanceledException` with `CancellationToken.IsCancellationRequested` true,
+  then asserts `_db.Accounts.AsNoTracking().ToListAsync()` is empty — read through the *original*
+  `_db`, sharing `_connection` with the intercepting context, not the intercepting context's own
+  (disposed) tracker.
+- **`InvitationRedemptionTests.A_cancellation_between_the_write_and_the_commit_still_rolls_back_and_stays_redeemable`** —
+  same shape, cancels between `SaveChangesAsync` and `CommitAsync` (`InvitationService.cs:318–319`).
+  Asserts the throw, asserts against the store that no account exists and the invitation carries
+  neither `RedeemedAt` nor `RevokedAt`, then keeps 4.2's "usable, not merely untouched" property:
+  redeems the same token again under a live call and asserts it succeeds.
+
+**Why a broken rollback would now make these fail, reasoned rather than run** (no mutation
+testing, per the constraint — the seam is already proven reachable, and nothing here is in enough
+doubt to need a mutant to settle it): two distinct breakages, both caught.
+
+1. If `CommitAsync` did not honour the token (committed unconditionally), the call would return
+   `Created`/`Redeemed` instead of throwing, and `Assert.ThrowsAnyAsync<OperationCanceledException>`
+   would fail outright — never reaching the store assertion.
+2. If the token-less `await using` disposal on cancellation failed to roll back (e.g. discarded the
+   transaction without issuing `ROLLBACK`), the write would still be visible to the store
+   assertion: `_db` and the intercepting context share one physical SQLite connection
+   (`_connection`), and SQLite allows only one transaction per connection, so an unrolled-back
+   write is read-your-own-writes visible to the very next query on that connection — exactly the
+   query `Assert.Empty`/`Assert.Null` runs. There is no way for an unrolled-back write to hide from
+   these assertions on this fixture.
+
+**Gates re-run**: `dotnet build` — 0 warnings, 0 errors. `dotnet test` — **349/349 passed**, full
+suite, no filter (was 347; +2). `openspec validate request-cancellation --strict` — valid.
+`dotnet format --verify-no-changes` — clean. `git diff --stat -- src` empty;
+`git status --short --untracked-files=all -- src tests` shows exactly the two modified test files
+plus the one new untracked helper (`CancelAfterSaveInterceptor.cs`) — nothing under `src`.
+
+No agent spawned. No boxes ticked. No commit made.
+
+→ @reviewer
+
+**[reviewer]** Second pass on block A (4.1/4.2/4.4). **Approve.**
+
+Read `git diff 7a4d6e1 -- tests` (confirmed `git diff 7a4d6e1 -- src` still empty, `wc -l` = 0) and
+`git status --short --untracked-files=all -- src tests`, which shows exactly the two modified test
+files plus `CancelAfterSaveInterceptor.cs` as `??`. Per CLAUDE.md's own warning, read that file
+directly rather than trusting the `??` — it is 29 lines, one `sealed class`, file-scoped namespace,
+matches the file's own name, cancels a supplied `CancellationTokenSource` from `SavedChangesAsync`
+and forwards to `base`. Nothing else in it.
+
+**1. Does the mid-flight test fail if the rollback is broken? Yes — and I didn't take the
+shared-connection premise on report, I built and ran a control experiment to isolate it from the
+"does the interceptor even land the cancellation in the right place" question.**
+
+Two separate things have to both be true for this test to have teeth: (a) the interceptor lands
+the cancellation in the SaveChangesAsync→CommitAsync window, and (b) a query issued through a
+*different* `DbContext` instance than the one that wrote can actually observe that context's
+uncommitted state — otherwise the assertion queries a connection that never saw the write and
+passes for a reason that has nothing to do with rollback. I tested these independently, outside
+the repo (a throwaway console spike, `ProjectReference`d read-only against `src/ZeroWiki`,
+never touching a tracked file — confirmed `git status` clean throughout, same discipline as my
+first pass):
+
+- **Reproduced the worker's exact shape** — one shared, already-open `SqliteConnection`; a
+  `db`-equivalent context built once (matching `_db`); a second, locally-built context wrapping
+  the *same* connection with the interceptor attached (matching `interceptingDb`) — and ran the
+  real call. Result: threw `TaskCanceledException`, and `db` (the other context) read **0 rows**
+  afterward.
+- **The control that actually settles (b), separately from (a):** built two contexts on one shared
+  connection by hand, had one open a write-locked transaction and `SaveChangesAsync` a row
+  *without* committing or rolling back yet, then read through the *other* context **while the
+  transaction was still open**. It saw **1 row** — the uncommitted write, live, through a
+  different `DbContext` object. Then disposed the first context's transaction without committing
+  (the rollback path) and re-read through the second context: **0 rows**. This is the load-bearing
+  result: it proves that if the production code's rollback were broken and the row survived, the
+  test's `Assert.Empty`/`Assert.Null` — which read through `_db`, not `interceptingDb` — **would
+  see it**, because a second EF Core `DbContext` sharing one physical `SqliteConnection` is not an
+  isolated view; it is the same session, same uncommitted transaction state, same
+  read-your-own-writes guarantee a single context gets. The premise holds because it is a property
+  of SQLite having one native transaction per connection handle, not of anything EF-specific that
+  could silently change. **Confirmed, not assumed: the assertion is not vacuous.**
+- I did not need to introduce an actual mutant into `src` to settle this — the control experiment
+  isolates the visibility question from the rollback-correctness question without touching
+  production code at all, which is the cheaper and sufficient way to answer it. No mutation testing
+  run, per the brief.
+
+**2. Does the interceptor leak? No — checked three ways.** `interceptingDb`'s options are built
+fresh, locally, inside the test method (`new DbContextOptionsBuilder<IdentityDbContext>()...`);
+nothing about `.AddInterceptors(...)` touches `_db`'s already-built options or any static/shared
+state. The `CancellationTokenSource` is a local as well. Structurally, `BootstrapServiceTests` and
+`InvitationRedemptionTests` are both plain `IDisposable` classes with no `IClassFixture`/
+`ICollectionFixture` — xUnit gives every test method a fresh class instance (fresh constructor,
+fresh `_connection`), so there is no path by which one test's interceptor could reach another
+test's context regardless. Within the same method: I verified empirically that disposing
+`interceptingDb` (the `await using` at the end of the mid-flight tests) leaves the shared
+`SqliteConnection`'s `.State` as `Open` and `_db` fully queryable afterward — EF Core does not
+take ownership of a connection instance handed to `UseSqlite(existing)`, so disposing the context
+that borrowed it does not close it out from under the class's own `_db`/`Dispose()`. No leak.
+
+**3. Are the corrected comments accurate, not overshot?** Read all four comment blocks against
+what each test actually exercises. The pre-cancelled tests now say they prove "the method is
+cancellable at all" and "an early cancel leaves nothing behind, and no more than that" — both true
+and both real, useful properties (the pre-filter's own cancellation-honouring is not nothing), so
+this isn't an understatement dressed as humility; it correctly scopes the claim to what the test
+can actually see, distinct from the transactional claim it explicitly hands off to the mid-flight
+test. The mid-flight tests' comments ("this test, unlike the pre-cancelled one, would see it and
+fail") are exactly what I verified above. No overshoot either direction.
+
+**4. 4.4 — confirmed untouched.** `A_cancelled_availability_check_throws_rather_than_reporting_the_store_empty`
+is byte-identical to my first pass, merely relocated after the new mid-flight test in the diff.
+Approved previously; nothing to re-litigate.
+
+**5. Standard lens.** `git diff 7a4d6e1 -- src` is empty (confirmed independently, `wc -l` = 0) —
+tests only, plus the one new test-only file. Block B untouched: no reference to `RevokeAsync`,
+`RemoveAsync`, or any de-authorisation call site anywhere in the diff or the new file. C# idiom:
+`CancelAfterSaveInterceptor` is `sealed`, file-scoped namespace, file name matches the type,
+primary-constructor syntax matching `BootstrapService`/`InvitationService`'s own style, no
+null-forgiving operators, no sync-over-async. New test method names
+(`A_cancellation_between_the_write_and_the_commit_still_rolls_back[_and_stays_redeemable]`) match
+the file's existing sentence-style convention. `_service`/`_db` used for the "live re-redemption"
+follow-up and `AssertNoAccountBeyondTheIssuerAsync()`, correctly, not `interceptingDb`/
+`interceptingService`.
+
+**Gates — independently re-run, not taken on trust:** `dotnet build` — 0 warnings, 0 errors.
+`dotnet test` — **349/349 passed**, full suite, no filter. `dotnet format --verify-no-changes` —
+clean. `openspec validate request-cancellation --strict` — valid. All four match the Architect's
+and worker's reported numbers exactly.
+
+**No findings. No nits. Approve.**
+
+→ @architect
+
 ## NEXT
 
 **Resume point: §4, blocked pending a Product Owner ruling on task 4.3** (see *Before §4 opens*
