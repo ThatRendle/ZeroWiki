@@ -1562,6 +1562,367 @@ and worker's reported numbers exactly.
 
 → @architect
 
+**[architect]** Block A closed — reviewer `Approve` on the second pass, gates green under my own run
+(build 0/0, 349/349 full suite, validate valid, format clean), 4.1/4.2/4.4 ticked, committed `7d4e20b`.
+Tree verified clean of spike residue before commit: `git diff -- src` empty, and the one untracked file
+(`CancelAfterSaveInterceptor.cs`) read directly rather than inferred from a clean diff, per CLAUDE.md's
+new-file hazard.
+
+**[architect]** Brief — block B, tasks 4.3 + 4.5 → @worker. **The last block in the change.**
+
+**Why these two are one block.** They are the two halves of a single argument, and each is nearly
+worthless alone:
+
+- **4.3** — each de-authorisation service *throws* under an already-cancelled token. Proves the
+  `CancellationToken` parameter is **live**.
+- **4.5** — every caller passes `CancellationToken.None` to de-authorisation, and none omits a token
+  from a read or create. Proves the callers **use it correctly**.
+
+4.3 without 4.5 proves a parameter nobody uses correctly. 4.5 without 4.3 proves callers pass `None` to
+a parameter that might be ignored — if the services silently dropped their token, the sweep would still
+be green and the whole D1/D2 apparatus would be decorative. **Together** they give the requirement.
+Review them as one argument.
+
+**4.3 — assert the throw, and mind that this is deliberately the opposite of D1's guarantee.**
+
+One test per de-authorisation path: `GitTokenService.RevokeAsync`, `InvitationService.RevokeAsync`,
+`GitEmailService.RemoveAsync`. Each: call with an already-cancelled token, assert it **throws**.
+
+This task was **re-cut by the Product Owner** (`7a4d6e1`) because its original wording — "revocation
+completes under an already-cancelled token" — is **false at the service level by design**. The services
+correctly honour their token, so `RevokeAsync(accountId, tokenId, cancelled)` throws at
+`GitTokenService.cs:108` before `SaveChangesAsync`. D1's guarantee that revocation survives a
+disconnect is a property of the **caller**, which passes `None`. Do not try to assert "revocation
+completes" here — that would assert the opposite of the requirement and there is no seam for it. If you
+find yourself wanting to make a service ignore its token, stop: `design.md` lists service changes as an
+explicit Non-Goal.
+
+Note the deliberate asymmetry, and do not "fix" it: these services **should** be cancellable, and 4.3
+proves they are. The de-authorisation guarantee comes entirely from the call sites §3 made explicit.
+
+**4.5 — the sweep, and per N2 the *primary* test of this whole change, not its afterthought.**
+
+§3 changed **no runtime behaviour**. The omitted arguments it replaced already bound to
+`CancellationToken.None` via the services' `= default`, so pre-§3 and post-§3 code are behaviourally
+identical and **no behavioural test at any level can distinguish them**. 4.5 is the only mechanical
+evidence §3's work exists. Both directions:
+
+- No page passes a request-scoped token to a de-authorisation call (the 3 sites §3 made explicit).
+- No page omits a token from a read or create (the 12 sites §2 filled in).
+
+15 sites total. Decide and state in the DEVLOG what this test actually reads — the `.razor` sources, or
+something else — and **why that instrument would catch a regression**. A sweep that cannot fail is
+worse than no sweep, because it reads as coverage. Consider deliberately: would your test fail if
+someone changed a `CancellationToken.None` back to `Context.RequestAborted`? If not, it is not a test.
+
+**Check your instrument before believing it** — CLAUDE.md's standing rule, and this block is exactly
+where it bites. Two agents once corroborated each other while both were wrong, because both anchor
+regexes required `href="…"` while Blazor renders `href=""` bare. Test whatever pattern you measure with
+against known-present *and* known-absent markup first, and say in the DEVLOG that you did.
+
+**Known non-findings** — confirmed by three supervisors; do not report as gaps:
+`BootstrapStartupExtensions.LogBootstrapStateAsync` (`Program.cs:74`, startup path, no token);
+`Logout.razor:44` `context.SignOutAsync(...)` (withdrawal-shaped, no token, no store row).
+
+**Also live, and yours to handle sensibly:** `RedeemInvitation.razor:116,125` spell the token `default`
+while their own comments say `CancellationToken.None` (note N4). They are reads/creates from §2, so
+they are *correct* — but a naive text sweep looking for the literal `CancellationToken.None` will
+mis-handle them. Make the sweep robust to that rather than papering over it, and say which you did.
+
+**Scope.** Tests only — `tests/ZeroWiki.Tests`. **No production code changes**, including no "tidying"
+of N4's two `default` spellings; that is a later change's call, and §4 is not the place. If a test
+cannot be written without touching `src`, stop and report.
+
+**Constraints.**
+
+- **Do not spawn a `reviewer` or any other agent.** Handoff is `→ @reviewer` here; the Architect
+  commissions it.
+- **No mutation testing.** This is the change's most mutation-tempting block and the answer is still
+  no: 4.3's property is a throw you can assert directly, and 4.5's soundness is a question about your
+  instrument, which you settle by testing the instrument against known-present and known-absent markup
+  — not by mutating `src`. CLAUDE.md's standing hazard is that an interrupted run has already once left
+  a live mutant in `BootstrapService.cs`. If you believe a mutant is genuinely the only way to settle
+  something, **say so and stop**.
+- **Do not commit. Do not tick boxes.**
+- Post to this DEVLOG as you go, `**[worker]**`, referencing `4.3/4.5`.
+
+**Done-gates** — all four, actual output: `dotnet build`; `dotnet test` **full suite, never a filter**
+(currently 349 — report the new total); `openspec validate request-cancellation --strict`;
+`dotnet format --verify-no-changes`.
+
+**[worker]** 4.3/4.5 done. Tests only — `git diff -- src` empty; six new/changed files, all under
+`tests/ZeroWiki.Tests`. Did not spawn a `reviewer` or any other agent. No mutation testing run.
+
+**4.3 — one test per de-authorisation path, each proving the parameter is live, not that
+revocation "completes".** `GitTokenServiceTests.Revoking_under_an_already_cancelled_token_throws`,
+`InvitationServiceTests.Revoking_under_an_already_cancelled_token_throws`,
+`GitEmailServiceTests.Removing_under_an_already_cancelled_token_throws`. Each: issue/add the
+record first, call the de-authorisation method with `new CancellationToken(canceled: true)`,
+assert `Assert.ThrowsAnyAsync<OperationCanceledException>`, then assert
+`thrown.CancellationToken.IsCancellationRequested` (confirms the throw came from the token being
+honoured, matching §4A's convention). Each then re-reads the store/re-verifies to show nothing
+was undone — a bonus, not the requirement: the throw alone is 4.3's assertion. Traced the first
+cancellable await in each method before writing the test, so none of these is a guess:
+`GitTokenService.RevokeAsync`/`GitEmailService.RemoveAsync` both hit their own
+`SingleOrDefaultAsync(..., cancellationToken)` first (`GitTokenService.cs:108`,
+`GitEmailService.cs:131`); `InvitationService.RevokeAsync` goes through
+`BeginWriteLockedTransactionAsync` first, whose own first cancellable op is
+`db.Database.OpenConnectionAsync(cancellationToken)` (`InvitationService.cs:406`) — all three
+throw before touching a row. Did not attempt to assert "revocation completes" — per the brief,
+that is false at the service level by design and there is no seam for it; the caller-side
+guarantee is what §4.5 proves.
+
+**4.5 — the sweep. What it reads, and why.** Reads the six pages' `.razor` source text directly
+off disk (`src/ZeroWiki/Components/Pages/*.razor`, located by walking up from the test binary's
+own directory — no build-output copy, no fixture) through a small hand-written instrument,
+`ServiceCallSweep.ExtractServiceCalls`: find `Service.Method(`, then depth-count parens from
+there to the matching close paren (not "look for the next `);`" — see below for why that
+assumption is false for a real site here), then read the text after the last top-level comma as
+the call's token argument, verbatim and unclassified. `RequestCancellationSweepTests` then
+asserts, for exactly the 15 known sites (12 read/create, 3 de-authorisation, matching every
+supervisor's count):
+
+- **De-authorisation sites** (`Account.razor` `GitTokenService.RevokeAsync`/
+  `GitEmailService.RemoveAsync`, `Invitations.razor` `InvitationService.RevokeAsync`) — the token
+  argument's text must equal exactly `CancellationToken.None`.
+- **Read/create sites** (the other 12) — the token argument's text must contain `RequestAborted`
+  and must not equal `CancellationToken.None`.
+- **A closed-world check first** (`Every_page_contains_exactly_the_fifteen_known_calls_and_no_others`)
+  — the set of calls the sweep actually finds across all six pages must equal the known-15 set
+  exactly, both directions. A 16th call site appearing later, or one of the 15 vanishing, fails
+  here rather than being silently unswept by the per-site theories, which only ever look at names
+  in the known list.
+
+**Would it fail if `CancellationToken.None` were changed back to `Context.RequestAborted`?**
+Yes — the de-authorisation assertion is an exact match against the literal text
+`CancellationToken.None`; `Context.RequestAborted` is neither that text nor absent, so
+`Assert.Equal("CancellationToken.None", call.TokenArgument)` fails. Would it fail if a
+read/create site's token argument were omitted, reverting to the pre-change state? Yes — the
+argument text would then belong to a different, non-token parameter (or be empty for a
+single-parameter call), which does not contain `RequestAborted`.
+
+**The `default`-vs-`CancellationToken.None` trap (N4), handled by reading verbatim rather than
+by exact-matching one spelling.** `RedeemInvitation.razor:116,125` read
+`HttpContext?.RequestAborted ?? default` — a correct §2 site whose comment says
+`CancellationToken.None` while the code says `default`. The read/create assertion checks
+`Contains("RequestAborted")` and `!= "CancellationToken.None"`, not an exact match against
+`Context.RequestAborted`, so these two classify correctly as flowing a request-derived token
+without needing special-casing in the test body. Handled generically, not papered over: the same
+check applies uniformly to all 12 read/create sites: it is the *presence of `RequestAborted`* that
+proves the site flows the token, and its absence that would prove a regression.
+
+**A real instrument bug found and fixed before it shipped — the `);`-anchored regex I started
+with is wrong.** `Bootstrap.razor:73` is `if (!await BootstrapService.IsAvailableAsync(Context.RequestAborted))`
+— the call's own closing paren is immediately followed by the `if`'s outer closing paren, not a
+semicolon. A regex anchored on `\)\s*;` right after the call would run straight past this call and
+capture everything up to the next real `);` — the unrelated `Navigation.NavigateTo("/", replace: true);`
+three lines later — misreading the token argument as `replace: true`. Caught this by tracing the
+actual source before trusting the pattern, not by a test failing; replaced it with the
+depth-counting close-paren scan in `ServiceCallSweep.FindMatchingCloseParen`, which finds the
+call's own matching paren regardless of what follows.
+
+**Instrument checked against known-present and known-absent markup before it was believed**
+(`ServiceCallSweepInstrumentTests`, 9 facts, none touching a real file) — literal source snippets,
+not the real pages: an explicit `CancellationToken.None` (known-present, reads back exactly);
+`Context.RequestAborted` (known-present); the `if`-condition-without-semicolon shape above
+(the actual bug, now a regression test); a multi-line argument list (`CreateFirstAdministratorAsync`'s
+own shape); the `HttpContext?.RequestAborted ?? default` fallback (reads back verbatim, contains
+`RequestAborted`, is not `CancellationToken.None`); an omitted token argument (known-absent —
+reads back as the wrong, non-token argument, containing neither expected string); a doc-comment
+reference (`<see cref="GitTokenService.RevokeAsync"/>` plus prose naming the method with no open
+paren) that must not match at all; nested parens in an argument list (robustness, no real site
+needs it); two distinct calls in one source both read and kept apart. This is the "test the
+pattern against known-present and known-absent markup first" CLAUDE.md asks for, done with
+snippets rather than by mutating a real page.
+
+**Did not run a mutation test against `src` to check "would it fail if changed back."** The
+instrument self-tests above model exactly that mutation (explicit `CancellationToken.None` vs.
+`Context.RequestAborted` vs. omitted) as literal string fixtures, which settles the question
+without touching production code, consistent with the brief's "not by mutating `src`."
+
+**Scope.** `git diff -- src` is empty. New files, all under `tests/ZeroWiki.Tests`:
+`Web/ServiceCall.cs`, `Web/ServiceCallSweep.cs`, `Web/ServiceCallSweepInstrumentTests.cs`,
+`Web/RequestCancellationSweepTests.cs`. Modified: `Identity/GitTokenServiceTests.cs`,
+`Identity/InvitationServiceTests.cs`, `Identity/GitEmailServiceTests.cs` (one 4.3 test each).
+`git status --short --untracked-files=all -- src tests` confirms exactly these seven files, no
+other blind spot.
+
+**Gates**: `dotnet build` — 0 warnings, 0 errors. `dotnet test` — **377/377 passed**, full suite,
+no filter (was 349; +28 — 3 from 4.3, 16 from the real sweep's closed-world check + 15 per-site
+theories, 9 from the instrument self-tests). `openspec validate request-cancellation --strict` —
+valid. `dotnet format --verify-no-changes` — clean (exit 0).
+
+No agent spawned. No boxes ticked. No commit made.
+
+→ @reviewer
+
+**[reviewer]** Verdict on block B (4.3/4.5), the last block in the change: **Approve with nits.**
+
+Re-ran all four gates myself: `dotnet build` 0/0; `dotnet test` **377/377**, full suite, no filter;
+`openspec validate request-cancellation --strict` valid; `dotnet format --verify-no-changes` clean
+(exit 0). `git diff 7a4d6e1 -- src` empty and `git status --short -- src` empty — confirmed
+independently, not inherited from the worker's report. Read all four new/untracked files in full
+rather than trusting the `??` status.
+
+**4.3 — confirmed as specified.** All three new tests
+(`GitTokenServiceTests.cs:178`, `InvitationServiceTests.cs:280`, `GitEmailServiceTests.cs:152`)
+issue/add the record, call the de-authorisation method with `new CancellationToken(canceled: true)`,
+assert `ThrowsAnyAsync<OperationCanceledException>`, and assert the token was honoured
+(`thrown.CancellationToken.IsCancellationRequested`). None asserts "revocation completes" — each
+re-reads the store afterward only to show nothing was undone, correctly framed as a bonus, not the
+requirement. Traced all three services directly: `GitTokenService.RevokeAsync` (`GitTokenService.cs:107-108`)
+and `GitEmailService.RemoveAsync` (`GitEmailService.cs:131-132`) both hit their own
+`SingleOrDefaultAsync(..., cancellationToken)` before any mutation; `InvitationService.RevokeAsync`
+goes through `BeginWriteLockedTransactionAsync(cancellationToken)` first. `git diff -- src` empty
+confirms no service was altered to ignore its token.
+
+**4.5 — the sweep works, and I verified both regression directions independently, not on trust.**
+Spiked the extraction logic outside the repo (not touching `src`) with the worker's exact
+`ExtractServiceCalls`/`FindMatchingCloseParen` logic reproduced verbatim:
+
+- De-auth reverted `CancellationToken.None` → `Context.RequestAborted`: extracted text
+  `"Context.RequestAborted"` ≠ `"CancellationToken.None"` → `Assert.Equal` fails. Confirmed.
+- Read/create token omitted entirely: extracted text falls back to the previous positional
+  argument (e.g. `"CallerAccountId"`), contains no `"RequestAborted"` → `Assert.Contains` fails.
+  Confirmed.
+- Read/create reverted to `CancellationToken.None`: extracted text is the literal string
+  `"CancellationToken.None"` → both `Assert.Contains("RequestAborted", …)` and
+  `Assert.NotEqual("CancellationToken.None", …)` fail. Confirmed.
+
+All three regressions the worker's comments claim to catch do fail loudly under the real assertions,
+not merely in theory.
+
+**Finding 1 (nit, not blocking) — `ServiceCallSweep.cs:43`'s `args[(args.LastIndexOf(',') + 1)..]`
+is not depth-aware, unlike the close-paren scan two lines above it.** For a call whose true last
+(token) argument is itself a multi-argument call — `Foo(a, Bar(b, c))` — the last comma in the
+whole argument span sits *inside* `Bar`, not at the top-level separator. Spiked this outside the
+repo with the worker's exact logic:
+`GitTokenService.RevokeAsync(accountId, TokenSource.Combine(x, y))` extracts as `"y)"`, not
+`"TokenSource.Combine(x, y)"`. **Verified none of the 15 real call sites trigger this** — I grepped
+every site in all six pages directly; every token argument is `CancellationToken.None`,
+`Context.RequestAborted`/`context.RequestAborted`, or `HttpContext?.RequestAborted ?? default`, none
+of which contain a comma. I also checked whether this could produce a *silent* misclassification
+(the worse failure mode) rather than a loud one: for the de-authorisation exact-match assertion, a
+nested-call token argument leaves a trailing stray character (e.g. `"CancellationToken.None)"` from
+the inner call's own paren) that breaks exact equality, so that direction still fails loudly even
+under this bug — spiked and confirmed. The read/create `Contains("RequestAborted")` direction is
+looser and I found one narrow, contrived shape where a nested wrapper call could produce a
+coincidental pass (`IssueAsync(accountId, Wrapper(x, Context.RequestAborted))` extracts as
+`"Context.RequestAborted)"`, which still satisfies both read/create assertions) — but this requires
+a future edit that doesn't conform to D1/D2's documented invariant that the token argument is always
+one of three specific literal forms, so I judge it a real but low-probability trap, not a present
+defect. **Recommendation, not a blocker:** the file already has `FindMatchingCloseParen`'s
+depth-counting; extending it (or a sibling helper) to split the top-level argument list by
+depth-zero commas, rather than `LastIndexOf(',')` on the raw span, would remove reliance on this
+unstated invariant entirely and cost only a few lines. Worker's call whether to take it now or park
+it — it does not affect the correctness of what's shipped today.
+
+**Finding 2 (non-blocking observation) — the `Contains("RequestAborted")` loosening for read/create
+sites (N4) is honest and correctly scoped.** I checked whether it opens a hole beyond finding 1's:
+walking the string, the only way a wrong-but-passing argument text arises is if it happens to contain
+the literal substring `"RequestAborted"` — there's no other identifier in this codebase that would
+produce that by accident. The trade-off is exactly what it's documented to be: loosened to accommodate
+`RedeemInvitation.razor:116,125`'s `?? default` spelling, tightened enough that omission, a reverted
+`CancellationToken.None`, or any argument not literally naming `RequestAborted` still fails. Confirmed
+`RedeemInvitation.razor:116` and `:125` both classify correctly via the instrument's own
+`The_null_tolerant_fallback_spelling_is_read_as_containing_RequestAborted_not_as_None` test and the
+real per-site theory (`ReadOrCreateSites` includes both `InvitationService.ValidateAsync` and
+`RedeemAsync` on that file).
+
+**`Every_page_contains_exactly_the_fifteen_known_calls_and_no_others` does what it claims.** It
+compares `(File, Service, Method)` tuples with no dependency on the per-site theories' name list, so
+a 16th site or a vanished one fails here rather than being silently unswept. `KnownSites`' kind
+split (12 read/create, 3 de-authorisation) matches D1's own prose exactly — `IsAvailableAsync`,
+`ValidateAsync`, the three `ListAsync`s, `CreateFirstAdministratorAsync`, `RedeemAsync`, both
+`IssueAsync`s, `AddAsync` as reads/creates; `GitTokenService.RevokeAsync`,
+`InvitationService.RevokeAsync`, `GitEmailService.RemoveAsync` as de-authorisation — not merely
+mirroring whatever the current diff happens to contain.
+
+**Instrument verification (`ServiceCallSweepInstrumentTests.cs`) is real, and covers both
+directions.** The `);`-anchored regex bug the worker reports (misreading `Bootstrap.razor:73`'s
+`if`-condition call, running past its own close paren into the next statement) is pinned by
+`A_call_inside_an_if_condition_without_its_own_trailing_semicolon_is_still_read_correctly`, using
+the exact real shape. Known-absent markup is genuinely exercised, not just known-present:
+`A_doc_comment_reference_to_the_method_does_not_match` (asserts `Assert.Empty` — no match at all)
+and `An_omitted_token_argument_is_visible_as_absent_rather_than_silently_passed` (asserts the
+extracted text does *not* contain `RequestAborted` and is *not* `CancellationToken.None` — absence
+of the markers, not just presence of a call). I additionally confirmed by grep that the real
+`// InvitationService.RevokeAsync's remarks for the full reasoning (D1).` comments in
+`Invitations.razor`/`Account.razor` are the real-world instance the doc-comment test models, and the
+closed-world test passing at 15/15 (not 16, not with duplicates) is empirical proof those comments
+aren't double-counted.
+
+**Proportionality — warranted, not over-built.** Four new files, ~379 lines, +28 tests for two
+tasks that the Architect's brief itself designated as "the primary test of this whole change." Each
+file has a distinct, non-overlapping job: `ServiceCall.cs` (9 lines) is a plain record, not an
+abstraction with one caller — both `ServiceCallSweep` and both test classes depend on its shape.
+`ServiceCallSweep.cs` (79 lines) is genuine hand-rolled parsing logic that had a real, previously
+shipped bug (the `);`-anchor), which is exactly the kind of code that warrants dedicated self-tests
+rather than trusting it against the real pages directly. `ServiceCallSweepInstrumentTests.cs` (142
+lines, 9 facts) tests the parser against literal snippets, not the test framework, and every fact
+maps to a distinct shape (explicit `None`, `RequestAborted`, the `if`-condition bug, multi-line
+arguments, the `?? default` fallback, omission, a doc comment, nesting, two calls in one source) —
+no filler. `RequestCancellationSweepTests.cs` (149 lines) is the payload: one closed-world check plus
+15 per-site theories against the real pages. I don't see dead scaffolding or self-tests that test
+only each other.
+
+**Scope, idiom, hazards.** Tests only (`git diff 7a4d6e1 -- src` empty, confirmed independently);
+stays inside `## 4.`; no drive-by changes. File-scoped namespaces, one top-level type per file,
+`internal sealed`/`sealed` as appropriate, no null-forgiving `!`, no sync-over-async, `async`
+methods suffixed `Async`, naming matches the codebase's existing sentence-style `Fact`/`Theory`
+convention. No auth/crypto hazard: nothing here touches Argon2id, session handling, or token
+issuance/storage; it reads `.razor` source text off disk in test-only code and asserts against
+service-layer behaviour already covered by 4.3.
+
+**Gate figures cross-checked, not just re-quoted.** 3 (4.3) + 1 (closed-world) + 15 (per-site
+theories) + 9 (instrument) = 28, matching 349 → 377 exactly. The worker's DEVLOG phrasing ("16 from
+the closed-world check + 15 per-site theories") reads oddly on a first pass — it means 16 = 1 + 15 —
+but the arithmetic is right and the total ties out under my own `dotnet test` run.
+
+No further action required to approve. Finding 1 is a recommendation the worker or a later change
+can take at its discretion; it does not block this block or the section.
+
+→ @architect
+
+**[worker]** Finding 1 fixed (Architect took it). `ServiceCallSweep`'s token-argument extraction is
+no longer a textual "split on the last comma" — it now walks the argument-list text tracking paren
+depth and treats only a comma at depth 0 as an argument separator, taking the text after the last
+such top-level comma (`LastTopLevelArgument`, `ServiceCallSweep.cs`). A final argument that is
+itself a call containing a comma — the reviewer's `RevokeAsync(accountId, TokenSource.Combine(x, y))`
+case — now extracts as the whole `TokenSource.Combine(x, y)` rather than the fragment `y)`, because
+that comma sits inside `Combine`'s own parens, at depth 1.
+
+Updated `ServiceCallSweep`'s `<remarks>` with a third paragraph naming the old behaviour, why it's
+wrong, and why the fix matters even with no current site hitting it (this sweep is the only
+mechanical evidence §3's work exists; a silently wrong extraction is worse than no sweep). Tightened
+`ServiceCall.TokenArgument`'s doc from "last positional argument" to "last **top-level** positional
+argument" to match.
+
+**Two new instrument self-tests** in `ServiceCallSweepInstrumentTests.cs`, both against the
+reviewer's exact case: `A_final_argument_that_is_itself_a_call_containing_a_comma_is_extracted_whole`
+(known-present — asserts the full `TokenSource.Combine(x, y)` comes back) and
+`A_final_argument_that_is_itself_a_call_is_not_truncated_to_a_fragment_of_itself` (known-absent
+counterpart — asserts it is neither `"y)"` nor `"y"`, the two ways a textual split could have been
+wrong). Same snippet-based approach as the rest of the file, no `src` or real page touched.
+
+**The 15 real sites are unchanged.** None of them has a comma inside its final argument (confirmed
+by re-reading all 15 in the original block), so depth-0 and textual last-comma splitting agree on
+every one. Not merely reasoned — verified: `RequestCancellationSweepTests.cs` is untouched this
+round, and every one of its 16 tests still passes unchanged, exact-match and `Contains` assertions
+alike, which is only possible if all 15 extracted token arguments are identical to before the fix.
+
+**Gates re-run**: `dotnet build` — 0 warnings, 0 errors. `dotnet test` — **379/379 passed**, full
+suite, no filter (was 377; +2, the two new instrument self-tests — `RequestCancellationSweepTests.cs`
+itself gained no new tests, per the brief). `openspec validate request-cancellation --strict` —
+valid. `dotnet format --verify-no-changes` — clean (exit 0).
+
+Scope: `git diff -- src` empty. Changed this round: `ServiceCallSweep.cs`, `ServiceCall.cs`,
+`ServiceCallSweepInstrumentTests.cs`. Untouched: `RequestCancellationSweepTests.cs`, `KnownSites`,
+the three 4.3 service test files, everything under `src`. No mutation testing run — settled by the
+two self-tests above, per the brief. No agent spawned. No boxes ticked. No commit made.
+
+→ @reviewer
+
 ## NEXT
 
 **Resume point: §4, blocked pending a Product Owner ruling on task 4.3** (see *Before §4 opens*

@@ -277,6 +277,28 @@ public sealed class InvitationServiceTests : IDisposable
         Assert.Equal(IssuedAt.AddHours(2), stored.RevokedAt);
     }
 
+    [Fact]
+    public async Task Revoking_under_an_already_cancelled_token_throws()
+    {
+        // Deliberately the opposite of D1's guarantee that revocation survives a disconnect: that
+        // guarantee is a property of the caller, which passes CancellationToken.None (§3), not of
+        // this method, which correctly honours whatever token it is given. This proves the
+        // parameter is live — 4.5's sweep is what proves every caller passes None to it.
+        var alice = await AddAccountAsync("alice");
+        var issued = await _service.IssueAsync(alice.Id);
+
+        var cancellationToken = new CancellationToken(canceled: true);
+
+        var thrown = await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => _service.RevokeAsync(alice.Id, AsMember, issued.Id, cancellationToken));
+
+        Assert.True(thrown.CancellationToken.IsCancellationRequested);
+
+        // The invitation stays exactly as issued: the throw happened before anything wrote.
+        var stored = await _db.Invitations.AsNoTracking().SingleAsync(i => i.Id == issued.Id);
+        Assert.Null(stored.RevokedAt);
+    }
+
     private async Task<Account> AddAccountAsync(string username, bool isAdministrator = false)
     {
         var account = new Account

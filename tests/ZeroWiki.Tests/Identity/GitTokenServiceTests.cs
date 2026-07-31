@@ -176,6 +176,27 @@ public sealed class GitTokenServiceTests : IDisposable
     }
 
     [Fact]
+    public async Task Revoking_under_an_already_cancelled_token_throws()
+    {
+        // Deliberately the opposite of D1's guarantee that revocation survives a disconnect: that
+        // guarantee is a property of the caller, which passes CancellationToken.None (§3), not of
+        // this method, which correctly honours whatever token it is given. This proves the
+        // parameter is live — 4.5's sweep is what proves every caller passes None to it.
+        var account = await AddAccountAsync("alice");
+        var issued = await _service.IssueAsync(account.Id);
+
+        var cancellationToken = new CancellationToken(canceled: true);
+
+        var thrown = await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => _service.RevokeAsync(account.Id, issued.Id, cancellationToken));
+
+        Assert.True(thrown.CancellationToken.IsCancellationRequested);
+
+        // The token stays live: the throw happened before RevokedAt was ever set.
+        Assert.NotNull(await _service.VerifyAsync("alice", issued.Token));
+    }
+
+    [Fact]
     public async Task Login_password_is_not_accepted_as_a_git_credential()
     {
         const string LoginPassword = "correct horse battery staple";
