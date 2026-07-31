@@ -313,7 +313,11 @@ else if (_emailRemoved is false)
         // The identifier came from the browser and authorises nothing: the service re-scopes it to
         // this account's own tokens, so a posted identifier naming somebody else's is simply not
         // found.
-        _revoked = await GitTokenService.RevokeAsync(CallerAccountId, RevokeInput.TokenId);
+
+        // CancellationToken.None, not Context.RequestAborted (D2): this must finish even if the
+        // browser disconnects, or the caller is left believing a live token is dead. See
+        // GitTokenService.RevokeAsync's remarks for the full reasoning (D1).
+        _revoked = await GitTokenService.RevokeAsync(CallerAccountId, RevokeInput.TokenId, CancellationToken.None);
 
         await LoadAsync();
     }
@@ -330,7 +334,10 @@ else if (_emailRemoved is false)
         // The identifier came from the browser and authorises nothing: the service re-scopes it to
         // this account's own emails, so a posted identifier naming somebody else's is simply not
         // found — the same shape as RevokeAsync above.
-        _emailRemoved = await GitEmailService.RemoveAsync(CallerAccountId, RemoveEmailInput.EmailId);
+
+        // CancellationToken.None, not Context.RequestAborted (D2) — same reasoning as RevokeAsync
+        // above, for the emails list rather than the tokens list.
+        _emailRemoved = await GitEmailService.RemoveAsync(CallerAccountId, RemoveEmailInput.EmailId, CancellationToken.None);
 
         await LoadEmailsAsync();
     }

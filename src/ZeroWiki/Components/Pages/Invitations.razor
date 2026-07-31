@@ -147,10 +147,15 @@ else if (_revocation is InvitationRevocation.NotFound)
     {
         // The identifier came from the browser and grants nothing by itself: the service re-scopes
         // it to the invitations this caller may act on.
+
+        // CancellationToken.None, not Context.RequestAborted (D2): this must finish even if the
+        // browser disconnects, or the caller is left believing a live invitation is dead. See
+        // InvitationService.RevokeAsync's remarks for the full reasoning (D1).
         _revocation = await InvitationService.RevokeAsync(
             CallerAccountId,
             CallerIsAdministrator,
-            RevokeInput.InvitationId);
+            RevokeInput.InvitationId,
+            CancellationToken.None);
 
         await LoadAsync();
     }

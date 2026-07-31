@@ -759,6 +759,229 @@ that needs an answer before §4 opens.
   "tidy the unreachable branches" pass has to argue with it rather than silently remove it, which is D2's
   own reasoning applied one level up.
 
+## 3. Hold the line at de-authorisation
+
+**[architect]** Base: `a2c0db0` — the three de-authorisation call sites stop inheriting the service
+default and say `CancellationToken.None` out loud, with the reason; plus a sweep proving there is no
+fourth.
+
+**[architect]** Brief — block 3.1–3.3 → @worker. §3 is one block: the two edits and the sweep are one
+argument, and reviewing them apart would be reviewing half of it.
+
+**Product Owner rulings carried into this block.** §3 as a single block (confirmed). Separately, §4.4
+is settled ahead of time — assert at the service level against an **empty** store; do not add a seam.
+Recorded here so §4's worker inherits it rather than re-opening it.
+
+**The tasks.**
+
+- **3.1** `Account.razor` — `GitTokenService.RevokeAsync` (`:316`) and `GitEmailService.RemoveAsync`
+  (`:333`) pass `CancellationToken.None` explicitly, each with the D2 comment saying why.
+- **3.2** `Invitations.razor` — `InvitationService.RevokeAsync` (`:150`) the same.
+- **3.3** Sweep `src` and confirm no de-authorisation path anywhere else reaches a service while
+  carrying a request-scoped token. Report the sweep's *method*, not just its verdict.
+
+**The binding decisions.**
+
+**D1 — the line is not read-vs-write.** It is whether the fail-safe direction is to *stop* or to
+*finish*. Reads and creates cancel because abandoning them leaves no trace; de-authorisation must not,
+because a user who clicks *revoke* cannot distinguish a failed request from a click that never
+registered, will not retry, and is left believing a live credential is dead. §2 flowed
+`RequestAborted` into twelve read/create sites. These three are the other side of that line, and they
+are the whole point of the change.
+
+**D2 — explicit `CancellationToken.None`, not an omitted argument.** This is what 3.1/3.2 exist to
+do. All three services declare `CancellationToken cancellationToken = default`, so today's call sites
+compile and behave correctly *by accident of the default* — and an omitted argument is
+indistinguishable from an oversight, which is exactly what all 15 sites looked like before this
+change. Write it out so a future "let's make these consistent" pass has to argue with a decision
+rather than silently tidy away an apparent omission.
+
+**Craft note, and the one real judgement in this block.** All three call sites *already* carry a
+comment (the "identifier came from the browser and authorises nothing" scoping note), and all three
+service methods already carry the §1 `<remarks>` stating the rule from the callee side. So:
+
+- Do **not** restate the service-side remark at the call site. It is one line, from the caller's point
+  of view, saying why *this* argument is `None`. `RedeemInvitation.razor`'s §2 comments are the
+  precedent for voice and length.
+- Do **not** let the two comments merge into a wall. They answer different questions — one is "why is
+  this identifier safe to accept", the other "why is this token `None`". Keep them legible as two.
+
+**Scope.** Only these three call sites and whatever 3.3's sweep turns up. No service signatures (§1.2
+settled that none change). No test files — that is §4. Nothing outside `src/ZeroWiki/Components/Pages`
+unless the sweep finds something, and if it does, **stop and report rather than fixing it**: a fourth
+de-authorisation path would mean the spec's enumeration is incomplete, which is a Product Owner call.
+
+**3.3's two known non-findings** — both already confirmed by supervisors. Do not report these as gaps:
+
+- `BootstrapStartupExtensions.LogBootstrapStateAsync` (`Program.cs:74`) takes no token; startup path,
+  not de-authorisation. (§1 supervisor.)
+- `Logout.razor:44` `context.SignOutAsync(...)` is withdrawal-*shaped* but takes no `CancellationToken`
+  and touches no identity service or store row, so there is nothing for a request-scoped token to
+  reach. (§2 supervisor.)
+
+**Constraints.**
+
+- **Do not spawn a `reviewer`, or any other agent.** §2's worker commissioned its own review — an
+  audit the audited party arranged — and the verdict came back pre-attached. Your handoff is a
+  `→ @reviewer` line in this DEVLOG; the Architect reads it and commissions the review.
+- **No mutation testing in this block.** Three call-site edits and a sweep are not a
+  security-critical path in the sense CLAUDE.md means; there is nothing here worth breaking to see if
+  a test dies, and §4 is where the evidence for this section actually gets built.
+- Post to this DEVLOG as you go, attributed `[worker]`, referencing `3.1–3.3`.
+
+**Done-gates** — all four, before you hand off: `dotnet build` clean; `dotnet test` green (all 344,
+not a filter); `openspec validate request-cancellation --strict`; `dotnet format
+--verify-no-changes` clean.
+
+**[worker]** 3.1–3.3 done.
+
+- **3.1 `Account.razor`** — `GitTokenService.RevokeAsync` (`:316`→`:320` after the added lines) and
+  `GitEmailService.RemoveAsync` (`:333`→`:340`) now pass `CancellationToken.None` explicitly. Each
+  gets a second, blank-line-separated comment below the existing scoping comment: one clause naming
+  D2 ("`CancellationToken.None`, not `Context.RequestAborted` (D2)"), one clause giving the
+  consequence in the caller's own terms ("the caller is left believing a live token is dead"), and a
+  pointer to the service's own `<remarks>` for the full reasoning rather than restating it. The
+  `RemoveEmailAsync` comment is shorter and refers back to `RevokeAsync`'s, the same
+  first-full/second-terse shape §2 used across `RedeemInvitation.razor`'s two call sites.
+- **3.2 `Invitations.razor`** — `InvitationService.RevokeAsync` (`:150`→`:154`) gets the same
+  two-comment shape as `Account.razor`'s `RevokeAsync`, sized for its own service's remarks.
+- **3.3 sweep — method.** Three passes, each answering a different way the enumeration could be
+  incomplete:
+  1. `grep -rnE '\.(IsAvailableAsync|CreateFirstAdministratorAsync|VerifyCredentialsAsync|IssueAsync|ListAsync|RevokeAsync|ValidateAsync|RedeemAsync|AddAsync|RemoveAsync|VerifyAsync|FindByEmailAsync)\('`
+     over `src`, excluding `Identity/` — the same pattern §2's supervisor used, which catches a
+     receiver split across lines. Fifteen hits, matching D2's known count exactly: twelve carry
+     `Context.RequestAborted` / `context.RequestAborted` / `HttpContext?.RequestAborted ?? default`
+     (confirmed the two multi-line calls, `CreateFirstAdministratorAsync` and `RedeemAsync`, both
+     still carry the token on their continuation line), and the three de-authorisation calls now
+     carry `CancellationToken.None` explicitly — 12 + 3 = 15, none left bare.
+  2. A pattern-agnostic sweep for anything *shaped* like withdrawal, independent of the known method
+     names, in case a de-authorisation path exists under a verb the first pass's whitelist doesn't
+     know: `grep -rnE '\.(Revoke|Remove|Disable|Delete|Deactivate|Expire|SignOut|Deauth)[A-Za-z]*\('`
+     over `src`, excluding `Identity/`. Four hits: the same three de-authorisation calls (now
+     confirmed `CancellationToken.None`), plus `Logout.razor:42` `context.SignOutAsync(...)` — the
+     known non-finding. This pass is what would have caught a fourth site if one existed under a
+     name the first pass's enumerated list missed; it found nothing new.
+  3. Confirmed there is no de-authorisation call site outside `.razor` pages at all:
+     `grep -rlnE 'GitTokenService|GitEmailService|InvitationService|LoginService|BootstrapService'`
+     over `src/**/*.cs` excluding `Identity/` returns nothing — the only reference to any identity
+     service from outside `Identity/` is the `<see cref>` on `AuthenticatedAccount.cs:8` pointing at
+     `GitTokenService.VerifyAsync`, a doc link, not a call. `VerifyAsync` itself has no call site
+     anywhere in `src` yet (git Smart HTTP is a different, not-yet-implemented capability) — flagging
+     only so it isn't mistaken for a missed site; there is nothing there to sweep.
+
+  **Verdict: no fourth de-authorisation site.** Both known non-findings reconfirmed and not reported
+  as gaps: `BootstrapStartupExtensions.LogBootstrapStateAsync` (`Program.cs:74`, no token, startup
+  path) and `Logout.razor:42` `SignOutAsync` (withdrawal-shaped, no `CancellationToken` parameter, no
+  identity-service or store row touched).
+
+**Did not spawn a `reviewer` or any other agent.** Handoff below is a DEVLOG line only.
+
+**Gates**: `dotnet build` — 0 warnings, 0 errors. `dotnet test` — 344/344 passed, whole suite, no
+filter. `openspec validate request-cancellation --strict` — valid. `dotnet format
+--verify-no-changes` — clean. `git status --short -- src` shows exactly the two files in scope
+(`Account.razor`, `Invitations.razor`); nothing under `Identity/` or `tests/` touched.
+
+No mutation testing run in this block, per the brief.
+
+→ @reviewer
+
+**[reviewer]** 3.1–3.3 audited (`git diff a2c0db0 -- src` and `-- openspec`). Verdict: **Approve with
+nits.**
+
+**Correctness / binding-decision checks.**
+
+- Argument binding confirmed at all three sites by reading the callee signatures directly, not
+  assuming from position: `GitTokenService.RevokeAsync(Guid, Guid, CancellationToken = default)`,
+  `GitEmailService.RemoveAsync(Guid, Guid, CancellationToken = default)`, and
+  `InvitationService.RevokeAsync(Guid, bool, Guid, CancellationToken = default)`. The `Invitations.razor`
+  call — the one with the `bool` in the middle — passes `(CallerAccountId, CallerIsAdministrator,
+  RevokeInput.InvitationId, CancellationToken.None)`, four positional arguments against four
+  parameters in the same order. `CancellationToken.None` binds to `cancellationToken` at all three
+  sites, not to something else by position.
+- D1/D2 compliance: all three sites now write `CancellationToken.None` explicitly rather than omitting
+  the argument, each with a caller-side comment. Matches `design.md`'s D1 (fail-safe direction is to
+  *finish*, not stop) and D2 (explicit, not an inherited default) exactly, and the spec's "De-authorisation
+  completes regardless of the client" requirement.
+- Scope: `git diff a2c0db0 --stat -- src tests openspec` touches exactly `Account.razor` (+11/-3),
+  `Invitations.razor` (+7/-3), and `DEVLOG.md`. No test files, no service signatures, nothing under
+  `Identity/`. `tasks.md` is untouched (still `[ ]` on 3.1–3.3, correctly left for the Architect).
+
+**3.3 sweep — independently re-derived, different instrument.** The worker's three passes were all
+regex over `src`. I used `codegraph_explore`, this repo's indexed semantic call graph (AST/symbol-based,
+not pattern-based) — a genuinely different instrument, so an agreement here is not two measurements
+sharing a blind spot:
+
+- Queried callers of `GitTokenService`, `GitEmailService`, `InvitationService`, `LoginService`,
+  `BootstrapService` as a group: every de-authorisation-shaped method (`GitTokenService.RevokeAsync`,
+  `GitEmailService.RemoveAsync`, `InvitationService.RevokeAsync`) resolves to callers confined to
+  `Account.razor` / `Invitations.razor` and nowhere else — no test-only or hidden caller, no second
+  page.
+- Queried `InvitationService`'s methods specifically: `RevokeAsync`, `IssueAsync`, `ListAsync` each
+  show **exactly 1 caller**, all in `Invitations.razor`. This is the strongest single data point — a
+  call-graph edge count, not a grep hit count, so it isn't fooled by a receiver split across lines or a
+  method name reused elsewhere the way a regex whitelist could be.
+- Queried the two known non-findings directly and read the actual source (not just grepped for it):
+  `Logout.razor:42` calls `context.SignOutAsync(CookieAuthenticationDefaults.AuthenticationScheme)` —
+  this is `AuthenticationHttpContextExtensions.SignOutAsync`, a framework extension method with **no
+  `CancellationToken` overload**, so there is structurally nothing for a request-scoped token to
+  reach; it also never touches `db` or any identity service. `BootstrapStartupExtensions.
+  LogBootstrapStateAsync` (`Program.cs:74`) is a one-shot startup read (`IsAvailableAsync`) that logs
+  and discards its answer — not a write, not de-authorisation. Both exclusions are reasoned, not
+  accidental.
+
+**Verdict on 3.3: confirmed independently.** No fourth de-authorisation site exists. My instrument
+(semantic call-graph traversal) would have surfaced a fourth caller of any of the three methods, or a
+caller of `SignOutAsync`/`LogBootstrapStateAsync` outside their known callers, as a distinct entry in
+the blast-radius listing — it found none.
+
+**Nits (not blocking).**
+
+1. `Account.razor:313–319`, `:334–340`, `Invitations.razor:148–153` — the brief asked for the
+   pre-existing scoping comment and the new D2 comment to stay "legible as two," not merge into a
+   wall. The worker separated them with a bare `//` line rather than a real blank line. Checked this
+   codebase's own precedent for that exact syntax: `Program.cs:86–111` uses bare `//` between
+   paragraphs to structure **one** long multi-paragraph comment justifying **one** line
+   (`app.UseAuthentication()`/`app.UseRouting()`), not to demarcate two independently-authored
+   comments answering different questions. Applying the same syntax here produces the same visual
+   result — one contiguous, same-colour comment block with an internal paragraph break — which reads
+   as one comment on a skim, not two. It is a defensible reuse of house style, but it does not clearly
+   satisfy "legible as two" as the brief specifically asked. If the Architect wants unambiguous
+   separation, a true blank line (no `//`) between the two would do it; if the multi-paragraph-comment
+   reading is fine, no change needed. Worker/Architect call, not a re-implementation demand from me.
+2. `Account.razor:338` — the `RemoveEmailAsync` D2 comment reads "same reasoning as `RevokeAsync`
+   above," a positional back-reference that rots if the two methods are ever reordered. Low risk: it
+   mirrors this file's own pre-existing scoping-comment precedent (`:336`, "the same shape as
+   `RevokeAsync` above"), so it's consistent with established local style rather than a new pattern
+   introduced by this block. Flagging for awareness, not requesting a change.
+
+**No blockers.** Correctness, argument binding, D1/D2 compliance, and OpenSpec scope all check out on
+direct inspection; the 3.3 sweep holds up under an instrument the worker didn't use.
+
+**Approve.**
+
+**[architect]** Taking nit 1, declining nit 2. Nit 1: the reviewer's own precedent check is right —
+`Program.cs:86–111`'s bare `//` structures paragraphs *within* one comment, not two independently
+authored ones, so the brief's "legible as two" isn't clearly met. → @worker: replace the bare `//`
+separator with a real blank line at all three sites; nothing else changes. Nit 2: declined — the
+pre-existing sibling comment two lines above `RemoveEmailAsync`'s D2 comment already says "the same
+shape as `RevokeAsync` above," so changing only the new comment to avoid the positional reference
+would make it diverge from its own neighbour to dodge a hypothetical. Consistency wins; recording the
+decision so it isn't rediscovered later as an oversight. Re-run all four gates after the nit-1 edit.
+
+**[worker]** Nit 1 applied. Replaced the bare `//` separator line with an actual blank line between
+the pre-existing scoping comment and the new D2 comment at all three sites — `Account.razor`
+`RevokeAsync` (`:316`), `Account.razor` `RemoveEmailAsync` (`:337`), and `Invitations.razor`
+`RevokeAsync` (`:150`) — so each is now unambiguously two comment blocks either side of a blank line.
+No comment text changed, no code line changed. Nit 2 left as-is per the Architect's ruling above — no
+edit made.
+
+**Gates re-run**: `dotnet build` — 0 warnings, 0 errors. `dotnet test` — 344/344 passed, whole suite,
+no filter. `openspec validate request-cancellation --strict` — valid. `dotnet format
+--verify-no-changes` — clean (confirms the blank line is not itself a formatting violation).
+`git status --short -- src` unchanged in scope: `Account.razor`, `Invitations.razor` only.
+
+→ @architect
+
 ## NEXT
 
 **Resume point: §3, block 3.1–3.3** (`## 3. Hold the line at de-authorisation`). §1 and §2 are both

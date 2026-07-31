@@ -14,9 +14,9 @@
 
 ## 3. Hold the line at de-authorisation
 
-- [ ] 3.1 `Account.razor` — `GitTokenService.RevokeAsync` and `GitEmailService.RemoveAsync` take `CancellationToken.None`, written explicitly with the D2 comment saying why
-- [ ] 3.2 `Invitations.razor` — `InvitationService.RevokeAsync` takes `CancellationToken.None`, same treatment
-- [ ] 3.3 Verify no de-authorisation path anywhere else in `src` reaches a service while carrying a request-scoped token
+- [x] 3.1 `Account.razor` — `GitTokenService.RevokeAsync` and `GitEmailService.RemoveAsync` take `CancellationToken.None`, written explicitly with the D2 comment saying why
+- [x] 3.2 `Invitations.razor` — `InvitationService.RevokeAsync` takes `CancellationToken.None`, same treatment
+- [x] 3.3 Verify no de-authorisation path anywhere else in `src` reaches a service while carrying a request-scoped token
 
 ## 4. Tests
 
