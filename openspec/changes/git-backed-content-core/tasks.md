@@ -9,9 +9,9 @@
 
 - [x] 2.1 On startup, detect an existing non-bare git repo on the volume; serve from its `docs/` working tree
 - [x] 2.2 If the volume has no repo, `git init` a non-bare repo, create `docs/`, set `receive.denyCurrentBranch=updateInstead`, and make an initial commit
-- [ ] 2.3 Install `pre-receive` and `post-receive` hooks into the repo on bootstrap
-- [ ] 2.4 Implement startup reconciliation: if the working tree is dirty, commit it as a recovery commit authored `System <system@zerowiki.org>` (D9 — always commit, never discard, no policy switch), leaving a clean tree
-- [ ] 2.5 Add a health/self-check that asserts the working-tree-clean invariant
+- [x] 2.3 Install `pre-receive` and `post-receive` hooks into the repo on bootstrap
+- [x] 2.4 Implement startup reconciliation: if the working tree is dirty, commit it as a recovery commit authored `System <system@zerowiki.org>` (D9 — always commit, never discard, no policy switch), leaving a clean tree
+- [x] 2.5 Add a health/self-check that asserts the working-tree-clean invariant
 
 ## 3. Content read & render
 

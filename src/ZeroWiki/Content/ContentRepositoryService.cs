@@ -6,7 +6,9 @@ namespace ZeroWiki.Content;
 /// Detects or initializes the content git repository at <see cref="ContentPaths.RepositoryRoot"/> on
 /// startup (D1, D8): an existing non-bare repository is used as-is, an empty or repo-less directory
 /// is initialized, and a bare repository — incompatible with D1's working-tree requirement — fails
-/// startup rather than being silently served as empty.
+/// startup rather than being silently served as empty. Installs the Smart HTTP git hooks, reconciles
+/// any dirty working tree left from a crash or manually copied-in content (D9), and asserts the
+/// working-tree-clean invariant before returning.
 /// </summary>
 /// <remarks>
 /// Deliberately not <c>BootstrapService</c> — <see cref="ZeroWiki.Identity.BootstrapService"/>
@@ -24,14 +26,27 @@ public sealed class ContentRepositoryService
 
     private const string InitialCommitMessage = "Initial commit";
 
+    /// <summary>
+    /// Message for the startup-reconciliation commit (D9). Deliberately distinct from
+    /// <see cref="InitialCommitMessage"/> so an operator meeting it in <c>git log</c> with no other
+    /// context recognises it as machine-made recovery, not an ordinary edit.
+    /// </summary>
+    private const string RecoveryCommitMessage = "Recover uncommitted content found at startup";
+
     private readonly ContentPaths _paths;
     private readonly GitProcessRunner _git;
+    private readonly GitHookInstaller _hooks;
     private readonly ILogger<ContentRepositoryService> _logger;
 
-    public ContentRepositoryService(ContentPaths paths, GitProcessRunner git, ILogger<ContentRepositoryService> logger)
+    public ContentRepositoryService(
+        ContentPaths paths,
+        GitProcessRunner git,
+        GitHookInstaller hooks,
+        ILogger<ContentRepositoryService> logger)
     {
         _paths = paths;
         _git = git;
+        _hooks = hooks;
         _logger = logger;
     }
 
@@ -96,7 +111,15 @@ public sealed class ContentRepositoryService
         await AssertGitResolvesRepositoryRootAsync(repositoryRoot, cancellationToken);
 
         await ApplyRepositoryConfigurationAsync(repositoryRoot, cancellationToken);
+        await _hooks.InstallHooksAsync(repositoryRoot, cancellationToken);
         await EnsureInitialCommitAsync(repositoryRoot, cancellationToken);
+
+        // D9: a dirty tree at startup (e.g. Markdown copied onto the volume before first start, or an
+        // interrupted save) is always committed as a recovery commit, never discarded.
+        await ReconcileWorkingTreeAsync(repositoryRoot, cancellationToken);
+
+        // Runs last: its whole job is to check that everything above actually achieved a clean tree.
+        await AssertWorkingTreeIsCleanAsync(repositoryRoot, cancellationToken);
     }
 
     private static InvalidOperationException BareRepositoryException(string repositoryRoot) =>
@@ -221,5 +244,182 @@ public sealed class ContentRepositoryService
             cancellationToken: cancellationToken);
 
         _logger.LogInformation("Initial commit created for the content repository at '{RepositoryRoot}'.", repositoryRoot);
+    }
+
+    /// <summary>
+    /// D9: commits any uncommitted changes left in the working tree at startup — for example after a
+    /// crash mid-save, or a folder of Markdown copied onto the volume before the app's first start —
+    /// as a single recovery commit authored <see cref="GitAuthor.System"/>. Always commits, never
+    /// discards, with no configurable policy: discarding is unrecoverable, and an unwanted recovery
+    /// commit is a plain <c>git revert</c> — except for a nested repository, which this method refuses
+    /// to commit at all rather than silently gitlink (see <see cref="FindStagedGitlinksAsync"/>).
+    /// </summary>
+    /// <remarks>
+    /// The gitlink check (<see cref="FindStagedGitlinksAsync"/>) asks whether committing now would
+    /// *introduce* a gitlink not already in <c>HEAD</c> — a delta, not a census of the whole index —
+    /// so a gitlink that landed in history before this check existed does not refuse startup on every
+    /// later restart. Detecting one retroactively is explicitly out of scope (Product Owner decision):
+    /// no shipped build has ever created one, and doing so would refuse to start a wiki that already
+    /// has one in its history, which is a worse outcome than leaving the pre-existing gap undetected.
+    /// </remarks>
+    private async Task ReconcileWorkingTreeAsync(string repositoryRoot, CancellationToken cancellationToken)
+    {
+        // `add -A` stages tracked modifications and deletions *and* untracked files. Untracked files
+        // are the load-bearing case: copying a folder of Markdown onto the volume is the ordinary way
+        // to populate a new ZeroWiki, and it arrives untracked. Staging only tracked changes (e.g.
+        // `add -u`) would leave that content uncommitted — the tree still dirty, and every push
+        // bouncing — while every existing check up to this point still looks like it succeeded.
+        await _git.RunOrThrowAsync(repositoryRoot, ["add", "-A"], cancellationToken: cancellationToken);
+
+        // D9 addendum (Product Owner decision): if any of what was just staged is itself a nested git
+        // repository — an operator copying in an existing Obsidian vault or a cloned notes folder,
+        // .git and all — `add -A` does not stage its files. It stages the directory as a gitlink (mode
+        // 160000), a bare reference to a commit in an object database this repository never touches.
+        // A commit would "succeed", git status --porcelain would report clean, and the invariant
+        // assertion below would pass — while the actual file contents are not recoverable from this
+        // repository's history at all, which defeats D9's own "an unwanted recovery commit is a plain
+        // git revert" rationale. Refuse to start rather than commit a gitlink silently.
+        var gitlinkPaths = await FindStagedGitlinksAsync(repositoryRoot, cancellationToken);
+        if (gitlinkPaths.Count > 0)
+        {
+            // Unstage before throwing, so a refused start is not also a half-staged one — `git reset`
+            // resets the index back to HEAD without touching the working tree, leaving exactly what
+            // the operator copied in untouched for them to fix.
+            await _git.RunOrThrowAsync(repositoryRoot, ["reset"], cancellationToken: cancellationToken);
+
+            throw new InvalidOperationException(BuildGitlinkErrorMessage(repositoryRoot, gitlinkPaths));
+        }
+
+        var stagedDiff = await _git.RunAsync(
+            repositoryRoot,
+            ["diff", "--cached", "--quiet"],
+            cancellationToken: cancellationToken);
+
+        if (stagedDiff.Succeeded)
+        {
+            // Nothing was staged: the tree was already clean. D9: a clean tree produces no commit.
+            return;
+        }
+
+        await _git.RunOrThrowAsync(
+            repositoryRoot,
+            ["commit", "-m", RecoveryCommitMessage],
+            environmentVariables: GitAuthor.System.ToEnvironmentVariables(),
+            cancellationToken: cancellationToken);
+
+        _logger.LogWarning(
+            "Startup reconciliation found uncommitted changes in the content repository at " +
+            "'{RepositoryRoot}' and committed them as a recovery commit authored 'System " +
+            "<system@zerowiki.org>' (D9).",
+            repositoryRoot);
+    }
+
+    /// <summary>
+    /// Finds every path that committing the current index right now would record as a gitlink (mode
+    /// <c>160000</c>) — the entry git writes for a nested repository instead of its file contents.
+    /// </summary>
+    /// <remarks>
+    /// Asks <c>git diff --cached --raw</c> — a diff of the index against <c>HEAD</c> — rather than
+    /// <c>git ls-files --stage</c>, which lists the *entire* index regardless of whether any of it is
+    /// new. A gitlink that already exists in <c>HEAD</c> (landed before this check existed) produces no
+    /// diff entry and so is correctly ignored on every later restart; only a gitlink this call's
+    /// <c>add -A</c> newly staged, or changed, appears. This call always sees a <em>born</em>
+    /// <c>HEAD</c> — <see cref="EnsureInitialCommitAsync"/> runs unconditionally before reconciliation
+    /// in <see cref="EnsureRepositoryAsync"/> and always creates the initial commit — so the genuinely
+    /// unborn-<c>HEAD</c> case (a fresh repository with no commits at all) never actually reaches this
+    /// method or the <c>git reset</c> below it, and the "nested repository copied in before the very
+    /// first commit" tests are covered by that ordering, not by this method tolerating an unborn
+    /// <c>HEAD</c>. (As a property of git, <c>diff --cached --raw</c> *would* diff against the empty
+    /// tree if it ever did face an unborn <c>HEAD</c> — but that is not why this code is safe today,
+    /// and would only become load-bearing if a future change reordered <c>EnsureRepositoryAsync</c> to
+    /// run reconciliation before the initial commit.)
+    /// <para>
+    /// Uses <c>-z</c>: without it, <c>core.quotePath</c> (on by default) renders any non-ASCII path as
+    /// a quoted C-style octal escape (e.g. <c>café-vault</c> becomes <c>"caf\303\251-vault"</c>), which
+    /// would land verbatim in the exception message an operator is meant to act on — defeating the
+    /// point of naming the path. <c>-z</c> disables that quoting and NUL-delimits records instead of
+    /// newline-delimiting them, so records and path fields are split on <c>'\0'</c>, not <c>'\n'</c>.
+    /// Each record is <c>":&lt;old mode&gt; &lt;new mode&gt; &lt;old sha&gt; &lt;new sha&gt;
+    /// &lt;status&gt;"</c>, NUL, then the path, NUL — except a rename/copy record (status <c>R</c>/
+    /// <c>C</c>), which carries two NUL-terminated paths (old name, then new name); the new name is
+    /// what this repository would actually contain, so it is the one kept.
+    /// </para>
+    /// </remarks>
+    private async Task<IReadOnlyList<string>> FindStagedGitlinksAsync(string repositoryRoot, CancellationToken cancellationToken)
+    {
+        var diff = await _git.RunOrThrowAsync(
+            repositoryRoot,
+            ["diff", "--cached", "--raw", "-z"],
+            cancellationToken: cancellationToken);
+
+        var fields = diff.StandardOutput.Split('\0', StringSplitOptions.RemoveEmptyEntries);
+        var gitlinkPaths = new List<string>();
+
+        var index = 0;
+        while (index < fields.Length)
+        {
+            var metadataParts = fields[index].TrimStart(':').Split(' ');
+            index++;
+
+            var newMode = metadataParts[1];
+            var status = metadataParts[4];
+
+            // A rename/copy record carries two NUL-terminated paths (old name, then new name); every
+            // other status carries one. Keep the last one consumed — the name this repository would
+            // actually hold.
+            var pathFieldCount = status.Length > 0 && (status[0] == 'R' || status[0] == 'C') ? 2 : 1;
+            var path = string.Empty;
+            for (var i = 0; i < pathFieldCount && index < fields.Length; i++, index++)
+            {
+                path = fields[index];
+            }
+
+            if (newMode == "160000")
+            {
+                gitlinkPaths.Add(path);
+            }
+        }
+
+        return gitlinkPaths;
+    }
+
+    private static string BuildGitlinkErrorMessage(string repositoryRoot, IReadOnlyList<string> gitlinkPaths)
+    {
+        var offendingPaths = string.Join(", ", gitlinkPaths.Select(path => $"'{path}'"));
+
+        return
+            $"The content repository at '{repositoryRoot}' contains a nested git repository at " +
+            $"{offendingPaths} — most likely copied in with its own .git directory (for example an " +
+            "existing Obsidian vault, or a cloned notes folder). ZeroWiki cannot commit a nested " +
+            "repository's file contents into this repository: git would record only a reference to a " +
+            "commit in the nested repository's own history, not the files themselves, and that " +
+            "content would not be recoverable from this wiki if the nested .git is ever removed. " +
+            "Remove the nested .git (or move the folder's contents in without it) and restart the " +
+            "application; refusing to start rather than commit a broken reference.";
+    }
+
+    /// <summary>
+    /// Asserts the working-tree-clean invariant holds after reconciliation. A startup-only check with
+    /// no HTTP surface (Product Owner decision): an anonymous endpoint would leak repository state to
+    /// strangers, an authenticated one cannot be called by an unauthenticated Docker
+    /// <c>HEALTHCHECK</c>, and the runtime image has no HTTP client to call one with anyway. A
+    /// non-empty result means reconciliation failed to do its job, not merely that the tree happens to
+    /// be dirty, so the failure message says that rather than just reporting uncleanliness.
+    /// </summary>
+    private async Task AssertWorkingTreeIsCleanAsync(string repositoryRoot, CancellationToken cancellationToken)
+    {
+        var status = await _git.RunOrThrowAsync(
+            repositoryRoot,
+            ["status", "--porcelain"],
+            cancellationToken: cancellationToken);
+
+        if (!string.IsNullOrEmpty(status.StandardOutput))
+        {
+            throw new InvalidOperationException(
+                $"The content repository at '{repositoryRoot}' is not clean after startup " +
+                $"reconciliation (git status --porcelain reported):\n{status.StandardOutput}" +
+                "Reconciliation should have committed every change; refusing to start rather than " +
+                "accept pushes against a dirty tree.");
+        }
     }
 }

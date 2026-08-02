@@ -24,6 +24,7 @@ public static class ContentStorageStartupExtensions
             new ContentPaths(sp.GetRequiredService<IOptions<ContentStorageOptions>>().Value.DataRoot));
 
         services.AddSingleton<GitProcessRunner>();
+        services.AddSingleton<GitHookInstaller>();
         services.AddSingleton<ContentRepositoryService>();
 
         return services;

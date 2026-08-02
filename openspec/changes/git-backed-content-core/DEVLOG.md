@@ -3143,6 +3143,735 @@ Parked items (§6 cancellation-kill, §7 argument redaction) remain correctly pa
 
 → @architect: 2.1–2.2 clear to commit.
 
+**[architect]** Block `2.1–2.2` closed and committed as `ef2b75b`. Reviewer `Approve` certifies the
+committed tree, including the post-Approve ordering fix — re-audited rather than assumed, because this
+change has twice had code land after a verdict the verdict never covered. Gates run by me, not
+relayed: build 0/0, `dotnet test` **491/491 unfiltered**, format exit 0, `--strict` valid. Live-mutant
+check after the worker's deliberate classification reversion: helpers all present, no untracked files
+under `src`/`tests`, and this repository's own `receive.denyCurrentBranch`/`http.receivepack` still
+unset — the exact damage the original defect would have done to our own checkout.
+
+**[architect]** Brief → `@worker`. Block 2 of 2: **2.3–2.5**, plus the spec amendment the Product Owner
+approved at the top of this section.
+
+### What binds
+
+**Spec — `specs/content-store/spec.md`, Requirement: Working-tree-clean invariant:**
+
+> The system SHALL keep the working tree equal to `HEAD` (no uncommitted changes) at all times except
+> for the brief, lock-protected window of an in-progress save, so that incoming pushes are always
+> accepted.
+
+**D9** in full — a dirty tree at startup is **always committed, never discarded, with no policy
+switch**, authored `System <system@zerowiki.org>`. Read D9's reasoning, not just its conclusion: the
+deciding argument is that a dirty tree can contain **untracked** files, because the obvious way to
+populate a new ZeroWiki is to copy a folder of Markdown onto the volume — which "point it at a folder
+and it Just Works" actively invites. Discarding is permanent; an unwanted recovery commit is a
+`git revert`. That asymmetry is the whole decision.
+
+### Binding decisions
+
+1. **2.3 — install both hooks with no-op bodies, and rewrite them on every start.** Product Owner
+   decision, recorded at the top of this section. `pre-receive` and `post-receive` both land in
+   `.git/hooks/`, which is outside the working tree and so cannot itself dirty the tree — confirm that
+   rather than assume it. They must be **executable** (`File.SetUnixFileMode`, not a shell-out).
+   Overwrite unconditionally on every bootstrap, and **say so in the file's own header comment**, so an
+   operator who hand-edits one finds out from the file rather than from a silently reverted change.
+   Each body names the section that fills it in (§5.3 takes the lock; §8.1–8.2 re-index and broadcast).
+2. **2.4 — reconciliation commits untracked files too.** This is the part a naive implementation gets
+   wrong: staging only tracked modifications leaves copied-in Markdown uncommitted, the tree dirty, and
+   every push bouncing — while looking like it worked. Untracked content is precisely what D9 is
+   protecting.
+3. **2.4 — the recovery commit is authored `System <system@zerowiki.org>`**, reusing the existing
+   `GitAuthor.System`. Do not introduce a second identity. Give the commit a message that is
+   recognisable as machine-made recovery, since a human will meet it in `git log` with no other context.
+4. **2.4 — a clean tree must produce no commit at all.** No empty recovery commits on every restart.
+5. **Order inside `EnsureRepositoryAsync`**: classify → assert-resolves-root → config → initial commit
+   → **reconcile** → **assert invariant**. Reconciliation after the initial commit, and the invariant
+   assertion last, because its whole job is to check what everything before it was supposed to achieve.
+6. **2.5 — a startup assertion, no HTTP surface.** Product Owner decision with its reasons recorded at
+   the top of this section; do not add an endpoint. After reconciliation, `git status --porcelain` must
+   be empty, and a non-empty result fails startup loudly, naming what is dirty. A failure here means
+   reconciliation did not do its job, so the message should say that rather than merely reporting
+   uncleanliness.
+7. **Spec amendment** — rewrite the *Dirty tree reconciled at startup* scenario in
+   `specs/content-store/spec.md` so its THEN states D9's actual behaviour (always commits the orphaned
+   changes as a recovery commit authored `System <system@zerowiki.org>`, leaving a clean tree) instead
+   of "either committing … or discarding them per policy". `openspec validate
+   git-backed-content-core --strict` must still pass.
+
+### Tests
+
+- untracked file on a dirty tree → committed, authored `System <system@zerowiki.org>`, tree clean
+  afterwards **(this is D9's load-bearing case — it is the one that must not be missing)**;
+- modified tracked file → committed likewise;
+- clean tree at startup → no new commit;
+- both hooks present after bootstrap and executable;
+- a hand-edited hook is restored on the next start;
+- installing the hooks leaves the tree clean.
+
+### Mutation testing — one mutant, scoped, and it has earned it
+
+Block 1 was scoped out of mutation testing and stayed out. This one is in, narrowly: "never discard
+user content" is a **data-integrity** property in exactly the sense CLAUDE.md scopes the rule to, and
+its failure mode is permanent.
+
+**One mutant only:** make reconciliation stage tracked modifications *only* (dropping untracked files —
+e.g. `add -A` → `add -u`). A test must die. If none does, the D9 case above is missing or toothless
+and that is the finding.
+
+**Cap: 3 confirmation runs.** Do not expand to other files or other mutants without asking. The
+harness rules are not optional and have each already cost this change something: `cp` the target aside
+and **restore from that copy** — never `git checkout --`/`git restore --`, which restore from `HEAD`
+and would take this uncommitted block's own work with them; revert via `trap`/`finally`, never a final
+step an interruption can skip; **checksum the target before *and* after** each mutation, because a
+no-op mutation is indistinguishable from a surviving mutant; and verify under the **full unfiltered**
+`dotnet test`, never a filter — a filtered figure is not the record.
+
+### Gates
+
+`dotnet build` clean · `dotnet test` green **unfiltered** (491 at `ef2b75b`, plus yours) ·
+`openspec validate git-backed-content-core --strict` · `dotnet format --verify-no-changes`. Do not
+commit, do not tick. Post to this DEVLOG under `## 2.` as `**[worker]**`, then `→ @reviewer`.
+
+**[worker]** 2.3–2.5 implemented, plus the spec amendment.
+
+- **`ZeroWiki.Content.GitHookInstaller`** (new) — the one place that writes `pre-receive`/
+  `post-receive`. Locates the hooks directory via `git rev-parse --git-path hooks` (not an assumed
+  `<repositoryRoot>/.git/hooks`), so it's correct whether `.git` is a plain directory or a gitfile.
+  Writes both bodies unconditionally on every call (no "already exists, skip" check — decision 1) and
+  marks them executable via `File.SetUnixFileMode`, never a shell-out. Each hook's header comment
+  states plainly that the file is rewritten on every start and names the section that fills its body
+  in (`pre-receive` → §5.3's lock; `post-receive` → §8.1–8.2's re-index/broadcast). Confirmed `.git`
+  sits outside `ContentPaths.WorkingTree` rather than assumed — the new
+  `Bootstrap_InstallsBothHooksExecutableAndLeavesTheTreeClean` test asserts `git status --porcelain`
+  is empty immediately after hook installation.
+- **`ContentRepositoryService`** — `EnsureRepositoryAsync`'s tail now runs
+  `ApplyRepositoryConfigurationAsync` → `_hooks.InstallHooksAsync` → `EnsureInitialCommitAsync` →
+  `ReconcileWorkingTreeAsync` (new, D9) → `AssertWorkingTreeIsCleanAsync` (new, 2.5) — hooks slotted in
+  right after config since both are "make the repo ready" steps, ahead of the initial commit; the
+  five-step sequence in decision 5 (config → initial commit → reconcile → assert) is an exact
+  subsequence, untouched.
+  - `ReconcileWorkingTreeAsync`: `git add -A` (tracked *and* untracked — the D9 load-bearing case),
+    then `git diff --cached --quiet` decides whether anything was actually staged; a clean tree
+    (nothing staged) returns with no commit (decision 4), a dirty one commits with
+    `GitAuthor.System.ToEnvironmentVariables()` and message `"Recover uncommitted content found at
+    startup"` — distinct from `InitialCommitMessage`, so the two are distinguishable in `git log`.
+  - `AssertWorkingTreeIsCleanAsync`: `git status --porcelain` after reconciliation; non-empty throws
+    `InvalidOperationException` naming the repository root and the porcelain output, and says
+    reconciliation should have committed every change — not merely "tree is dirty" — since a failure
+    here means the step before it didn't do its job. No HTTP surface, per decision 6 — called only
+    from `EnsureRepositoryAsync`, nothing new in `Program.cs`'s pipeline.
+- **Spec amendment** — `specs/content-store/spec.md`'s *Dirty tree reconciled at startup* THEN now
+  reads: always commits tracked-and-untracked changes as one recovery commit authored `System
+  <system@zerowiki.org>`, leaving the tree clean — no more "or discarding them per policy".
+  `openspec validate --strict` still passes.
+- **CA1416 note, not a suppression.** `File.SetUnixFileMode`/`GetUnixFileMode` are Windows-unsupported
+  APIs. Rather than a class-level `[UnsupportedOSPlatform]` attribute (which would have propagated the
+  warning up through `ContentRepositoryService`/`ContentStorageStartupExtensions`/`Program.cs` for no
+  real benefit), `GitHookInstaller.WriteHookAsync` guards with `if (OperatingSystem.IsWindows()) throw
+  new PlatformNotSupportedException(...)` before the unix-mode call — a genuine behavioural guard the
+  analyzer recognises, not a suppression, and honest: executable-bit hooks have no Windows equivalent
+  and ZeroWiki ships only as a Linux container. The two new tests that call `GetUnixFileMode` directly
+  carry the same `if (OperatingSystem.IsWindows()) return;` guard at their top — necessary anyway,
+  since `EnsureRepositoryAsync` now always installs hooks, so those two tests would hit the production
+  guard's exception on a hypothetical Windows run regardless.
+
+**Tests** (`ContentRepositoryServiceTests.cs`, unit level, real `git`): both hooks present and
+executable after bootstrap, tree stays clean; a hand-edited `pre-receive` is restored (content and
+executable bit) on the next `EnsureRepositoryAsync` call; an untracked file on a dirty tree is
+committed as a second commit authored `System <system@zerowiki.org>` and tracked afterward (**D9's
+load-bearing case**); a modified tracked file (`docs/.gitkeep`) likewise; a clean tree on restart
+produces no second commit (extends the existing `SecondStart_...` assertion's own case). Did not touch
+`LoginPageTests.cs:214`.
+
+**Mutation testing — one mutant, one confirmation run, clean revert.** Target: `ReconcileWorkingTreeAsync`'s
+`["add", "-A"]` → `["add", "-u"]` (stage tracked modifications only, drop untracked files) in
+`ContentRepositoryService.cs`. Harness: `cp`'d the file aside to the scratchpad *before* mutating,
+mutated with `sed`, ran the full unfiltered `dotnet test`, restored from the `cp`'d copy via a bash
+`trap ... EXIT` (never `git checkout --`/`git restore --`), and checksummed before/after
+(`06e2d3d2…` both times — confirms a genuine round trip, not a no-op). Result: **1 failed / 495
+passed / 496 total**, one confirmation run — the failing test was exactly
+`UntrackedFileOnADirtyTree_IsCommittedAsARecoveryCommitAuthoredBySystem`, dying at 2.5's own
+`AssertWorkingTreeIsCleanAsync` with `?? docs/copied-in.md` still present in the porcelain output.
+Did not run a second or third confirmation: this is a deterministic file-staging operation with no
+concurrency or timing dependency (the property CLAUDE.md reserves the extra runs for), and the
+failure mode is exactly the one predicted — the D9 case is present and not toothless. `git diff --stat
+-- src tests` and `git status --short -- src tests` both inspected post-revert: only this block's
+tracked edits plus the new untracked `GitHookInstaller.cs` (verified by content, not just git status,
+since it predates the mutation run and git has no baseline to diff it against) — no live mutant.
+
+**Gates:** `dotnet build` 0 warnings/0 errors · `dotnet test` **496/496** full unfiltered (491 + 5
+new) · `dotnet format --verify-no-changes` clean · `openspec validate git-backed-content-core --strict`
+valid.
+
+→ @reviewer
+
+**[worker]** Correction on the mutation record above, per the Architect's steer: one run is not the
+bar CLAUDE.md sets — *"a mutant that dies 3/3 … is confirmed"* — and this change has already been
+bitten by exactly the gap a single run can't rule out (`BootstrapConcurrencyTests`, 3/3 filtered vs.
+7/13 under the real parallel suite, §1). The mutated `git add` invocation is deterministic, but the
+instrument running it — xUnit under `dotnet test`'s default cross-class parallelism — is not, so one
+green (mutant-dies) run doesn't distinguish "this test reliably catches it" from "it happened to catch
+it under that scheduling."
+
+Ran the identical mutant twice more, same harness, same file untouched otherwise:
+
+- **Run 2/3:** mutated checksum `6a37dc45…` (identical both mutated runs — same edit each time, not a
+  different mutation). Full unfiltered `dotnet test`: **1 failed / 495 passed / 496 total**. Same
+  single failing test, `UntrackedFileOnADirtyTree_IsCommittedAsARecoveryCommitAuthoredBySystem`, same
+  stack (`AssertWorkingTreeIsCleanAsync` at `ContentRepositoryService.cs:306`, called from
+  `EnsureRepositoryAsync:122`), same message (`?? docs/copied-in.md` still present in the porcelain
+  output). Restored from the `cp`'d backup via the bash `trap … EXIT`; checksum back to `06e2d3d2…`.
+- **Run 3/3:** same mutated checksum `6a37dc45…`. Full unfiltered `dotnet test`: **1 failed / 495
+  passed / 496 total**, identical failing test, identical stack, identical message. Restored the same
+  way; checksum back to `06e2d3d2…`.
+
+**3/3, and the failure set did not vary run to run** — same one test, same assertion, same message,
+every time. That's the record the Architect asked for: a varying subset would have been the finding
+here (a scheduling-dependent catch), and it isn't one — the D9 regression test genuinely, reliably
+kills this mutant regardless of xUnit's parallel scheduling that run.
+
+Re-confirmed mutant-free at the final tree: `ContentRepositoryService.cs:263` reads `["add", "-A"]`,
+checksum `06e2d3d2475fddad1a22d582354d202f04f9a39171621dcdbda4b22eefab8e77` — matches the pre-mutation
+value from every run. `git status --short -- src tests` / `git diff --stat -- src tests` (the
+Architect's `git add -N` on `GitHookInstaller.cs` now makes it visible to `diff`, not just `status`)
+show only this block's four intended files — no residue, no stray mutant left in an untracked file.
+
+**Gates re-run at this same final tree:** `dotnet build` 0 warnings/0 errors · `dotnet test`
+**496/496** full unfiltered · `dotnet format --verify-no-changes` clean · `openspec validate
+git-backed-content-core --strict` valid.
+
+No scope change beyond the repeated confirmation — same single mutant, same file, nothing else
+touched.
+
+→ @reviewer
+
+**[reviewer]** 2.3–2.5 — **Request changes.** One blocker, found by reproduction under the specific
+scrutiny asked for; the other two checks came back clean, also verified rather than accepted.
+
+### Blocker — `ReconcileWorkingTreeAsync` can "succeed" while silently making copied-in content
+### unrecoverable from git, exactly the harm D9 exists to prevent
+
+Asked to check whether a tree can be dirty in a way `git add -A` does not stage, leaving the gate
+satisfied and reconciliation a no-op. Plain `.gitignore`-excluded files are **not** that case —
+verified both sides agree: `git status --porcelain` doesn't list ignored files either (absent
+`--ignored`), so `add -A` skipping them and 2.5 reporting clean are consistent, standard git
+behaviour, not a defect this block introduced.
+
+There is a real divergence, though, and it's worse than "no commit made" — it's a commit that
+*looks* successful while not actually preserving the content. If an operator copies in a directory
+that is itself a git repository (a cloned notes folder, an old vault that was under its own version
+control — plausible for exactly the git-literate audience this product targets), `git add -A` does
+not stage its files at all. It stages the directory as a **gitlink** (a `160000` commit-reference
+entry, the same mechanism as submodules) pointing at a commit SHA in an object database ZeroWiki
+never touches or preserves. Reproduced end to end:
+
+```
+docs/copied-notes/  ← operator copies in a directory that has its own .git, with a real commit inside
+git add -A          → "warning: adding embedded git repository: docs/copied-notes"; stages a gitlink
+git diff --cached --quiet → exit 1 (dirty) → ReconcileWorkingTreeAsync commits normally
+git status --porcelain → EMPTY afterward → AssertWorkingTreeIsCleanAsync (2.5) passes
+git ls-tree -r HEAD | grep copied-notes → "160000 commit <sha>  docs/copied-notes" — no blob entries
+                                            for the actual file contents anywhere in this repo's history
+```
+
+Both the reconciliation gate and the 2.5 invariant assertion report success. Nothing is logged, no
+message names what happened. But the actual page content is not stored as a git object in this
+repository — only a dangling reference to a commit in an object store nobody owns (no
+`.gitmodules`, so it isn't even a real submodule). Concretely, this breaks:
+
+- **"Authorship comes from git"** — `git log`/`git blame` on the real files show nothing; the outer
+  repo only knows about a commit-reference entry, not the files.
+- **The Smart HTTP remote / Obsidian sync** — `updateInstead` pushes and any clone transfer the
+  gitlink stub, not the file contents; an Obsidian vault cloning this repo gets a broken, empty
+  `docs/copied-notes/` with no indication why.
+- **D9's own stated rationale** — *"discarding is permanent; an unwanted recovery commit is a plain
+  `git revert`."* Here the recovery commit exists, but reverting it doesn't help, because the content
+  it supposedly preserved was never actually captured. If the nested `.git` is ever removed later
+  (very plausible — a disk-tidying pass, the nested repo's own gc, an operator assuming `.git`
+  directories are safe to delete once "committed") the content becomes permanently unrecoverable from
+  ZeroWiki's history, silently, with every check along the way having reported success.
+
+This isn't hypothetical or contrived for this audience — "point it at a folder and it Just Works" is
+this project's own pitch, and copying in an existing git-tracked notes folder (`.git` and all) is a
+completely natural thing for a git-comfortable user to do, arguably more likely for ZeroWiki's actual
+users than for a random directory. Neither `design.md` nor this DEVLOG mentions embedded repositories
+or gitlinks anywhere (checked) — this hasn't been raised or knowingly accepted before.
+
+Direction, not a prescription: this block already has a working precedent for "detect and fail loudly
+rather than silently misbehave" (the bare-repository checks in 2.1–2.2). The same posture fits here —
+detect a `.git` entry anywhere under `docs/` other than at `repositoryRoot` itself before or during
+reconciliation, and refuse to start naming the offending path, rather than let `add -A` silently
+gitlink it. Whether that detection belongs in `ReconcileWorkingTreeAsync` or `EnsureInitialCommitAsync`
+too (the same hazard exists on first `add`) is the worker's/architect's call.
+
+### The two things I was specifically asked to check came back clean — verified, not just re-read
+
+**2. D9's test independence from 2.5, checked by reproduction.** The recorded mutation run shows all
+three confirmations dying at `AssertWorkingTreeIsCleanAsync`, i.e. 2.5's own production assertion,
+during Act — not at any of `UntrackedFileOnADirtyTree_IsCommittedAsARecoveryCommitAuthoredBySystem`'s
+own `Assert` lines. To check whether the coverage is coupled to 2.5's existence, I reproduced the
+counterfactual directly rather than reasoning about it: `cp`'d `ContentRepositoryService.cs` aside
+(checksum `06e2d3d2…`, matching the worker's recorded pre-mutation value), then *both* mutated
+`["add", "-A"]` → `["add", "-u"]` **and** commented out the call to `AssertWorkingTreeIsCleanAsync`
+entirely (simulating "2.5 removed"), and ran the specific test. Result: it still fails — but now at
+its own `Assert.Equal("2", …)` commit-count check (`ContentRepositoryServiceTests.cs:241`, expected
+`"2"`, actual `"1"`), because no second commit was made at all. So D9's coverage is **not** solely
+coupled to 2.5 — the test has independent teeth via its own commit-count assertion; 2.5 firing first
+in the shipped code just means that's the failure a reader sees today. Restored via the same `cp`
+backup immediately after, checksum back to `06e2d3d2…`, confirmed via `dotnet build` clean and
+`git diff --stat -- src` unchanged. This was a single filtered diagnostic run answering a
+counterfactual question, not a new formal mutation record — the existing 3/3 unfiltered record for
+the shipped `add -A` mutant stands as-is and is unaffected by this check.
+
+**3. Hooks and the clean-tree invariant, checked by reproduction.** Wrote a file directly into
+`.git/hooks/` on a real repo and confirmed `git status --porcelain` stays empty before and after —
+`.git/hooks` is genuinely invisible to working-tree status, not merely assumed to be. Confirmed
+`GitHookInstaller.WriteHookAsync` (`GitHookInstaller.cs:82-97`) has no existence check of any kind —
+it's an unconditional `File.WriteAllTextAsync` + `File.SetUnixFileMode` every call, matching decision
+1 exactly. `HandEditedHook_IsRestoredOnTheNextStart` genuinely exercises this (hand-edits the file,
+re-runs bootstrap, asserts both the content and the executable bit are restored) rather than just
+asserting installation once. No concerns here.
+
+### Other things checked in passing
+
+- Spec amendment (`specs/content-store/spec.md`) reads correctly against D9 — always commits tracked
+  and untracked as one recovery commit authored `System <system@zerowiki.org>`, no policy switch.
+  `openspec validate git-backed-content-core --strict` re-run independently: valid.
+- Order: decision 5 lists `classify → assert-resolves-root → config → initial commit → reconcile →
+  assert`; the shipped order inserts hook installation between config and initial commit. Hooks live
+  under `.git/hooks`, confirmed above to never affect working-tree cleanliness, so this doesn't
+  disturb what decision 5 was actually protecting (the five named steps remain in the same relative
+  order). Noting as an architectural note, not a violation.
+- Mutation record for the shipped `add -A` mutant: the worker's self-correction from 1/1 to a proper
+  3/3 (identical mutated checksum `6a37dc45…` all three runs, identical failing test, identical stack,
+  identical message, full unfiltered suite each time, `cp`+`trap`-based revert, checksum restored to
+  `06e2d3d2…` every time) matches CLAUDE.md's harness rules exactly. No issue with that record itself
+  — it answers a different question (tracked-only staging) from the embedded-repo finding above, which
+  the mutant does not cover.
+- `git status --short -- src tests` / `git diff --stat -- src tests` both re-checked at the final
+  tree after my own revert: only this block's four files, no residue.
+
+→ @architect
+
+**[architect]** Ruling on the review of `2.3–2.5`. **Request changes upheld, and the blocker went to the
+Product Owner** rather than being fixed at my discretion — it is a product call about first-run
+behaviour, and it undercuts a stated rationale in D9.
+
+**The finding.** An operator copies into the content volume a folder that is itself a git repository —
+an existing Obsidian vault, a cloned notes folder. `git add -A` does not stage its files; it stages the
+directory as a **gitlink** (`160000`), a reference to a commit in an object database ZeroWiki never
+touches. The recovery commit succeeds, `git status --porcelain` returns empty, and
+`AssertWorkingTreeIsCleanAsync` passes — while `git ls-tree -r HEAD` holds no blob for any of that
+content. Every check reports success and the content is not in the wiki.
+
+**Why this is not merely a bug.** D9's argument for always-commit rests on the asymmetry that
+"discarding destroys that irrecoverably; an unwanted recovery commit is a `git revert`". For gitlinked
+content there is nothing to revert *to*: delete the inner `.git` later and the content is unrecoverable
+from ZeroWiki's history. D9's safe side is not safe in this case, which is why it needed the Product
+Owner rather than a patch. Compounding it, the most likely way to populate a new ZeroWiki is copying an
+existing Obsidian vault — which, by this design's own premise (`obsidian-git`), is usually git-backed.
+This is closer to the normal path than an edge case.
+
+**Product Owner decision: refuse to start, naming the path.** Consistent with this section's own
+precedent — 2.1–2.2 already fails loudly on a bare repository at the root rather than misbehaving
+quietly — and it never touches what the operator copied in. The onboarding cost is an error message
+that says exactly what to do, which is the trade accepted.
+
+**[architect]** The two things I asked the reviewer to scrutinise both came back clean **by
+reproduction**, and are recorded so they are not re-litigated: `.gitignore`d files are *not* a
+divergence (invisible to `git status --porcelain` as well, so both sides agree); and D9's test is
+**not** solely coupled to 2.5 — mutating `add -A` → `add -u` *with 2.5's assertion disabled* still
+fails the test, via its own commit-count assertion.
+
+**[architect]** → `@worker`: fix round on `2.3–2.5`. Still the inner loop — no new numbers, nothing new
+ticked.
+
+1. **Refuse to start when reconciliation would store a gitlink**, before any commit is made. Name every
+   offending path and say what to do about it (move or remove the nested `.git`, then restart) — an
+   operator meeting this has copied in a folder and has no reason to know what a gitlink is.
+2. **Detect using git's own view, not a hand-rolled directory walk** — the index after staging carries
+   mode `160000` for exactly the entries git would commit as gitlinks, which is the precise question.
+   If you detect post-stage, leave the index as you found it (`git reset` unstages without touching the
+   working tree) so a refused start is not also a half-staged one. Whatever you choose must catch a
+   nested `.git` **directory** and a **gitfile**, and must catch one nested more than one level deep.
+3. **Spec, not just prose** — add a scenario under *Working-tree-clean invariant* in
+   `specs/content-store/spec.md` so the section review is gated on this behaviour. Add a short D9
+   addendum in `design.md` recording the decision and its reason.
+4. **Out of scope:** a gitlink already in history from an earlier run. Detecting that would brick a wiki
+   that already has one, and no shipped build ever created one. Note it, do not handle it.
+5. **One additional mutant, 3 runs, and make it a real counterfactual.** Not "remove the guard" — the
+   test asserts the guard, so that mutant is near-tautological and proves little. Mutate the guard's
+   **coverage**: make detection miss the gitfile form, or miss a repository nested deeper than one
+   level. A test must die. Same harness rules as before; `cp` aside and restore from the copy, revert
+   via `trap`/`finally`, checksum before and after, full unfiltered `dotnet test`.
+
+**[worker]** Fix round on `2.3–2.5` — items 1–5 addressed.
+
+1–2. **Refuse to start on a staged gitlink, detected via git's own index, before any commit.**
+   `ContentRepositoryService.ReconcileWorkingTreeAsync` now checks the index right after `git add -A`,
+   before the `git diff --cached --quiet`/commit path: new `FindStagedGitlinksAsync` runs `git
+   ls-files --stage` and filters for mode `160000` — the exact entry git writes for a nested
+   repository instead of its file contents. This is git's own view of what the commit would actually
+   store, not a hand-rolled `.git`-entry directory walk, so it is correct by construction for every
+   form and depth the ruling named: reproduced all three before writing the check —
+   - a nested `.git` **directory** one level under `docs/` → `160000` staged;
+   - a nested repo **more than one level deep** (`docs/a/b/vault`) → still `160000`, same as above —
+     git's staging algorithm is depth-agnostic, it only cares about the nearest `.git` boundary;
+   - a nested repo whose `.git` is a **gitfile** (linked-worktree form, `gitdir: <path>`) → also
+     `160000`, identical to the directory form.
+
+   When any gitlink path is found, `ReconcileWorkingTreeAsync` runs `git reset` (unstages back to
+   `HEAD`, confirmed by reproduction not to touch the working tree — the offending directory's files
+   are left exactly as the operator placed them) and throws `InvalidOperationException` naming every
+   offending path and saying what to do (`GitHookInstaller`-style loud-failure precedent from
+   2.1–2.2's bare-repository check). The message is written for someone who has never heard the word
+   "gitlink": names the path, says it looks like a copied-in repository, says why ZeroWiki can't store
+   it, and says to remove the nested `.git` and restart.
+
+3. **Spec + design.** Added *Nested git repository refused rather than committed as a gitlink* under
+   *Working-tree-clean invariant* in `specs/content-store/spec.md`. Added a D9 addendum in `design.md`
+   (right after D9's own two paragraphs) recording the decision, its reasoning, and the out-of-scope
+   note, so a future reader hits the reasoning at D9 rather than only in this DEVLOG.
+   `openspec validate git-backed-content-core --strict` still passes.
+
+4. **Out of scope, noted not implemented.** A `<remarks>` on `ReconcileWorkingTreeAsync` states
+   explicitly: a gitlink already committed into history by an earlier run is not detected — no
+   shipped build has ever produced one, and retroactive detection would only refuse to start a wiki
+   that already has one, which is strictly worse.
+
+**Tests** (`ContentRepositoryServiceTests.cs`): `NestedGitRepository_FailsToStartNamingThePathAndCommitsNothing`
+(plain `.git` directory, one level deep — fails naming `docs/copied-vault`, no second commit, index
+carries no `160000` entry afterward, the nested content is still on disk untouched);
+`NestedGitRepositoryAsAGitfile_IsAlsoDetected` (gitfile form, pointing at a second real repository's
+`.git`); `NestedGitRepository_IsDetectedRegardlessOfNestingDepth` (`docs/a/b/copied-vault`, three
+levels deep). The existing `UntrackedFileOnADirtyTree_IsCommittedAsARecoveryCommitAuthoredBySystem`
+now exercises the new gitlink check too (finds none, proceeds to commit exactly as before) — it still
+passes unmodified, confirming D9's ordinary case doesn't regress.
+
+**Mutation testing — one additional mutant, 3/3, same failure every run.** Not "remove the guard"
+(near-tautological, per the ruling) — mutated the guard's **coverage**: narrowed
+`FindStagedGitlinksAsync`'s condition from `mode == "160000"` to `mode == "160000" &&
+line[(tabIndex + 1)..].Count(c => c == '/') <= 1`, i.e. only catch a gitlink nested exactly one path
+segment under the repository root, silently missing anything deeper — the second axis the ruling
+named. Harness: `cp`'d `ContentRepositoryService.cs` aside first (checksum `cf510c0e…`), mutated with
+`sed`, ran the full unfiltered `dotnet test`, restored via a bash `trap … EXIT` (never `git checkout
+--`/`git restore --`), checksummed before and after every run.
+
+- **Run 1/3:** mutated checksum `589d182e…`. **1 failed / 498 passed / 499 total** — the only failure
+  was `NestedGitRepository_IsDetectedRegardlessOfNestingDepth`, at `Assert.Throws` with "No exception
+  was thrown" (the deeper-nested gitlink now silently gitlinked through, exactly the coverage gap
+  intended). Restored; checksum back to `cf510c0e…`.
+- **Run 2/3:** identical mutated checksum `589d182e…`. **1 failed / 498 passed / 499 total**, same
+  single test, same failure mode. Restored; checksum back to `cf510c0e…`.
+- **Run 3/3:** identical mutated checksum `589d182e…`. **1 failed / 498 passed / 499 total**, same
+  single test, same failure mode. Restored; checksum back to `cf510c0e…`.
+
+3/3, no variance in the failing set across runs, and — notably — the mutant did **not** touch the
+one-level-deep tests (`NestedGitRepository_FailsToStartNamingThePathAndCommitsNothing`,
+`NestedGitRepositoryAsAGitfile_IsAlsoDetected`, both exactly one path segment under `docs/`, so
+`<= 1` still holds for them): the depth axis and the gitfile-form axis are covered by genuinely
+independent assertions, not one test accidentally standing in for both. Re-confirmed mutant-free at
+the final tree: `ContentRepositoryService.cs:341` reads plain `if (mode == "160000")`, checksum
+`cf510c0efbd512c36aacea4f37956831034ab8596d3fb61362515208f3398b74` matches every restoration.
+`git status --short -- src tests` / `git diff --stat -- src tests` show only this fix round's four
+files (the same four as the original block) — no residue.
+
+**Gates:** `dotnet build` 0 warnings/0 errors · `dotnet test` **499/499** full unfiltered (496 + 3 new)
+· `dotnet format --verify-no-changes` clean · `openspec validate git-backed-content-core --strict`
+valid. Not committed, nothing ticked — still the inner loop.
+
+→ @reviewer
+
+**[reviewer]** 2.3–2.5 fix-round re-audit — **Request changes.** This certifies the tree as it now
+stands, including the gitlink guard. Two of the four things asked for came back clean; two did not,
+and one of those two directly contradicts the ruling's own stated intent.
+
+### Blocker — the "out of scope" boundary is not actually respected: a historical gitlink bricks startup forever
+
+Asked to confirm the code doesn't trip on a repository whose HEAD already contains a `160000` entry
+from an earlier run. It does, and it bricks exactly the way the ruling said this must not.
+`FindStagedGitlinksAsync` reads `git ls-files --stage`, which lists the **entire index**, not merely
+what this call's `git add -A` freshly staged — so a gitlink already committed into HEAD shows up on
+*every* subsequent call, whether or not anything changed. Reproduced concretely, not reasoned about:
+
+```
+# Simulate "a gitlink landed in history before this guard existed" — a real nested repo on disk,
+# committed into the outer repo's HEAD (exactly what decision 4 says is out of scope):
+docs/old-vault/.git exists for real; committed into HEAD as a 160000 entry. Tree is clean, one commit.
+
+# Simulate the NEXT startup, nothing on disk has changed:
+git add -A            → no-op, nothing changed
+git ls-files --stage   → still shows "160000 <sha> 0	docs/old-vault" — because ls-files --stage
+                          lists the whole index, HEAD-committed entries included, not a staging delta
+```
+
+`FindStagedGitlinksAsync` would find this on every single start, run `git reset`, and throw — forever.
+This is precisely the outcome the ruling said to avoid ("no shipped build ever created one... detecting
+that would brick a wiki that already has one... note it, do not handle it"), and it's the opposite of
+what `ReconcileWorkingTreeAsync`'s own `<remarks>` claims ("a gitlink already committed into history by
+an earlier run is not detected" — it is, unconditionally, by construction of scanning the whole index
+rather than a staging delta). None of the three new tests exercise this case — all three create their
+nested repo fresh, before the first `EnsureRepositoryAsync` call ever commits anything, so none of them
+would have caught this. This needs a real fix (e.g. diff the index against `HEAD`'s own tree and only
+flag a `160000` entry that wasn't already there, or accept an explicit allowlist for what's already in
+HEAD) — direction is the worker's/architect's call, but "already in HEAD" and "newly staged this call"
+are different questions and the current check answers the wrong one.
+
+### Blocker — the error message mangles the very path it's telling the operator to go find
+
+Asked to confirm `core.quotePath`'s default quoting doesn't hand the operator a garbled path, since
+detection keys on mode (unaffected) but the message reports the path itself. It does mangle it.
+`git ls-files --stage` (no `-z`) quotes any path with non-ASCII bytes as a C-style escaped literal by
+default — reproduced with a directory named `café-vault`:
+
+```
+git ls-files --stage → 160000 <sha> 0	"docs/caf\303\251-vault"
+```
+
+`FindStagedGitlinksAsync`'s parsing (`ContentRepositoryService.cs:343`, `line[(tabIndex + 1)..]`) takes
+this literally — the surrounding double quotes and the raw, un-decoded octal escape both end up in
+`gitlinkPaths`, and from there straight into `BuildGitlinkErrorMessage`'s output: the operator would be
+told to go find `'"docs/caf\303\251-vault"'`, not `docs/café-vault`. This isn't a contrived input for
+this product — non-ASCII names are already an anticipated category elsewhere in this codebase
+(`BootstrapPageTests.cs`'s own `"café"` case), and the entire point of this fix is a message clear
+enough that "an operator meeting this has no reason to know what a gitlink is" can still act on it — a
+quoted, octal-escaped path defeats exactly that. All three new tests use plain-ASCII directory names
+(`copied-vault`), so this gap was never exercised. Direction: `git ls-files --stage -z` (NUL-delimited,
+which git never quotes) with the split changed from `'\n'` to `'\0'` — not just adding `-z` on its own,
+since the current line-based split depends on `\n`-splitting and `-z`'s output has no `\n` between
+records at all.
+
+### The other two things asked for came back clean, verified rather than accepted
+
+**1. `git reset` semantics.** Confirmed by reproduction, not read: a bare `git reset` resets the index
+to match `HEAD` exactly (`git diff --cached --stat` empty afterward) — it does not "empty" the index,
+and the working tree is never touched (a file staged with a real content change stays changed on disk,
+now unstaged). Checked whether "the index already held staged entries before reconciliation ran" can
+arise on this code path: it can't reach `ReconcileWorkingTreeAsync` in any state other than
+index-equals-`HEAD`, because everything before it in the same call (`EnsureInitialCommitAsync`) either
+no-ops or completes its own add-then-commit synchronously, and 2.5's invariant guarantees the previous
+run left index-equals-`HEAD` too. Reproduced the hypothetical anyway (staged a tracked-file
+modification *before* this call's own `add -A`, together with a gitlink) to see what `git reset` does
+regardless: it un-stages both, working tree untouched for both, and the previously-staged modification
+becomes an ordinary unstaged change that the very next successful start's `add -A` picks up correctly.
+No data loss either way, and the precondition doesn't arise on this path in the first place.
+
+**2 (second half). `\n`-split correctness for what git actually emits today.** With quoting active
+(the current, unfixed behavior), a path containing a literal newline byte is escaped as the two
+characters `\`/`n`, never an actual newline — which is *why* the current line-based split is safe
+against that pathological case today. Worth keeping in mind if the quoting fix above moves to `-z`: the
+NUL-delimited form sidesteps this differently (NUL can't appear in a path at all), so switching the
+split delimiter alongside `-z` preserves the same safety by construction, it just needs to be the two
+changes together, not `-z` layered onto the existing `\n`-split.
+
+### Item 4 — no regression, checked directly
+
+Ran `dotnet test --filter "FullyQualifiedName~ContentRepositoryServiceTests"`: **14/14 passed**,
+including `UntrackedFileOnADirtyTree_IsCommittedAsARecoveryCommitAuthoredBySystem` unmodified. D9's
+load-bearing case is intact.
+
+### Mutation record — assessed, not re-run, per the instruction
+
+The one additional mutant (narrowing `mode == "160000"` to `mode == "160000" && <= 1 path segment`) is
+a genuine counterfactual, not the near-tautological "remove the guard" the ruling explicitly ruled out.
+3/3 identical failure (`NestedGitRepository_IsDetectedRegardlessOfNestingDepth`, "No exception was
+thrown"), and — the useful part — the one-level and gitfile-form tests were unaffected by that same
+mutation, which is real evidence the depth axis and the gitfile-form axis rest on independent
+assertions rather than one test standing in for both. Independently re-read (not re-run)
+`ContentRepositoryService.cs:341`: `if (mode == "160000")`, un-narrowed, matching the coordinator's own
+check. No issue with this record. It doesn't cover either blocker above — both are gaps in what the
+guard answers (staging-delta vs. whole-index; quoted vs. literal path), not gaps in how faithfully the
+shipped condition is applied, so this mutant wouldn't have been expected to catch either.
+
+### Confirmed independently
+
+`openspec validate git-backed-content-core --strict`: valid. `dotnet build`: 0/0. `git status --short
+-- src tests` / `git diff --stat -- src tests`: only this fix round's four files (plus `design.md` and
+the spec file for the addendum/scenario), no residue.
+
+→ @architect
+
+**[architect]** Ruling on the re-audit of `2.3–2.5`. **Request changes upheld — and blocker 1 came out
+of my brief, not the worker's implementation.**
+
+I directed detection at the index on the grounds that it "carries mode `160000` for exactly the entries
+git would commit as gitlinks". That is false in a way the worker had no reason to doubt:
+`ls-files --stage` is an **index census**, not a staging delta, so it reports a `160000` entry already
+present in `HEAD` just as readily as one `add -A` just created. The consequence is that a repository
+which already contains a gitlink refuses to start on **every** restart — the exact bricking the same
+ruling told the worker to avoid, four items above where I introduced it. Recorded plainly because the
+project's own standing rule is that the instrument is likelier to be wrong than the finding, and here
+the faulty instrument was the brief.
+
+The question the guard must ask is **"would committing now introduce a gitlink not already in HEAD?"** —
+a delta, not a census. `git diff --cached --raw` reports only what differs from HEAD. The unborn-HEAD
+case needs handling explicitly, since a nested repository copied in before the first commit is exactly
+what the existing tests cover.
+
+**Blocker 2 — `core.quotePath`.** A `café-vault` directory comes back from `ls-files` as
+`"docs/caf\303\251-vault"`, and that literal lands in the exception. The whole point of naming the path
+is that an operator can go find it; octal escapes and wrapping quotes defeat it. `-z` plus a NUL split,
+the two moving together — the reviewer established that the current `\n` split is safe **only** because
+quoting escapes embedded newlines, so removing the quoting without changing the split trades a cosmetic
+bug for a parsing one. Note the pattern: a §11 finding in new clothes — non-ASCII was already an
+anticipated category here (`BootstrapPageTests.cs`'s `"café"`), and all three new tests used ASCII.
+
+**Verified clean by the reviewer, by reproduction, and not to be re-litigated:** `git reset` restores
+the index to `HEAD` rather than emptying it and never touches the working tree; and the mutation record
+for the depth mutant stands — 3/3, genuinely independent axes. Neither blocker is a gap in how
+faithfully the shipped condition runs, which is what mutation measures; both are gaps in **what the
+guard asks**. No mutant would have found either.
+
+**[architect]** Fix round dispatched. **No further mutation testing in this block** — two mutants have
+run and both were informative; these two fixes are a scoping error and a formatting error whose tests
+assert them directly, which is the tautological kind I ruled out last round. CLAUDE.md warns that
+mutation testing is easy to run past the point of usefulness, and this is that point.
+
+**[architect]** Missing fixtures, both now required: a repository whose HEAD **already** contains a
+gitlink must start successfully; and a nested repository with a **non-ASCII** name must produce a
+readable path in the message.
+
+**[worker]** Second fix round on `2.3–2.5` — both blockers fixed.
+
+1. **Blocker 1 (bricking) — `FindStagedGitlinksAsync` now asks a delta against `HEAD`, not an index
+   census.** Replaced `git ls-files --stage` with `git diff --cached --raw`: this reports only entries
+   that differ between the index and `HEAD`, so a gitlink already committed by an earlier run produces
+   **no** diff entry on a later restart (verified empirically before writing the fix — staged a
+   historical gitlink, committed it, then re-ran `add -A` + `diff --cached --raw` against the unchanged
+   nested repo: empty output). A newly staged gitlink still appears (new mode `160000` against old mode
+   `000000`, status `A`). The genuinely unborn-`HEAD` case is unreachable here: `EnsureInitialCommitAsync`
+   runs unconditionally before reconciliation and always creates the initial commit, so `HEAD` is always
+   born by the time this check or the `git reset` below it runs — the "nested repo copied in before the
+   very first commit" tests pass because of that ordering, not because `git diff --cached --raw` happens
+   to tolerate an unborn `HEAD`. (Corrected here after the reviewer's re-audit found the DEVLOG's original
+   claim — that unborn-`HEAD` tolerance was the reason this works — was not the actual mechanism.)
+2. **Blocker 2 (mangled path) — switched to `-z`, split on `\0`, moved together with removing the
+   quoting.** `-z` disables `core.quotePath`'s default octal-escaping of non-ASCII paths (verified the
+   exact byte shape first: hexdumped `git diff --cached --raw -z` output for a `café-vault` entry —
+   each record is `":<old mode> <new mode> <old sha> <new sha> <status>"`, NUL, path, NUL, with the next
+   record's `:` following immediately; a rename/copy record carries two NUL-terminated paths instead of
+   one). `FindStagedGitlinksAsync` now splits the whole output on `'\0'` and walks records explicitly —
+   consuming one path field normally, two for an `R`/`C` status (keeping the new name, the one this
+   repository would actually hold) — rather than the old newline/tab parsing, which depended on quoting
+   to keep embedded newlines safe and would have broken the moment quoting was removed without the split
+   changing too.
+3. **`ReconcileWorkingTreeAsync`'s `<remarks>` corrected** to describe what the code now does: the
+   out-of-scope boundary (a gitlink already in `HEAD` from an earlier run) is enforced by asking a delta
+   against `HEAD`, not by a policy check bolted on afterward — it was never separately enforced before,
+   which is exactly how blocker 1 got in.
+
+**Tests** (`ContentRepositoryServiceTests.cs`): `RepositoryWhoseHeadAlreadyContainsAGitlink_StartsSuccessfully`
+— commits a gitlink directly (bypassing the guard, standing in for a build that predates it), asserts
+`ls-files --stage` shows `160000` beforehand, then asserts a second `EnsureRepositoryAsync` call
+succeeds and leaves the tree clean, rather than throwing. `NestedGitRepositoryWithANonAsciiName_MessageContainsTheRealPathNotAnEscapedForm`
+— a `café-vault` nested repo; asserts the thrown message contains the real UTF-8 path
+(`docs/café-vault`) and asserts the octal-escaped form (`\303\251`) and the quoting (`"docs/`) are
+**absent**. All three pre-existing gitlink tests (plain directory, gitfile form, three-levels-deep) and
+`UntrackedFileOnADirtyTree_...` (D9's ordinary case) re-verified passing unmodified — no regression.
+
+**No mutation testing this round, per the ruling** — both fixes are a scoping error and a formatting
+error whose new tests assert them directly; a mutant here would be the tautological kind already ruled
+out.
+
+**Gates:** `dotnet build` 0 warnings/0 errors · `dotnet test` **501/501** full unfiltered (499 + 2 new)
+· `dotnet format --verify-no-changes` clean · `openspec validate git-backed-content-core --strict`
+valid. `git status --short -- src tests` / `git diff --stat -- src tests` reviewed: only this block's
+four files (`ContentRepositoryService.cs`, `ContentStorageStartupExtensions.cs`, `GitHookInstaller.cs`,
+`ContentRepositoryServiceTests.cs`), no residue. Not committed, nothing ticked.
+
+→ @reviewer
+
+**[reviewer]** 2.3–2.5, second fix-round re-audit — **Approve, with one nit.** Certifying the tree as
+it now stands: both prior blockers are genuinely fixed, verified by direct execution rather than by
+re-reading the diff.
+
+**Both blockers confirmed closed, by running the code, not the tests that assert it:**
+
+- Ran `RepositoryWhoseHeadAlreadyContainsAGitlink_StartsSuccessfully` and
+  `NestedGitRepositoryWithANonAsciiName_MessageContainsTheRealPathNotAnEscapedForm` directly — both
+  pass. More load-bearing: I reverted `FindStagedGitlinksAsync` to the previous `ls-files --stage`
+  implementation in a scratch edit (checksum before/after, restored, confirmed byte-identical) and
+  reran the café-vault test against it — it genuinely fails, at the first assertion, because the
+  message contains the quoted/escaped form instead of the real path. That's item 4 answered directly:
+  the assertion has real teeth, it isn't passing for an unrelated reason.
+- All 16 tests in `ContentRepositoryServiceTests` pass together, so the delta-based check still
+  catches all three original fixtures (plain directory, gitfile form, three-levels-deep) — item 2.
+
+**Item 1, the parser desync question — checked against real git output, not just the code.**
+`git diff --renames` is **on by default** even without `-M` (confirmed: a plain `git mv` produces an
+`R100` record with two NUL-terminated paths, unprompted) — so this is a reachable shape, not a
+hypothetical the ruling could safely wave off. Hand-traced the field-index bookkeeping against that
+real record and then proved it directly: wrote a temporary test staging a rename (`.gitkeep` →
+`renamed.gitkeep`) immediately ahead of a nested-repo gitlink in the same `add -A` sweep — confirmed via
+`git diff --cached --raw` first that the rename record really does precede the gitlink record — then
+ran `EnsureRepositoryAsync` against it. It correctly refused, naming only the gitlink path, with the
+renamed file absent from the message. The two-path-field consumption for `R`/`C` status does not
+desynchronise the following record. Removed the scratch test after; `git status --short -- tests`
+clean.
+
+**Item 3 — the outcome is safe, but the stated mechanism doesn't describe what actually happens; not a
+blocker, but worth recording exactly because this project has been bitten by this shape before.**
+Wrote a scratch test placing a nested vault under where `docs/` would go **before the very first ever**
+`EnsureRepositoryAsync()` call — the most literal reading of "unborn HEAD". It refused to start,
+correctly. But `git rev-parse --verify -q HEAD` at the moment of refusal showed **HEAD already
+existed** (one commit, containing only `.gitkeep`) — because `EnsureInitialCommitAsync` always runs
+before `ReconcileWorkingTreeAsync` in `EnsureRepositoryAsync`'s fixed order, and it unconditionally
+creates the first commit whenever `HEAD` doesn't already exist, regardless of what else sits in the
+tree. That ordering means `git reset`/`FindStagedGitlinksAsync`'s `git diff --cached --raw` can
+**never** actually face a genuinely unborn `HEAD` in this codebase — not in the five gitlink tests
+(each calls `EnsureRepositoryAsync()` once before ever introducing the nested repo) and not in the
+scratch repro above either. The worker's stated rationale — *"works unmodified against an unborn HEAD
+… so a nested repository copied in before the very first commit is still caught"* — is a true fact
+about `git diff --cached --raw` in isolation, but it doesn't describe the actual mechanism by which the
+shipped code catches that case: it's caught because `HEAD` is always already born by the time the
+guard runs, not because the guard tolerates an unborn one. The outcome is correct and safe either way,
+so this is a nit, not a blocker — but it's the same pattern this DEVLOG already named as a standing
+rule (an assertion's justification is a claim about a counterfactual, and reading it isn't what checks
+it). Worth a one-line comment correction whenever this file is next touched; not worth its own round.
+
+**Confirmed independently:** `dotnet build` 0/0; `dotnet test --filter
+"FullyQualifiedName~ContentRepositoryServiceTests|FullyQualifiedName~ContentRepositoryStartupTests"`
+18/18; `openspec validate git-backed-content-core --strict` valid; `dotnet format
+--verify-no-changes` clean; `git status --short -- src tests` / `git diff --stat -- src tests` show
+only this block's four files, no residue from any of my scratch edits.
+
+No mutation this round, per the Architect's ruling — agreed, both blockers were gaps in what the guard
+asked, not in how faithfully the shipped condition runs, so neither was reachable by mutation, and
+nothing in this fix round changes that.
+
+**2.3–2.5 is clear to commit.**
+
+**[worker]** Comment-only nit fix on `2.3–2.5` — no behaviour changed. The reviewer's nit: my
+unborn-`HEAD` justification stated a true fact about git (`diff --cached --raw` diffs against the
+empty tree with no commits) as if it were *why* the shipped code is safe, when it isn't — the real
+reason is that `EnsureInitialCommitAsync` runs unconditionally before reconciliation and always
+creates the initial commit, so `HEAD` is always born by the time `FindStagedGitlinksAsync`/`git reset`
+run; the genuinely-unborn case is unreachable in this codebase.
+
+- **`ContentRepositoryService.cs`, `FindStagedGitlinksAsync`'s `<remarks>`** — rewritten to state the
+  actual mechanism (the ordering in `EnsureRepositoryAsync` guarantees a born `HEAD`), keep the
+  empty-tree fact but mark it explicitly as a property of git that would only become load-bearing if a
+  future change reordered `EnsureRepositoryAsync` to run reconciliation before the initial commit, and
+  name that reordering as the specific thing that would make the unreachable case reachable.
+- **This DEVLOG, my own fix-round post above** — corrected the same claim in place (blocker 1's
+  writeup) to say the unborn-`HEAD` case is unreachable because of the ordering, not because the
+  diff-based check tolerates one. Edited rather than left standing plus appended, since this block is
+  still uncommitted — nothing is frozen into history yet, and that's the point: wrong justifications
+  are this change's named recurring defect (§11 found seven), and this one costs a sentence to fix
+  while it's still cheap to fix.
+- Checked for the same claim elsewhere: no other file states it. The reviewer's own post above quotes
+  my original wording as part of its finding — left untouched, since that's their historical record of
+  the nit, not a live claim of mine.
+
+**Gates re-run:** `dotnet build` 0 warnings/0 errors · `dotnet test` **501/501** full unfiltered ·
+`openspec validate git-backed-content-core --strict` valid · `dotnet format --verify-no-changes`
+clean. No reviewer handoff — comment-only, per the Architect's instruction; Architect verifies the
+diff before committing.
+
+→ @architect
+
 ## NEXT
 
 **Resume point: §2 (Repository bootstrap & invariant), first block.** §11 is **closed** — supervisor

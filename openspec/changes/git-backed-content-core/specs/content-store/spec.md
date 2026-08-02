@@ -63,5 +63,10 @@ The system SHALL keep the working tree equal to `HEAD` (no uncommitted changes) 
 
 #### Scenario: Dirty tree reconciled at startup
 
-- **WHEN** the app starts and finds uncommitted changes in the working tree (for example after a crash mid-save)
-- **THEN** the system reconciles the tree to a clean state — either committing the orphaned changes as a recovered edit or discarding them per policy — before serving requests or accepting pushes
+- **WHEN** the app starts and finds uncommitted changes in the working tree (for example after a crash mid-save, or content copied onto the volume before first start)
+- **THEN** the system always commits the changes — tracked and untracked alike — as a single recovery commit authored `System <system@zerowiki.org>`, leaving the tree clean, before serving requests or accepting pushes
+
+#### Scenario: Nested git repository refused rather than committed as a gitlink
+
+- **WHEN** startup reconciliation finds a nested git repository under the working tree (for example an existing Obsidian vault or a cloned notes folder copied in with its own `.git`)
+- **THEN** the system refuses to start, naming the offending path, rather than committing it as a gitlink — a reference to a commit in an object database the system never touches, from which the actual content could not be recovered

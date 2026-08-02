@@ -176,10 +176,270 @@ public sealed class ContentRepositoryServiceTests : IDisposable
         Assert.Equal("1", (await _git.RunOrThrowAsync(_dataRoot, ["rev-list", "--count", "HEAD"])).StandardOutput.Trim());
     }
 
+    [Fact]
+    public async Task Bootstrap_InstallsBothHooksExecutableAndLeavesTheTreeClean()
+    {
+        // Executable-bit hooks are a POSIX filesystem concept with no Windows equivalent, matching
+        // GitHookInstaller's own PlatformNotSupportedException guard; nothing to assert on Windows.
+        if (OperatingSystem.IsWindows())
+        {
+            return;
+        }
+
+        var service = CreateService();
+
+        await service.EnsureRepositoryAsync();
+
+        var repositoryRoot = RepositoryRoot;
+        var preReceivePath = Path.Combine(repositoryRoot, ".git", "hooks", GitHookInstaller.PreReceiveHookName);
+        var postReceivePath = Path.Combine(repositoryRoot, ".git", "hooks", GitHookInstaller.PostReceiveHookName);
+
+        Assert.True(File.Exists(preReceivePath));
+        Assert.True(File.Exists(postReceivePath));
+        Assert.True(File.GetUnixFileMode(preReceivePath).HasFlag(UnixFileMode.UserExecute));
+        Assert.True(File.GetUnixFileMode(postReceivePath).HasFlag(UnixFileMode.UserExecute));
+
+        // .git/hooks sits outside the working tree (docs/), so installing hooks cannot itself dirty
+        // the tree the working-tree-clean invariant governs.
+        await AssertPorcelainIsEmptyAsync(repositoryRoot);
+    }
+
+    [Fact]
+    public async Task HandEditedHook_IsRestoredOnTheNextStart()
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            return;
+        }
+
+        var service = CreateService();
+        await service.EnsureRepositoryAsync();
+
+        var repositoryRoot = RepositoryRoot;
+        var preReceivePath = Path.Combine(repositoryRoot, ".git", "hooks", GitHookInstaller.PreReceiveHookName);
+        await File.WriteAllTextAsync(preReceivePath, "#!/bin/sh\necho 'hand-edited'\nexit 1\n");
+
+        await service.EnsureRepositoryAsync();
+
+        var restoredContent = await File.ReadAllTextAsync(preReceivePath);
+        Assert.DoesNotContain("hand-edited", restoredContent, StringComparison.Ordinal);
+        Assert.Contains("exit 0", restoredContent, StringComparison.Ordinal);
+        Assert.True(File.GetUnixFileMode(preReceivePath).HasFlag(UnixFileMode.UserExecute));
+    }
+
+    [Fact]
+    public async Task UntrackedFileOnADirtyTree_IsCommittedAsARecoveryCommitAuthoredBySystem()
+    {
+        var service = CreateService();
+        await service.EnsureRepositoryAsync();
+
+        var repositoryRoot = RepositoryRoot;
+        await File.WriteAllTextAsync(Path.Combine(repositoryRoot, "docs", "copied-in.md"), "# Copied in\n");
+
+        await service.EnsureRepositoryAsync();
+
+        Assert.Equal("2", (await _git.RunOrThrowAsync(repositoryRoot, ["rev-list", "--count", "HEAD"])).StandardOutput.Trim());
+        var authorName = (await _git.RunOrThrowAsync(repositoryRoot, ["log", "-1", "--format=%an"])).StandardOutput.Trim();
+        var authorEmail = (await _git.RunOrThrowAsync(repositoryRoot, ["log", "-1", "--format=%ae"])).StandardOutput.Trim();
+        Assert.Equal("System", authorName);
+        Assert.Equal("system@zerowiki.org", authorEmail);
+
+        var lsFiles = await _git.RunOrThrowAsync(repositoryRoot, ["ls-files", "docs/copied-in.md"]);
+        Assert.Equal("docs/copied-in.md", lsFiles.StandardOutput.Trim());
+
+        await AssertPorcelainIsEmptyAsync(repositoryRoot);
+    }
+
+    [Fact]
+    public async Task ModifiedTrackedFile_IsCommittedAsARecoveryCommitAuthoredBySystem()
+    {
+        var service = CreateService();
+        await service.EnsureRepositoryAsync();
+
+        var repositoryRoot = RepositoryRoot;
+        var gitKeepPath = Path.Combine(repositoryRoot, "docs", ".gitkeep");
+        await File.WriteAllTextAsync(gitKeepPath, "no longer empty\n");
+
+        await service.EnsureRepositoryAsync();
+
+        Assert.Equal("2", (await _git.RunOrThrowAsync(repositoryRoot, ["rev-list", "--count", "HEAD"])).StandardOutput.Trim());
+        var authorEmail = (await _git.RunOrThrowAsync(repositoryRoot, ["log", "-1", "--format=%ae"])).StandardOutput.Trim();
+        Assert.Equal("system@zerowiki.org", authorEmail);
+
+        await AssertPorcelainIsEmptyAsync(repositoryRoot);
+    }
+
+    [Fact]
+    public async Task CleanTree_ProducesNoRecoveryCommitOnRestart()
+    {
+        var service = CreateService();
+        await service.EnsureRepositoryAsync();
+
+        var repositoryRoot = RepositoryRoot;
+        await service.EnsureRepositoryAsync();
+
+        Assert.Equal("1", (await _git.RunOrThrowAsync(repositoryRoot, ["rev-list", "--count", "HEAD"])).StandardOutput.Trim());
+        await AssertPorcelainIsEmptyAsync(repositoryRoot);
+    }
+
+    [Fact]
+    public async Task NestedGitRepository_FailsToStartNamingThePathAndCommitsNothing()
+    {
+        var service = CreateService();
+        await service.EnsureRepositoryAsync();
+
+        var repositoryRoot = RepositoryRoot;
+        var nestedPath = Path.Combine(repositoryRoot, "docs", "copied-vault");
+        await CreateNestedGitRepositoryDirectoryAsync(nestedPath);
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() => service.EnsureRepositoryAsync());
+        Assert.Contains("docs/copied-vault", exception.Message, StringComparison.Ordinal);
+
+        // No commit was made, and the index carries no gitlink — `git reset` left it exactly as found.
+        Assert.Equal("1", (await _git.RunOrThrowAsync(repositoryRoot, ["rev-list", "--count", "HEAD"])).StandardOutput.Trim());
+        var lsFiles = await _git.RunOrThrowAsync(repositoryRoot, ["ls-files", "--stage"]);
+        Assert.DoesNotContain("160000", lsFiles.StandardOutput, StringComparison.Ordinal);
+
+        // The offending content is untouched in the working tree — the operator can still fix it.
+        Assert.True(File.Exists(Path.Combine(nestedPath, "note.md")));
+    }
+
+    [Fact]
+    public async Task NestedGitRepositoryAsAGitfile_IsAlsoDetected()
+    {
+        // A directory whose .git is a gitfile (linked worktree layout) rather than an ordinary
+        // directory — git stages this identically as a 160000 gitlink, so detection must not assume
+        // .git is always a directory.
+        var service = CreateService();
+        await service.EnsureRepositoryAsync();
+
+        var repositoryRoot = RepositoryRoot;
+
+        var realGitDirectory = Path.Combine(_dataRoot, "real-vault-gitdir");
+        Directory.CreateDirectory(realGitDirectory);
+        await _git.RunOrThrowAsync(realGitDirectory, ["init", "-b", "main"]);
+        await File.WriteAllTextAsync(Path.Combine(realGitDirectory, "note.md"), "# Note\n");
+        await _git.RunOrThrowAsync(realGitDirectory, ["add", "note.md"]);
+        await _git.RunOrThrowAsync(
+            realGitDirectory,
+            ["commit", "-m", "inner commit"],
+            new Dictionary<string, string>
+            {
+                ["GIT_AUTHOR_NAME"] = "Inner",
+                ["GIT_AUTHOR_EMAIL"] = "inner@example.com",
+                ["GIT_COMMITTER_NAME"] = "Inner",
+                ["GIT_COMMITTER_EMAIL"] = "inner@example.com",
+            });
+
+        var nestedPath = Path.Combine(repositoryRoot, "docs", "copied-vault");
+        Directory.CreateDirectory(nestedPath);
+        await File.WriteAllTextAsync(
+            Path.Combine(nestedPath, ".git"),
+            $"gitdir: {Path.Combine(realGitDirectory, ".git")}\n");
+        await File.WriteAllTextAsync(Path.Combine(nestedPath, "note.md"), "# Note\n");
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() => service.EnsureRepositoryAsync());
+        Assert.Contains("docs/copied-vault", exception.Message, StringComparison.Ordinal);
+
+        Assert.Equal("1", (await _git.RunOrThrowAsync(repositoryRoot, ["rev-list", "--count", "HEAD"])).StandardOutput.Trim());
+        var lsFiles = await _git.RunOrThrowAsync(repositoryRoot, ["ls-files", "--stage"]);
+        Assert.DoesNotContain("160000", lsFiles.StandardOutput, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task NestedGitRepository_IsDetectedRegardlessOfNestingDepth()
+    {
+        var service = CreateService();
+        await service.EnsureRepositoryAsync();
+
+        var repositoryRoot = RepositoryRoot;
+        var nestedPath = Path.Combine(repositoryRoot, "docs", "a", "b", "copied-vault");
+        await CreateNestedGitRepositoryDirectoryAsync(nestedPath);
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() => service.EnsureRepositoryAsync());
+        Assert.Contains("docs/a/b/copied-vault", exception.Message, StringComparison.Ordinal);
+
+        Assert.Equal("1", (await _git.RunOrThrowAsync(repositoryRoot, ["rev-list", "--count", "HEAD"])).StandardOutput.Trim());
+        var lsFiles = await _git.RunOrThrowAsync(repositoryRoot, ["ls-files", "--stage"]);
+        Assert.DoesNotContain("160000", lsFiles.StandardOutput, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task RepositoryWhoseHeadAlreadyContainsAGitlink_StartsSuccessfully()
+    {
+        // Stands in for a gitlink that landed in history before this guard existed (no shipped build
+        // has ever created one, but the guard must not brick a repository that already has one from
+        // some other means). The check must ask "would committing now introduce a gitlink not already
+        // in HEAD", not census the whole index — otherwise this would refuse to start forever.
+        var service = CreateService();
+        await service.EnsureRepositoryAsync();
+
+        var repositoryRoot = RepositoryRoot;
+        var nestedPath = Path.Combine(repositoryRoot, "docs", "historical-vault");
+        await CreateNestedGitRepositoryDirectoryAsync(nestedPath);
+
+        // Commit the gitlink directly, bypassing ReconcileWorkingTreeAsync's guard entirely, standing
+        // in for a build that landed one before this check existed.
+        await _git.RunOrThrowAsync(repositoryRoot, ["add", "-A"]);
+        await _git.RunOrThrowAsync(
+            repositoryRoot,
+            ["commit", "-m", "historical gitlink predating the guard"],
+            GitAuthor.System.ToEnvironmentVariables());
+
+        var lsFilesBeforeRestart = await _git.RunOrThrowAsync(repositoryRoot, ["ls-files", "--stage"]);
+        Assert.Contains("160000", lsFilesBeforeRestart.StandardOutput, StringComparison.Ordinal);
+
+        // The restart must succeed rather than refuse — the gitlink is already in HEAD, not newly
+        // introduced by this call.
+        await service.EnsureRepositoryAsync();
+
+        await AssertPorcelainIsEmptyAsync(repositoryRoot);
+    }
+
+    [Fact]
+    public async Task NestedGitRepositoryWithANonAsciiName_MessageContainsTheRealPathNotAnEscapedForm()
+    {
+        var service = CreateService();
+        await service.EnsureRepositoryAsync();
+
+        var repositoryRoot = RepositoryRoot;
+        var nestedPath = Path.Combine(repositoryRoot, "docs", "café-vault");
+        await CreateNestedGitRepositoryDirectoryAsync(nestedPath);
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() => service.EnsureRepositoryAsync());
+
+        Assert.Contains("docs/café-vault", exception.Message, StringComparison.Ordinal);
+
+        // core.quotePath's default C-style octal escaping (e.g. "docs/caf\303\251-vault") must not
+        // appear — that is the exact defect being fixed.
+        Assert.DoesNotContain("\\303\\251", exception.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("\"docs/", exception.Message, StringComparison.Ordinal);
+
+        Assert.Equal("1", (await _git.RunOrThrowAsync(repositoryRoot, ["rev-list", "--count", "HEAD"])).StandardOutput.Trim());
+    }
+
+    private async Task CreateNestedGitRepositoryDirectoryAsync(string nestedPath)
+    {
+        Directory.CreateDirectory(nestedPath);
+        await _git.RunOrThrowAsync(nestedPath, ["init", "-b", "main"]);
+        await File.WriteAllTextAsync(Path.Combine(nestedPath, "note.md"), "# Note\n");
+        await _git.RunOrThrowAsync(nestedPath, ["add", "note.md"]);
+        await _git.RunOrThrowAsync(
+            nestedPath,
+            ["commit", "-m", "inner commit"],
+            new Dictionary<string, string>
+            {
+                ["GIT_AUTHOR_NAME"] = "Inner",
+                ["GIT_AUTHOR_EMAIL"] = "inner@example.com",
+                ["GIT_COMMITTER_NAME"] = "Inner",
+                ["GIT_COMMITTER_EMAIL"] = "inner@example.com",
+            });
+    }
+
     private string RepositoryRoot => Path.Combine(_dataRoot, "wiki");
 
     private ContentRepositoryService CreateService() =>
-        new(new ContentPaths(_dataRoot), _git, NullLogger<ContentRepositoryService>.Instance);
+        new(new ContentPaths(_dataRoot), _git, new GitHookInstaller(_git), NullLogger<ContentRepositoryService>.Instance);
 
     private async Task AssertIsNonBareAsync(string repositoryRoot)
     {
