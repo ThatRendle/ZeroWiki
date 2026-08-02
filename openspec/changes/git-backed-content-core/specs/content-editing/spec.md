@@ -4,6 +4,8 @@
 
 The system SHALL persist every browser save by writing the file to the working tree and creating exactly one git commit per save-point, authored as the logged-in ZeroWiki user. The system SHALL NOT create a commit per keystroke; rapid edits SHALL be coalesced to a save-point (for example by debounce or explicit save) before committing.
 
+The author identity the system records SHALL be a well-formed address for **every** account, including one whose username predates the username form rules. The username form rules govern only the choosing of a username, so they cannot make this true on their own.
+
 #### Scenario: Save creates one authored commit
 
 - **WHEN** an authenticated user saves a page
@@ -13,6 +15,11 @@ The system SHALL persist every browser save by writing the file to the working t
 
 - **WHEN** a user makes many keystroke-level changes within a short editing burst
 - **THEN** the system creates one commit for the resulting save-point rather than one commit per change
+
+#### Scenario: An account predating the username rules still commits a well-formed author
+
+- **WHEN** a user whose username would not satisfy the current username form rules saves a page
+- **THEN** the system still records a well-formed author address for that commit, rather than emitting a malformed one or refusing the save
 
 ### Requirement: Optimistic concurrency on save
 

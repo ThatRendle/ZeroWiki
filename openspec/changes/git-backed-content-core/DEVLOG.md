@@ -2430,14 +2430,190 @@ this block, mine included, contributed no behaviour. No untracked files anywhere
 
 → `@supervisor` for round two over `bb3cb2c..HEAD`.
 
+**[supervisor]** Round-two section review of **§11**, scope `bb3cb2c..HEAD` — two commits
+(`70a31aa`, `2af401c`). **Verdict: Approve. §11 is closed.** S1 is discharged in both halves. Two
+findings below, both low, neither blocking, and I say plainly why each one is not.
+
+### Probe 1 — the subset argument is sound. You were right and I was wrong.
+
+`accepted ⊆ legal` is the property D10 needs; `legal ⊆ accepted` is required by nothing in this
+system. My *"misaligned in both directions"* was rhetorical framing, and the `_legacy_` row was
+evidence I marshalled for it rather than a defect it named. You separated the two correctly.
+
+I checked the **result**, not just the argument, on a third instrument: an oracle written from
+RFC 5322 `atext` in full (`A-Za-z0-9!#$%&'*+/=?^_\`{|}~-`), which is a **wider** class than the
+charset-restricted oracle both you and the reviewer used, so it is genuinely independent of both.
+Pattern extracted from `CredentialPolicy.cs` programmatically, never retyped. Exhaustive over 111,110
+strings of length ≤ 5 from a 10-character alphabet including `:`, space, `\n` and `!`, plus 400,000
+dot-heavy randoms: **accepted-but-illegal = 0.** The property holds.
+
+**And it was not the convenient call.** You accepted the *more expensive* half — the §6 obligation,
+which no pattern change can ever discharge and which costs a later section real work — and rejected
+the half that carried no defect. Convenience would have done exactly the reverse. That is the check
+I would apply to anyone shrinking a finding, and it passes.
+
+### Probe 2 — `Consequence binding §6` is real, but it is standing on one reader's memory
+
+The text is right and in D10's own idiom. The weakness is not its wording, it is its **location**.
+`design.md` D10 is read by whoever briefs §6; `tasks.md` §6.3 says *"create one commit authored as
+the logged-in user"* and says nothing about legacy names. Meanwhile this change already built the
+mechanism for precisely this problem — `## NEXT`'s **"Forward obligations — each is owed by a
+specific section"**, which carries five entries and does **not** carry this one. The obligation lives
+in the document that describes the design, not in the one the Architect reads at resume.
+
+Two things make it survive, and I would do both:
+
+1. **Add it as forward obligation #6 in `## NEXT`.** Free, and it is the same mechanism already
+   trusted for the lockfile trap and the missing HTTP client.
+2. **Promote it into a spec scenario** on whichever capability carries §6's commit authorship
+   (`specs/content-store/`): *an account whose username predates the username rules still produces a
+   well-formed author line*. This is the only form with a **gate** behind it — a spec scenario is
+   what §6's own section review is checked against, whereas `design.md` prose is checked by nobody.
+
+### Probe 3 — the record is true, with one residual over-claim, which I found the way this section says such things are found
+
+Everything checkable holds: the pattern literal is D11's candidate verbatim; `accepted ⊆ legal`;
+unbroken maximum 128 → 127 confirmed; upper slack intact (admits `Maximum + 1`); N1's lower slack
+intact (`a`, `ab` still match, so `[MinLength]` stays the only attribute failing a 2-character name);
+`a..b`/`a...b`/`ab..cd` refused at all four layers; `RefusedUsernames()` extended so the refusal is
+pinned to cost no derivation; no substring collision between the three rule descriptions, so every
+`Assert.DoesNotContain` stays sound after the message text changed.
+
+**F1 (low) — `CredentialPolicy.cs:85-91` states the slack rationale without its bound, and past that
+bound it is false.** The paragraph says `125` admits 127 unbroken alphanumerics *"**so** an over-long
+username fails the length check and is reported as a length problem **rather than also being told its
+charset is wrong**"*. At the **service** that is true at every length, because length is checked
+first. At the **form**, where N1 established every attribute runs, it is true only up to 127. I ran
+the differential as a **form** model across the pattern change:
+
+| unbroken alnum length | service pre → post | form pre → post |
+|---|---|---|
+| 65 – 127 | len → len | len → len |
+| **128** | len → len | **len → len + shape** |
+| 129+ | len → len | len + shape → len + shape |
+
+Exactly one length moved. A 128-character all-alphanumeric name begins and ends alphanumeric, uses
+only the permitted charset and contains no doubled dot — **one fault, two messages**, and the shape
+rule it is told about is one it did not break. That is the same sentence the worker used to justify
+changing `UsernameRuleDescription`, applied to a case nobody looked at.
+
+**Not blocking, and the reason matters more than the finding.** The effect is cosmetic and sits at
+128 characters, twice the cap; it is pre-existing above 128 and the remediation moved the boundary by
+one. What is worth carrying is **why two 666,000-input differentials missed it: both classified
+through the *service* model** — trim, then length-before-shape, first fault wins — and N1, this
+section's own headline finding, is that **the form is exactly where those two disagree**. §11 derived
+the rule *"an assertion's justification is a claim about a counterfactual, and the only instrument
+that checks it is the mutation that produces that counterfactual"* and then produced only the
+service-side counterfactual. The blind spot is in the **model**, not in the diligence — structurally
+the same failure as `new Regex` versus `[GeneratedRegex]`, one level up.
+
+**F2 (nit) — the accept scenario is not an iff, and now omits two rules rather than one.**
+`specs/user-accounts/spec.md`, *"Well-formed username is accepted"*: its WHEN is satisfied by `a..b`
+(≥ 3 characters, alphanumeric ends, permitted charset), which the new consecutive-dot scenario
+refuses. **I checked whether this block introduced it, and it did not** — at the requirement's origin
+(`bd2eeea`) the same WHEN already omitted the 64-character cap, so a 65-character name satisfied it
+and was refused. It has always been an illustrative happy-path clause rather than a description of
+the accepted set; the remediation extended an existing looseness by one rule rather than creating a
+defect class. Fix before archive, one clause: *"…at most 64 characters … and containing no two dots
+in a row."* Had this been introduced here I would have blocked on it, because a self-contradicting
+requirement is what N2 was.
+
+### Probe 4 — the two post-`Approve` edits
+
+**Behaviour-neutrality: verified by me, not accepted from the record.** `git diff 70a31aa..HEAD --
+src` filtered to non-`///`, non-`//` lines is **exactly two lines** — the `UsernamePattern` literal
+and `UsernameRuleDescription` — both certified by the reviewer *before* either comment edit existed.
+So neither post-`Approve` edit could have moved behaviour, and the declaration is sound on its own
+evidence rather than on assertion.
+
+**Content.** `:104-115` restating both unguarded rewrites against **the limit the timing test
+asserts** rather than against this pattern's own cost is correct, and it is a better answer than
+Note 1 asked for: the limit is a constant in the test, so it cannot rot on someone else's machine.
+`:93-102`'s noise-floor clause is true of the harness that produced it, the reviewer's Note 2 caveat
+is fair, and I agree with leaving it — rewriting it reintroduces the precise value two passes have
+now removed. One residual, recorded not raised: `:94-95` says the branches are *"disjoint on their
+first character … **so** the run never branches"*, offered as the reason cost is constant.
+Disjointness removes *branch* backtracking; what bounds the work is the finite `{0,125}` — the engine
+still backtracks the unit **count**, ≤ 126 steps. Both facts are in the paragraph, so nothing is
+false; the *"so"* just credits the weaker of the two reasons.
+
+**The polish-versus-rule distinction: I tested it rather than accepting it, and it holds.** The test
+is not whether the distinction sounds principled — it is whether it was applied when applying it was
+*expensive*. It was: you reopened a file you had just declared closed, to correct your own paragraph,
+because you had imposed the rule three lines above it. And you declined Note 2, where acting would
+have been cheap and cosmetic, on the substantive ground that the fix reintroduces the thing the rule
+forbids. Costly direction taken, cheap direction declined. A convenient distinction runs the other
+way round, and that pattern is not present. It is a rule.
+
+### For `## NEXT`
+
+1. **Forward obligation #6 — D10's `Consequence binding §6`**, plus the spec-scenario promotion in
+   Probe 2. Item 2 is the one with a gate behind it.
+2. **Standing rule:** a timing comment may assert a **direction** or an **order of magnitude**, never
+   a precise value — and any timing figure names the engine it was measured on. `[GeneratedRegex]`
+   and the interpreted engine differ by ~2 orders of magnitude on this pattern's rewrites.
+3. **Standing rule, the one I would most want carried into §2:** a differential is only as good as
+   the **surface** it models. Both §11 differentials modelled the service; the form is where N1 says
+   behaviour diverges, and that is where the one residual defect sat. When a rule is enforced on two
+   surfaces, the differential runs on both.
+4. **Before archive:** the accept scenario's WHEN needs its two missing rules (F2).
+5. `CredentialPolicy.cs:85-91` — name the surface the slack claim holds on, or its bound (F1).
+6. **Carried from round one:** page-test matrices still asymmetric (`"café"`, `"admin\tx"` in
+   `BootstrapPageTests.cs` only); the username is now immutable-by-consequence, which belongs in §6's
+   brief; and `## NEXT` is still stale at "4/39" and "394/394" against an actual **7/40** and
+   **483/483**.
+
+→ `@architect`. §11 **closed**. Open §2.
+
+**[architect]** §11 **CLOSED** — supervisor `Approve`, round two, 2026-08-02. Close-out actions
+applied by me below; `## NEXT` rewritten per §3c.2.
+
+**The supervisor named the wrong file, and I checked before following it.** Its recommendation was to
+promote D10's `Consequence binding §6` into a spec scenario on "§6's capability
+(`specs/content-store/`)". §6 is commit-on-save, which `proposal.md:21` assigns to
+**`content-editing`**; `content-store` owns repository layout, rendering, the index and the clean-tree
+invariant. Filing it there would have put the obligation in a capability whose section review never
+looks at §6 — the precise failure the promotion exists to prevent, executed faithfully. Recorded not
+to score a point but because it is the seventh-and-a-half instance of the section's one lesson: a
+recommendation is a claim, and this one was checkable in ten seconds.
+
+**Applied:**
+
+1. **The §6 obligation now has a gate.** `specs/content-editing/spec.md`, *Commit-on-save*: a prose
+   sentence requiring a well-formed author address for **every** account including one whose username
+   predates the rules, plus a scenario. The supervisor's reasoning is exactly right and is the whole
+   point — design prose is read by whoever happens to read it; a spec scenario is what §6's own
+   section review is checked against. It also stays in D10, so both the briefer and the reviewer meet
+   it.
+2. **Forward obligation #6 added** to `## NEXT` below, in the list this change already built for
+   obligations owed by a section that does not exist yet.
+3. **F1 and F2 parked, not fixed** — both low, both explicitly non-blocking, and F2 is **pre-existing
+   from `bd2eeea`** rather than introduced here. They are close-out items before archive.
+
+**On the supervisor's answer to probe 1.** It withdrew "misaligned in both directions" and checked the
+result on a *third* instrument — an oracle built from RFC 5322 `atext` in full, a wider class than the
+charset-restricted oracle both the worker and the reviewer used, so genuinely independent of both:
+accepted-but-illegal = 0. That is the right way to settle a disagreement about a claim, and it is the
+reason I asked it not to defer to me.
+
+**On F1, which is the most valuable finding in this review.** Two 666k-input differentials missed a
+real behaviour difference at length 128 because **both classified through the *service* model** —
+while N1, this section's own headline finding, is that the form is exactly where the two surfaces
+disagree. §11 derived the rule *"a justification is only checked by producing its counterfactual"* and
+then produced only the service-side counterfactual. Same shape as `new Regex` versus
+`[GeneratedRegex]`, one level up: the blind spot was the **model**, not the diligence. I have not
+independently verified the 128 boundary; it is recorded as the supervisor stated it, unverified by me,
+and whoever fixes it should reproduce it first.
+
 ## NEXT
 
-**Resume point: §2 (Repository bootstrap & invariant), first block.** §1 is **closed** — supervisor
-`Approve` on round two over `bd2eeea..HEAD`.
+**Resume point: §2 (Repository bootstrap & invariant), first block.** §11 is **closed** — supervisor
+`Approve` on round two over `bb3cb2c..HEAD`.
 
-**State: 4/39 tasks ticked** *(counted from `tasks.md`, not carried forward)*. Branch
-`change/git-backed-content-core`. Gates at close-out: `dotnet build` 0/0, `dotnet test` **394/394**
-full unfiltered suite, `dotnet format --verify-no-changes` clean, `openspec validate --strict` valid.
+**State: 7/40 tasks ticked** *(counted from `tasks.md`, not carried forward)*. Branch
+`change/git-backed-content-core`. Gates at close-out, run by the Architect rather than relayed:
+`dotnet build` 0/0, `dotnet test` **483/483** full unfiltered, `dotnet format --verify-no-changes`
+exit 0, `openspec validate --strict` valid.
 
 | Section | Block | Commit | Reviewer | Supervisor |
 |---|---|---|---|---|
@@ -2445,50 +2621,82 @@ full unfiltered suite, `dotnet format --verify-no-changes` clean, `openspec vali
 | §1 | 1.1–1.3 | `3f6d837` | Approve w/ nits | Request changes → **Approve** |
 | §1 | remediation (blocker + notes 2, 4) | `7102eed` | Approve | ↑ |
 | §1 | 1.4 DataProtection | `0247443` | Approve | ↑ |
+| §1 | close-out (docs) | `bb3cb2c` | — | — |
+| §11 | 11.1–11.3 | `70a31aa` | Request changes → Approve w/ nits | Request changes (S1) → **Approve** |
+| §11 | remediation (S1 + comment corrections) | `2af401c` | Request changes → **Approve** | ↑ |
 
-**Execution order from here: §11 → §2.** §11 (username form) is small, isolated, and foundational to
-D10's synthetic identity, so it lands before the repository work begins rather than after it.
+**Execution order from here: §2 → §3 → … → §10.** §11 is done; the remaining sections run in
+`tasks.md` order.
 
 ### Forward obligations — each is owed by a specific section
 
-1. **§5 — the lockfile must not live in the working tree.** *(supervisor note 3, and the one most
-   likely to bite.)* A lockfile under `/data/wiki/docs` is an untracked file, which makes the tree
-   dirty, which D9 then dutifully commits, and `updateInstead` bounces every push against a tree it
-   believes is unclean. Put it under `.git/` or beside the repository, and **extend `ContentPaths`**
-   rather than growing a parallel notion of where things live.
-2. **§8 — the image has no HTTP client.** *(supervisor note 1.)* `curl`, `wget` and `nc` are all
-   absent from the runtime image; `flock` **is** present, so §5.3 is safe. Decide how `post-receive`
-   signals the app **before** §8 starts, or it reopens §1's Dockerfile.
-3. **§7 — `git-receive-pack` returns `403 Forbidden` in this image.** Found by the supervisor while
-   confirming the `safe.directory` fix. It is git's export policy (`http.receivepack` unset), **not**
-   an ownership or auth problem — setting `http.receivepack=true` flips the identical invocation to
-   200. Recorded because it will read as an authentication bug to whoever meets it first, and the
-   hours lost to that diagnosis are the whole reason this note exists. Belongs in §2's repo config.
-4. **§2 — resolve `ContentPaths` from DI.** The registered singleton currently has **zero consumers
-   in `src/`**; only `ResolveContentPaths` at `Program.cs:88` reads the data root, because
-   DataProtection must be configured before `Build()`. §2's brief should say *inject it*, so the
-   singleton acquires the consumers that justify it.
-5. **A latent trap in the test harness.** `ResolveContentPaths` reading configuration before
-   `Build()` works **only** because `ZeroWikiAppFactory` uses `UseSetting`. A future harness using
+1. **§5 — the lockfile must not live in the working tree.** A lockfile under `/data/wiki/docs` is an
+   untracked file, which makes the tree dirty, which D9 dutifully commits, and `updateInstead` then
+   bounces every push against a tree it believes unclean. Put it under `.git/` or beside the
+   repository, and **extend `ContentPaths`** rather than growing a parallel notion of where things
+   live.
+2. **§8 — the image has no HTTP client.** `curl`, `wget` and `nc` are all absent from the runtime
+   image; `flock` **is** present, so §5.3 is safe. Decide how `post-receive` signals the app **before**
+   §8 starts, or it reopens §1's Dockerfile.
+3. **§7 — `git-receive-pack` returns `403 Forbidden` in this image.** git's export policy
+   (`http.receivepack` unset), **not** ownership or auth — setting `http.receivepack=true` flips the
+   identical invocation to 200. Recorded because it reads as an authentication bug to whoever meets it
+   first. Belongs in §2's repo config.
+4. **§2 — resolve `ContentPaths` from DI.** The registered singleton has **zero consumers in `src/`**;
+   only `ResolveContentPaths` at `Program.cs:88` reads the data root, because DataProtection must be
+   configured before `Build()`. §2's brief should say *inject it*.
+5. **A latent trap in the test harness.** `ResolveContentPaths` reading configuration before `Build()`
+   works **only** because `ZeroWikiAppFactory` uses `UseSetting`. A future harness using
    `ConfigureAppConfiguration` would hand the DI singleton the override while the key ring silently
-   took the `/data` default. `ResolveContentPathsMatchesTheDiRegisteredSingleton` does **not** cover
-   this; `LoginPageTests.cs:214`'s on-disk assertion is the real guard — **do not soften it**.
+   took the `/data` default. `LoginPageTests.cs:214`'s on-disk assertion is the real guard — **do not
+   soften it**.
+6. **§6 — the author line must be well-formed for accounts that predate the username rules.** D10's
+   `Consequence binding §6`, now also a **scenario** in `specs/content-editing/spec.md` so §6's
+   section review is gated on it rather than trusting prose. Non-retroactivity is deliberate and
+   correct, which is exactly why §11 could not discharge this: `LoginServiceTests.cs:271-289` pins
+   `.old.name.` still authenticating, and §6 constructs the address. Also tell §6's brief that the
+   username is **immutable by consequence** — a permanent artifact plus no rename path.
 
-### Standing rules earned in §0–§1
+### Close-out items before archive
 
-- **Any regex harness must carry an instrument self-check** — Perl interpolated `$\` out of a
-  pattern and produced a fully self-consistent wrong answer (§0).
-- **`git checkout --` / `git restore --` are not valid revert primitives** for a tree holding
-  uncommitted work: they restore from `HEAD` and take uncommitted changes with them. Restore from
-  content saved before mutating, and verify by checksum (§1).
-- **A raw checksum is not a valid instrument for a live WAL-mode SQLite file** — checkpointing
-  churns pages with no logical change. Compare `sqlite3 .dump` or row counts (§1).
+- **F2 (nit, pre-existing from `bd2eeea`)** — `specs/user-accounts/spec.md`, scenario *"Well-formed
+  username is accepted"*: its WHEN is satisfied by `a..b`, which the new scenario refuses, and it
+  already omitted the 64-character cap before this change touched it. One clause. It has always been
+  illustrative rather than a description of the accepted set.
+- **F1 (low)** — `CredentialPolicy.cs:85-91`'s slack claim ("an over-long name is reported as a length
+  problem rather than also being told its charset is wrong") holds at the **service** at every length,
+  but at the **form** only to 127; a 128-character alphanumeric name gets two messages for one fault.
+  Name the surface it holds on, or its bound. **Unverified by the Architect** — reproduce before
+  fixing.
+- Page-test matrices are asymmetric: `BootstrapPageTests.cs:83-94` covers `"café"` and `"admin\tx"`;
+  `RedeemInvitationPageTests.cs:262-271` omits both.
+
+### Standing rules earned in §0–§11
+
+- **A differential is only as good as the surface it models.** When a rule is enforced on two
+  surfaces, run the differential on **both** — two 666k-input runs missed F1 because both classified
+  through the service model, in the same section that discovered the form disagrees with it (§11).
+- **Produce every counterfactual on the engine that ships.** `new Regex(...)` is **not**
+  `[GeneratedRegex]`; they disagreed by ~80x here and produced a fully self-consistent wrong answer
+  (§11).
+- **A timing comment may assert a direction or an order of magnitude, never a precise value**, and
+  every timing figure names its engine. A precise value measures a machine and rots silently on
+  someone else's (§11).
+- **An assertion's justification is a claim about a counterfactual**, and the only instrument that
+  checks it is the mutation that produces it. Seven claims-about-why were wrong in §11 while the code
+  was fine; every one was caught by mutating, none by reading (§11).
+- **A mutation harness must `cp` the target aside and restore from that copy.** `git checkout --` /
+  `git restore --` restore from `HEAD` and take an uncommitted block's own edits with them — it
+  happened here despite the rule already being written down, and the **checksum-before-and-after** is
+  what caught it, twice (§1, §11).
+- **A raw checksum is not a valid instrument for a live WAL-mode SQLite file** — checkpointing churns
+  pages with no logical change. Compare `sqlite3 .dump` or row counts (§1).
+- **Any regex harness must carry an instrument self-check** — Perl interpolated `$\` out of a pattern
+  and produced a fully self-consistent wrong answer (§0).
 - **`safe.directory` is `--system`, set as root before the `USER` switch.** HOME-scoped `--global`
-  dies in §7's CGI subprocess. Anything changing the container user or repository ownership has to
-  keep this true.
-- **Both instrument failures in this change so far were in the harness, not the code.** §2 onward
-  carries heavier mutation testing; assume the measurement is wrong before assuming the finding is
-  real.
+  dies in §7's CGI subprocess.
+- **Every instrument failure in this change so far has been in the harness, not the code.** Assume the
+  measurement is wrong before assuming the finding is real.
 
-Design questions outstanding: **none.** `design.md`'s Open Questions section is fully resolved
-(D8–D11 plus the two inherited as already-resolved).
+Design questions outstanding: **none.** `design.md`'s Open Questions are fully resolved, and D11 now
+states the `accepted ⊆ legal` posture whose absence was S1.
