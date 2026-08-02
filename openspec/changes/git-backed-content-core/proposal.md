@@ -22,7 +22,7 @@ ZeroWiki is a zero-config Markdown wiki: point it at a folder and it Just Works,
 - `git-sync`: the Smart HTTP git remote behind wiki auth — `git-upload-pack`/`git-receive-pack` endpoints, `updateInstead` push acceptance, re-index/broadcast hooks, `obsidian-git` compatibility, and git-identity → account mapping.
 
 ### Modified Capabilities
-<!-- None — this is the first change; no existing specs. -->
+- `user-accounts`: adds a **Username form** requirement (first and last character alphanumeric, 3–64 characters). Pulled in because D10 makes the username the localpart of every commit author address, and a leading or trailing dot is not a legal RFC 5322 dot-atom — the shape has to be right where usernames are chosen, not patched where they are used.
 
 ## Impact
 

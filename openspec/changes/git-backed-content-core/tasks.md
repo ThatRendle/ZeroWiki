@@ -9,7 +9,7 @@
 - [ ] 2.1 On startup, detect an existing non-bare git repo on the volume; serve from its `docs/` working tree
 - [ ] 2.2 If the volume has no repo, `git init` a non-bare repo, create `docs/`, set `receive.denyCurrentBranch=updateInstead`, and make an initial commit
 - [ ] 2.3 Install `pre-receive` and `post-receive` hooks into the repo on bootstrap
-- [ ] 2.4 Implement startup reconciliation: if the working tree is dirty, commit-as-recovered or discard per configured policy, leaving a clean tree
+- [ ] 2.4 Implement startup reconciliation: if the working tree is dirty, commit it as a recovery commit authored `System <system@zerowiki.org>` (D9 — always commit, never discard, no policy switch), leaving a clean tree
 - [ ] 2.5 Add a health/self-check that asserts the working-tree-clean invariant
 
 ## 3. Content read & render
@@ -63,3 +63,9 @@
 - [ ] 10.1 Unit/integration tests for CAS rejection, transactional rollback, and startup reconciliation
 - [ ] 10.2 Concurrency test: interleaved browser save and push are serialized and never leave a dirty tree
 - [ ] 10.3 Index rebuild-from-repo test
+
+## 11. Username form (`user-accounts` amendment)
+
+- [ ] 11.1 Tighten `CredentialPolicy.UsernamePattern` to `^[A-Za-z0-9]([A-Za-z0-9._-]{0,126}[A-Za-z0-9])?\z` so the first and last characters are alphanumeric (D11)
+- [ ] 11.2 Add `MinimumUsernameLength = 3` with its rule description, enforced at the service boundary as `MinimumPasswordLength` is
+- [ ] 11.3 Tests for the boundary cases: leading/trailing `.`/`-`/`_` refused, 2 characters refused as a length fault, 3 and 64 accepted, 65 refused, trailing newline refused
