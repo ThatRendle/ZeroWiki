@@ -68,6 +68,55 @@ public class ContentStorageOptionsTests
         Assert.Equal(Path.GetFullPath("/data/wiki/docs"), paths.WorkingTree);
     }
 
+    [Fact]
+    public void DerivesKeysDirectoryAsSiblingOfRepositoryRoot()
+    {
+        var paths = BuildContentPaths(new Dictionary<string, string?>
+        {
+            ["ContentStorage:DataRoot"] = "/data",
+        });
+
+        Assert.Equal(Path.GetFullPath("/data/keys"), paths.KeysDirectory);
+    }
+
+    [Fact]
+    public void KeysDirectoryIsOutsideTheRepositoryRoot()
+    {
+        // The DataProtection key ring must never land inside the git repository's own tree — a key
+        // file written under RepositoryRoot would be picked up by commit-on-save (D9) and pushed to
+        // every Obsidian vault that clones the remote.
+        var paths = BuildContentPaths(new Dictionary<string, string?>
+        {
+            ["ContentStorage:DataRoot"] = "/data",
+        });
+
+        Assert.False(
+            paths.KeysDirectory.StartsWith(paths.RepositoryRoot + Path.DirectorySeparatorChar, StringComparison.Ordinal),
+            $"'{paths.KeysDirectory}' must not live under the repository root '{paths.RepositoryRoot}'.");
+    }
+
+    [Fact]
+    public void ResolveContentPathsMatchesTheDiRegisteredSingleton()
+    {
+        // ResolveContentPaths (used by Program.cs to configure DataProtection before the DI
+        // container is built) must derive the exact same paths as the AddContentStorage-registered
+        // singleton — one definition of the data root, not two that can drift.
+        var configurationValues = new Dictionary<string, string?>
+        {
+            ["ContentStorage:DataRoot"] = "/srv/zerowiki",
+        };
+
+        var diPaths = BuildContentPaths(configurationValues);
+
+        var configuration = new ConfigurationBuilder()
+            .AddInMemoryCollection(configurationValues)
+            .Build();
+        var resolvedPaths = ContentStorageStartupExtensions.ResolveContentPaths(configuration);
+
+        Assert.Equal(diPaths.DataRoot, resolvedPaths.DataRoot);
+        Assert.Equal(diPaths.KeysDirectory, resolvedPaths.KeysDirectory);
+    }
+
     private static ContentPaths BuildContentPaths(Dictionary<string, string?> configurationValues)
     {
         var configuration = new ConfigurationBuilder()

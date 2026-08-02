@@ -3,6 +3,7 @@
 - [x] 1.1 Create the ASP.NET Core 10 Blazor Web App solution with Static SSR as the default render mode (Interactive Server enabled per-island, not globally)
 - [x] 1.2 Add a Dockerfile that installs `git` and runs the app; document the mounted data volume
 - [x] 1.3 Configure the app to resolve the content volume path from configuration (env/mount)
+- [x] 1.4 Persist the DataProtection key ring to the mounted volume (outside the git repository) with a pinned application name, so a container restart does not sign every member out
 
 ## 2. Repository bootstrap & invariant
 

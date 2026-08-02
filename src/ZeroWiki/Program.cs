@@ -1,5 +1,6 @@
 using Microsoft.AspNetCore.Authentication.Cookies;
 using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.DataProtection;
 using ZeroWiki.Components;
 using ZeroWiki.Content;
 using ZeroWiki.Data;
@@ -69,6 +70,26 @@ builder.Services.AddAuthorization(options =>
 // Supplies the cascading AuthenticationState the navigation's AuthorizeView and AuthorizeRouteView
 // read.
 builder.Services.AddCascadingAuthenticationState();
+
+// The DataProtection key ring backs the authentication cookie above. Unpersisted, it is
+// regenerated per process — every container restart or image replacement signs every member out.
+// Persisted at <DataRoot>/keys: a sibling of identity.db, inside the mounted volume, but
+// deliberately outside ContentPaths.RepositoryRoot (see ContentPaths.KeysDirectory) so the ring is
+// never picked up by commit-on-save and pushed to an Obsidian vault.
+//
+// SetApplicationName is pinned explicitly, not left to the default: the default discriminator is
+// derived from the content root path, which differs between `dotnet run` (the repo's src/ZeroWiki)
+// and the container (/app) — an unpinned name would happily persist a ring across restarts that
+// still can't decrypt yesterday's cookies, the same symptom with a file on disk implying it's fixed.
+//
+// Unencrypted at rest on Linux (no DPAPI-equivalent protector is available): accepted, because the
+// ring sits on the same volume and behind the same trust boundary as identity.db, which already
+// holds the Argon2id password hashes.
+var contentPaths = ContentStorageStartupExtensions.ResolveContentPaths(builder.Configuration);
+builder.Services
+    .AddDataProtection()
+    .SetApplicationName("ZeroWiki")
+    .PersistKeysToFileSystem(new DirectoryInfo(contentPaths.KeysDirectory));
 
 var app = builder.Build();
 

@@ -23,15 +23,46 @@ public sealed class ZeroWikiAppFactory : WebApplicationFactory<Program>
     /// <summary>The origin every test client addresses; see <see cref="CreateHttpClient"/>.</summary>
     public static readonly Uri BaseAddress = new("https://localhost");
 
-    private readonly string _databasePath =
-        Path.Combine(Path.GetTempPath(), $"zerowiki-web-{Guid.NewGuid():n}.db");
-
+    private readonly string _databasePath;
+    private readonly string _dataRoot;
     private readonly string _connectionString;
 
     /// <summary>Everything this application logged, so a test can sweep it for a secret.</summary>
     public CapturingLoggerProvider Logs { get; } = new();
 
-    public ZeroWikiAppFactory() => _connectionString = TestDatabase.ConnectionStringFor(_databasePath);
+    /// <summary>The SQLite file backing this instance — reusable by <see cref="RestartedFrom"/>.</summary>
+    public string DatabasePath => _databasePath;
+
+    /// <summary>
+    /// The <c>ContentStorage:DataRoot</c> this instance was configured with, hence where its
+    /// DataProtection key ring lives on disk — reusable by <see cref="RestartedFrom"/>.
+    /// </summary>
+    public string DataRoot => _dataRoot;
+
+    public ZeroWikiAppFactory()
+        : this(
+            Path.Combine(Path.GetTempPath(), $"zerowiki-web-{Guid.NewGuid():n}.db"),
+            Path.Combine(Path.GetTempPath(), $"zerowiki-web-data-{Guid.NewGuid():n}"))
+    {
+    }
+
+    private ZeroWikiAppFactory(string databasePath, string dataRoot)
+    {
+        _databasePath = databasePath;
+        _dataRoot = dataRoot;
+        _connectionString = TestDatabase.ConnectionStringFor(_databasePath);
+    }
+
+    /// <summary>
+    /// Builds a fresh host — a new DI container, a new in-process DataProtection key ring loaded
+    /// from disk — against the <em>same</em> database file and <em>same</em> key-ring directory as
+    /// <paramref name="previous"/>. Everything a real process restart changes (the DI container,
+    /// every in-memory singleton, the loaded key ring) changes here too; only the OS process
+    /// identity doesn't, which nothing under test depends on. Used to prove a cookie issued before
+    /// a restart is still valid after one — see <c>LoginPageTests</c>.
+    /// </summary>
+    public static ZeroWikiAppFactory RestartedFrom(ZeroWikiAppFactory previous) =>
+        new(previous.DatabasePath, previous.DataRoot);
 
     /// <summary>A client that surfaces redirects instead of following them.</summary>
     /// <remarks>
@@ -71,10 +102,17 @@ public sealed class ZeroWikiAppFactory : WebApplicationFactory<Program>
     /// exception handler and HSTS, so leaving it to whatever the host machine exports would make
     /// these tests exercise a pipeline nobody chose. <c>Production</c> is the shape the container
     /// actually ships in.
+    /// <para>
+    /// <c>ContentStorage:DataRoot</c> is pinned to a throwaway temp directory for the same reason
+    /// as the identity connection string above: left at its <c>/data</c> default, the DataProtection
+    /// key ring (<c>Program.cs</c>) would try to create <c>/data/keys</c> on whatever host runs the
+    /// test suite, which has no such directory and no permission to make one.
+    /// </para>
     /// </remarks>
     protected override void ConfigureWebHost(IWebHostBuilder builder) => builder
         .UseEnvironment(Environments.Production)
         .UseSetting("ConnectionStrings:IdentityDb", _connectionString)
+        .UseSetting("ContentStorage:DataRoot", _dataRoot)
         .ConfigureLogging(logging => logging
             .AddProvider(Logs)
 
@@ -97,5 +135,10 @@ public sealed class ZeroWikiAppFactory : WebApplicationFactory<Program>
         // Safe without clearing any connection pool: TestDatabase turns pooling off, so disposing
         // the host above closed every handle to this file.
         TestDatabase.Delete(_databasePath);
+
+        if (Directory.Exists(_dataRoot))
+        {
+            Directory.Delete(_dataRoot, recursive: true);
+        }
     }
 }

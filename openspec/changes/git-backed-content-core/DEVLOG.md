@@ -289,6 +289,412 @@ build` 0 warnings / 0 errors, `dotnet test` **389/389**, `dotnet format --verify
 `openspec validate git-backed-content-core --strict` valid. `git diff -- src` and `git status
 --short -- src` inspected before commit. Boxes 1.1–1.3 ticked; block committed.
 
+**[supervisor]** Section review of `git diff bd2eeea..HEAD` (one block, `3f6d837`, plus the
+post-Approve README edit). Judged against §1's real job — *is a container image plus one mounted
+volume a working deployment substrate for §2–§9?* — not against the three task sentences.
+
+**Verdict: Request changes.** One blocker, verified empirically and fixable in one line of §1's own
+artifact. Everything else is a `## NEXT` note.
+
+### Verified independently (the record is honest)
+
+Built the image and ran it rather than reasoning statically. Every empirical claim in this thread
+holds:
+
+- `git` 2.43.0 in the **runtime** stage; `git-http-backend` present and executable at
+  `/usr/lib/git-core/git-http-backend` (`-rwxr-xr-x`). §7 has its binary.
+- Runs as `uid=1654(app)`; `/data` is `uid=1654 gid=1654 mode=755` in the image; a fresh named
+  volume is seeded from it and the app writes `identity.db`/`-shm`/`-wal` as `app:app` with no
+  permission error. Container boots and serves: `/` → 200, `/login` → 200.
+- **`emmz` is intact.** Verified non-destructively — copied the file and queried the *copy*, never
+  opening the original. 1 Account (`emmz`, `CreatedAt` `2026-07-26T16:26:07`), 1 GitToken,
+  1 Invitation; `sha256` of `src/ZeroWiki/App_Data/identity.db` identical before and after my read.
+- **1.1 independently confirmed, not accepted on the record.** `Program.cs:13` is plain
+  `AddRazorComponents()` and `Program.cs:123` plain `MapRazorComponents<App>()` — no
+  `AddInteractiveServerComponents`, no `AddInteractiveServerRenderMode`, and no `@rendermode` in any
+  of the 15 `.razor` files. The app is Static-SSR-by-default today, with *zero* interactive
+  infrastructure registered. D7 holds; the ticked 1.1 is a true record.
+- **D8's content layout is consistent across all three surfaces** — `ContentPaths.cs:22-23`
+  (`<root>/wiki`, `<root>/wiki/docs`), `Dockerfile:49-50` (`ContentStorage__DataRoot=/data`), and
+  `README.md`. No drift.
+- **No PO data baked into the image.** `find / -xdev` for `*.db` / `App_Data` in the built image
+  returns nothing — `.dockerignore`'s `**/App_Data/` and `**/*.db` are effective. Worth stating
+  explicitly because the build context contains real credentials.
+- No dead scaffolding: `/data/wiki` correctly does *not* exist in the image — §2 creates it.
+  `ContentPaths` is three fields, all consumed from §2 onward. It earns its keep.
+- Checked, and **not** a finding: `/invitations` and `/account` answer anonymous requests with
+  `200` + the login page body, not a redirect and not page content. Uniform and non-enumerating.
+
+### Blocker — `safe.directory` is HOME-scoped and evaporates in exactly §7's subprocess
+
+`Dockerfile:47` — `RUN git config --global --add safe.directory '*'` — runs *after* `USER $APP_UID`,
+so it writes **`/home/app/.gitconfig` only**. There is no `/etc/gitconfig` in the image. The setting
+therefore survives only for processes that inherit `HOME=/home/app`.
+
+§7 shells out to `git http-backend` as a **CGI subprocess**, and building CGI properly means
+constructing an explicit environment. Reproduced against a repo whose owning uid ≠ the app's euid —
+the precise scenario the Dockerfile header comment says this defends (`a volume populated by another
+means, or restored from a backup taken as a different user`):
+
+| environment | result |
+|---|---|
+| `HOME=/home/app` (inherited) | clean — `safe.directory` applies |
+| `env -u HOME` | `fatal: detected dubious ownership in repository at '/data/wiki'` |
+| `env -i PATH=...` (scrubbed) | `fatal: detected dubious ownership` |
+| `git http-backend` under a scrubbed CGI env | **`Status: 500 Internal Server Error`** |
+
+This matters beyond the code because the record asserts otherwise. The `[architect]` standing note
+above says *"`safe.directory '*'` is set globally for the app user and is **load-bearing for §2 and
+§7**, not decoration."* It is load-bearing, and it is broken in §7 — so §7's worker inherits a
+guarantee that does not hold, and the symptom is an HTTP 500 that reads as a git-protocol problem
+rather than a container one. A block review cannot see this: the Dockerfile line is correct in
+isolation, and §7 does not exist yet.
+
+**Verified fix** (I built it and re-ran the table): move the config to **system scope**, before the
+`USER` switch, so it is HOME-independent —
+
+```dockerfile
+RUN git config --system --add safe.directory '*'   # as root, before USER $APP_UID
+```
+
+That writes `/etc/gitconfig`; both the `env -i` case and the `http-backend` CGI case then pass, the
+latter returning a proper `application/x-git-upload-pack-advertisement` instead of a 500.
+
+**Remediation block shape** — small, one file plus the record:
+1. `Dockerfile:47` → `--system`, relocated above `USER $APP_UID`.
+2. Correct the `[architect]` standing note in this thread: system-scope, and *why* per-user scope was
+   insufficient, so §7 does not re-derive it.
+3. Optional but cheap: state in the Dockerfile comment that the scope is deliberate because
+   `http-backend` runs with a constructed environment.
+
+No test is warranted — this is container configuration, and the evidence is the reproduction above.
+
+### Architectural notes → `## NEXT` (not part of the fix block)
+
+1. **The runtime image has no HTTP client.** `curl`, `wget`, and `nc` are all absent; `flock` **is**
+   present at `/usr/bin/flock`, so §5.3's shell hooks are safe. But §8.1/§8.2 have `post-receive`
+   calling back into the app, and if that callback is HTTP the image cannot make the call. Decide
+   §8's callback mechanism *before* §8 starts — if it is HTTP, the Dockerfile changes, and a later
+   section reopening §1's artifact is the drift this review exists to prevent.
+2. **D8 says "both paths are configuration, defaulting to `/data`" — that is not true of the
+   identity path.** `appsettings.json:10` ships `Data Source=App_Data/identity.db` as the base
+   default for *every* environment; only the `Dockerfile:49` `ENV` moves it to `/data`. Content uses
+   the opposite strategy: production default in code (`ContentStorageOptions.cs:15`), Development
+   overriding to `App_Data`. Two inverted defaulting strategies for one volume layout. Inside the
+   container it is correct, so this is coherence rather than a defect — but the D8 layout is now
+   asserted in four places and the identity half is right in only one of them.
+3. **`ContentPaths` has no `GitDir` and no lock path, and §5 needs one.** The `flock` lockfile must
+   not live in the working tree — an untracked lockfile under `docs/` dirties the tree, which D9
+   would commit as content and `updateInstead` would bounce pushes on. `ContentPaths` is the right
+   home for it (`<RepositoryRoot>/.git/…`); flag it in §5's brief so §5 extends this type rather
+   than growing a parallel path helper beside it.
+4. **`VOLUME ["/data"]` buys a footgun and nothing else.** Named-volume seeding happens regardless of
+   the instruction; what `VOLUME` adds is that `docker run` with no `-v` silently creates an
+   *anonymous* volume — measured, +1 dangling volume per run — so the wiki appears to work and the
+   data is stranded on the next `docker rm`. For a product whose whole story is "one volume", failing
+   loudly would serve the operator better. Worth a deliberate keep-or-drop call, not urgent.
+5. **DataProtection key ring — severity read agreed.** Not re-raised as a finding. The reviewer's
+   "UX papercut, not a security defect" is right: forced re-login is a conservative failure mode, git
+   tokens are hashed in the DB and untouched. One addition — the ring currently sits under
+   `/home/app`, i.e. container-local, so it is lost on replacement rather than merely unshared;
+   `<DataRoot>/keys` remains the natural fix whenever the PO decides scope.
+
+Housekeeping: I removed every container, volume, and image I created. One anonymous volume from the
+`VOLUME` demonstration in note 4 is left behind among pre-existing dangling volumes — I did not prune,
+since blind `volume prune` on this host could take data that isn't mine.
+
+**[architect]** Supervisor's `Request changes` accepted in full. **Correcting my own standing note
+above**: I wrote that `safe.directory '*'` is "set globally for the app user and is load-bearing for
+§2 and §7". The first half is exactly the defect — *globally* means `--global`, which is HOME-scoped,
+and §7's `git http-backend` CGI subprocess runs under a constructed environment where `HOME` may not
+survive. The note would have handed §7's worker a guarantee that does not hold, and the symptom
+(`Status: 500`) reads as a git-protocol bug rather than a container one. The supervisor built the fix
+and re-ran its whole table; treat `--system` as the binding form from here.
+
+**[architect]** Two Product Owner decisions land in §1 alongside the remediation:
+
+- **New task 1.4 — persist the DataProtection key ring.** The Product Owner's call (2026-08-02) on
+  the scope question the block reviewer raised: fold it into §1 rather than park it. The supervisor's
+  note 5 sharpens why — the ring currently sits under `/home/app`, which is *container-local*, so it
+  is lost on every image replacement, not merely on restart.
+- **Process:** per the Product Owner's steer on ceremony, the remediation and 1.4 go to **one worker
+  and one reviewer pass**, but land as **two commits** — a `fix(...)` for the supervisor's findings
+  (ticking nothing) and a `feat(...)` for 1.4. Halving the agent round-trips is the saving; blurring
+  what was a defect and what was new work is not, so the commit record stays split.
+
+**[architect]** Remediation scope — the blocker plus the two `## NEXT` notes that are one-liners in
+the same file, taken now because reopening the Dockerfile later costs more than doing them together:
+
+1. **Blocker** — `git config --system --add safe.directory '*'` as root, *before* the `USER` switch.
+2. **Note 2** — D8 says both paths default to `/data`, but `appsettings.json` ships
+   `Data Source=App_Data/identity.db` as the base default for every environment, so the container is
+   only correct because its `ENV` says so. Align identity with content's strategy: `/data` in the
+   base, `App_Data` in the Development override. **This is the change that can destroy the Product
+   Owner's account if it lands half-done** — the Development override must exist in the same edit.
+3. **Note 4** — drop `VOLUME ["/data"]`. It does not enable named-volume seeding (that happens
+   regardless) and it silently creates an anonymous volume on every `docker run` without `-v`, which
+   the supervisor measured.
+
+Notes 1 and 3 are **not** in this block. Both are forward obligations, pinned in `## NEXT`.
+
+**[worker]** Both pieces done — reporting Piece A (remediation) and Piece B (1.4) separately since
+they land as two commits.
+
+**Piece A — remediation (ticks nothing):**
+
+- **A1 (blocker).** Reproduced the failure first, on the unmodified image: built
+  `zerowiki-remediation:before`, seeded a named volume with a repo owned by a different uid (5000)
+  than the app (1654), then ran the exact four-row table against it —
+  `HOME` inherited → clean, `env -u HOME` → `fatal: detected dubious ownership`, `env -i` → same
+  fatal, `git http-backend` under a constructed CGI env → **`Status: 500 Internal Server Error`**.
+  All four match the supervisor's report exactly. Fixed by moving `git config --system --add
+  safe.directory '*'` above `USER $APP_UID`, as root (writes `/etc/gitconfig`, HOME-independent).
+  Rebuilt (`:after`) and re-ran the identical table against the identical volume: all four now
+  clean, and `http-backend` returns a real
+  `Status: 200` / `application/x-git-upload-pack-advertisement` body instead of 500. Also updated
+  the header comment, which described the bug as the intended behaviour.
+- **A2.** `appsettings.json`'s `ConnectionStrings:IdentityDb` base default moved to
+  `Data Source=/data/identity.db`; `appsettings.Development.json` now carries the matching
+  `App_Data/identity.db` override alongside its existing `ContentStorage:DataRoot`. Verified
+  non-destructively before touching anything: copied `App_Data/identity.db`, took `sqlite3 .dump |
+  sha256sum` (`934deca5…`) and read `emmz`'s `CreatedAt` (`2026-07-26T16:26:07.1478100Z`) from the
+  copy. After the edit, ran the app in Development against the **real** file
+  (`ASPNETCORE_ENVIRONMENT=Development dotnet run`): log said `"No migrations were applied"` and
+  `"The identity store already has at least one account; the first-administrator bootstrap path is
+  inert"` — it opened the existing store, not a fresh one. Killed the process, re-ran the dump/hash
+  on the original file: **identical** `934deca5…`, same row counts (1/1/1), same `CreatedAt`.
+  `emmz` is untouched.
+- **A3.** Removed `VOLUME ["/data"]`. Verified after removal: a fresh named volume is still seeded
+  correctly (`identity.db` created `app:app`, no permission error), and a run with **no** `-v` flag
+  left the dangling-volume count unchanged (29 before, 29 after) — no anonymous volume created.
+
+All docker images/volumes/containers created for this reproduction were removed afterward; the two
+long-running unrelated containers on this host (`dhpp-sql`, `storage`) were untouched.
+
+**Piece B — 1.4, persist the DataProtection key ring:**
+
+- Added `ContentPaths.KeysDirectory` (`<DataRoot>/keys`), computed alongside `RepositoryRoot` and
+  `WorkingTree` in the same constructor — one place derives all of D8's paths.
+- Added `ContentStorageStartupExtensions.ResolveContentPaths(IConfiguration)`: reads the same
+  `ContentStorageOptions` section `AddContentStorage` binds, so `Program.cs` can get `ContentPaths`
+  before `builder.Build()` (which `PersistKeysToFileSystem` needs) without a second notion of where
+  the data root is, and without the `BuildServiceProvider()` anti-pattern (ASP0000).
+  `ResolveContentPathsMatchesTheDiRegisteredSingleton` asserts the two never drift.
+- `Program.cs`: `AddDataProtection().SetApplicationName("ZeroWiki").PersistKeysToFileSystem(new
+  DirectoryInfo(contentPaths.KeysDirectory))`. Comments in place for: why the app name is pinned
+  explicitly (default discriminator derives from content root, which differs between `dotnet run`
+  and the container), and why unencrypted-at-rest on Linux is accepted (same volume, same trust
+  boundary as `identity.db`'s Argon2id hashes).
+- `ZeroWikiAppFactory` now also pins `ContentStorage:DataRoot` to a throwaway temp directory,
+  mirroring the existing identity-connection-string override — without it, every integration test
+  would have tried to create `/data/keys` on the host running the suite.
+- **End-to-end, not inferred:**
+  - Container: built the image, bootstrapped a real account and logged in over real HTTP (curl,
+    antiforgery token + `_handler` hidden field extracted from the rendered form), captured the
+    `ZeroWiki.Authentication` cookie. `docker restart` → cookie still authenticates. Removed the
+    container entirely and started a **new** one (image-replacement scenario) against the same
+    named volume → cookie **still** authenticates. Confirmed `/data/keys/key-*.xml` on the volume,
+    owned `app:app`, mode `0600`. No more "keys not persisted outside the container" warning in
+    either log.
+  - `xUnit`: added `ZeroWikiAppFactory.RestartedFrom(previous)` — a second factory sharing the same
+    database file and `DataRoot`, giving a fresh DI container and freshly-loaded key ring, i.e.
+    everything a real restart changes except the OS process. `A_session_survives_a_restart_…`
+    signs in, restarts, asserts the cookie still authenticates, **and** asserts a `.xml` key file
+    exists under the factory's own `DataRoot` (so the pass can't be explained by some other
+    DataProtection default-repository fallback). `A_session_does_not_survive_an_unshared_key_ring`
+    is the control: an independent factory with its own `DataRoot` cannot decrypt the first
+    instance's cookie.
+  - **Instrument check, capped at 3 runs as CLAUDE.md scopes for this project.** Mutated
+    `Program.cs` to drop only `.PersistKeysToFileSystem(...)` (kept `AddDataProtection()` +
+    `SetApplicationName`). 3/3 consistent: the positive test **still passed** — this dev machine's
+    writable `$HOME` lets ASP.NET's own default repository discovery fall back to
+    `~/.aspnet/DataProtection-Keys`, which both hosts in the same test process incidentally share,
+    masking the mutation — while the control test failed with an unrelated-looking body mismatch
+    (the cookie decrypted against the wrong account's ring). This is a property of the *test
+    environment*, not the shipped code: `PersistKeysToFileSystem(...)` is an explicit repository
+    override with no dependency on that fallback, which is exactly what the on-disk-file assertion
+    above now checks directly rather than relying on cross-host behaviour to prove it. Reverted;
+    `shasum` of `Program.cs` matched before/after; `git diff -- src` and `git status --short -- src`
+    both clean of residue afterward.
+  - Development: confirmed the identity-store aliasing didn't regress Development's content-storage
+    default — ran the app in Development and observed `App_Data/keys/key-*.xml` appear (mode
+    `0600`) alongside `App_Data/identity.db`, i.e. the relative `App_Data` root resolves to the
+    same place for both. Did **not** attempt a real sign-in-restart round trip against the PO's real
+    `identity.db` — bootstrap is inert with an existing account and the real `emmz` password isn't
+    available to this worker, and seeding a synthetic account into that file was ruled out by A2's
+    non-destructive requirement. The container test and the `RestartedFrom` xUnit test exercise the
+    identical `Program.cs` wiring end to end; only the `DataRoot` value differs between Development
+    and the container, and that value's correct resolution is what's confirmed directly.
+
+**Gates (both pieces, final tree):** `dotnet build` 0 warnings / 0 errors. `dotnet test` full suite
+**394/394** (389 existing + 3 `ContentPaths`/`ResolveContentPaths` tests + 2 `LoginPageTests`
+restart tests). `dotnet format --verify-no-changes` clean. `openspec validate
+git-backed-content-core --strict` valid. `git diff -- src` / `git status --short -- src` reviewed
+before reporting — no mutation residue.
+
+Diff is cleanly separable: `Dockerfile` + `appsettings.json` + `appsettings.Development.json` =
+Piece A; `Program.cs`, `Content/ContentPaths.cs`, `Content/ContentStorageStartupExtensions.cs`, and
+the three test files = Piece B.
+
+→ @reviewer
+
+**[reviewer]** Audited `git diff 3f6d837` (11 files) — the remediation (Piece A) and 1.4 (Piece B).
+Built and ran rather than reasoning statically, per the brief. One process note first: my first
+mutation attempt used a shell `trap ... EXIT` to auto-revert, which doesn't work across separate
+tool calls (shell state doesn't persist), and a subsequent `git checkout -- Program.cs` — intended
+as a revert — instead discarded the worker's **uncommitted** Piece B changes back to HEAD, since
+`git checkout --` restores from the index/HEAD, not "the state before my edit," for anything not
+yet committed. Caught it immediately via checksum, reconstructed the file from the diff I'd already
+captured, and confirmed byte-for-byte restoration (`sha256 c27f7083…`, matching before any mutation)
+before continuing. Recording it here in the interest of an honest record, and because it's a sharp
+edge worth knowing about: **for uncommitted work, `git checkout --`/`git restore --` is not a safe
+revert primitive — it discards forward, it doesn't rewind.** All mutation reverts from that point on
+used direct Edit-based restoration verified by checksum, never `git checkout`.
+
+**Piece A — no blockers, all three items reproduced independently:**
+
+- **A1 confirmed, end-to-end.** Built the current image; `/etc/gitconfig` has `[safe] directory = *`
+  and `/home/app/.gitconfig` does not exist. Seeded a named volume with a repo `chown`'d to uid 5000
+  (app runs as 1654) and ran the four-row table: `HOME` inherited, `env -u HOME`, `env -i`, and
+  `git http-backend` under a constructed CGI environment (`GIT_PROJECT_ROOT`, `PATH_INFO=/wiki/info/refs`,
+  `QUERY_STRING=service=git-upload-pack`, no `HOME`) — all four clean, the CGI case returning a real
+  `Content-Type: application/x-git-upload-pack-advertisement` body with no `Status:` override (200).
+  Then, to see the actual regression rather than take the fix on faith, rebuilt the image with the
+  Dockerfile's config moved back to `--global` after `USER $APP_UID` (the pre-fix shape) via an
+  Edit-then-immediately-Edit-back on `Dockerfile`, never `git checkout`, checksum-verified restored
+  (`sha256 4b4b21fc…`, unchanged from before the experiment). Against that image, same volume: `env -u
+  HOME` and `env -i` both `fatal: detected dubious ownership`, and `http-backend` returned
+  **`Status: 500 Internal Server Error`** — the exact defect the supervisor reported, reproduced fresh.
+  `Dockerfile:20-27,49-51` match.
+- **A2 confirmed — nothing else resolves to `/data`.** `ZeroWikiAppFactory.cs:112-115` pins both
+  `UseEnvironment(Environments.Production)` and `UseSetting("ContentStorage:DataRoot", _dataRoot)`
+  unconditionally, so the test host never sees `appsettings.Development.json`'s override *or* falls
+  through to the base `/data` default — it's pinned to a throwaway temp dir regardless. Confirmed
+  empirically, not just read: `/data` does not exist on this machine, so if the pin were missing or
+  wrong, the suite would fail loudly (permission denied at the filesystem root) rather than pass by
+  accident — and the full suite passes 394/394. Also ran `dotnet run` with
+  `ASPNETCORE_ENVIRONMENT=Development` against the **real** `App_Data/identity.db` afterward to
+  double-check nothing regressed for the PO's store: log said the bootstrap path is inert, i.e. it
+  opened the existing store. Did not touch the file directly myself beyond that read-only run.
+- **A3 confirmed.** No `VOLUME` instruction in the Dockerfile. Named-volume seeding still works —
+  fresh volume, `identity.db` and `keys/` created owned `1654:1654`, app serves `200`. A bare
+  `docker run` with no `-v` left the dangling-volume count unchanged (26 before, 26 after) — no
+  anonymous volume created.
+
+**Piece B — no blockers:**
+
+- **B1 confirmed.** `ContentPaths.cs:24` derives `KeysDirectory = Path.Combine(DataRoot, "keys")` —
+  a sibling of `RepositoryRoot`, not nested under it, and structurally cannot drift there since both
+  are computed independently from the same `DataRoot` in one constructor. Live-verified via the named
+  volume run above: `/data` held `identity.db` and `keys/` at the top level, no `wiki/` involvement.
+  `KeysDirectoryIsOutsideTheRepositoryRoot` (ContentStorageOptionsTests.cs) asserts this statically too.
+- **B2 confirmed.** `Program.cs:91` pins `.SetApplicationName("ZeroWiki")` explicitly, ahead of
+  `.PersistKeysToFileSystem(...)`.
+- **B3 — verified myself, not just re-read. The restart test can fail, and does, cleanly.** Mutated
+  `Program.cs` to drop only `.PersistKeysToFileSystem(...)` (checksum before: `c27f7083…`), ran the
+  **full, unfiltered** `dotnet test`: **2 dead / 392 passed / 394 total**, both restart tests failing
+  with a consistent, understood mode —
+  `A_session_survives_a_restart_because_the_key_ring_is_persisted` fails at its own on-disk-file
+  assertion (`LoginPageTests.cs:214`, "Expected at least one persisted key under …") before it ever
+  reaches the cookie check, and `A_session_does_not_survive_an_unshared_key_ring` fails on an
+  unexpected signed-in body instead of the anonymous landing page — consistent with this dev
+  machine's writable `$HOME` letting both hosts fall back to the same discovered key repository once
+  the explicit override is gone, exactly as the worker's write-up describes. One confirmation run,
+  clean and consistent — no need for a second under the cap. Reverted via Edit (not `git checkout`,
+  see above), checksum back to `c27f7083…`, `git diff -- src` / `git status --short -- src` clean
+  afterward.
+  - On the DEVLOG wording itself: "3/3 consistent: the positive test **still passed**" reads, taken
+    literally against the *current* shipped test, as false — I just showed the current
+    `A_session_survives_…` test does **not** pass under this mutation, on this same kind of dev
+    machine. Read charitably it's describing what the cookie-only assertion *would* do without the
+    on-disk check that was added specifically to close that gap — which matches what I found — but as
+    written it's ambiguous enough that a future reader could conclude the shipped positive test is
+    fragile to the `$HOME`-fallback quirk, when I've now confirmed it isn't. Nit, not a blocker:
+    tighten the wording to say plainly that the on-disk assertion is what catches the mutation today,
+    rather than leaving "the positive test still passed" standing unqualified.
+- **B4 — judgement assessed independently, and I agree with it.** The dev-machine `$HOME` fallback is
+  a property of this environment (ASP.NET's own default key-repository discovery finding a writable
+  profile directory), not of the shipped code — `PersistKeysToFileSystem(...)` is an explicit
+  repository override with no dependency on that fallback path, and the container never has this
+  problem (no equivalent writable-`$HOME`-shared-across-hosts scenario; each container is a single
+  process). Confirmed the container path separately: `docker restart` and a full container
+  replacement both preserved the session per the worker's write-up, which is the environment that
+  actually ships. Not a defect in shipped code.
+- **B5 confirmed.** Neither `.csproj` gained a `PackageReference` for `Microsoft.AspNetCore.DataProtection`
+  — it's shared-framework, as expected.
+- **B6 confirmed.** `.gitignore`'s blanket `App_Data/` rule already covers `App_Data/keys` (no
+  separate entry needed); `git status --short -- src/ZeroWiki/App_Data` is empty despite the
+  directory existing on disk from live verification runs — nothing staged, nothing tracked.
+
+**Nits (neither blocking):**
+- `ContentStorageStartupExtensions.ResolveContentPaths` (Piece B) reuses `ContentPaths`'s own
+  constructor guard (`ContentPaths.cs:16-19`, `ArgumentException: Data root must not be empty.`)
+  rather than `AddContentStorage`'s `.Validate()`/`ValidateOnStart()` predicate — so a misconfigured
+  empty/whitespace `ContentStorage:DataRoot` now surfaces as an unhandled `ArgumentException` with a
+  stack trace at `Program.cs:88`, before the host ever gets to produce the friendlier
+  `OptionsValidationException` message block 1's reviewer confirmed has teeth. Verified live
+  (`ContentStorage__DataRoot="   " dotnet run`) — the message is still clear ("Data root must not be
+  empty"), just delivered less politely and earlier than the options pipeline would have. Not a new
+  defect (the guard is pre-existing, block-1 code, shared by both call sites) and not worth blocking
+  on for a project this size — noting only because two paths into the same class now fail two
+  different ways for the same bad input.
+- B3's DEVLOG wording, above.
+
+**Gates:** re-verified independently at this exact tree after all reverts — `dotnet build` 0
+warnings/0 errors, `dotnet test` **394/394** (full, unfiltered), `dotnet format --verify-no-changes`
+clean, `git diff -- src` and `git status --short -- src` both clean of mutation residue. Did not
+re-run `openspec validate --strict` since nothing in scope of that check changed.
+
+**Verdict: Approve.**
+
+→ @architect
+
+**[architect]** Reviewer's `Approve` accepted for both pieces. Both nits handled here rather than
+sent back:
+
+- **Nit 1 (`ResolveContentPaths` bypasses `ValidateOnStart`)** — accepted as-is, not fixed. An empty
+  `DataRoot` still fails fast at startup and still says why; the only loss is that the message comes
+  from `ContentPaths`' own constructor guard rather than the options pipeline. Fixing it means
+  building the options pipeline twice or deferring DataProtection registration past `Build()`, which
+  is more machinery than a marginally tidier exception is worth. Recorded so the next reader knows it
+  was considered.
+- **Nit 2 (the worker's B3 wording)** — a defect in the record, so corrected here rather than left:
+  the worker's phrase *"the positive test still passed"* reads as though the restart test cannot
+  fail. It can, and does. The reviewer independently dropped `PersistKeysToFileSystem` from
+  `Program.cs` and ran the **full unfiltered** suite: **2 dead / 392 passed / 394 total**, both
+  restart tests red with a consistent failure mode. That is the number that matters; treat the
+  worker's wording as superseded by this post.
+
+**[architect]** ⚠️ **Second instrument failure of this change, and a new standing rule.** The reviewer
+mutated `Program.cs` for the B3 check and tried to revert with a shell `trap … EXIT`, which does not
+survive across separate tool calls; the follow-up `git checkout --` then **discarded the worker's
+uncommitted Piece B changes**, because `git checkout`/`git restore` restore from `HEAD`, not from
+"the state before my edit". Uncommitted work is invisible to that primitive. The reviewer caught it
+immediately by checksum and reconstructed the file byte-for-byte against the pre-mutation SHA-256.
+
+**I verified the reconstruction independently rather than accepting it** — a hand-rebuilt production
+file is exactly the claim not to take on trust. Three checks: the DataProtection wiring is present
+and complete in `Program.cs`; `git diff --stat 3f6d837` shows `Program.cs` at `+21`, identical to its
+pre-review shape; and the two restart tests the reviewer proved die without that wiring are **green
+in a full 394/394 run** — which they could not be if the reconstruction were wrong.
+
+**The rule this earns:** CLAUDE.md already mandates reverting via `trap`/`finally`. Add that
+**`git checkout --` / `git restore --` are not valid revert primitives for a working tree containing
+uncommitted work** — they silently restore to `HEAD` and take any uncommitted changes with them.
+Revert a mutation by restoring the *content you saved before mutating*, and verify by checksum.
+Note the first instrument failure this change (the Perl `$\` interpolation, §0) was also a harness
+defect rather than a code defect. Two for two: the harness has been wrong more often than the code.
+
+**[architect]** Gates re-verified independently at the final tree, after the review: `dotnet build`
+0 warnings / 0 errors, `dotnet test` **394/394** (full suite, unfiltered), `dotnet format
+--verify-no-changes` clean, `openspec validate --strict` valid. `git diff -- src` and `git status
+--short -- src` inspected and clean of mutation residue. The Product Owner's account re-checked
+non-destructively via a copy after A2: `emmz`, administrator, `CreatedAt` `2026-07-26T16:26:07`
+unchanged.
+
+Landing as **two commits**: the remediation as a `fix` (ticking nothing), then 1.4 as a `feat`. The
+DEVLOG rides with the second, which closes the work.
+
 ## NEXT
 
 **Resume point: §1, block 1 (1.1–1.3).** Nothing committed on this branch yet beyond the design

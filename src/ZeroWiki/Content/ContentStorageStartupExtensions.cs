@@ -25,4 +25,20 @@ public static class ContentStorageStartupExtensions
 
         return services;
     }
+
+    /// <summary>
+    /// Derives <see cref="ContentPaths"/> straight from <paramref name="configuration"/>, without a
+    /// built <see cref="IServiceProvider"/>. Some startup wiring — the DataProtection key ring
+    /// (<c>Program.cs</c>) — needs the data root before <c>WebApplicationBuilder.Build()</c> runs,
+    /// so it cannot resolve the DI-registered <see cref="ContentPaths"/> singleton. This reads the
+    /// same <c>ContentStorage</c> section through the same <see cref="ContentStorageOptions"/> type
+    /// as <see cref="AddContentStorage"/>, so there is one definition of the data root, not two.
+    /// </summary>
+    public static ContentPaths ResolveContentPaths(IConfiguration configuration)
+    {
+        var options = configuration.GetSection(ContentStorageOptions.SectionName).Get<ContentStorageOptions>()
+            ?? new ContentStorageOptions();
+
+        return new ContentPaths(options.DataRoot);
+    }
 }

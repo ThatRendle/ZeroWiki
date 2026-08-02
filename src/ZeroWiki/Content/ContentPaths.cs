@@ -21,6 +21,7 @@ public sealed class ContentPaths
         DataRoot = Path.GetFullPath(dataRoot);
         RepositoryRoot = Path.Combine(DataRoot, "wiki");
         WorkingTree = Path.Combine(RepositoryRoot, "docs");
+        KeysDirectory = Path.Combine(DataRoot, "keys");
     }
 
     /// <summary>The mounted data volume root, e.g. <c>/data</c>.</summary>
@@ -31,4 +32,12 @@ public sealed class ContentPaths
 
     /// <summary>The working tree the app renders — <c>&lt;RepositoryRoot&gt;/docs</c>.</summary>
     public string WorkingTree { get; }
+
+    /// <summary>
+    /// Where the DataProtection key ring is persisted — <c>&lt;DataRoot&gt;/keys</c>, a sibling of
+    /// <c>identity.db</c>. Deliberately outside <see cref="RepositoryRoot"/>: a key file written
+    /// under the content repo would be picked up by commit-on-save and pushed to every Obsidian
+    /// vault that clones the remote.
+    /// </summary>
+    public string KeysDirectory { get; }
 }
