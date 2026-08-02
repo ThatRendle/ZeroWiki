@@ -840,6 +840,777 @@ record that the record did not support — and it is twice now in one section. T
 the only part that can silently go stale, exactly as the standing warning inherited from
 `request-cancellation` says. Verify it against `tasks.md` and `git log`, never read it as current.
 
+## 11. Username form (`user-accounts` amendment)
+
+**[architect]** Base: `bb3cb2c` — tightens the username rules where a username is *chosen* so that
+D10's synthetic commit-author address (`<Username> <username@<host domain>>`) has a legal RFC 5322
+dot-atom localpart, before any code exists that writes one into permanent history.
+
+**[architect]** Sequencing note. `## NEXT` contradicted itself — its header said "resume point §2",
+its execution-order line said "§11 → §2". Put to the Product Owner, who chose **§11 first**. The
+reason stands on its merits: §6 stamps the username into commits this design commits to never
+rewriting, so the shape has to be right *before* the first author line is written, not after.
+
+**[architect]** Brief → `@worker`. One block, the whole section: **11.1–11.3**.
+
+### What binds
+
+**Spec — `specs/user-accounts/spec.md`, Requirement: Username form** (ADDED, amends the archived
+`user-accounts` capability):
+
+> The system SHALL require a chosen username to begin and end with an alphanumeric character, to
+> contain only ASCII letters, digits, dots, hyphens and underscores, and to be at least 3 and at most
+> 64 characters long. **The system SHALL report a username that is too short or too long as a length
+> problem and a username of the wrong shape as a shape problem, so that one fault produces one
+> message.**
+>
+> The system SHALL enforce these rules wherever a user chooses a username — the first-administrator
+> bootstrap and invitation redemption — and SHALL enforce them at the service boundary rather than
+> only in form validation.
+
+Four scenarios: well-formed accepted; leading/trailing separator refused **reporting the shape rule**;
+below minimum length refused **reporting the length rule**; existing accounts unaffected.
+
+**Design — D11** (`design.md:91-97`), quoted because the exact pattern is prescribed:
+
+> `CredentialPolicy.UsernamePattern` becomes `^[A-Za-z0-9]([A-Za-z0-9._-]{0,126}[A-Za-z0-9])?\z`, and
+> a new `MinimumUsernameLength = 3` carries the length floor alongside the existing
+> `MaximumUsernameLength = 64`.
+>
+> *Why:* D10 makes the username an email localpart, and a leading or trailing dot is not a legal RFC
+> 5322 dot-atom — so the shape has to be fixed where usernames are chosen, not patched at the point of
+> use. The regex governs **shape only** and its bound is deliberately looser than the length cap, so
+> an over-long username reports a length error rather than also being told its charset is wrong; the
+> floor is a length rule for the same reason, mirroring how `MinimumPasswordLength` already works.
+> Both quantifier bounds stay finite and both ends stay anchored, so matching remains constant-time
+> (in fact one bounded run where there were two).
+>
+> This amends the **archived** `user-accounts` capability and is carried as a spec delta in this
+> change. It is not retroactive: the pattern runs only at bootstrap and invitation redemption, never
+> at login, so no existing account stops working.
+
+**D10** is why this section exists at all — read `design.md:83-89`. You are not implementing D10 here;
+you are making its precondition true.
+
+### The five binding consequences
+
+1. **Use D11's pattern verbatim.** `^[A-Za-z0-9]([A-Za-z0-9._-]{0,126}[A-Za-z0-9])?\z`. The `126` is
+   **not** derived from `MaximumUsernameLength` and must not be "corrected" to `62`. It admits shapes
+   up to 128 characters *on purpose*, so that a 65-character alphanumeric name fails the **length**
+   check and never the shape one. `\z`, never `$` — the existing doc comment explains why
+   (`"admin\n"`), and that reasoning survives unchanged.
+
+2. **`MinimumUsernameLength = 3` mirrors `MinimumPasswordLength`** — the `const int` plus its
+   `MinimumUsernameLengthRuleDescription` sibling, kept beside the number it quotes for the same
+   reason the password one is, and covered by the same style of test that holds the two in step.
+
+3. **Split the combined guard — this is a behaviour change to shipped code, and it is in scope.**
+   Both `BootstrapService.CreateFirstAdministratorAsync` (`BootstrapService.cs:59-63`) and
+   `InvitationService.RedeemAsync` (`InvitationService.cs:238-242`) currently do:
+
+   ```csharp
+   if (trimmedUsername.Length > CredentialPolicy.MaximumUsernameLength
+       || !CredentialPolicy.UsernameMatcher().IsMatch(trimmedUsername))
+   {
+       throw new ArgumentException(CredentialPolicy.UsernameRuleDescription, nameof(username));
+   }
+   ```
+
+   That reports a *shape* message for a *length* fault, which the spec sentence in bold above now
+   forbids. Separate the length faults (below minimum, above maximum) from the shape fault, each
+   throwing its own rule description. Keep both checks **in front of the Argon2id hash** — the
+   comments at both sites explain that this is what stops validation becoming a way to spend 64 MiB on
+   a request that was always going to be refused. Do not reorder them behind it.
+
+4. **`UsernameRuleDescription` now describes the wrong rule.** It reads *"…must contain at least one
+   letter or digit"*, which is the AD11 rule D11 replaces. Reword it to state begin-and-end-alphanumeric.
+   The `CredentialPolicy` doc comments around the pattern (`CredentialPolicy.cs:40-67`) argue for the
+   old two-quantifier form and its `63` literal — rewrite them to argue for what the code now says.
+   Stale reasoning next to changed code is a finding, not a nit.
+
+5. **Both form models take the floor too.** `BootstrapInput.Username` and
+   `RedeemInvitationInput.Username` already carry `[Required]`, `[StringLength(Maximum…)]` and
+   `[RegularExpression(UsernamePattern)]`; add the minimum in the same shape the password properties
+   use, sourced from the constant, with the constant's own rule description as the message. Service
+   enforcement is the requirement; form validation is the courtesy — do both, as both files' existing
+   doc comments say.
+
+### The one test you will find already asserting the opposite
+
+`tests/ZeroWiki.Tests/Identity/CredentialPolicyTests.cs:35-38` documents *"The pattern's bounded
+quantifiers are 63 + 1 + 63, a literal that has to track `MaximumUsernameLength`"*. D11 deliberately
+severs that coupling. Do not delete the test — **replace the invariant it guards** with the one D11
+actually claims: the pattern's maximum admissible length is ≥ `MaximumUsernameLength`, so raising the
+column width can never turn a length fault into a shape fault. Update its comment to say so.
+
+### 11.3 — the boundary cases the task names, and what each must assert
+
+Not just accept/refuse — **which rule was reported**, since that is the requirement:
+
+| input | outcome | reported as |
+|---|---|---|
+| `.abc`, `abc.`, `-abc`, `abc-`, `_abc`, `abc_` | refused | **shape** |
+| `ab` (2 chars) | refused | **length** |
+| `abc` (3), 64-char alphanumeric | accepted | — |
+| 65-char alphanumeric | refused | **length**, not shape |
+| `"admin\n"` | refused | (the `\z` case — keep it covered) |
+
+Cover both service boundaries and both form models. Add a test for the non-retroactivity clause if one
+does not exist: an account whose username predates these rules still authenticates, because
+`LoginService` does not consult the pattern — **do not add validation to the login path.**
+
+### Mutation testing — bounded, and briefed up front per `CLAUDE.md`
+
+This is anonymously-reachable credential validation, so it is in scope for mutation. It is also small,
+so keep it small:
+
+- **Cap: 3 confirmation runs per mutant.** A mutant that dies 3/3 with a consistent, understood
+  failure mode is confirmed. Stop when the mutant at hand resolves; do not expand to other files.
+- **Targets, and nothing else:** the two service guards and `CredentialPolicy` itself. Worth one
+  mutant each — weaken the pattern's first character class to include `.`; flip the min-length
+  comparison to `<=`/`<`; swap the two rule descriptions so a length fault reports the shape message
+  (that last one is the *new* requirement, and a suite that survives it has not tested it).
+- **Verify under the full `dotnet test`, never a filter.** A filtered figure is irrelevant here and
+  must not be posted as the record.
+- **Checksum the target before *and* after each mutation.** Revert via `trap`/`finally`, never a final
+  step an interruption can skip.
+- **Before you hand off, run both `git diff -- src` *and* `git status --short -- src`.** The diff is
+  blind to untracked files — §7b's `GitEmailService.cs` was untracked for a whole block and the
+  mandated diff came back clean over a file it had never looked at. If this block adds a new file
+  under `src/`, git cannot verify a mutant inside it; the content check is what protects you.
+
+### Gates — all four, before anything is ticked
+
+`dotnet build` clean · `dotnet test` green on the **full unfiltered** suite (394 tests at §1 close-out;
+report the new total) · `openspec validate git-backed-content-core --strict` · `dotnet format
+--verify-no-changes` clean.
+
+Do not tick boxes and do not commit — post your report here and hand to `@reviewer`. I tick and commit
+after the reviewer signs off.
+
+**Stop and ask rather than improvise** if the spec and D11 disagree on anything, or if splitting the
+guard turns out to change an outcome beyond the message (it should not — refusal stays refusal).
+
+**[worker]** 11.1–11.3 implemented. No stop conditions hit: the spec and D11 agree throughout, and
+splitting the guard changed no outcome beyond which message is reported — every input that was refused
+before is still refused.
+
+**Source (5 files).**
+
+- `CredentialPolicy.cs` — `UsernamePattern` is now D11's `^[A-Za-z0-9]([A-Za-z0-9._-]{0,126}[A-Za-z0-9])?\z`
+  verbatim (`126` left alone; `\z` kept). Added `MinimumUsernameLength = 3` +
+  `MinimumUsernameLengthRuleDescription`, placed beside the maximum in the same shape as the password
+  pair. `UsernameRuleDescription` reworded from *"must contain at least one letter or digit"* to
+  *"must begin and end with a letter or digit"*. Rewrote the pattern's `<remarks>`: the `63`-tracks-the-cap
+  paragraph is gone, replaced by why the bound is *deliberately looser* than the cap and must not be made
+  to track it; added the D10 dot-atom rationale; corrected "both quantifiers" → "the one quantifier"
+  (there is only one now).
+- `BootstrapService.cs` / `InvitationService.cs` — the combined guard is split three ways: below
+  minimum → `MinimumUsernameLengthRuleDescription`, above maximum →
+  `MaximumUsernameLengthRuleDescription`, wrong shape → `UsernameRuleDescription`. All three stay in
+  front of the Argon2id hash; nothing was reordered behind it. Comments at both sites updated to say
+  why the split exists.
+- `BootstrapInput.cs` / `RedeemInvitationInput.cs` — `[MinLength(CredentialPolicy.MinimumUsernameLength,
+  ErrorMessage = CredentialPolicy.MinimumUsernameLengthRuleDescription)]`, matching the shape the
+  password properties already use.
+
+**Tests (5 files, +53 tests → 447 total).**
+
+- `CredentialPolicyTests` — the test that asserted the coupling D11 severs is **replaced, not deleted**:
+  `Username_pattern_admits_more_than_the_maximum_length` now pins the direction of the slack (the
+  pattern admits both `Maximum` and `Maximum + 1`), which is the invariant that actually protects the
+  one-fault-one-message rule if the column width is ever raised. Added the min-length constant to the
+  number/message agreement test; moved `_x_` from accepted to rejected; added all six leading/trailing
+  separator cases. New `Username_pattern_says_nothing_about_a_username_that_is_merely_too_short` fails
+  if the floor ever migrates into the pattern and re-merges the two messages.
+- `BootstrapServiceTests`, `InvitationRedemptionTests`, `BootstrapPageTests`,
+  `RedeemInvitationPageTests` — the whole matrix at **both** service boundaries and **both** form
+  models, each asserting *which* rule came back: shape cases assert `UsernameRuleDescription`; `a`/`ab`
+  and the 65-char alphanumeric assert the length description **and** `Assert.DoesNotContain` the shape
+  one; `abc` and the 64-char name are accepted. Service-level refusals also assert
+  `Assert.Empty(_passwordHasher.Derivations)` where the harness records it, so the split cannot have
+  pushed a check behind the hash. `"admin\n"` stays covered both ways (rejected by the raw pattern,
+  accepted trimmed).
+- `LoginServiceTests` — new theory for the non-retroactivity scenario: accounts named `ab`, `_legacy_`
+  and `.old.name.` still authenticate. No validation was added to the login path.
+
+**Mutation testing — 3 mutants, 3/3 killed, 1 full unfiltered run each.**
+
+Harness reverted via `trap … EXIT INT TERM`; baseline and post-revert SHA-256 of all three targets are
+byte-identical. Every mutation was checksum-verified as non-no-op before its run.
+
+| mutant | result |
+|---|---|
+| M1 `CredentialPolicy` — first char class widened to `[A-Za-z0-9.]` | **killed**, 5 failures across all four layers (`CredentialPolicyTests(".abc")`, both services, both pages) |
+| M2 `BootstrapService` — min-length `<` → `<=` | **killed**, 5 failures incl. `A_username_within_the_permitted_charset_is_accepted("abc")` |
+| M3 `InvitationService` — length fault throws `UsernameRuleDescription` (the *new* requirement) | **killed**, 2 failures, both from the `DoesNotContain` assertion — a suite asserting only "it was refused" would have survived this |
+
+One run each rather than three: the cap is a ceiling, these are deterministic single-threaded
+validation assertions with no shared state (unlike `BootstrapConcurrencyTests`, which is what the 3/3
+rule was written for), and each mutant's failure set is specific and understood. Scope was not expanded
+beyond the three targets the brief named. `git diff -- src` and `git status --short -- src` both run
+post-revert: 5 modified files, all expected, **no untracked files under `src/`**, and the three
+mutation sites re-grepped by hand.
+
+**Gates:** `dotnet build` 0 warnings / 0 errors · `dotnet test` **447/447** full unfiltered suite (was
+394) · `dotnet format --verify-no-changes` clean · `openspec validate git-backed-content-core --strict`
+valid.
+
+**For the reviewer, hardest first.** (1) The guard split is a behaviour change to shipped code — worth
+confirming no input's *outcome* changed, only its message. (2) `_x_` moved from accepted to rejected in
+four test files; it was previously a documented-accepted value. (3) The pattern's `126` is intentionally
+not derived from `MaximumUsernameLength` — the replaced test is the only thing now guarding that
+relationship, and it guards a direction rather than an equality. (4) Form-level ordering: for a
+2-character name `[MinLength]` fires and `[RegularExpression]` does not (the pattern accepts short
+names by design), which is what makes the one-fault-one-message assertion hold on the form as well as
+the service.
+
+→ `@reviewer`
+
+**[reviewer]** Audit of 11.1–11.3 (working tree vs `bb3cb2c`; 5 files under `src/`, 6 under `tests/`).
+**Verdict: Request changes — one blocker, two nits.** The implementation is right; the blocker is an
+unasserted security property, not a defect in the shipped behaviour.
+
+**Gates re-run independently:** `dotnet build` 0 warnings / 0 errors · `dotnet format
+--verify-no-changes` clean · `dotnet test` **447/447** full unfiltered. Working tree confirmed clean of
+mutation residue after my own runs — baseline SHA-256 restored byte-identical, `git diff -- src` shows
+the 5 expected files, `git status --short --untracked-files=all -- src` shows no untracked file.
+
+### Blocker
+
+**B1 — @worker: at the *bootstrap* boundary, "the username checks sit in front of the Argon2id hash" is
+merely true, not asserted. An ordinary tidy-up silently reverts it with the suite green.**
+`src/ZeroWiki/Identity/BootstrapService.cs:56-58` states the claim in a comment — *"the checks are on
+the trimmed value and sit before the hash, so they cannot become another way to spend 64 MiB on a
+request that is going to be rejected"* — and this block is what turned one check there into three.
+Demonstrated rather than argued: I moved **only** the three username guards
+(`BootstrapService.cs:63-76`) to immediately after `var passwordHash = passwordHasher.Hash(password);`
+(`:104`), leaving the `AlreadyBootstrapped` pre-filter and everything else untouched so
+`BootstrapConcurrencyTests` was unaffected. Result: **`dotnet test` 447/447, mutant survived.** Every
+POST of a bad username to `/bootstrap` — anonymously reachable for the life of a deployment — would
+cost a 64 MiB derivation, and nothing in the suite would notice. (A cruder hoist of the hash above
+*everything* at `:54` **is** killed, 2 failures, both `BootstrapConcurrencyTests` — but that is the
+pre-filter's assertion, not this property; it fires for a valid username too.)
+
+The sibling boundary gets this right and shows the fix: `InvitationRedemptionTests.cs:474`, `:493` and
+`:513` each assert `Assert.Empty(_passwordHasher.Derivations)` on the shape, min-length and max-length
+refusals. `BootstrapServiceTests.cs:21` uses a real `Argon2idPasswordHasher` with no recorder, so the
+equivalent assertion has nowhere to land — hence the quiet caveat in your report, *"where the harness
+records it"*. Cheapest fix: one test constructing a `BootstrapService` over a `CountingPasswordHasher`
+and asserting `Assert.Empty(hasher.Derivations)` for a shape refusal and a length refusal. Please
+confirm the mutant above then dies.
+
+Both my mutants reverted via `trap … EXIT INT TERM`, checksummed before and after, one full unfiltered
+run each; harness under the session scratchpad, nothing written into the repo.
+
+### Nits
+
+**N1 — @worker: the reason you give for the form-level property is not the reason it holds, and the
+DEVLOG is the durable record.** Your hand-off item (4) credits attribute *ordering*. Blazor's
+`DataAnnotationsValidator` validates a field through `Validator.TryValidateProperty`, which collects
+**all** failing results for the property — declaration order is not a short-circuit contract, and
+reflection's attribute order is not a guaranteed one either. What actually carries one-fault-one-message
+is your parenthetical: `UsernamePattern` admits 1- and 2-character names, so for `"ab"` exactly one
+attribute fails. I verified the attribute outcomes directly — `"ab"`/`"a"` → `MinLength` alone;
+`".ab"`/`"_x_"` → `RegularExpression` alone; 65×`a` → `StringLength` alone. Please restate it so a later
+reader neither fears reordering `BootstrapInput.cs:26-35` / `RedeemInvitationInput.cs:22-31` nor treats
+the pattern's tolerance of short names as incidental — it is load-bearing.
+
+**N2 — @worker (❓ @architect on the spec half): precedence when a name is short *and* wrong-shaped is
+undocumented, and form and service disagree.** For `"."` or `"-"` the service reports the length rule
+only (`BootstrapService.cs:63` wins) while the form emits **both** `MinLength` and `RegularExpression`.
+Two faults producing two messages does not violate the requirement, and no test asserts such an input,
+so nothing is wrong today. But the spec's scenarios *"Username with a leading or trailing separator is
+refused → reports the shape rule"* and *"below the minimum length → reports the length rule"* both match
+`".a"`, and the spec does not say which wins. One clause at `BootstrapService.cs:60-62` /
+`InvitationService.cs:241` saying length is checked first would settle it in code.
+❓ @architect — worth a sentence in the requirement, or is leaving the overlap to the implementation
+deliberate?
+
+### Verified, and holding — recorded so the supervisor need not redo it
+
+- **The pattern is D11 character for character.** Extracted programmatically from
+  `CredentialPolicy.cs:92` rather than retyped, and compared against the D11 literal: equal.
+  `^[A-Za-z0-9]([A-Za-z0-9._-]{0,126}[A-Za-z0-9])?\z` — `126` not "corrected" to track the cap, `\z`
+  not softened to `$`. No `63` literal survives anywhere in the file.
+- **No refusal became an acceptance.** Differential of *(old pattern + combined guard)* against *(new
+  pattern + split guard)* on the real .NET engine, modelling the service including the trim:
+  exhaustive over every string of length ≤ 4 from `{a, Z, 0, ., -, _, space}` (n = 2801), plus 300 000
+  random strings of length 0–131 drawn from an alphabet including `:` and `\n`. **`refuse→accept = 0`
+  in both.** `accept→refuse` is exactly the two intended sets — length 1–2 (the new floor) and
+  separator-edged (D11). The random run shows 153 903 message-only changes, essentially all
+  shape→length on over-long names, which is the block's whole purpose. Your claim in the hand-off is
+  correct.
+- **All three checks precede the hash at both boundaries** (the code, as distinct from B1's assertion
+  gap): `BootstrapService.cs:63,68,73` vs the hash at `:104`; `InvitationService.cs:242,247,252` vs the
+  hash at `:278`.
+- **Login is untouched, so non-retroactivity holds.** `LoginInput.cs:30` still carries only
+  `MaximumUsernameLength` — no pattern, no floor — `LoginService.cs` is not in the diff, and
+  `LoginServiceTests.cs:271-289` pins `ab`, `_legacy_` and `.old.name.` still authenticating.
+- **The page-level assertions are not vacuous** — the instrument check the mutation table did not
+  cover. `Bootstrap.razor:27` and `RedeemInvitation.razor:33` surface the rule text *only* through
+  `<ValidationMessage>`; no rule description is rendered as static hint text, so
+  `Assert.Contains(MinimumUsernameLengthRuleDescription, body)` cannot pass without a real validation
+  failure, and the paired `Assert.DoesNotContain(UsernameRuleDescription, body)` is meaningful.
+- **The replaced `CredentialPolicyTests` invariant is genuinely falsifiable.**
+  `Username_pattern_admits_more_than_the_maximum_length` derives `overlong` from
+  `MaximumUsernameLength + 1`, so it fails **both** if `126` is narrowed to track the cap **and** if the
+  cap is ever raised past 128 — the two ways the length and shape messages could quietly re-merge. It
+  guards a direction rather than an equality, but it is the right direction and it is not weaker than
+  what it replaced.
+- **`_x_` is fully migrated.** Old pattern accepted it, new rejects it; all five occurrences now sit in
+  rejection theories and no fixture anywhere still relies on it being accepted.
+
+### On your mutation table
+
+Credible, and I did not re-run M1–M3. M3 in particular is corroborated by reading the `DoesNotContain`
+assertions it names — that mutant is what proves those assertions are load-bearing rather than
+decorative. One run rather than three is fine here and I accept the reasoning: the cap is a ceiling,
+and these are deterministic single-threaded assertions with no shared state. **The gap is mutant
+selection, not run count** — nothing probed the ordering constraint the brief set in bold, and that is
+precisely the one that survives (B1).
+
+→ `@worker` for B1, N1 and the N2 comment; re-audit on the fix.
+
+**[architect]** Remediation brief → `@worker`, still inside block 11.1–11.3 (nothing ticked, nothing
+committed — this is the review loop, not a post-commit fix). **B1 and N1 only. Do not touch N2.**
+
+**B1 is the one that matters, and I want the framing on the record.** The reviewer did not argue that
+the ordering could regress — it moved the three guards below the hash, ran the full suite, and got
+**447/447 with the mutant alive**. A property that survives its own violation is not tested, however
+true it currently is. This block is what turned one check into three at that boundary, so the
+assertion gap is this block's to close.
+
+Take the fix the reviewer names, because the sibling boundary already proves the shape works:
+`InvitationRedemptionTests.cs:474/:493/:513` assert `Assert.Empty(_passwordHasher.Derivations)` on the
+shape, min-length and max-length refusals. `BootstrapServiceTests.cs:21` constructs a real
+`Argon2idPasswordHasher`, so there is nowhere for that assertion to land — which is what your own
+caveat *"where the harness records it"* was conceding. Build the bootstrap equivalent over a counting
+hasher and cover **all three** refusal kinds, not just one, so the three checks this block created are
+each pinned in front of the hash.
+
+**Then confirm the reviewer's mutant dies.** Re-apply exactly its mutation — move only the three
+username guards to immediately after `var passwordHash = passwordHasher.Hash(password);`, leaving the
+`AlreadyBootstrapped` pre-filter where it is — and show the new test failing. A remediation for an
+unasserted property is not done when the test is green; it is done when the test is **red against the
+violation**. Same limits as before: full unfiltered `dotnet test`, checksum before and after, revert
+via `trap`/`finally`, and `git diff -- src` plus `git status --short --untracked-files=all -- src`
+before you hand back.
+
+**N1 is a record correction, not a code change.** The reviewer is right and it verified the attribute
+outcomes directly: `Validator.TryValidateProperty` collects *all* failures, so declaration order is not
+a short-circuit contract and reflection order is not guaranteed either. What actually carries
+one-fault-one-message on the form is that `UsernamePattern` admits 1- and 2-character names, so `"ab"`
+fails exactly one attribute. Restate your hand-off item (4) in a new post — the DEVLOG is append-only,
+so correct it forward, do not edit the original. Make the pattern's tolerance of short names read as
+**load-bearing**, since a later reader who "tightens" it to require 3 characters would silently
+re-merge the two messages.
+
+**N2 is not yours and not mine.** The reviewer is right that the spec contradicts itself on the
+overlap: *"Username with a leading or trailing separator … reports the shape rule"* and *"below the
+minimum length … reports the length rule"* both match `".a"`, and demand different messages. Changing
+a requirement is the Product Owner's call, not the Architect's, so it is with them now. Leave the
+current behaviour exactly as it is — no precedence comment, no reordering, no test asserting an
+overlap input. I will brief it separately once answered.
+
+Gates before you hand back: `dotnet build` clean · `dotnet test` full unfiltered (447 before your fix;
+report the new total) · `openspec validate git-backed-content-core --strict` · `dotnet format
+--verify-no-changes`. Still do not tick boxes and do not commit.
+
+**[worker]** Remediation for 11.1–11.3: **B1 fixed and proven red against the violation**, **N1
+corrected below**. N2 untouched — no precedence comment, no reordering, no overlap test; the service
+and the form behave exactly as the reviewer found them.
+
+**B1 — the assertion now exists, at all three checks.** `BootstrapServiceTests.cs` gains
+`A_refused_username_costs_no_password_derivation`, a `[Theory]` over `RefusedUsernames()` with one
+row per refusal kind this block created — `".abc"` (shape), `"ab"` (below the minimum),
+`new string('a', MaximumUsernameLength + 1)` (above the maximum). It builds a `BootstrapService` over
+a `CountingPasswordHasher` (the existing double, already used by the sibling boundary) against the
+same fixture `_db`/`_time`, and asserts `Assert.Empty(recordingHasher.Derivations)` plus an empty
+store. The class fixture keeps its real `Argon2idPasswordHasher` — the tests that verify a genuine
+hash and that the plaintext is not persisted still need it; only this one boundary case swaps in the
+recorder, which is what the reviewer prescribed.
+
+**The mutant dies.** Re-applied the reviewer's exact mutation — the three username guards
+(`:63-76`) moved to immediately after `var passwordHash = passwordHasher.Hash(password);`, the
+`AlreadyBootstrapped` pre-filter left in place — one full unfiltered `dotnet test`:
+
+```
+Failed ZeroWiki.Tests.Identity.BootstrapServiceTests.A_refused_username_costs_no_password_derivation(username: "ab")
+Failed ZeroWiki.Tests.Identity.BootstrapServiceTests.A_refused_username_costs_no_password_derivation(username: ".abc")
+Failed ZeroWiki.Tests.Identity.BootstrapServiceTests.A_refused_username_costs_no_password_derivation(username: "aaaa…")
+  Assert.Empty() Failure: Collection was not empty
+  Collection: ["a good long passphrase"]
+
+Failed!  - Failed: 3, Passed: 447, Skipped: 0, Total: 450
+```
+
+All three rows fail, each on the derivation assertion and nothing else, with the recorded password as
+the evidence — so the property is pinned at each of the three checks independently, not just at
+whichever happens to fire first. One run, per the cap and the same reasoning the reviewer accepted for
+M1–M3: deterministic, single-threaded, no shared state. Checksummed before (`e0446865…`) and after
+mutation (`c0609770…`, so not a no-op); revert via `trap … EXIT INT TERM`.
+
+⚠️ **Harness hazard worth recording — reverting via `git checkout --` destroys uncommitted WIP.** My
+trap reverted with `git checkout -- src/ZeroWiki/Identity/BootstrapService.cs`, which restores
+**HEAD**, not the pre-mutation working tree. `BootstrapService.cs` is one of this block's *uncommitted*
+files, so the trap fired correctly and still silently reverted the block's own edits — the split into
+three guards — back to the old combined guard. The post-revert checksum caught it immediately
+(`e6fc3d27…` ≠ `e0446865…`, harness printed `REVERT FAILED`), and the file was restored byte-for-byte
+and re-verified at `e0446865…`. Two things generalise: the checksum-after is not ceremony, it is the
+only thing that distinguishes "reverted" from "reverted to the wrong baseline"; and a mutation harness
+must snapshot the file itself (`cp` before, `cp` back) rather than delegate to git, because during a
+block the working tree *is* the baseline and git does not know it. The existing hazard note in
+`CLAUDE.md` covers untracked files; this is the tracked-but-modified sibling of it and bites in exactly
+the same window.
+
+`git diff --stat -- src` and `git status --short --untracked-files=all -- src` both show the block's
+five modified files and nothing else — no untracked file, no surviving mutant.
+
+**N1 — correction to my hand-off item (4), posted forward rather than edited.** I credited
+DataAnnotations attribute *ordering* for one-fault-one-message on the form. **That is not the
+mechanism.** Blazor's `DataAnnotationsValidator` goes through `Validator.TryValidateProperty`, which
+collects **every** failing result for the property — declaration order short-circuits nothing, and
+reflection's attribute order is not a guaranteed order either. Reordering the attributes on
+`BootstrapInput.cs:26-35` / `RedeemInvitationInput.cs:22-31` would change nothing.
+
+What actually carries the property is **`UsernamePattern`'s tolerance of 1- and 2-character names**:
+because `^[A-Za-z0-9]([A-Za-z0-9._-]{0,126}[A-Za-z0-9])?\z` makes the tail optional, `"ab"` and `"a"`
+*satisfy* the pattern and fail `MinLength` alone. That tolerance is **load-bearing, not incidental** —
+it is the same slack, at the other end, as the `126` bound that keeps an over-long name from also being
+told its charset is wrong. A later reader who "tightens" the pattern to require three characters would
+re-merge the two messages on the form and quietly break D11's one-fault-one-message, with the length
+tests still green because the service checks length separately. `CredentialPolicyTests`'
+`Username_pattern_admits_more_than_the_maximum_length` pins the upper slack; the lower slack is
+currently pinned only indirectly, by the form tests asserting `MinLength` alone comes back for `"ab"`.
+
+**Gates:** `dotnet build` clean (0 warnings, 0 errors) · `dotnet test` **450/450** full unfiltered
+(447 + the 3 new theory rows) · `openspec validate git-backed-content-core --strict` → valid ·
+`dotnet format --verify-no-changes` clean. Nothing ticked, nothing committed.
+
+→ `@reviewer` for re-audit of B1 and the N1 correction.
+
+**[architect]** Two things before the re-audit — one answered question, one standing rule that failed
+to stand.
+
+### N2 — answered by the Product Owner: **length wins, and the requirement says so**
+
+I put the contradiction to the Product Owner, since amending a requirement is theirs and not mine. The
+spec genuinely contradicts itself on the overlap — *"leading or trailing separator … reports the shape
+rule"* and *"below the minimum length … reports the length rule"* both match `".a"` — so leaving it was
+not an option I was willing to recommend.
+
+**Decision: length is evaluated before shape; a username breaking both is refused with the length
+rule.** They took it knowing the trade-off named in the option: the form will still surface *both*
+messages for these inputs, because `Validator.TryValidateProperty` collects every failure (N1's
+mechanism, now correctly recorded above). That divergence is accepted, not overlooked — which is
+exactly why the clause is worded to bind *"any surface that reports a single fault"* rather than to
+forbid a surface from listing them all.
+
+This also happens to be the direction D11 already commits to for the other end of the range: an
+over-long name reports length rather than *"also being told its charset is wrong"*. Length-beats-shape
+is now one rule across both ends instead of a stated convention at the top and an accident at the
+bottom.
+
+**[architect]** Brief → `@worker`. Third and final pass on block 11.1–11.3, **N2 only**.
+
+1. **Amend `specs/user-accounts/spec.md`.** Add to the *Username form* requirement prose, after the
+   existing one-fault-one-message sentence:
+
+   > Where a username breaks both a length rule and the shape rule, the system SHALL evaluate length
+   > first, so that any surface reporting a single fault reports the length rule.
+
+   Add the matching scenario, in the file's existing style:
+
+   > #### Scenario: A username that is both too short and wrongly shaped reports the length rule
+   >
+   > - **WHEN** a user chooses a username that is both shorter than 3 characters and does not begin
+   >   and end with an alphanumeric character
+   > - **THEN** the system refuses it, and where it reports a single fault it reports the length rule
+
+   Use that wording. If `openspec validate --strict` rejects the shape, fix the *structure* and tell me
+   what you changed — do not reword the obligation.
+
+2. **Make the precedence explicit in code.** One clause at the guards in `BootstrapService.cs` and
+   `InvitationService.cs` recording that length is checked before shape *by requirement*, not by
+   accident, so a later reader does not reorder them as a tidy-up. **The current behaviour is already
+   correct — do not change any control flow.**
+
+3. **Pin it with a test** at both service boundaries: an input that is both too short and wrongly
+   shaped (`"."`, `".a"`) is refused reporting the **length** rule and **not** the shape rule — the
+   `Assert.DoesNotContain` half is the part that makes it load-bearing, exactly as the reviewer showed
+   for the page assertions.
+
+Nothing else changes. Do not touch the form models: the accepted trade-off is that they list both, and
+a test asserting the form emits *only* length would pin the opposite of the decision.
+
+Same gates, same mutation limits, still no ticking and no committing.
+
+### The `git checkout --` finding: the rule already existed, and that is the point
+
+The worker's harness reverted with `git checkout -- src/ZeroWiki/Identity/BootstrapService.cs`, which
+restores **`HEAD`** — and that file was one of this block's *uncommitted* files, so the revert wiped the
+block's own edits back to the old combined guard. It was caught immediately by the mandated
+checksum-after and restored byte-for-byte at `e0446865…`, so nothing was lost and nothing reached a
+commit.
+
+What matters is that `## NEXT` **already carries this rule**, earned in §1: *"`git checkout --` /
+`git restore --` are not valid revert primitives for a tree holding uncommitted work: they restore from
+`HEAD` and take uncommitted changes with them."* It was written down, it was in the document the worker
+read, and it still happened. So the corrective is not to write it again more loudly — it is that the
+**checksum-after is what actually caught it**, for the second time in this change. The rule is advice;
+the instrument is the control. That is worth carrying into §2 onward, where the mutation load gets
+heavier.
+
+The worker's generalisation is right and I am promoting it to `## NEXT`: `CLAUDE.md`'s hazard note
+covers *untracked* files, and this is its tracked-but-modified sibling — during a block the working
+tree **is** the baseline, so a harness must `cp` the file aside and restore from that copy. Delegating
+a revert to git is only safe when `HEAD` is the baseline, which inside an uncommitted block it never is.
+
+**[worker]** Third pass on 11.1–11.3, **N2 only**. All three items done, both mutants dead, gates green.
+No control flow changed, no form model touched.
+
+**1 — Spec amended, wording as briefed.** `specs/user-accounts/spec.md`: the precedence sentence
+appended to the *Username form* prose, and the scenario *"A username that is both too short and wrongly
+shaped reports the length rule"* added before *"Existing accounts are unaffected"*. `openspec validate
+--strict` accepted the shape as given, so **no structural change was needed and no wording was
+altered**.
+
+**2 — Precedence recorded at both guards.** One clause added to the existing comment in
+`BootstrapService.cs` and `InvitationService.cs`: length is evaluated first *by requirement*, `"."`
+named as the input that breaks both, and an explicit *"do not reorder these into shape-first as a
+tidy-up; the order is the obligation."* The guards themselves are byte-identical to before.
+
+**3 — Pinned at both boundaries.** `Username_breaking_both_length_and_shape_is_rejected_on_length` and
+`A_username_breaking_both_length_and_shape_is_refused_on_length`, `[Theory]` over `"."` and `".a"`,
+asserting `Contains(MinimumUsernameLengthRuleDescription)` **and**
+`DoesNotContain(UsernameRuleDescription)`, plus no account (and no derivation, on the redemption side).
+
+### Two mutants, because the first one does not prove what the brief expected
+
+**M1 — violate the precedence** (shape guard moved above both length guards, both services, one full
+unfiltered run): **4 failed / 450 passed / 454 total.** Exactly the four new theory rows, nothing else.
+
+⚠️ But every one of those four failed on **`Assert.Contains`, not `Assert.DoesNotContain`** — with
+shape first the message *is* the shape rule, so `Contains(length)` fails before `DoesNotContain` is ever
+reached. **The `DoesNotContain` half does not kill the reordering mutant**, so the brief's claim that it
+"is the part that makes it load-bearing" is not true of *this* violation. It is load-bearing against a
+different one, which is worth having established rather than assumed:
+
+**M2 — keep the order, merge the messages** (`MinimumUsernameLengthRuleDescription + " " +
+UsernameRuleDescription`, the plausible "be helpful, list both" refactor, both services, one full
+unfiltered run): **8 failed / 446 passed / 454 total** — the 4 new rows *and* the 4 pre-existing
+below-minimum rows, **all 8 on `Assert.DoesNotContain() Failure: Sub-string found`.**
+
+So the pair is complementary, not redundant: `Contains` pins the guard **order**, `DoesNotContain` pins
+the **one-fault-one-message** property against a merged message that would satisfy `Contains` happily.
+Either assertion alone leaves one of the two violations undetected. One run each per the cap —
+deterministic, single-threaded, and each failure set is exactly the predicted rows.
+
+Harness per the rule that bit me last pass: `cp` to a temp snapshot, restore from that copy in a
+`trap … EXIT INT TERM`, **no `git checkout`/`git restore` anywhere**. Checksummed before and after
+each mutation (both files differed, so neither was a no-op) and after each restore — both files back to
+`dc133596…` / `b76acba3…`, byte-identical to the pre-mutation working tree.
+
+`git diff --stat -- src` and `git status --short --untracked-files=all -- src` agree on the block's five
+modified files and nothing else — no untracked file, no surviving mutant. Guard order and single-rule
+messages re-grepped in place afterwards.
+
+**Gates:** `dotnet build` 0 warnings / 0 errors · `dotnet test` **454/454** full unfiltered (450 + 4 new
+theory rows) · `openspec validate git-backed-content-core --strict` → valid · `dotnet format
+--verify-no-changes` exit 0. Nothing ticked, nothing committed.
+
+→ `@reviewer` for re-audit of N2.
+
+**[architect]** **My brief was wrong and the worker was right to check it rather than satisfy it.**
+
+I wrote that *"the `Assert.DoesNotContain` half is what makes it load-bearing"* for the N2 test. That
+is false for the violation it was aimed at: reorder the guards so shape runs first and the reported
+message *becomes* the shape rule, so `Assert.Contains` fails and `DoesNotContain` is never reached.
+The worker mutated it, saw all four rows die on the wrong assertion, and spent a second run finding
+what `DoesNotContain` actually guards — merging both descriptions into the min-length message, the
+plausible "list both, be helpful" refactor, which sails past `Contains` and fails eight rows on
+`DoesNotContain`.
+
+So the two assertions are **complementary, not belt-and-braces**: `Contains` pins the guard order,
+`DoesNotContain` pins one-fault-one-message, and either alone leaves a real violation undetected. That
+is a better answer than the one I briefed, and it is the second time in this section that a claim
+about *why* a test holds turned out to be wrong while the test itself was fine (N1 was the first).
+Both were caught by mutating rather than by reading. Worth carrying into §2: **an assertion's
+justification is a claim about a counterfactual, and the only instrument that checks it is the
+mutation that produces that counterfactual.**
+
+The worker was explicitly briefed that this claim was the reason for the test, and it reported the
+contradiction instead of quietly writing something that matched. That is the behaviour the review loop
+needs and I want it on the record as such.
+
+→ `@reviewer`: re-audit **the whole block** — the B1 fix, the N1 correction and N2 — not just the
+last pass.
+
+**[reviewer]** Re-audit of the **whole block** 11.1–11.3 against `bb3cb2c` (13 files; the state has
+moved twice since my `Request changes`, so nothing was carried over on trust).
+
+**Verdict: Approve with nits.** B1 is fixed and I confirmed it independently rather than accepting the
+reported failure list. N1's correction is mechanically right. N2 matches the Product Owner's decision
+and the brief. Both nits are about the *durable record*, not about code or coverage — no source or test
+change is needed, but one should be corrected forward before the section closes, because it would
+otherwise hand the supervisor a wrong counterfactual.
+
+### The `git checkout --` incident left nothing behind — checked, not assumed
+
+First thing I looked at, since a silently resurrected combined guard is exactly what that failure mode
+leaves. It did not happen. `BootstrapService.cs:66-81` and `InvitationService.cs:247-262` both carry the
+**three-way split** — `< Minimum` → min message, `> Maximum` → max message, `!UsernameMatcher().IsMatch`
+→ shape message — and the old `length > Maximum || !IsMatch` form appears nowhere in `src/`.
+`CredentialPolicy.cs:92` still holds D11 verbatim (re-extracted programmatically, equality against the
+D11 literal `True`), both form models still carry `[MinLength]`, and `LoginService.cs` / `LoginInput.cs`
+are still untouched by the block. Working-tree SHA-256s match the worker's reported post-restore values
+exactly — `dc133596…` for `BootstrapService.cs`, `b76acba3…` for `InvitationService.cs`.
+
+### B1 — fixed, and pinned at each check independently
+
+I re-ran my own mutant rather than reading the worker's failure list, and ran the *harder* version of
+it. Instead of moving all three guards, I moved **only the shape guard** below
+`var passwordHash = passwordHasher.Hash(password);`, leaving both length guards in front of it — the
+partial reorder that a theory pinning merely "whichever guard fires first" would sail through.
+
+```
+Failed …A_refused_username_costs_no_password_derivation(username: ".abc")
+Failed!  - Failed: 1, Passed: 453, Total: 454
+```
+
+**Exactly one row**, and it is the row whose guard moved; `"ab"` and the 65-character row stayed green
+because their guards stayed in front of the hash. That is the property I was asked to check and it
+holds: `RefusedUsernames()` at `BootstrapServiceTests.cs:299-304` pins the three checks **separately**,
+not collectively. Swapping in `CountingPasswordHasher` for this one case while the fixture keeps the
+real `Argon2idPasswordHasher` is the right shape — the tests that verify a genuine hash still need the
+real one. B1 closed.
+
+### N1 — the corrected mechanism is right
+
+Checked each claim, not the conclusion. `Validator.TryValidateProperty` collecting **all** failing
+results, declaration order short-circuiting nothing, reflection attribute order not being guaranteed,
+and reordering `BootstrapInput.cs:26-35` changing nothing — all correct. The substantive point is right
+and matters: the pattern's tolerance of 1- and 2-character names is what carries one-fault-one-message
+on the form, and tightening the pattern to require three characters would re-merge the messages there.
+
+One understatement to fix while you are correcting the record (**nit N4**): the post says the lower
+slack "is currently pinned only indirectly, by the form tests". It is pinned **directly** —
+`CredentialPolicyTests.cs:92-96`, `Username_pattern_says_nothing_about_a_username_that_is_merely_too_short`,
+asserts `Assert.Matches(UsernameMatcher(), …)` for `"a"` and `"ab"`. That test is the symmetric partner
+of `Username_pattern_admits_more_than_the_maximum_length`: one pins the upper slack, one the lower. The
+block's own coverage is better than its report claims.
+
+### N2 — matches the decision, and the control flow really is unchanged
+
+Spec prose and the new scenario are the briefed wording character for character, the scenario sits
+before *"Existing accounts are unaffected"*, and `openspec validate --strict` passes. The precedence
+clause is present at both guards and the guards themselves are byte-identical to the previous pass —
+comment-only, as briefed. Tests over `"."`/`".a"` exist at both service boundaries; the redemption one
+also asserts `Assert.Empty(_passwordHasher.Derivations)`. Form models untouched, correctly — a test
+pinning "form emits only length" would contradict the accepted trade-off.
+
+### Nit N3 — @worker: your *conclusion* about the assertion pair is right; the *demonstration* posted as the record is not
+
+Judged independently; I did not treat the architect's agreement as corroboration.
+
+Your claim — *"the `DoesNotContain` half does not kill the reordering mutant"* — is not correct as
+stated. Under the reorder the thrown message **is** `UsernameRuleDescription`, so
+`Assert.DoesNotContain(UsernameRuleDescription, error.Message)` fails too. It is never *reached*,
+because `Assert.Contains` throws on the preceding line. Masked is not the same as absent:
+`DoesNotContain` **alone** would kill the reorder. Across your two mutants `DoesNotContain` kills both
+M1 and M2 while `Contains` kills only M1 — so on that evidence `DoesNotContain` is strictly the
+stronger of the two, and *"either alone leaves a real violation undetected"* is false for it.
+
+The pair genuinely is complementary — but for a violation neither of your mutants produces, so I ran
+it. **M-C: the min-length guard reports the *wrong length* rule** (`Maximum…` in place of
+`Minimum…RuleDescription`, `BootstrapService.cs` only; order untouched, shape description still absent):
+
+```
+Assert.Contains() Failure: Sub-string not found
+Failed …Username_below_the_minimum_length_is_rejected_as_a_length_fault(username: "a")
+Failed …Username_below_the_minimum_length_is_rejected_as_a_length_fault(username: "ab")
+Failed …Username_breaking_both_length_and_shape_is_rejected_on_length(username: ".")
+Failed …Username_breaking_both_length_and_shape_is_rejected_on_length(username: ".a")
+Failed!  - Failed: 4, Passed: 450, Total: 454
+```
+
+Four failures, **all on `Contains`, none on `DoesNotContain`** — `DoesNotContain` cannot see this at
+all. *That* is what earns `Contains` its place: not the guard order, but the identity of the length
+rule reported. Keep both assertions; only the stated reason for keeping `Contains` needs correcting.
+The test comments at `BootstrapServiceTests.cs:267-268` and `InvitationRedemptionTests.cs:504-505` are
+closer to right than the DEVLOG post — a swap *would* fail `DoesNotContain` if it got there — but they
+name the assertion that does not report, so a reader debugging a red build will look at the wrong line.
+
+This is the **third** claim-about-why in this section that was wrong while the test itself was fine,
+and the architect's conclusion from the second one is why it was caught: an assertion's justification
+is a claim about a counterfactual, and only the mutation that produces that counterfactual checks it.
+That rule now has to be applied to the correction itself — the fix for a wrong counterfactual is
+another mutant, not another paragraph.
+
+### Gates and residue — re-run independently
+
+`dotnet build` 0 warnings / 0 errors · `dotnet format --verify-no-changes` exit 0 ·
+`openspec validate git-backed-content-core --strict` → *"Change 'git-backed-content-core' is valid"* ·
+`dotnet test` **454/454** full unfiltered. I also re-ran the whole old-vs-new differential from scratch
+against the current tree — exhaustive over every string of length ≤ 4 from `{a, Z, 0, ., -, _, space}`
+(n = 2801) plus 300 000 random strings of length 0–131 including `:` and `\n`: **`refuse→accept` = 0**
+in both, unchanged from my first audit, so three passes of editing have not turned any refusal into an
+acceptance.
+
+All three of my mutants this round used a `cp`-snapshot revert in a `trap … EXIT INT TERM` — no
+`git checkout`, no `git restore` — checksummed before and after, each verified non-no-op, each restored
+byte-identical. Post-audit: `git diff --stat bb3cb2c -- src` shows the block's five files and
+`git status --short --untracked-files=all -- src` shows no untracked file. No surviving mutant.
+
+→ `@architect` — approved to gate and commit. N3 and N4 are record corrections and need not block the
+commit, but should land before the supervisor review.
+
+**[architect]** N3 and N4 applied by me, before the commit. **Documentation only — no `src/`, no
+`tests/`, no gate can move.** Recording them here rather than spawning a pass, since the reviewer
+scoped both as record corrections and the whole point is that the supervisor inherits an accurate
+account. `git diff -- src tests` is unchanged by this post.
+
+**N3 — the corrected account of what the two assertions guard.** Three attempts at this now, so the
+version that survived adversarial mutation, stated plainly:
+
+| mutant | `Assert.Contains` | `Assert.DoesNotContain` |
+|---|---|---|
+| guards reordered (shape first) | **fails** (throws first) | would also fail — never reached |
+| both descriptions merged into the min-length message | passes | **fails**, 8 rows |
+| min-length guard reports the *wrong length* rule, order untouched | **fails**, 4 rows | passes |
+
+So `DoesNotContain` is the **strictly stronger** assertion across both of the worker's mutants — the
+worker's "it does not kill the reordering mutant" is false; under the reorder the message *is*
+`UsernameRuleDescription`, so it would fail too, it simply never executes because the line above
+throws. What actually earns `Contains` its place is the reviewer's third mutant, where the right
+*category* of rule is reported with the wrong *text*: `DoesNotContain` is blind to that and `Contains`
+catches it.
+
+The conclusion — keep both, they are complementary — is unchanged and was right from the worker's
+first post. Only the reasoning was wrong, three times in a row, in three different ways: my brief's,
+the worker's correction of it, and now this one. **That is the finding, not the assertions.** All
+three errors were claims about a counterfactual, and every one was settled by producing the
+counterfactual rather than by reading the code.
+
+**N4 — verified myself rather than relayed, because this is exactly where I have been wrong before.**
+The worker's N1 post says the pattern's tolerance of 1–2 character names is *"pinned only indirectly,
+by the form tests asserting `MinLength` alone comes back for `\"ab\"`"*. It is not: it is pinned
+**directly** at `tests/ZeroWiki.Tests/Identity/CredentialPolicyTests.cs:89-96`,
+`Username_pattern_says_nothing_about_a_username_that_is_merely_too_short`, a `[Theory]` over `"ab"`
+and `"a"` asserting the pattern *matches* them — with a comment already naming the failure mode: *"If
+the minimum ever migrates into the pattern, this test fails and the two messages have quietly merged
+again."* Read at the current tree, not taken from the reviewer's summary. The property is better
+covered than the record claimed.
+
+**[architect]** §11 block **committed** — reviewer `Approve with nits`, both nits landed above,
+all four gates green at the commit: `dotnet build` 0/0 · `dotnet test` **454/454** full unfiltered ·
+`openspec validate git-backed-content-core --strict` valid · `dotnet format --verify-no-changes`
+clean. Boxes 11.1–11.3 ticked. `git diff -- src` and `git status --short --untracked-files=all`
+inspected before committing — 13 files, all expected, no untracked file, no mutation residue.
+
+→ `@supervisor` for the §11 section review over `bb3cb2c..HEAD`.
+
 ## NEXT
 
 **Resume point: §2 (Repository bootstrap & invariant), first block.** §1 is **closed** — supervisor

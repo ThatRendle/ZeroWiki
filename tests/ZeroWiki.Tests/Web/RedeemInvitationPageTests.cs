@@ -262,7 +262,14 @@ public sealed partial class RedeemInvitationPageTests : IDisposable
     [InlineData("has space")]
     [InlineData("colon:name")]
     [InlineData("___")]
-    public async Task A_username_outside_the_permitted_charset_is_rejected_and_creates_nothing(string username)
+    [InlineData(".abc")]
+    [InlineData("abc.")]
+    [InlineData("-abc")]
+    [InlineData("abc-")]
+    [InlineData("_abc")]
+    [InlineData("abc_")]
+    [InlineData("_x_")]
+    public async Task A_username_of_the_wrong_shape_is_rejected_and_creates_nothing(string username)
     {
         var link = await IssueInvitationAsync();
 
@@ -273,6 +280,40 @@ public sealed partial class RedeemInvitationPageTests : IDisposable
             CredentialPolicy.UsernameRuleDescription,
             await response.Content.ReadAsStringAsync(),
             StringComparison.Ordinal);
+        await AssertOnlyTheIssuerExistsAsync();
+    }
+
+    [Theory]
+    [InlineData("a")]
+    [InlineData("ab")]
+    public async Task A_username_below_the_minimum_length_is_rejected_as_a_length_fault(string username)
+    {
+        var link = await IssueInvitationAsync();
+
+        var response = await SubmitAsync(_app.CreateHttpClient(), link, username, InviteePassword);
+        var body = await response.Content.ReadAsStringAsync();
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+        // One fault, one message: a name that is only too short must not also be told its
+        // character set is wrong.
+        Assert.Contains(CredentialPolicy.MinimumUsernameLengthRuleDescription, body, StringComparison.Ordinal);
+        Assert.DoesNotContain(CredentialPolicy.UsernameRuleDescription, body, StringComparison.Ordinal);
+        await AssertOnlyTheIssuerExistsAsync();
+    }
+
+    [Fact]
+    public async Task An_overlong_username_is_rejected_as_a_length_fault_not_a_shape_one()
+    {
+        var link = await IssueInvitationAsync();
+        var username = new string('a', CredentialPolicy.MaximumUsernameLength + 1);
+
+        var response = await SubmitAsync(_app.CreateHttpClient(), link, username, InviteePassword);
+        var body = await response.Content.ReadAsStringAsync();
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        Assert.Contains(CredentialPolicy.MaximumUsernameLengthRuleDescription, body, StringComparison.Ordinal);
+        Assert.DoesNotContain(CredentialPolicy.UsernameRuleDescription, body, StringComparison.Ordinal);
         await AssertOnlyTheIssuerExistsAsync();
     }
 

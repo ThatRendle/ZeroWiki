@@ -67,6 +67,6 @@
 
 ## 11. Username form (`user-accounts` amendment)
 
-- [ ] 11.1 Tighten `CredentialPolicy.UsernamePattern` to `^[A-Za-z0-9]([A-Za-z0-9._-]{0,126}[A-Za-z0-9])?\z` so the first and last characters are alphanumeric (D11)
-- [ ] 11.2 Add `MinimumUsernameLength = 3` with its rule description, enforced at the service boundary as `MinimumPasswordLength` is
-- [ ] 11.3 Tests for the boundary cases: leading/trailing `.`/`-`/`_` refused, 2 characters refused as a length fault, 3 and 64 accepted, 65 refused, trailing newline refused
+- [x] 11.1 Tighten `CredentialPolicy.UsernamePattern` to `^[A-Za-z0-9]([A-Za-z0-9._-]{0,126}[A-Za-z0-9])?\z` so the first and last characters are alphanumeric (D11)
+- [x] 11.2 Add `MinimumUsernameLength = 3` with its rule description, enforced at the service boundary as `MinimumPasswordLength` is
+- [x] 11.3 Tests for the boundary cases: leading/trailing `.`/`-`/`_` refused, 2 characters refused as a length fault, 3 and 64 accepted, 65 refused, trailing newline refused

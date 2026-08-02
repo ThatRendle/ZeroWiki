@@ -451,7 +451,16 @@ public sealed class InvitationRedemptionTests : IDisposable
     [InlineData("colon:name")]
     [InlineData("___")]
     [InlineData("café")]
-    public async Task A_username_outside_the_permitted_charset_is_refused_at_the_boundary(string username)
+    // D11: an alphanumeric at each end, because D10 makes the username the localpart of the
+    // commit-author address and a leading or trailing dot is not a legal dot-atom.
+    [InlineData(".abc")]
+    [InlineData("abc.")]
+    [InlineData("-abc")]
+    [InlineData("abc-")]
+    [InlineData("_abc")]
+    [InlineData("abc_")]
+    [InlineData("_x_")]
+    public async Task A_username_of_the_wrong_shape_is_refused_at_the_boundary(string username)
     {
         // AD11, from the same constant as bootstrap — the git remote presents the username as the
         // Basic-auth userid, where a colon is structurally illegal.
@@ -460,9 +469,93 @@ public sealed class InvitationRedemptionTests : IDisposable
         var error = await Assert.ThrowsAsync<ArgumentException>(
             () => _service.RedeemAsync(issued.Token, username, Password));
 
+        // Which rule was reported: D11 requires one fault to produce one message.
         Assert.Contains(CredentialPolicy.UsernameRuleDescription, error.Message, StringComparison.Ordinal);
         Assert.Empty(_passwordHasher.Derivations);
         await AssertNoAccountBeyondTheIssuerAsync();
+    }
+
+    [Theory]
+    [InlineData("a")]
+    [InlineData("ab")]
+    public async Task A_username_below_the_minimum_length_is_refused_as_a_length_fault(string username)
+    {
+        var issued = await IssueAsync();
+
+        var error = await Assert.ThrowsAsync<ArgumentException>(
+            () => _service.RedeemAsync(issued.Token, username, Password));
+
+        Assert.Contains(
+            CredentialPolicy.MinimumUsernameLengthRuleDescription,
+            error.Message,
+            StringComparison.Ordinal);
+        Assert.DoesNotContain(CredentialPolicy.UsernameRuleDescription, error.Message, StringComparison.Ordinal);
+        Assert.Empty(_passwordHasher.Derivations);
+        await AssertNoAccountBeyondTheIssuerAsync();
+    }
+
+    [Theory]
+    [InlineData(".")]
+    [InlineData(".a")]
+    public async Task A_username_breaking_both_length_and_shape_is_refused_on_length(string username)
+    {
+        // The overlap the requirement now settles: these are under the minimum *and* have no
+        // alphanumeric at each end, so both rules match and only one message may come back. The
+        // requirement fixes length first, which pins the guard order — swapping the length and
+        // shape checks would report the shape rule and fail the DoesNotContain below.
+        var issued = await IssueAsync();
+
+        var error = await Assert.ThrowsAsync<ArgumentException>(
+            () => _service.RedeemAsync(issued.Token, username, Password));
+
+        Assert.Contains(
+            CredentialPolicy.MinimumUsernameLengthRuleDescription,
+            error.Message,
+            StringComparison.Ordinal);
+        Assert.DoesNotContain(CredentialPolicy.UsernameRuleDescription, error.Message, StringComparison.Ordinal);
+        Assert.Empty(_passwordHasher.Derivations);
+        await AssertNoAccountBeyondTheIssuerAsync();
+    }
+
+    [Fact]
+    public async Task An_overlong_username_is_refused_as_a_length_fault_not_a_shape_one()
+    {
+        // Alphanumeric throughout, so length is the only thing wrong with it. The pattern's bound
+        // is looser than the cap precisely so this reports the length rule.
+        var issued = await IssueAsync();
+        var username = new string('a', CredentialPolicy.MaximumUsernameLength + 1);
+
+        var error = await Assert.ThrowsAsync<ArgumentException>(
+            () => _service.RedeemAsync(issued.Token, username, Password));
+
+        Assert.Contains(
+            CredentialPolicy.MaximumUsernameLengthRuleDescription,
+            error.Message,
+            StringComparison.Ordinal);
+        Assert.DoesNotContain(CredentialPolicy.UsernameRuleDescription, error.Message, StringComparison.Ordinal);
+        Assert.Empty(_passwordHasher.Derivations);
+        await AssertNoAccountBeyondTheIssuerAsync();
+    }
+
+    [Fact]
+    public async Task A_username_at_exactly_the_maximum_length_is_accepted()
+    {
+        var issued = await IssueAsync();
+        var username = new string('a', CredentialPolicy.MaximumUsernameLength);
+
+        Assert.Equal(InvitationRedemption.Redeemed, await _service.RedeemAsync(issued.Token, username, Password));
+
+        Assert.Single(await _db.Accounts.AsNoTracking().Where(a => a.Username == username).ToListAsync());
+    }
+
+    [Fact]
+    public async Task A_username_at_exactly_the_minimum_length_is_accepted()
+    {
+        var issued = await IssueAsync();
+
+        Assert.Equal(InvitationRedemption.Redeemed, await _service.RedeemAsync(issued.Token, "abc", Password));
+
+        Assert.Single(await _db.Accounts.AsNoTracking().Where(a => a.Username == "abc").ToListAsync());
     }
 
     [Fact]

@@ -2,7 +2,7 @@
 
 ### Requirement: Username form
 
-The system SHALL require a chosen username to begin and end with an alphanumeric character, to contain only ASCII letters, digits, dots, hyphens and underscores, and to be at least 3 and at most 64 characters long. The system SHALL report a username that is too short or too long as a length problem and a username of the wrong shape as a shape problem, so that one fault produces one message.
+The system SHALL require a chosen username to begin and end with an alphanumeric character, to contain only ASCII letters, digits, dots, hyphens and underscores, and to be at least 3 and at most 64 characters long. The system SHALL report a username that is too short or too long as a length problem and a username of the wrong shape as a shape problem, so that one fault produces one message. Where a username breaks both a length rule and the shape rule, the system SHALL evaluate length first, so that any surface reporting a single fault reports the length rule.
 
 The system SHALL enforce these rules wherever a user chooses a username — the first-administrator bootstrap and invitation redemption — and SHALL enforce them at the service boundary rather than only in form validation.
 
@@ -20,6 +20,11 @@ The system SHALL enforce these rules wherever a user chooses a username — the 
 
 - **WHEN** a user chooses a username shorter than 3 characters
 - **THEN** the system refuses it and reports the length rule, and no account is created
+
+#### Scenario: A username that is both too short and wrongly shaped reports the length rule
+
+- **WHEN** a user chooses a username that is both shorter than 3 characters and does not begin and end with an alphanumeric character
+- **THEN** the system refuses it, and where it reports a single fault it reports the length rule
 
 #### Scenario: Existing accounts are unaffected
 

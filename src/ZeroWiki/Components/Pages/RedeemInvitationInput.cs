@@ -19,6 +19,9 @@ public sealed class RedeemInvitationInput
     /// message about the character set that never mentions spaces.
     /// </summary>
     [Required(ErrorMessage = "Choose a username.")]
+    [MinLength(
+        CredentialPolicy.MinimumUsernameLength,
+        ErrorMessage = CredentialPolicy.MinimumUsernameLengthRuleDescription)]
     [StringLength(
         CredentialPolicy.MaximumUsernameLength,
         ErrorMessage = CredentialPolicy.MaximumUsernameLengthRuleDescription)]

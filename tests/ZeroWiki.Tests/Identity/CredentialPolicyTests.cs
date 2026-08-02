@@ -27,23 +27,31 @@ public sealed class CredentialPolicyTests
             CredentialPolicy.MaximumUsernameLength.ToString(CultureInfo.InvariantCulture),
             CredentialPolicy.MaximumUsernameLengthRuleDescription,
             StringComparison.Ordinal);
+        Assert.Contains(
+            CredentialPolicy.MinimumUsernameLength.ToString(CultureInfo.InvariantCulture),
+            CredentialPolicy.MinimumUsernameLengthRuleDescription,
+            StringComparison.Ordinal);
     }
 
     [Fact]
-    public void Username_pattern_admits_exactly_the_maximum_length()
+    public void Username_pattern_admits_more_than_the_maximum_length()
     {
-        // The pattern's bounded quantifiers are 63 + 1 + 63, a literal that has to track
-        // MaximumUsernameLength. If the constant is raised without widening them, a legal
-        // username starts being rejected by the pattern instead of accepted.
+        // D11 severs the coupling this test used to guard: the pattern governs shape only, and its
+        // bound (126) is deliberately looser than MaximumUsernameLength rather than derived from
+        // it. The invariant that survives is the direction of the slack — the pattern admits at
+        // least the maximum length, so an over-long name always fails the length check and is
+        // reported as a length problem, never as a shape one, and raising the column width can
+        // never turn a length fault into a shape fault.
         var longest = new string('a', CredentialPolicy.MaximumUsernameLength);
+        var overlong = new string('a', CredentialPolicy.MaximumUsernameLength + 1);
 
         Assert.Matches(CredentialPolicy.UsernameMatcher(), longest);
+        Assert.Matches(CredentialPolicy.UsernameMatcher(), overlong);
     }
 
     [Theory]
     [InlineData("admin")]
     [InlineData("a.b-c_1")]
-    [InlineData("_x_")]
     [InlineData("A1")]
     [InlineData("x")]
     [InlineData("1")]
@@ -66,8 +74,26 @@ public sealed class CredentialPolicyTests
     [InlineData("\nadmin")]
     // A trailing newline is the case a `$`-anchored pattern would wrongly accept.
     [InlineData("admin\n")]
+    // D11: the first and last characters must be alphanumeric, because D10 makes the username the
+    // localpart of the commit-author address and a leading or trailing dot is not a dot-atom.
+    [InlineData(".abc")]
+    [InlineData("abc.")]
+    [InlineData("-abc")]
+    [InlineData("abc-")]
+    [InlineData("_abc")]
+    [InlineData("abc_")]
+    [InlineData("_x_")]
     public void Username_pattern_rejects_disallowed_values(string username) =>
         Assert.DoesNotMatch(CredentialPolicy.UsernameMatcher(), username);
+
+    [Theory]
+    [InlineData("ab")]
+    [InlineData("a")]
+    public void Username_pattern_says_nothing_about_a_username_that_is_merely_too_short(string username) =>
+        // The floor is a length rule, not part of the pattern, so that "ab" is told it is too
+        // short rather than told its character set is wrong. If the minimum ever migrates into the
+        // pattern, this test fails and the two messages have quietly merged again.
+        Assert.Matches(CredentialPolicy.UsernameMatcher(), username);
 
     [Fact]
     public void Username_pattern_rejects_a_very_long_input_without_doing_the_work()

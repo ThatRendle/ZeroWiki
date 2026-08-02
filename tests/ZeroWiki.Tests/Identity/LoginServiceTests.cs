@@ -68,6 +68,26 @@ public sealed class LoginServiceTests : IDisposable
         Assert.Equal(Username, account.Username);
     }
 
+    [Theory]
+    // Shapes the current rules refuse when a username is chosen: too short, and separators at the
+    // ends.
+    [InlineData("ab")]
+    [InlineData("_legacy_")]
+    [InlineData(".old.name.")]
+    public async Task An_account_whose_username_predates_the_current_rules_still_authenticates(string username)
+    {
+        // D11 governs the *choosing* of a username, never the presenting of one. Login must not
+        // consult CredentialPolicy: a shape check here would refuse an account that already exists,
+        // and — worse — refuse it without paying for a password verification, rebuilding the
+        // "does this account exist" oracle the uniform-failure requirement exists to close.
+        await AddAccountAsync(username, _hasher.Hash(Password));
+
+        var account = await _service.VerifyCredentialsAsync(username, Password);
+
+        Assert.NotNull(account);
+        Assert.Equal(username, account.Username);
+    }
+
     [Fact]
     public async Task Wrong_password_is_rejected()
     {

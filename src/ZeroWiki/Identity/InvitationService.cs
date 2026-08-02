@@ -227,16 +227,33 @@ public sealed class InvitationService(
 
         var trimmedUsername = username.Trim();
 
-        // The same two guards bootstrap applies, from the same constants. AD11's charset is a
-        // structural invariant — the git remote presents the username as the Basic-auth userid,
-        // where RFC 7617 makes a colon illegal — so it belongs at the boundary unconditionally.
-        // AD10's minimum is here because AD10 itself names this path: "applies to every path where
-        // a user chooses a password — §3 bootstrap and §4 invitation redemption — so the two cannot
-        // diverge". That is the decision scoping itself to both, not §3's exception being widened.
-        // Both sit in front of the password hash, so neither can become another way to spend 64 MiB
-        // on a request that was always going to be refused.
-        if (trimmedUsername.Length > CredentialPolicy.MaximumUsernameLength
-            || !CredentialPolicy.UsernameMatcher().IsMatch(trimmedUsername))
+        // The same guards bootstrap applies, from the same constants. The username charset and
+        // shape are structural invariants — the git remote presents the username as the Basic-auth
+        // userid, where RFC 7617 makes a colon illegal, and D10 authors a browser save as
+        // `username@<host domain>`, where a leading or trailing dot is not a legal dot-atom — so
+        // they belong at the boundary unconditionally. AD10's password minimum is here because
+        // AD10 itself names this path: "applies to every path where a user chooses a password —
+        // §3 bootstrap and §4 invitation redemption — so the two cannot diverge". That is the
+        // decision scoping itself to both, not §3's exception being widened. All of them sit in
+        // front of the password hash, so none can become another way to spend 64 MiB on a request
+        // that was always going to be refused.
+        //
+        // Length and shape report separate messages (D11): one fault, one message. Where a name
+        // breaks both — "." is under the minimum and has no alphanumeric end — the requirement
+        // fixes the precedence rather than leaving it to ordering: length is evaluated first so a
+        // single-fault surface reports the length rule. Do not reorder these into "shape first" as
+        // a tidy-up; the order is the obligation.
+        if (trimmedUsername.Length < CredentialPolicy.MinimumUsernameLength)
+        {
+            throw new ArgumentException(CredentialPolicy.MinimumUsernameLengthRuleDescription, nameof(username));
+        }
+
+        if (trimmedUsername.Length > CredentialPolicy.MaximumUsernameLength)
+        {
+            throw new ArgumentException(CredentialPolicy.MaximumUsernameLengthRuleDescription, nameof(username));
+        }
+
+        if (!CredentialPolicy.UsernameMatcher().IsMatch(trimmedUsername))
         {
             throw new ArgumentException(CredentialPolicy.UsernameRuleDescription, nameof(username));
         }
