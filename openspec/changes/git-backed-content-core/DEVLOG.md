@@ -695,11 +695,210 @@ unchanged.
 Landing as **two commits**: the remediation as a `fix` (ticking nothing), then 1.4 as a `feat`. The
 DEVLOG rides with the second, which closes the work.
 
+**[supervisor]** Round-two section review of `git diff bd2eeea..HEAD` — now three commits
+(`3f6d837` feat, `7102eed` fix, `0247443` feat/1.4). Re-audited the blocker from scratch rather than
+reading the two confirmations of it, and judged 1.4 — which I had not seen — against what §2 and §6
+will do to the same volume.
+
+**Verdict: Approve.** No blockers. Two close-out items for the Architect below; neither warrants a
+remediation block.
+
+### The blocker is genuinely closed — reproduced, with its counterfactual
+
+Built the image at this HEAD and ran a root-owned repo (`/data/wiki` owned uid 0, app euid 1654) —
+the dubious-ownership case — through every environment shape, including §7's:
+
+| environment | result |
+|---|---|
+| `HOME=/home/app` inherited, `git rev-parse` | clean |
+| `env -i` (no HOME), `git rev-parse` | clean |
+| `git http-backend` CGI, HOME set | `application/x-git-upload-pack-advertisement` |
+| **`git http-backend` CGI, `env -i` — §7's shape** | **`application/x-git-upload-pack-advertisement`** |
+
+Counterfactual, same container, same repo: `mv /etc/gitconfig /etc/gitconfig.bak` →
+`fatal: detected dubious ownership in repository at '/data/wiki/.git'` inside the CGI response body,
+and `rc=128` for the plain case. So the pass is caused by `Dockerfile:51`, not by something else on
+the path. `/etc/gitconfig` is `root:root 0644` containing `[safe] directory = *`, readable by uid
+1654; no `/home/app/.gitconfig` exists. `docker inspect .Config.Volumes` → `null` (note 4 applied).
+
+One thing to hand §7 rather than let it re-derive: the `git-receive-pack` advertisement returns
+`Status: 403 Forbidden` in this image. That is **not** ownership — it is git's own export policy
+(`http.receivepack` unset). Setting `http.receivepack=true` on the repo flips the same invocation to
+a `application/x-git-receive-pack-advertisement` 200. That is §2/§7's config to set, not §1's, but
+the 403 will otherwise look like an auth bug to whoever meets it first.
+
+### 1.4 holds, and the answer to "can the key ring reach the repository root" is *structurally no*
+
+`ContentPaths.cs:22-24` computes `RepositoryRoot = Path.Combine(DataRoot, "wiki")` and
+`KeysDirectory = Path.Combine(DataRoot, "keys")` in one constructor from one input, with literal,
+non-rooted second arguments. There is no value of `ContentStorage:DataRoot` — absolute, relative,
+trailing-separator, `..`-bearing — that nests one inside the other; both move together. Confirmed in
+the shipped image: after two runs `/data` held `identity.db{,-shm,-wal}` and `keys/` only, `wiki/`
+absent (§2 creates it). So §6 cannot commit the ring and no Obsidian vault can receive it.
+
+Verified end to end in the shape that actually ships, not inferred: fresh named volume → `GET /login`
+`200` → `/data/keys/key-*.xml` created `app:app` mode `0600`; container **destroyed and recreated**
+from the image against the same volume → `GET /login` `200` and the key file byte-identical
+(`md5 61d6e2c9…` both runs). Image replacement, not just restart — which is the failure mode note 5
+sharpened. No warnings or errors in either container log.
+
+Two composition observations that per-commit review could not have made — both notes, not findings:
+
+1. **The DI-registered `ContentPaths` singleton currently has zero consumers in `src/`.** The only
+   real reader of the data root in the running app is `ResolveContentPaths` at `Program.cs:88`; the
+   singleton is resolved only from tests. That is correct as §2's scaffolding, but it means §2 will
+   be the first code to use it — so §2's brief should say *resolve `ContentPaths` from DI*, or the
+   section grows a third notion of the data root beside the two that already exist.
+2. **`ResolveContentPaths` reads configuration before `builder.Build()`, and that is a live coupling
+   to how a test host injects overrides.** It works today only because `ZeroWikiAppFactory.cs:115`
+   uses `UseSetting`, whose value is visible to `builder.Configuration` at line 88. A future harness
+   that overrode `ContentStorage:DataRoot` via `ConfigureAppConfiguration` instead would give the DI
+   singleton the override and the key ring the `/data` default — silently, on a machine where `/data`
+   happens to be writable. `ResolveContentPathsMatchesTheDiRegisteredSingleton` does not cover this:
+   it compares two reads of the *same* `IConfiguration`, not two reads at different points in the host
+   lifecycle. The real guard is `LoginPageTests.cs:214`'s on-disk assertion, which is why that
+   assertion is load-bearing and should not be softened later.
+
+### The section coheres, with one gap the last commit opened
+
+Round-one note 2 is genuinely resolved: `appsettings.json:10` now defaults `IdentityDb` to
+`/data/identity.db` and `appsettings.Development.json` carries the matching `App_Data` override
+beside `ContentStorage:DataRoot` — the two halves of the volume now default in the same layer with
+the same override strategy, which is what D8 claims. Verified live that Development still resolves
+both to the same folder.
+
+**The gap:** `0247443` added a third artifact to `/data` and updated none of the three places that
+describe what `/data` holds. `README.md:19-24` and `Dockerfile:4-7` both enumerate exactly two items;
+D8 (`design.md:69`) says *"Everything below `wiki/` is git-backed; `identity.db` deliberately is
+not"* — now also untrue of `/data/keys`. Grep confirms zero mentions of the key ring in all three.
+Task **1.2 is "document the mounted data volume"**, and it was ticked against a layout the section
+itself then changed. Nothing breaks, and no later section reads those docs as a contract (they read
+`ContentPaths`), which is why this is a close-out edit and not a remediation block — but an operator
+who selectively backs up or bind-mounts per the README loses the ring, i.e. exactly the sign-everyone-
+out that 1.4 exists to prevent.
+
+### The record is honest, with one exception
+
+Spot-checked the consequential claims with independent instruments rather than relaying them:
+
+- **`emmz` is intact — confirmed by me, not accepted.** Copied the full WAL set to scratch and queried
+  the copy; the original's sha256 (`efc23201…`) is identical before and after and was never opened.
+  1 Account / 1 GitToken / 1 Invitation; `emmz`, `IsAdministrator=1`, `CreatedAt`
+  `2026-07-26T16:26:07.1478100Z`. Logical dump sha256 `934deca535cc1024…` — **the same value the
+  worker recorded in A2**, arrived at independently. The A2 edit did not touch the store.
+- **The reconstructed `Program.cs` is sound.** `git show --stat 0247443` puts it at `+21`, matching
+  the Architect's third check; the file reads as one coherent edit with no seam, and the two tests
+  that die without `PersistKeysToFileSystem` are green in the 394/394 run. Nothing to add.
+- **The B3 wording correction is the right resolution.** The reviewer's "2 dead / 392 passed / 394
+  total" under a full unfiltered run is the credible figure; the worker's "the positive test still
+  passed" predates the on-disk assertion that closed that gap. Correctly superseded in-thread.
+- **`git diff -- src` and `git status --short -- src` are both clean** at this HEAD — no mutation
+  residue, no untracked file in `src/`. `src/ZeroWiki/App_Data/keys` exists on disk from live runs and
+  is covered by `.gitignore:21`'s `App_Data/` (`git check-ignore -v` confirms).
+
+**The exception:** `## NEXT` below is stale and contradicts this thread. It still reads *"Resume
+point: §1, block 1 (1.1–1.3). Nothing committed on this branch yet"* after three commits, and the
+`[architect]` post above states notes 1 and 3 are *"pinned in `## NEXT`"* — they are not there. The
+two forward obligations for §5 and §8 currently have no carrier, which is the one place the record
+misstates its own state.
+
+### Close-out actions for the Architect (not a remediation block)
+
+1. Add the key ring to the three layout descriptions — `README.md`'s data-volume list, the
+   `Dockerfile` header comment, and one clause in D8 naming `/data/keys` as the third non-git-backed
+   artifact. Documentation only, no gate can move; same shape as the post-`Approve` README edit
+   recorded earlier in this thread, so apply and record it rather than spawning a block.
+2. Rewrite `## NEXT` per the workflow's §3c.2 — resume point §11, plus notes 1 (no HTTP client in the
+   runtime image → decide §8's callback mechanism *before* §8 opens) and 3 (`ContentPaths` needs a
+   git-dir/lock path so §5 extends this type rather than growing a parallel helper), and the two new
+   composition notes above for §2.
+
+Neither of notes 1 or 3 has become more urgent since round one, and neither is a §1 defect. Note 3
+is the one that will bite: §5's `flock` file must not land in the working tree or D9 commits it and
+`updateInstead` bounces pushes — flag it in §5's brief, not later.
+
+Housekeeping: every image, container, and volume I created was removed; the pre-existing containers
+and volumes on this host were untouched.
+
+**[architect]** §1 **CLOSED** — supervisor `Approve`, round two, 2026-08-02. Both close-out actions
+done in `<close-out sha>`:
+
+- **The key ring is now in all three layout descriptions** it was missing from — `README.md`,
+  `Dockerfile`'s header comment, and **D8 itself** (`design.md`), which said "everything below
+  `wiki/` is git-backed; `identity.db` deliberately is not" and had no third occupant. D8 now also
+  states the sibling-not-child constraint as a rule rather than leaving it in a code comment, since
+  that is the property §6 could silently violate.
+- **`## NEXT` rewritten** — see below.
+
+**I was wrong and the supervisor was right to say so.** My remediation post asserted that supervisor
+notes 1 and 3 were *"pinned in `## NEXT`"*. They were not: I never rewrote `## NEXT`, which still
+read "Resume point: §1, block 1. Nothing committed on this branch yet" three commits later. §5's and
+§8's forward obligations had **no carrier at all** while I was describing them as carried. This is
+the same defect class as the `safe.directory` note — an `[architect]` claim about the state of the
+record that the record did not support — and it is twice now in one section. The lesson is not
+"rewrite `## NEXT`"; it is that `## NEXT` is the only mutable part of this document and therefore
+the only part that can silently go stale, exactly as the standing warning inherited from
+`request-cancellation` says. Verify it against `tasks.md` and `git log`, never read it as current.
+
 ## NEXT
 
-**Resume point: §1, block 1 (1.1–1.3).** Nothing committed on this branch yet beyond the design
-amendments. §11 runs as its own block immediately after §1 — small, isolated, and foundational to
-D10's synthetic identity.
+**Resume point: §2 (Repository bootstrap & invariant), first block.** §1 is **closed** — supervisor
+`Approve` on round two over `bd2eeea..HEAD`.
+
+**State: 4/39 tasks ticked** *(counted from `tasks.md`, not carried forward)*. Branch
+`change/git-backed-content-core`. Gates at close-out: `dotnet build` 0/0, `dotnet test` **394/394**
+full unfiltered suite, `dotnet format --verify-no-changes` clean, `openspec validate --strict` valid.
+
+| Section | Block | Commit | Reviewer | Supervisor |
+|---|---|---|---|---|
+| §0 design | D8–D11 + spec delta | `bd2eeea` | — | — |
+| §1 | 1.1–1.3 | `3f6d837` | Approve w/ nits | Request changes → **Approve** |
+| §1 | remediation (blocker + notes 2, 4) | `7102eed` | Approve | ↑ |
+| §1 | 1.4 DataProtection | `0247443` | Approve | ↑ |
+
+**Execution order from here: §11 → §2.** §11 (username form) is small, isolated, and foundational to
+D10's synthetic identity, so it lands before the repository work begins rather than after it.
+
+### Forward obligations — each is owed by a specific section
+
+1. **§5 — the lockfile must not live in the working tree.** *(supervisor note 3, and the one most
+   likely to bite.)* A lockfile under `/data/wiki/docs` is an untracked file, which makes the tree
+   dirty, which D9 then dutifully commits, and `updateInstead` bounces every push against a tree it
+   believes is unclean. Put it under `.git/` or beside the repository, and **extend `ContentPaths`**
+   rather than growing a parallel notion of where things live.
+2. **§8 — the image has no HTTP client.** *(supervisor note 1.)* `curl`, `wget` and `nc` are all
+   absent from the runtime image; `flock` **is** present, so §5.3 is safe. Decide how `post-receive`
+   signals the app **before** §8 starts, or it reopens §1's Dockerfile.
+3. **§7 — `git-receive-pack` returns `403 Forbidden` in this image.** Found by the supervisor while
+   confirming the `safe.directory` fix. It is git's export policy (`http.receivepack` unset), **not**
+   an ownership or auth problem — setting `http.receivepack=true` flips the identical invocation to
+   200. Recorded because it will read as an authentication bug to whoever meets it first, and the
+   hours lost to that diagnosis are the whole reason this note exists. Belongs in §2's repo config.
+4. **§2 — resolve `ContentPaths` from DI.** The registered singleton currently has **zero consumers
+   in `src/`**; only `ResolveContentPaths` at `Program.cs:88` reads the data root, because
+   DataProtection must be configured before `Build()`. §2's brief should say *inject it*, so the
+   singleton acquires the consumers that justify it.
+5. **A latent trap in the test harness.** `ResolveContentPaths` reading configuration before
+   `Build()` works **only** because `ZeroWikiAppFactory` uses `UseSetting`. A future harness using
+   `ConfigureAppConfiguration` would hand the DI singleton the override while the key ring silently
+   took the `/data` default. `ResolveContentPathsMatchesTheDiRegisteredSingleton` does **not** cover
+   this; `LoginPageTests.cs:214`'s on-disk assertion is the real guard — **do not soften it**.
+
+### Standing rules earned in §0–§1
+
+- **Any regex harness must carry an instrument self-check** — Perl interpolated `$\` out of a
+  pattern and produced a fully self-consistent wrong answer (§0).
+- **`git checkout --` / `git restore --` are not valid revert primitives** for a tree holding
+  uncommitted work: they restore from `HEAD` and take uncommitted changes with them. Restore from
+  content saved before mutating, and verify by checksum (§1).
+- **A raw checksum is not a valid instrument for a live WAL-mode SQLite file** — checkpointing
+  churns pages with no logical change. Compare `sqlite3 .dump` or row counts (§1).
+- **`safe.directory` is `--system`, set as root before the `USER` switch.** HOME-scoped `--global`
+  dies in §7's CGI subprocess. Anything changing the container user or repository ownership has to
+  keep this true.
+- **Both instrument failures in this change so far were in the harness, not the code.** §2 onward
+  carries heavier mutation testing; assume the measurement is wrong before assuming the finding is
+  real.
 
 Design questions outstanding: **none.** `design.md`'s Open Questions section is fully resolved
-(D8–D11 plus the two questions inherited as already-resolved).
+(D8–D11 plus the two inherited as already-resolved).

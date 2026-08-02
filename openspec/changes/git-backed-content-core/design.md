@@ -66,7 +66,9 @@ The app is a Blazor Web App whose **default render mode is Static SSR** (compone
 
 ### D8 — One mounted volume at `/data`: `identity.db` beside a `wiki/` repository
 
-Production is a single Docker volume mounted at `/data`. The identity store is `/data/identity.db`; the content repository is `/data/wiki`, a non-bare git repo whose `docs/` directory is the working tree the app renders — so `.git` lives at `/data/wiki/.git` and pages at `/data/wiki/docs/*.md`. Everything below `wiki/` is git-backed; `identity.db` deliberately is not. Both paths are configuration, defaulting to `/data`, so development points at a local gitignored folder without a second code path.
+Production is a single Docker volume mounted at `/data`. The identity store is `/data/identity.db`; the content repository is `/data/wiki`, a non-bare git repo whose `docs/` directory is the working tree the app renders — so `.git` lives at `/data/wiki/.git` and pages at `/data/wiki/docs/*.md`; and the DataProtection key ring backing the authentication cookie is `/data/keys`. Everything below `wiki/` is git-backed; `identity.db` and `keys/` deliberately are not. All paths are configuration, defaulting to `/data`, so development points at a local gitignored folder without a second code path.
+
+**`keys/` is a sibling of the repository and must stay one.** Inside `/data/wiki` the key ring would be picked up by commit-on-save and pushed to every Obsidian vault that clones the remote — the signing keys for every session, distributed to every laptop. The path is derived so that no configuration value can nest one inside the other.
 
 *Why:* one mount is the entire deployment story — `docker run -v zerowiki:/data` and nothing else, which is what "zero-config" has to mean for an operator. Keeping SQLite outside the repository keeps D6 honest for *content* without committing a binary database into page history, where it would bloat every clone and conflict on every push.
 

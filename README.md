@@ -22,6 +22,10 @@ Mount exactly one volume at `/data`. It holds:
   part of the content repository.
 - **`/data/wiki`** — the content git repository root. `.git` lives at `/data/wiki/.git`; the
   rendered working tree is `/data/wiki/docs/*.md`.
+- **`/data/keys`** — the DataProtection key ring that backs the authentication cookie. It lives
+  beside the repository rather than inside it, and it must stay there: keys under `/data/wiki`
+  would be committed as content and pushed to every vault that clones the remote. Losing this
+  directory signs everyone out; it does not lose any content.
 
 On first run against an empty **named** volume, Docker populates `/data` from the image, which is
 created there already owned by the container's non-root user — no manual chown or init step is

@@ -5,6 +5,9 @@
 #   /data/identity.db   — the SQLite identity store (accounts, invitations, git tokens).
 #   /data/wiki           — the content git repository root; .git lives at /data/wiki/.git and the
 #                           rendered working tree at /data/wiki/docs/*.md.
+#   /data/keys           — the DataProtection key ring backing the authentication cookie. A sibling
+#                           of the repository, never inside it: keys under /data/wiki would be
+#                           committed by commit-on-save and pushed to every Obsidian vault.
 # Both paths are configuration (ConnectionStrings:IdentityDb and ContentStorage:DataRoot below),
 # defaulting to /data so the container needs no other configuration to run:
 #
