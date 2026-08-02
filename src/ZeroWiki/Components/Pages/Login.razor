@@ -67,7 +67,7 @@
         var context = HttpContext
             ?? throw new InvalidOperationException("Signing in requires the static server-rendered HttpContext.");
 
-        var account = await LoginService.VerifyCredentialsAsync(Input.Username, Input.Password);
+        var account = await LoginService.VerifyCredentialsAsync(Input.Username, Input.Password, context.RequestAborted);
         if (account is null)
         {
             _rejected = true;

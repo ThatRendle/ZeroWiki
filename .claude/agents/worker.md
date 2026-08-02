@@ -167,6 +167,12 @@ Confirm `git diff -- src` is what you expect before you report.
 - **Do not self-approve.** When the block builds and tests pass, report it complete and hand off to the
   `reviewer` (`→ @reviewer` in the DEVLOG). **Always to the reviewer, never `→ @supervisor`** — the
   Architect invokes the supervisor at section end; it is not a handoff you make.
+- **Do not spawn the `reviewer` — or any other agent — yourself.** The handoff is a *DEVLOG post*, not
+  an agent invocation: you write `→ @reviewer` and report back to the Architect, who commissions the
+  review. An audit the audited party arranged is not independent, however good the auditor is — you
+  choose its brief, its scope and what it is told to look at, and none of those are yours to choose.
+  This has actually happened (`request-cancellation` §2), and the tell is that the block came back
+  already carrying a verdict. Report; do not deliver a review with your work.
 - **The one thing you *do* write outside code is the DEVLOG.** Keep it current as you work (above) —
   that's expected, not a scope breach.
 - Do not hand-roll password hashing or session tokens — use Argon2id via a vetted library and the
@@ -195,4 +201,6 @@ verification recipe** — exact command, what to do, what they should see — an
 
 Be terse. When you finish a block: post the outcome to the DEVLOG and report back to the Architect in
 one or two sentences — what changed, the list of `N.M` tasks completed (and any needing human
-confirmation), build/test status — then explicitly hand off to the `reviewer`.
+confirmation), build/test status — then explicitly hand off to the `reviewer` by writing `→ @reviewer`
+in the DEVLOG. That line *is* the handoff; the Architect reads it and commissions the review. Do not
+spawn the reviewer yourself (see Boundaries).

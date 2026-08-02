@@ -63,6 +63,14 @@ public sealed class LoginService(
             ? candidate.PasswordHash
             : DummyPasswordHash;
 
+        // Checked once, here, unconditionally on both the known- and unknown-username paths —
+        // never inside a branch that depends on whether an account matched. A check placed after
+        // this point diverges by branch and would let cancellation timing leak account existence,
+        // trading the CPU saving below for a worse bargain: a user-enumeration oracle (F2).
+        cancellationToken.ThrowIfCancellationRequested();
+
+        // The one line this change exists to add: a disconnect observed during the lookup must
+        // not still buy a full ~100 ms, 64 MiB Argon2id run for a response nobody will read (F2).
         var verified = passwordHasher.Verify(password, hashToVerify);
 
         if (candidate is null)

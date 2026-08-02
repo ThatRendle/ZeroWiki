@@ -118,6 +118,11 @@ public sealed class GitEmailService(IdentityDbContext db)
     /// used to learn whether an identifier belongs to somebody else. Removing the last remaining
     /// email is allowed: "zero associated emails" is a legal account state.
     /// </summary>
+    /// <remarks>
+    /// Callers must pass <see cref="CancellationToken.None"/> here, not the request's own token
+    /// (D1): abandoning this on disconnect would leave the member believing an address is
+    /// disassociated while it still attributes their commits.
+    /// </remarks>
     public async Task<bool> RemoveAsync(
         Guid accountId,
         Guid emailId,

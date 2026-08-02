@@ -112,8 +112,10 @@ else if (_revocation is InvitationRevocation.NotFound)
 
     private RevokeInvitationInput RevokeInput => PostedRevokeInput ??= new();
 
-    private ClaimsPrincipal User => HttpContext?.User
+    private HttpContext Context => HttpContext
         ?? throw new InvalidOperationException("Managing invitations requires the static server-rendered HttpContext.");
+
+    private ClaimsPrincipal User => Context.User;
 
     private Guid CallerAccountId => Guid.TryParse(User.FindFirstValue(ClaimTypes.NameIdentifier), out var accountId)
         ? accountId
@@ -129,7 +131,7 @@ else if (_revocation is InvitationRevocation.NotFound)
 
     private async Task IssueAsync()
     {
-        var issued = await InvitationService.IssueAsync(CallerAccountId);
+        var issued = await InvitationService.IssueAsync(CallerAccountId, Context.RequestAborted);
 
         // The plaintext exists only for this render. It is deliberately not carried through a
         // redirect, TempData or a session: a redemption link in a URL lands in browser history,
@@ -145,16 +147,21 @@ else if (_revocation is InvitationRevocation.NotFound)
     {
         // The identifier came from the browser and grants nothing by itself: the service re-scopes
         // it to the invitations this caller may act on.
+
+        // CancellationToken.None, not Context.RequestAborted (D2): this must finish even if the
+        // browser disconnects, or the caller is left believing a live invitation is dead. See
+        // InvitationService.RevokeAsync's remarks for the full reasoning (D1).
         _revocation = await InvitationService.RevokeAsync(
             CallerAccountId,
             CallerIsAdministrator,
-            RevokeInput.InvitationId);
+            RevokeInput.InvitationId,
+            CancellationToken.None);
 
         await LoadAsync();
     }
 
     private async Task LoadAsync() =>
-        _invitations = await InvitationService.ListAsync(CallerAccountId, CallerIsAdministrator);
+        _invitations = await InvitationService.ListAsync(CallerAccountId, CallerIsAdministrator, Context.RequestAborted);
 
     private bool IsRevocable(InvitationSummary invitation) => invitation.RedeemedAt is null;
 

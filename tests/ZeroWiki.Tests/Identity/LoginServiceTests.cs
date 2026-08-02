@@ -225,6 +225,67 @@ public sealed class LoginServiceTests : IDisposable
         Assert.Null(await _service.VerifyCredentialsAsync(Username, "the wrong passphrase"));
     }
 
+    [Fact]
+    public async Task A_cancellation_observed_after_the_lookup_throws_before_verifying()
+    {
+        // Distinguishes "threw before verifying" from merely "threw at some point": the
+        // cancellation lands inside CanVerify, which VerifyCredentialsAsync always calls strictly
+        // after the account lookup and strictly before Verify. If the new check were missing, or
+        // placed after Verify, this call would still throw eventually (SingleOrDefaultAsync's own
+        // token, or a later ThrowIfCancellationRequested after hashing) — the VerifyCallCount
+        // assertion is what proves it threw *before* the Argon2id run, not just before returning.
+        await AddAccountAsync(Username, _hasher.Hash(Password));
+
+        using var cts = new CancellationTokenSource();
+        var hasher = new CancelOnCanVerifyPasswordHasher(_hasher, cts);
+        var service = new LoginService(_db, hasher, _logs.CreateLogger<LoginService>());
+
+        var thrown = await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => service.VerifyCredentialsAsync(Username, Password, cts.Token));
+
+        Assert.True(thrown.CancellationToken.IsCancellationRequested);
+        Assert.Equal(0, hasher.VerifyCallCount);
+    }
+
+    [Fact]
+    public async Task A_cancellation_observed_after_the_lookup_on_the_unknown_username_path_throws_before_verifying()
+    {
+        // The test above covers only the known-username branch: CanVerify is short-circuited away
+        // entirely when no account matches (`candidate is not null && CanVerify(...)`), so it never
+        // fires here and cannot be reused as a hook. This is exactly the branch a regression that
+        // moved the explicit check inside `if (candidate is not null)` would leave unguarded, and
+        // nothing about the test above would notice.
+        //
+        // DataReaderDisposing lands the cancellation after the empty-result lookup has already
+        // resolved `candidate` to null but before VerifyCredentialsAsync's own code runs — see
+        // CancelOnReaderDisposingInterceptor's remarks for why this hook, and not the more obvious
+        // ReaderExecutedAsync, is the one that actually discriminates rather than always throwing
+        // from inside SingleOrDefaultAsync regardless of whether a caller-side check exists.
+        //
+        // No account is added: the store is empty, so "nobody" is genuinely unknown.
+        var cancellationTokenSource = new CancellationTokenSource();
+
+        await using var interceptingDb = new IdentityDbContext(
+            new DbContextOptionsBuilder<IdentityDbContext>()
+                .UseSqlite(_connection)
+                .AddInterceptors(new CancelOnReaderDisposingInterceptor(cancellationTokenSource))
+                .Options);
+        var recorder = new RecordingPasswordHasher(_hasher);
+        var interceptingService = new LoginService(interceptingDb, recorder, _logs.CreateLogger<LoginService>());
+
+        var thrown = await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => interceptingService.VerifyCredentialsAsync("nobody", Password, cancellationTokenSource.Token));
+
+        Assert.True(thrown.CancellationToken.IsCancellationRequested);
+
+        // The property this test actually pins: had the check been reachable only from the
+        // known-username branch, this call would have returned null instead of throwing, and
+        // Verify would have run once against the dummy hash — confirmed by reproducing that exact
+        // regression against this same interceptor in a throwaway spike before this test was
+        // written (0 calls, throw here; 1 call, no throw, under the regressed shape).
+        Assert.Empty(recorder.Verifications);
+    }
+
     private async Task<Guid> AddAccountAsync(
         string username,
         string passwordHash,

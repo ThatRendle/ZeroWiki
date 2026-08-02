@@ -18,13 +18,19 @@
 <p>Signing in comes next; that page does not exist yet.</p>
 
 @code {
+    [CascadingParameter]
+    private HttpContext? HttpContext { get; set; }
+
     /// <summary>
     /// This page asserts that an administrator exists, so it must not serve that claim while the
     /// store is still empty. It is anonymously reachable for the same reason /bootstrap is.
     /// </summary>
     protected override async Task OnInitializedAsync()
     {
-        if (await BootstrapService.IsAvailableAsync())
+        var context = HttpContext
+            ?? throw new InvalidOperationException("Checking bootstrap availability requires the static server-rendered HttpContext.");
+
+        if (await BootstrapService.IsAvailableAsync(context.RequestAborted))
         {
             Navigation.NavigateTo("/bootstrap", replace: true);
         }

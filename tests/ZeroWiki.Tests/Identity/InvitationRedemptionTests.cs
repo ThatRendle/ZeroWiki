@@ -79,6 +79,82 @@ public sealed class InvitationRedemptionTests : IDisposable
     }
 
     [Fact]
+    public async Task A_cancelled_redemption_leaves_the_invitation_still_redeemable()
+    {
+        // Pre-cancelled, not mid-flight. The first cancellable await here is RejectionAsync's
+        // lookup (:260), before password hashing or the write lock, so it throws before
+        // redemption begins at all. That proves the method is cancellable and that an early
+        // cancel leaves nothing behind, and no more than that: it never enters the write lock or
+        // the SaveChangesAsync/CommitAsync window, so it is the *weakest* form of this claim and
+        // cannot fail if the transactional rollback there were broken. See the mid-flight test
+        // below for the property this one cannot reach.
+        //
+        // "Still redeemable" is not tested here as "not redeemed" — it is proved usable: a
+        // second, live redemption of the same token has to succeed afterwards.
+        var issued = await IssueAsync();
+        var cancellationToken = new CancellationToken(canceled: true);
+
+        var thrown = await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => _service.RedeemAsync(issued.Token, "bob", Password, cancellationToken));
+
+        Assert.True(thrown.CancellationToken.IsCancellationRequested);
+
+        // Against the store, not the return value: no account exists, and the invitation carries
+        // neither a redemption nor a revocation.
+        await AssertNoAccountBeyondTheIssuerAsync();
+        var afterCancellation = await _db.Invitations.AsNoTracking().SingleAsync(i => i.Id == issued.Id);
+        Assert.Null(afterCancellation.RedeemedAt);
+        Assert.Null(afterCancellation.RevokedAt);
+
+        // Usable, not merely untouched: the same token still redeems successfully.
+        Assert.Equal(InvitationRedemption.Redeemed, await _service.RedeemAsync(issued.Token, "bob", Password));
+
+        var account = Assert.Single(await _db.Accounts.AsNoTracking().Where(a => a.Username == "bob").ToListAsync());
+        Assert.NotNull(account);
+        Assert.NotNull((await _db.Invitations.AsNoTracking().SingleAsync(i => i.Id == issued.Id)).RedeemedAt);
+    }
+
+    [Fact]
+    public async Task A_cancellation_between_the_write_and_the_commit_still_rolls_back_and_stays_redeemable()
+    {
+        // Reaches the window the pre-cancelled test above cannot: cancel the token only once
+        // SaveChangesAsync has finished writing the new account and the consumed invitation into
+        // the still-uncommitted transaction, so the token stays live through the whole
+        // check-then-act and only goes cancelled right before CommitAsync (:318-319) runs. If
+        // that rollback were broken — if the account or the redemption survived a cancelled
+        // commit — this test, unlike the pre-cancelled one, would see it and fail.
+        var issued = await IssueAsync();
+        var cancellationTokenSource = new CancellationTokenSource();
+
+        await using var interceptingDb = new IdentityDbContext(
+            new DbContextOptionsBuilder<IdentityDbContext>()
+                .UseSqlite(_connection)
+                .AddInterceptors(new CancelAfterSaveInterceptor(cancellationTokenSource))
+                .Options);
+        var interceptingService = new InvitationService(
+            interceptingDb,
+            _tokenGenerator,
+            _passwordHasher,
+            _time,
+            _logs.CreateLogger<InvitationService>());
+
+        var thrown = await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => interceptingService.RedeemAsync(issued.Token, "bob", Password, cancellationTokenSource.Token));
+
+        Assert.True(thrown.CancellationToken.IsCancellationRequested);
+
+        // Against the store: no account, and the invitation carries neither timestamp.
+        await AssertNoAccountBeyondTheIssuerAsync();
+        var afterCancellation = await _db.Invitations.AsNoTracking().SingleAsync(i => i.Id == issued.Id);
+        Assert.Null(afterCancellation.RedeemedAt);
+        Assert.Null(afterCancellation.RevokedAt);
+
+        // Usable, not merely rolled back: the same token still redeems successfully afterwards.
+        Assert.Equal(InvitationRedemption.Redeemed, await _service.RedeemAsync(issued.Token, "bob", Password));
+        Assert.NotNull((await _db.Invitations.AsNoTracking().SingleAsync(i => i.Id == issued.Id)).RedeemedAt);
+    }
+
+    [Fact]
     public async Task An_invitation_never_creates_an_administrator()
     {
         // The only route to IsAdministrator is the one-time bootstrap. An invitation grants

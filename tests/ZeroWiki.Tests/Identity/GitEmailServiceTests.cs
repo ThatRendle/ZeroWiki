@@ -150,6 +150,48 @@ public sealed class GitEmailServiceTests : IDisposable
     }
 
     [Fact]
+    public async Task Adding_under_an_already_cancelled_token_throws_and_leaves_no_email()
+    {
+        // AddAsync is a bare Add + SaveChangesAsync, not transactional (F1/D1) — but its first
+        // cancellable await is FindByEmailAsync's uniqueness check, before the insert, so a
+        // pre-cancelled call throws before SaveChangesAsync ever writes and leaves no row. This is
+        // the pre-write window only; it says nothing about a cancellation observed after the write
+        // commits.
+        var alice = await AddAccountAsync("alice");
+
+        var cancellationToken = new CancellationToken(canceled: true);
+
+        var thrown = await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => _service.AddAsync(alice.Id, "alice@example.com", cancellationToken));
+
+        Assert.True(thrown.CancellationToken.IsCancellationRequested);
+
+        Assert.Empty(await _service.ListAsync(alice.Id));
+    }
+
+    [Fact]
+    public async Task Removing_under_an_already_cancelled_token_throws()
+    {
+        // Deliberately the opposite of D1's guarantee that removal survives a disconnect: that
+        // guarantee is a property of the caller, which passes CancellationToken.None (§3), not of
+        // this method, which correctly honours whatever token it is given. This proves the
+        // parameter is live — 4.5's sweep is what proves every caller passes None to it.
+        var alice = await AddAccountAsync("alice");
+        await _service.AddAsync(alice.Id, "alice@example.com");
+        var emailId = Assert.Single(await _service.ListAsync(alice.Id)).Id;
+
+        var cancellationToken = new CancellationToken(canceled: true);
+
+        var thrown = await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => _service.RemoveAsync(alice.Id, emailId, cancellationToken));
+
+        Assert.True(thrown.CancellationToken.IsCancellationRequested);
+
+        // The association stays exactly as added: the throw happened before anything was removed.
+        Assert.Single(await _service.ListAsync(alice.Id));
+    }
+
+    [Fact]
     public async Task The_last_email_on_an_account_can_be_removed()
     {
         // The account model allows "zero associated git emails" explicitly; nothing here may

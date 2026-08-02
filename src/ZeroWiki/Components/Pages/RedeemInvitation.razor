@@ -109,13 +109,20 @@
     {
         if (HttpContext is null || HttpMethods.IsGet(HttpContext.Request.Method))
         {
-            _outcome = await InvitationService.ValidateAsync(Token);
+            // HttpContext's null case is pre-existing (see the remarks above) and is tolerated,
+            // not thrown on, on this page alone. When it is null there is no request to abort, so
+            // the fallback to CancellationToken.None is the deliberately correct value here, not
+            // an omitted argument.
+            _outcome = await InvitationService.ValidateAsync(Token, HttpContext?.RequestAborted ?? default);
         }
     }
 
     private async Task SubmitAsync()
     {
-        var outcome = await InvitationService.RedeemAsync(Token, Input.Username, Input.Password);
+        // Same null tolerance as OnInitializedAsync above, and the same reasoning: no HttpContext
+        // means no request to abort, so CancellationToken.None is correct rather than an oversight.
+        var outcome = await InvitationService.RedeemAsync(
+            Token, Input.Username, Input.Password, HttpContext?.RequestAborted ?? default);
 
         if (outcome is InvitationRedemption.Redeemed)
         {

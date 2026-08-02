@@ -58,13 +58,19 @@
     /// <summary>Non-null view of the form state — a fresh instance on the first GET.</summary>
     private BootstrapInput Input => PostedInput ??= new();
 
+    [CascadingParameter]
+    private HttpContext? HttpContext { get; set; }
+
+    private HttpContext Context => HttpContext
+        ?? throw new InvalidOperationException("Bootstrapping requires the static server-rendered HttpContext.");
+
     /// <summary>
     /// Closes the page to anyone arriving once an account exists. A courtesy only — the guard
     /// that counts is in <see cref="SubmitAsync"/>, since a hand-crafted POST never does this GET.
     /// </summary>
     protected override async Task OnInitializedAsync()
     {
-        if (!await BootstrapService.IsAvailableAsync())
+        if (!await BootstrapService.IsAvailableAsync(Context.RequestAborted))
         {
             Navigation.NavigateTo("/", replace: true);
         }
@@ -74,7 +80,8 @@
     {
         // Independently re-checked inside the service, under the store's write lock, so this
         // decision cannot be raced or reached by skipping the GET above.
-        var outcome = await BootstrapService.CreateFirstAdministratorAsync(Input.Username, Input.Password);
+        var outcome = await BootstrapService.CreateFirstAdministratorAsync(
+            Input.Username, Input.Password, Context.RequestAborted);
 
         Navigation.NavigateTo(
             outcome == BootstrapOutcome.Created ? "/bootstrap/complete" : "/",

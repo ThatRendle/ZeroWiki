@@ -176,6 +176,77 @@ public sealed class GitTokenServiceTests : IDisposable
     }
 
     [Fact]
+    public async Task Issuing_under_an_already_cancelled_token_throws_and_leaves_no_token()
+    {
+        // IssueAsync is a bare Add + SaveChangesAsync, not transactional (F1/D1) — but it still
+        // honours the token on its one cancellable await, so a pre-cancelled call throws before
+        // SaveChangesAsync ever writes and leaves no row. This is the pre-write window only; it
+        // says nothing about a cancellation observed after the write commits — the case D1's
+        // shown-once argument is actually about, and one this test cannot and does not cover.
+        var account = await AddAccountAsync("alice");
+
+        var cancellationToken = new CancellationToken(canceled: true);
+
+        var thrown = await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => _service.IssueAsync(account.Id, cancellationToken));
+
+        Assert.True(thrown.CancellationToken.IsCancellationRequested);
+
+        Assert.Empty(await _db.GitTokens.AsNoTracking().ToListAsync());
+    }
+
+    [Fact]
+    public async Task A_cancellation_observed_after_the_write_commits_does_not_remove_the_token()
+    {
+        // This pins a KNOWN LIMIT, not a guarantee — do not "fix" IssueAsync to make this fail.
+        // IssueAsync has no transaction (design.md D1, corrected): it is a bare Add followed by a
+        // single SaveChangesAsync, which SQLite autocommits immediately once it completes. Landing
+        // the cancellation after that write — via CancelAfterSaveInterceptor, the same instrument
+        // block A used to prove the *transactional* creates roll back — lands it after the row is
+        // already durably committed, with nothing left to roll back. The Product Owner ruled
+        // explicitly against making these three creates transactional (§4 remediation), so this is
+        // the accepted boundary of the guarantee, deliberately made executable rather than left as
+        // prose: the call returns normally, and the token exists whether or not the client that
+        // requested it is still there to receive it.
+        var account = await AddAccountAsync("alice");
+
+        var cancellationTokenSource = new CancellationTokenSource();
+
+        await using var interceptingDb = new IdentityDbContext(
+            new DbContextOptionsBuilder<IdentityDbContext>()
+                .UseSqlite(_connection)
+                .AddInterceptors(new CancelAfterSaveInterceptor(cancellationTokenSource))
+                .Options);
+        var interceptingService = new GitTokenService(interceptingDb, _tokenGenerator, _time);
+
+        var issued = await interceptingService.IssueAsync(account.Id, cancellationTokenSource.Token);
+
+        Assert.True(cancellationTokenSource.IsCancellationRequested);
+        Assert.NotNull(await _service.VerifyAsync("alice", issued.Token));
+    }
+
+    [Fact]
+    public async Task Revoking_under_an_already_cancelled_token_throws()
+    {
+        // Deliberately the opposite of D1's guarantee that revocation survives a disconnect: that
+        // guarantee is a property of the caller, which passes CancellationToken.None (§3), not of
+        // this method, which correctly honours whatever token it is given. This proves the
+        // parameter is live — 4.5's sweep is what proves every caller passes None to it.
+        var account = await AddAccountAsync("alice");
+        var issued = await _service.IssueAsync(account.Id);
+
+        var cancellationToken = new CancellationToken(canceled: true);
+
+        var thrown = await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => _service.RevokeAsync(account.Id, issued.Id, cancellationToken));
+
+        Assert.True(thrown.CancellationToken.IsCancellationRequested);
+
+        // The token stays live: the throw happened before RevokedAt was ever set.
+        Assert.NotNull(await _service.VerifyAsync("alice", issued.Token));
+    }
+
+    [Fact]
     public async Task Login_password_is_not_accepted_as_a_git_credential()
     {
         const string LoginPassword = "correct horse battery staple";
