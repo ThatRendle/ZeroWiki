@@ -1,8 +1,8 @@
 ## 1. Project & container scaffolding
 
-- [ ] 1.1 Create the ASP.NET Core 10 Blazor Web App solution with Static SSR as the default render mode (Interactive Server enabled per-island, not globally)
-- [ ] 1.2 Add a Dockerfile that installs `git` and runs the app; document the mounted data volume
-- [ ] 1.3 Configure the app to resolve the content volume path from configuration (env/mount)
+- [x] 1.1 Create the ASP.NET Core 10 Blazor Web App solution with Static SSR as the default render mode (Interactive Server enabled per-island, not globally)
+- [x] 1.2 Add a Dockerfile that installs `git` and runs the app; document the mounted data volume
+- [x] 1.3 Configure the app to resolve the content volume path from configuration (env/mount)
 
 ## 2. Repository bootstrap & invariant
 

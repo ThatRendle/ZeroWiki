@@ -1,6 +1,7 @@
 using Microsoft.AspNetCore.Authentication.Cookies;
 using Microsoft.AspNetCore.Authorization;
 using ZeroWiki.Components;
+using ZeroWiki.Content;
 using ZeroWiki.Data;
 using ZeroWiki.Identity;
 using ZeroWiki.Security;
@@ -11,6 +12,7 @@ var builder = WebApplication.CreateBuilder(args);
 // Add services to the container.
 builder.Services.AddRazorComponents();
 builder.Services.AddIdentityDb(builder.Configuration);
+builder.Services.AddContentStorage(builder.Configuration);
 builder.Services.AddSingleton(TimeProvider.System);
 builder.Services.AddSingleton<IPasswordHasher, Argon2idPasswordHasher>();
 builder.Services.AddSingleton<ISecretTokenGenerator, SecretTokenGenerator>();
