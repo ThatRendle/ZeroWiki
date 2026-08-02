@@ -2605,6 +2605,544 @@ then produced only the service-side counterfactual. Same shape as `new Regex` ve
 independently verified the 128 boundary; it is recorded as the supervisor stated it, unverified by me,
 and whoever fixes it should reproduce it first.
 
+## 2. Repository bootstrap & invariant
+
+**[architect]** Base: `7b50e46` — makes the mounted volume an actual git repository the app can serve
+from and be pushed into: detect-or-initialize, the repo configuration without which `updateInstead`
+and the Smart HTTP remote cannot work at all, the hook install mechanism, and D9's startup
+reconciliation with the working-tree-clean invariant it establishes.
+
+**[architect]** Pre-flight (CLAUDE.md §2): tree clean, on `change/git-backed-content-core`,
+`openspec validate --strict` valid, `proposal.md` / `design.md` / `specs/content-store/spec.md` read,
+plus the `git-sync` requirement that depends on this section's repo config. §1 and §11 both carry a
+supervisor `Approve`, so nothing is owed backwards.
+
+**[architect]** Three questions put to the Product Owner before the first block, and their answers:
+
+1. **2.3 — mechanism plus no-op hook bodies.** §2 delivers the hook installer and hooks that exist and
+   do nothing (`exit 0`); §5.3 and §8.1–8.2 write the real bodies. *Architect call on the part the
+   options left open:* **bootstrap rewrites both hooks on every start**, so an upgraded image ships
+   updated hook bodies rather than inheriting whatever the volume happens to hold. That is also what
+   makes landing no-op bodies safe — they are not a permanent artifact but the current version of a
+   file the app owns. An operator's hand-edit to a hook is overwritten; at this scale that is the
+   zero-config posture, not an oversight, and it should be said out loud in the code.
+2. **2.5 — a startup assertion, no HTTP surface.** Recorded with its reasons so §7/§8 do not
+   relitigate it: an anonymous `/health` tells strangers about repository state, which is the shape
+   AD21 exists to close; an authenticated one cannot be called by a Docker `HEALTHCHECK`, which
+   carries no credentials; and §1's runtime image has no `curl`, `wget` or `nc` (`## NEXT` obligation
+   2), so nothing inside the container could call either.
+3. **The spec scenario is tightened to D9.** `specs/content-store/spec.md`'s *"Dirty tree reconciled
+   at startup"* still says the tree is reconciled *"either committing the orphaned changes as a
+   recovered edit or discarding them per policy"* — wording that predates D9, which removes the policy
+   switch and always commits. Permissive rather than contradictory, so it was not a stop-and-ask, but
+   it invites a knob the design forbids. Block 2 amends it, so §2's section review is gated on the
+   scenario rather than on prose in `design.md`.
+
+**[architect]** Carve: **two blocks.** `2.1–2.2` (detect-or-init, repo config, initial commit) then
+`2.3–2.5` (hook install mechanism, D9 reconciliation, the invariant self-check, spec amendment).
+
+**[architect]** Brief → `@worker`. Block 1 of 2: **2.1–2.2**.
+
+### What binds
+
+**Spec — `specs/content-store/spec.md`, Requirement: Git repository is the source of truth:**
+
+> The system SHALL treat the mounted content volume as a non-bare git repository whose working tree is
+> the authoritative store for all page content and authorship.
+
+Two scenarios are in scope: *Repository present on startup* (serve from the working tree "without
+requiring any additional configuration") and *Empty volume is initialized* (a non-bare repo, a `docs/`
+directory, an initial commit). *Authorship comes from git* is §3.4's, not this block's.
+
+**D1** — non-bare repo, pushes accepted into the checked-out branch via
+`receive.denyCurrentBranch = updateInstead`. **D8** — `<DataRoot>/wiki` is the repository root and
+`<DataRoot>/wiki/docs` the working tree; `ContentPaths` already computes both, so do not recompute
+them anywhere.
+
+### Binding decisions
+
+1. **Resolve `ContentPaths` from DI** (`## NEXT` obligation 4). The singleton §1 registered has zero
+   consumers in `src/`; this block gives it its first. Do **not** call `ResolveContentPaths` — that
+   exists only for the pre-`Build()` DataProtection wiring and carries a comment saying so.
+2. **Apply the repo configuration on every start, not only when initializing.** 2.2's wording hangs it
+   off the init path, but then a repository made by an earlier image, or restored from a backup, never
+   receives it. Idempotent on every start, whether or not this start created the repo — the same
+   posture as the hooks in block 2.
+3. **The configuration set is `receive.denyCurrentBranch=updateInstead` (D1) *and*
+   `http.receivepack=true`** (`## NEXT` obligation 3). Without the second, `git-receive-pack` returns
+   **403** in this image — git's export policy, not authentication and not ownership — and §7 will read
+   it as an auth bug. It is repo configuration, so it belongs here.
+4. **Do not call it `BootstrapService`.** `ZeroWiki.Identity.BootstrapService` already exists and means
+   "the first administrator". A second one in `Content` makes every later conversation ambiguous.
+5. **`git init -b <branch>` — name the branch explicitly.** Bare `git init` takes `init.defaultBranch`
+   from host configuration, which differs between a developer's laptop and the container. §7's
+   `updateInstead` push targets the checked-out branch and the app has to know its name. Use `main`,
+   as a named constant rather than a literal repeated at call sites.
+6. **The initial commit is authored `System <system@zerowiki.org>`** — *Architect call extending D9,
+   flagged as such for the reviewer.* D9 gives that identity to *recovery* commits because they belong
+   to the software rather than to a member. The initial commit is the same kind of thing, and there is
+   no member to attribute it to — it can precede the first administrator entirely.
+7. **Pass the author explicitly on every commit; never rely on ambient git configuration.**
+   `git -c user.name=… -c user.email=… commit`, or `GIT_AUTHOR_*`/`GIT_COMMITTER_*`. In the container
+   there is no ambient identity and the commit merely fails; on a developer's laptop it silently
+   succeeds and authors ZeroWiki's initial commit **as the developer**. The second is the dangerous
+   one, because it looks like it worked.
+8. **`docs/` must exist in a fresh clone.** git does not track empty directories, so `git init` +
+   `mkdir docs` + `commit --allow-empty` gives an operator's Obsidian clone no `docs/` at all. Commit a
+   `docs/.gitkeep`. It needs no enumeration exemption — page enumeration and the derived index are
+   Markdown-only by design (`design.md`'s attachments resolution).
+9. **A bare repo at `RepositoryRoot` is a misconfiguration: fail loudly, do not initialize over it.**
+   2.1 says detect an existing **non-bare** repo. The three cases: *(a)* repo present and non-bare →
+   use it; *(b)* nothing there, or a directory with no `.git` → initialize in place (this is the "copy
+   a folder of Markdown onto the volume" case D9 calls the normal one, and block 2's reconciliation is
+   what commits what was copied); *(c)* repo present and **bare** → the whole of D1 rests on a working
+   tree, so refuse to start, naming the path, rather than silently serving nothing.
+10. **Leave the tree clean.** This block's own exit condition: after bootstrap `git status --porcelain`
+    is empty. Block 2 turns that into an asserted invariant; this block must not be what breaks it.
+
+### Where it plugs in
+
+`Program.cs` already has the shape — `await app.MigrateIdentityDbAsync();` then
+`await app.LogBootstrapStateAsync();`. The content-repository step joins them, before the pipeline.
+Startup, not first request: an operator learning about a broken volume from a 500 on page one is the
+wrong failure mode.
+
+### Shelling out to git
+
+Every later section shells out to git (§3.4 `log`/`blame`, §6 `add`/`commit`, §7 `http-backend`).
+Introduce **one** small runner here and use it for everything this block does: process start,
+arguments as an array and never a concatenated string, working directory, captured stdout/stderr,
+non-zero exit surfaced as a failure that carries stderr. It does **not** need to anticipate §7's
+streaming CGI case — it needs to not be reinvented three times. Keep it minimal; a speculative
+abstraction is exactly what the supervisor flags.
+
+### Tests
+
+- empty data root → repo initialized, non-bare, `docs/` present **and tracked**, exactly one commit,
+  authored `System <system@zerowiki.org>`, `git status --porcelain` empty;
+- second start over the same root → no second initial commit, configuration still correct, tree still
+  clean (`ZeroWikiAppFactory.RestartedFrom` already gives this shape);
+- a repo created *without* the configuration, standing in for an older image → configuration applied on
+  the next start;
+- a bare repo at `RepositoryRoot` → startup fails with a message naming the path;
+- the branch is the constant, not the host's `init.defaultBranch`.
+
+Integration level through `ZeroWikiAppFactory` where the subject is startup wiring, unit level against
+a temp directory where it is the service. **Do not soften `LoginPageTests.cs:214`** (`## NEXT`
+obligation 5) — it is the guard that keeps the key-ring path honest.
+
+### Mutation testing — deliberately not in this block
+
+Repository bootstrap is not auth, concurrency, or data integrity in the sense CLAUDE.md scopes the
+rule to (`BootstrapService`, `InvitationService`, `LoginService`, `GitTokenService`, the anonymous
+gate). Ordinary unit tests with normal coverage are the correct standard for 2.1–2.2. **Do not start a
+mutation run.** D9's reconciliation in block 2 is the only candidate in this section, and I will scope
+it there if it earns it.
+
+### Gates
+
+`dotnet build` clean · `dotnet test` green **unfiltered** (483 today, no filter — a filtered figure is
+not the record) · `openspec validate git-backed-content-core --strict` · `dotnet format
+--verify-no-changes`. Post progress and any question to this DEVLOG under `## 2.`, then hand to
+`@reviewer`.
+
+**[worker]** 2.1–2.2 implemented.
+
+- **`ZeroWiki.Content.GitProcessRunner`** (new, `GitProcessRunner.cs`) — the one process runner for
+  every content-repository git invocation. `RunAsync`/`RunOrThrowAsync(workingDirectory, arguments,
+  environmentVariables?, cancellationToken)`: arguments go through `ProcessStartInfo.ArgumentList` as
+  a genuine array (never a concatenated string), `environmentVariables` layers on top of the inherited
+  environment (used for `GIT_AUTHOR_*`/`GIT_COMMITTER_*`), stdout/stderr are captured, and a non-zero
+  exit from `RunOrThrowAsync` throws `GitProcessException` carrying stderr. Kept to exactly this — no
+  streaming/CGI shape, per the brief.
+- **`GitAuthor`** (new) — a `Name`/`Email` record with `ToEnvironmentVariables()` and a static `System`
+  identity (`System <system@zerowiki.org>`, decision 6). Shared shape for D9's later recovery commits
+  and §6's member commits, not introduced speculatively — decision 6 already names both as "the same
+  kind of thing".
+- **`ContentRepositoryService`** (new, deliberately not `BootstrapService` — decision 4) —
+  `EnsureRepositoryAsync`: `Directory.CreateDirectory(RepositoryRoot)`, then `git rev-parse
+  --is-bare-repository` decides the three cases in decision 9 — non-zero exit ⇒ no repo yet ⇒
+  `git init -b main` (`DefaultBranch` is a named constant, decision 5); `"true"` ⇒ bare ⇒
+  `InvalidOperationException` naming `RepositoryRoot`, never initialized over; `"false"` ⇒ existing
+  non-bare repo, used as-is. Configuration (`receive.denyCurrentBranch=updateInstead`,
+  `http.receivepack=true`) is applied unconditionally on every call, per decision 2/3. The initial
+  commit is gated on `git rev-parse --verify -q HEAD` failing (no history yet): creates `docs/`,
+  writes `docs/.gitkeep` if absent, `git add docs/.gitkeep`, then `git commit` with
+  `GitAuthor.System.ToEnvironmentVariables()` supplying `GIT_AUTHOR_*`/`GIT_COMMITTER_*` — never
+  ambient config (decision 7).
+- **`ContentStorageStartupExtensions`** — `AddContentStorage` now also registers `GitProcessRunner`
+  and `ContentRepositoryService` as singletons (both stateless beyond the already-singleton
+  `ContentPaths`). New `EnsureContentRepositoryAsync(this IHost, CancellationToken)` mirrors
+  `MigrateIdentityDbAsync`/`LogBootstrapStateAsync`'s shape (`CreateAsyncScope` → resolve → call) and
+  resolves `ContentRepositoryService` from DI — satisfying `## NEXT` obligation 4, the singleton's
+  first real consumer. Did **not** touch `ResolveContentPaths`, which stays pre-`Build()`-only.
+- **`Program.cs`** — `await app.EnsureContentRepositoryAsync();` inserted between
+  `MigrateIdentityDbAsync` and `LogBootstrapStateAsync`, before the pipeline, per the brief.
+
+**Tests** — `tests/ZeroWiki.Tests/Content/ContentRepositoryServiceTests.cs` (unit level, real `git`
+against a throwaway temp dir): empty root → non-bare repo, `docs/.gitkeep` tracked, exactly one
+commit authored `System <system@zerowiki.org>`, porcelain empty; second start → still one commit,
+config still correct, porcelain empty; a repo pre-created (manually, with its own commit authored by
+someone else) but never configured → gets configured on the next start, its existing commit
+untouched; a bare repo → `InvalidOperationException` whose message contains the path; a host with
+`GIT_CONFIG_GLOBAL` pointed at an `init.defaultBranch=notmain` config → the repo still ends up on
+`main`. `tests/ZeroWiki.Tests/Web/ContentRepositoryStartupTests.cs` (integration level, through
+`ZeroWikiAppFactory`): booting the real app initializes the repo under `ContentPaths.RepositoryRoot`
+with a clean porcelain status; `ZeroWikiAppFactory.RestartedFrom` over the same `DataRoot` still
+shows exactly one commit. Did not touch `LoginPageTests.cs:214`.
+
+No mutation testing run, per the brief's scoping call — repository bootstrap isn't auth, concurrency,
+or data integrity in CLAUDE.md's sense.
+
+**Gates:** `dotnet build` 0 warnings/0 errors · `dotnet test` **490/490** full unfiltered (483 + 7 new)
+· `dotnet format --verify-no-changes` clean · `openspec validate git-backed-content-core --strict`
+valid. `git status --short` / `git diff --stat` reviewed before reporting: only the files this block
+touches, plus this DEVLOG entry.
+
+→ @reviewer
+
+**[reviewer]** 2.1–2.2 — **Request changes.**
+
+**Blocker — repo detection trusts `git`'s upward directory discovery, not whether
+`RepositoryRoot` itself is a repo (`ContentRepositoryService.cs:49-64`, `78-93`).**
+`EnsureRepositoryAsync` decides case (a)/(b)/(c) from `git rev-parse --is-bare-repository` run with
+`WorkingDirectory = repositoryRoot`. Git does not confine that lookup to `repositoryRoot` — by
+default it walks up parent directories until it finds a `.git`. If `repositoryRoot` has no `.git` of
+its own **but is nested inside an ancestor git repository**, the probe still succeeds (`"false"`),
+so the code takes the "existing non-bare repo, use as-is" branch (line 63) instead of decision 9(b)'s
+"directory with no `.git` → initialize in place" — and then `ApplyRepositoryConfigurationAsync`
+(`78-93`) runs `git config receive.denyCurrentBranch updateInstead` / `http.receivepack true` against
+whatever repo `git` actually discovered, i.e. **the ancestor**, not `repositoryRoot`.
+
+This is not hypothetical — it is exactly this project's own local-dev setup:
+`src/ZeroWiki/appsettings.Development.json:12` sets `ContentStorage:DataRoot` to the relative path
+`App_Data`, which `dotnet run` (cwd = the project directory) resolves to
+`src/ZeroWiki/App_Data`, itself nested inside the ZeroWiki repo checkout that has its own `.git` two
+levels up. `App_Data/wiki` has no `.git` of its own. On first `dotnet run` in Development,
+`ContentRepositoryService` will discover the **ZeroWiki checkout's own `.git`**, conclude "existing
+non-bare repo", and silently write `receive.denyCurrentBranch=updateInstead` /
+`http.receivepack=true` into the ZeroWiki dev repo's own `.git/config` — the repository this change
+is being built in. Since that ancestor repo already has commits, `EnsureInitialCommitAsync`'s HEAD
+probe also succeeds, so it never creates `docs/` or `docs/.gitkeep` under `App_Data/wiki` either —
+the app would believe bootstrap succeeded while `App_Data/wiki/docs` doesn't exist.
+
+I reproduced the general mechanism directly (outer repo + no-`.git` subdirectory two levels down):
+`git rev-parse --is-bare-repository` succeeds from the nested dir and reports `false`, and a
+subsequent `git config receive.denyCurrentBranch updateInstead` run from that same nested cwd lands
+in the **outer** repo's `.git/config` — confirmed by reading it back afterward. The test suite never
+catches this because `ZeroWikiAppFactory`/`ContentRepositoryServiceTests` both root their `DataRoot`
+under `Path.GetTempPath()`, which isn't nested in any repo — so 490/490 green is not evidence this
+path is safe.
+
+Fix needs to check whether **`repositoryRoot` itself** is a git repository — e.g. test
+`Directory.Exists(Path.Combine(repositoryRoot, ".git"))` (non-bare) in C# before ever shelling to
+`git`, falling back to treating `repositoryRoot` itself as a candidate bare repo (`HEAD` +
+`objects`/`refs` directly present) only when that's absent — rather than relying on `git rev-parse`'s
+own ancestor-discovery semantics for the initial detection.
+
+**Nits**
+
+1. `GitProcessRunner.cs` declares three top-level types (`GitProcessRunner`, `GitProcessResult`,
+   `GitProcessException`) in one file — the only file in `src/` doing this (checked). Split into
+   `GitProcessResult.cs` / `GitProcessException.cs` per the codebase's one-type-per-file convention,
+   especially since §3/§6/§7 will all import these.
+2. `ContentRepositoryServiceTests.cs:112-133`
+   (`Branch_IsTheNamedConstantRegardlessOfTheHostsDefaultBranch`) mutates the process-wide
+   `GIT_CONFIG_GLOBAL` environment variable via `Environment.SetEnvironmentVariable`. xUnit runs test
+   classes in parallel by default, so any `git` subprocess spawned by a concurrently-running class
+   (e.g. `ContentRepositoryStartupTests`, or any other test that boots `ZeroWikiAppFactory`) during
+   this test's window inherits the bogus global config. Blast radius is nil today — every `git init`
+   call in this code passes `-b main` explicitly — but it's worth scoping narrower (e.g. don't rely on
+   process-wide env for a value only one child process should see) before a future git invocation
+   depends on unset config.
+
+**Architectural notes**
+
+- `GitProcessRunner.RunAsync` threads `cancellationToken` into `WaitForExitAsync`/`ReadToEndAsync` but
+  never kills the process on cancellation — `Process.Dispose()` doesn't terminate a still-running
+  process, so cancelling only stops *waiting*. Not exercised here (no caller in this block passes a
+  token that's ever actually cancelled), but worth closing before §6's commit-on-save path reuses this
+  runner for a request that can be aborted mid-commit.
+- `GitProcessException`'s message includes the raw joined argument list. Harmless for this block's
+  arguments (`init`/`config`/`commit`), but §7 will shell to `git` with token-bearing remote URLs
+  through the same runner — flagging now so that caller redacts before it ever reaches a log or an
+  exception message.
+
+→ @worker
+
+**[architect]** Ruling on the review of `2.1–2.2`. **Request changes upheld.** I found the same blocker
+independently before the reviewer reported, and the two findings are worth recording as genuinely
+independent rather than as one result stated twice — the standing rule from §11 is that two
+measurements agreeing is not corroboration when they share an instrument. They do not here. I ran
+`git rev-parse --is-bare-repository` in the **real** `src/ZeroWiki/App_Data`, and got `false` / exit 0
+with `--show-toplevel` naming the ZeroWiki checkout and `--verify HEAD` resolving to `7b50e46` — the
+production symptom, on the actual path, read-only. The reviewer built a nested sandbox and confirmed
+the *consequence* by reading the outer repository's `.git/config` back after a `git config` from the
+nested cwd. One measured the classification, the other measured the write. Different instruments,
+same conclusion.
+
+**Why the suite is green over it, which is the part worth keeping.** Both harnesses root `DataRoot`
+under `Path.GetTempPath()`, which is outside any repository, so 490/490 says nothing about the case
+that is broken. The single configuration this defect needs — a data root nested inside a git repo — is
+exactly the configuration a developer runs and no test has. That is the §11 lesson one level out: the
+blind spot was the **fixture**, not the diligence.
+
+### To fix
+
+1. **Blocker — classify the repository without git's upward discovery.** Decide case (a)/(b)/(c) from
+   whether `RepositoryRoot` *itself* is a repository, in C#, before shelling out at all. Treat a `.git`
+   **file** as well as a directory as "present": a gitfile means a worktree or submodule layout, which
+   is not a case to initialize over.
+2. **Blocker, second half — assert what git actually resolved.** Fixing classification stops this
+   path, but every later section reuses the runner, and the failure mode is silent. After ensuring the
+   repository, assert that `git rev-parse --show-toplevel` **equals** `ContentPaths.RepositoryRoot`,
+   and fail loudly if it does not. Mechanism is the worker's call (`GIT_CEILING_DIRECTORIES`, an
+   explicit `--git-dir`, or the assertion itself) — but whatever is chosen must be **verified against a
+   nested-repo reproduction**, not reasoned about. Git's ceiling-directory semantics are easy to state
+   backwards.
+3. **Regression test with the fixture that was missing** — a data root nested inside a git repository.
+   Without it the next refactor reintroduces this and the suite stays green again.
+4. **Nit — split `GitProcessRunner.cs`.** Three top-level types in one file; it is the only file in
+   `src/` doing so.
+5. **Nit — the branch-override test mutates process-wide `GIT_CONFIG_GLOBAL`.** Low practical impact
+   today because every `git init` here passes `-b main` explicitly, but it is a cross-class flakiness
+   source under xUnit's default parallelism, and this change has already paid for one filtered-versus-
+   parallel discrepancy.
+
+### Parked, not fixed here — each owed by a named section
+
+Both are real; neither is a defect in *this* block's behaviour, and fixing them here is the scope creep
+the supervisor exists to catch. Carried to `## NEXT`.
+
+- **§6 — `GitProcessRunner` does not kill the subprocess on cancellation.** Inert today: startup passes
+  `CancellationToken.None`, so there is nothing to cancel. §6 is where an abortable commit-on-save
+  makes it live.
+- **§7 — `GitProcessException`'s message carries the raw argument list.** Inert today: bootstrap passes
+  no secrets. §7 passes token-bearing URLs through the same runner, at which point the exception
+  message — and anything that logs it — becomes a credential leak. `CapturingLoggerProvider` already
+  exists to sweep logs for exactly this.
+
+**[architect]** → `@worker`: fix round on `2.1–2.2`, items 1–5 above. Not a new block and nothing new
+is ticked. → `@reviewer` re-audits after.
+
+**[worker]** Fix round on `2.1–2.2` — all five items addressed.
+
+1. **Blocker, classification.** `EnsureRepositoryAsync` no longer asks git anything before knowing
+   whether `repositoryRoot` has a repository of its own. `HasOwnGitEntry` checks
+   `Directory.Exists`/`File.Exists` on `<repositoryRoot>/.git` in C# — a gitfile counts as present
+   (worktree/submodule, not something to initialize over), matching the ruling. Only when that
+   entry exists does the code ask git `rev-parse --is-bare-repository`, which is now safe: with
+   `.git` confirmed present at `repositoryRoot`, discovery from that cwd always finds it first,
+   ancestor or not. Reproduced the original bug directly (outer repo + no-`.git` nested dir two
+   levels down: `rev-parse --is-bare-repository` from the nested dir returns `false` against the
+   *outer* repo) and confirmed the fixed classification no longer shells to git in that path at all.
+   **Extra defect caught while fixing this**: a bare repository has no `.git` entry — `HEAD`/
+   `objects`/`refs` sit directly in the repo root, which is what makes it bare — so `HasOwnGitEntry`
+   alone would have misrouted case (c) into "absent, initialize", silently laying a working tree over
+   an existing bare repo. Added `LooksLikeBareGitDirectory` (checks `HEAD` + `objects/` + `refs/`
+   directly in `repositoryRoot`) as an explicit third branch before the "initialize" fallback.
+2. **Blocker, assertion.** Added `AssertGitResolvesRepositoryRootAsync`, run once at the end of
+   `EnsureRepositoryAsync`. Chose "the assertion alone" (no `GIT_CEILING_DIRECTORIES`): it runs
+   `git --git-dir=.git --work-tree=. rev-parse --show-toplevel` (discovery bypassed entirely) and
+   compares it to plain `rev-parse --show-toplevel` (discovery as every other caller through this
+   runner will use it) with cwd = `repositoryRoot` both times, and throws if they differ. Verified
+   against a real nested-repo reproduction rather than reasoning about it, per the ruling — and the
+   reproduction caught a design mistake before it shipped: comparing git's output against
+   `Path.GetFullPath(repositoryRoot)` (a C# string) fails on macOS, because `--show-toplevel`
+   resolves symlinks and `Path.GetFullPath` doesn't — confirmed `/tmp/…` vs. `/private/tmp/…` on this
+   machine's own temp directory, which would have made the assertion misfire on every test run rather
+   than only on the bug it's meant to catch. Comparing two git-resolved paths instead sidesteps that
+   entirely, and the same reproduction confirmed it degrades correctly when the bug *is* present: run
+   from the nested dir before `git init`, plain discovery returns the outer repo's toplevel while the
+   `--git-dir` form would fail (no `.git` yet) — either way the two diverge and the assertion fires.
+3. **Regression test** — `ContentRepositoryServiceTests.DataRootNestedInsideAnAncestorGitRepository_InitializesItsOwnRepositoryInstead`:
+   an ancestor repo with its own commit, `repositoryRoot` nested inside it with no `.git` of its own.
+   Asserts the nested repo gets initialized correctly (non-bare, `docs/.gitkeep` tracked, one
+   `System`-authored commit, configuration applied, clean porcelain) **and** that the ancestor is
+   untouched — no `receive.denyCurrentBranch` written into it, its own single commit still exactly
+   one. This is the fixture that was missing; both existing harnesses root `DataRoot` under
+   `Path.GetTempPath()`, which sits inside no repository.
+4. **Nit, file split.** `GitProcessResult.cs` and `GitProcessException.cs` are now their own files;
+   `GitProcessRunner.cs` holds only the runner.
+5. **Nit, `GIT_CONFIG_GLOBAL`.** `Branch_IsTheNamedConstantRegardlessOfTheHostsDefaultBranch` no
+   longer touches `Environment.SetEnvironmentVariable` at all. It now calls
+   `_git.RunOrThrowAsync(repositoryRoot, ["init", "-b", DefaultBranch], environmentVariables: …)` —
+   the exact invocation shape `ContentRepositoryService` uses — with `GIT_CONFIG_GLOBAL` scoped to
+   that one subprocess via `GitProcessRunner`'s existing per-call environment override, never the
+   process-wide environment other concurrently-running test classes' git subprocesses would inherit.
+
+**Gates:** `dotnet build` 0 warnings/0 errors · `dotnet test` **491/491** full unfiltered (490 + 1 net
+new: the nested-repo fixture; the `GIT_CONFIG_GLOBAL` test was rewritten, not added) ·
+`dotnet format --verify-no-changes` clean · `openspec validate git-backed-content-core --strict`
+valid. `git status --short` / `git diff --stat` reviewed: only this block's files, plus the two new
+split files and this DEVLOG entry. No mutation testing, per the original brief's scoping call.
+
+Explicitly untouched, per the ruling's scope: 2.3–2.5, hooks, reconciliation, self-check, and the two
+items parked to §6/§7.
+
+→ @reviewer
+
+**[reviewer]** 2.1–2.2 re-audit over the full working-tree diff against `7b50e46` — **Approve.**
+
+This certifies the current tree (`ContentRepositoryService.cs`, `GitProcessRunner.cs` +
+`GitProcessResult.cs` + `GitProcessException.cs`, `GitAuthor.cs`, the startup wiring, both test
+files), not only the fix-round delta.
+
+**Blocker verified closed, by reproduction, not by reading the fix.**
+
+- Re-ran the original nested-repo scenario (an ancestor repo with a commit, `repositoryRoot` nested
+  inside it with no `.git` of its own) against the code **as it stood before this fix round** —
+  reconstructed from the previous review — and confirmed independently what the finding predicted:
+  `bareProbe` reports `"false"` (discovering the ancestor), the old code takes the "existing repo"
+  branch, writes `receive.denyCurrentBranch=updateInstead` into the **ancestor's** `.git/config`, and
+  the `HEAD` probe (also discovering the ancestor, which already has a commit) returns early —
+  `repositoryRoot/.git` is never created. `Directory.Exists(Path.Combine(repositoryRoot, ".git"))`
+  — the new regression test's first assertion — genuinely fails against that code. The new test is
+  not vacuous.
+- `HasOwnGitEntry`/`LooksLikeBareGitDirectory` (`ContentRepositoryService.cs:106-120`) decide
+  classification entirely in C#, before any git process runs, closing the path the blocker exploited.
+
+**The third branch (`LooksLikeBareGitDirectory`) does what it claims, checked specifically as asked.**
+
+- A real `git init --bare` produces `HEAD` + `objects/` + `refs/` directly at the repo root with no
+  `.git` entry — confirmed against a real bare repo. The three-marker check is the right shape: no
+  ordinary wiki content can produce it by accident, since page content lives under `docs/`
+  (`ContentPaths.WorkingTree`), a subdirectory of `repositoryRoot`, never at `repositoryRoot` itself —
+  so `HEAD`/`objects`/`refs` sitting directly in `repositoryRoot` has no legitimate non-bare-repo
+  explanation. The only way to false-positive this is to hand-place a file named `HEAD` and
+  directories named `objects`/`refs` directly in the repository root before first start, which no
+  normal operation does. Worth naming as a known, accepted tradeoff rather than a gap — it isn't
+  worth blocking on.
+- Order is correct: `HasOwnGitEntry` is checked first, so a directory that happens to have both a
+  `.git` entry and stray `HEAD`/`objects`/`refs` siblings is correctly classified from the `.git` it
+  actually has, not misrouted into the bare branch.
+
+**The defense-in-depth assertion (`AssertGitResolvesRepositoryRootAsync`) fires on divergence and is
+not vacuous — checked by reproduction in both directions:**
+
+- Simulated the same nested-repo shape and ran the assertion's two invocations directly: with cwd at
+  the nested, `.git`-less directory, `git --git-dir=.git --work-tree=. rev-parse --show-toplevel`
+  fails outright (`fatal: not a git repository: '.git'`, exit 128) while plain `rev-parse
+  --show-toplevel` resolves to the ancestor — the two diverge (one throws, one succeeds with a
+  different value), so the assertion is a genuine backstop, not a comparison that can never fail.
+  Because classification now runs first, this path is unreachable in the current code (it would only
+  fire if classification itself had a bug) — which is exactly what "defense in depth" means here.
+- Confirmed the symlink reasoning independently rather than taking it on trust: on this machine,
+  `git init` under `/tmp/…` (a symlink to `/private/tmp/…`) has `rev-parse --show-toplevel` and the
+  explicit `--git-dir` form **agree** on the resolved `/private/tmp/…` path, while a naive
+  `Path.GetFullPath("/tmp/…")` would retain the unresolved `/tmp/…` form — so comparing against a
+  C#-computed path would have produced a false positive on exactly this host. Comparing two
+  git-resolved paths avoids it. Also confirmed the `--git-dir`/plain-discovery comparison agrees
+  correctly for a linked worktree (gitfile, not a `.git` directory) — no false divergence there either.
+
+**Nits addressed, confirmed in the diff:**
+
+- `GitProcessRunner.cs` now holds only the runner; `GitProcessResult.cs` and `GitProcessException.cs`
+  are their own files — one type per file, matching the rest of `src/`.
+- `Branch_IsTheNamedConstantRegardlessOfTheHostsDefaultBranch` (`ContentRepositoryServiceTests.cs:112-135`)
+  no longer touches `Environment.SetEnvironmentVariable`; `GIT_CONFIG_GLOBAL` is scoped to the single
+  `git init` subprocess via `GitProcessRunner`'s own per-call environment override. The cross-class
+  flakiness source is gone.
+
+**Optional micro-nit, not blocking:** the two "bare repository" `InvalidOperationException` sites
+(`ContentRepositoryService.cs:61-64` and `:74-76`) duplicate the same message text; a small private
+helper would remove the duplication if it's ever touched again, but it isn't worth a fix round on its
+own.
+
+Confirmed `git diff -- src` / `git status --short -- src` show only this block's files — no mutation
+residue, consistent with no mutation run having been started for this block, per the brief's scoping.
+
+Parked items (subprocess-kill-on-cancellation → §6, `GitProcessException` raw-argument redaction →
+§7) correctly not re-raised here — both remain inert in this block's actual usage and are already
+owed by name in `## NEXT`.
+
+→ @architect: 2.1–2.2 clear to commit.
+
+**[architect]** One more small fix round before committing — a finding of my own, not a reopened
+review. `AssertGitResolvesRepositoryRootAsync` ran *last* (after `ApplyRepositoryConfigurationAsync`
+and the initial commit), which makes it a backstop that reports the blocker's damage rather than
+preventing it: if classification ever regresses, the config writes and the commit would already have
+landed in whatever repository git discovered before the assertion had a chance to throw. → `@worker`:
+move it to run immediately after classification, before any write; every surviving branch leaves
+`.git` present at `repositoryRoot` by then, so it has what it needs. Also folded in the reviewer's
+micro-nit on the duplicated bare-repository message while this round is open. Confirm by reproduction,
+not reasoning, as before.
+
+**[worker]** Fix round on `2.1–2.2`, ordering + micro-nit.
+
+- **Reordered.** `AssertGitResolvesRepositoryRootAsync` now runs immediately after the
+  classification `if`/`else if`/`else` and before `ApplyRepositoryConfigurationAsync`/
+  `EnsureInitialCommitAsync` (`ContentRepositoryService.cs:91-99`). Every branch that doesn't throw
+  leaves `.git` present at `repositoryRoot` — found as-is, or just created by `init` — so the
+  assertion has everything it needs at that point.
+- **Confirmed by reproduction, not reasoning.** Built the same nested-repo scenario as the earlier
+  fix round (ancestor repo with a commit, `repositoryRoot` nested inside with no `.git` of its own),
+  then deliberately ran the *old*, buggy classification (`git rev-parse --is-bare-repository` from
+  the nested dir, trusting discovery — reports `false`, i.e. "existing non-bare repo, use as-is").
+  With the assertion in its new position: `git --git-dir=.git --work-tree=. rev-parse --show-toplevel`
+  fails outright (`fatal: not a git repository: '.git'`, since the nested dir has no `.git` of its
+  own) — the assertion throws before any config write runs — and reading the ancestor's
+  `.git/config` back afterward confirms `receive.denyCurrentBranch` was never set there (lookup
+  exits 1). For contrast, ran the same two `git config` writes with cwd = the nested dir *first* (the
+  old ordering) and confirmed they land straight in the **ancestor's** `.git/config` —
+  `denyCurrentBranch = updateInstead` and `receivepack = true` both show up in
+  `outer/.git/config` — which is exactly the damage the reordering prevents.
+- **Micro-nit folded in.** The two "bare repository" `InvalidOperationException` call sites now
+  share one message via a private `BareRepositoryException(string repositoryRoot)` helper
+  (`ContentRepositoryService.cs:102-105`); no more duplicated text.
+
+**Gates:** `dotnet build` 0 warnings/0 errors · `dotnet test` **491/491** full unfiltered · `dotnet
+format --verify-no-changes` clean · `openspec validate git-backed-content-core --strict` valid.
+`git status --short` / `git diff --stat -- src` reviewed: only this block's files, no mutation
+residue (none run). Nothing else touched — §6/§7 park items and 2.3–2.5 untouched, no mutation
+testing.
+
+→ @architect: 2.1–2.2 clear to commit.
+
+**[reviewer]** 2.1–2.2 re-audit, ordering fix + micro-nit — **Approve.** This certifies the tree as it
+now stands (`ContentRepositoryService.cs:91-105` and everything already certified in the prior round).
+
+**Ordering change verified by reproduction, not on report.**
+
+- Confirmed the new position (`AssertGitResolvesRepositoryRootAsync` at line 96, ahead of
+  `ApplyRepositoryConfigurationAsync`/`EnsureInitialCommitAsync` at 98–99) by re-running the exact
+  causal chain myself: on a fresh nested-repo fixture (ancestor with a commit, `repositoryRoot`
+  nested inside with no `.git` of its own), simulating the naive/reverted classification's
+  `bareProbe` reports `"false"` (discovers the ancestor) exactly as before, then ran the assertion's
+  two invocations in the new position — `git --git-dir=.git --work-tree=. rev-parse --show-toplevel`
+  fails outright (`fatal: not a git repository: '.git'`) — and confirmed the ancestor's
+  `receive.denyCurrentBranch` is still unset afterward. Under the old ordering (config writes first,
+  assertion last) the same reproduction lands both keys in the ancestor's `.git/config` before
+  anything throws. The reordering is a genuine fail-before-write, not fail-and-report.
+
+**Checked the specific hazard raised — reachability across all three classification branches, and
+no spurious failure against an unborn HEAD.**
+
+- Both throwing branches (bare via `bareProbe`, bare via `LooksLikeBareGitDirectory`) return before
+  reaching the assertion — correct, no write should be attempted for either. The two non-throwing
+  branches (existing non-bare repo; freshly `git init`'d) both leave `.git` present at
+  `repositoryRoot` before the assertion runs, so it's reachable with what it needs in both.
+- Specifically checked the fresh-init path, which is the one that reaches the assertion with **zero
+  commits**: ran `git init -b main` in a scratch directory and confirmed both `git rev-parse
+  --show-toplevel` and the explicit `--git-dir=.git --work-tree=. rev-parse --show-toplevel` succeed
+  and agree on an unborn-HEAD repository (`rev-parse --verify -q HEAD` fails there, exit 1, but
+  `--show-toplevel` doesn't depend on history — it succeeded, exit 0, on both invocations). Moving the
+  assertion ahead of `EnsureInitialCommitAsync` does not introduce a spurious failure on the init path.
+
+**Micro-nit fix confirmed:** `BareRepositoryException(string repositoryRoot)` (`:102-105`) is used at
+both former call sites; no duplicated message text remains.
+
+**Mutation-hazard check, independently:** `git status --short -- src tests` shows only this block's
+own tracked additions, no stray untracked files; `git diff --stat` matches the files under review;
+this repository's own `receive.denyCurrentBranch`/`http.receivepack` remain unset — the classification
+fix holds against the very repo this change is being built in, not just the test fixtures. No
+mutation run was needed or started for this fix — it's a reproducible ordering property, not a
+security/concurrency/data-integrity path per CLAUDE.md's mutation scoping.
+
+Parked items (§6 cancellation-kill, §7 argument redaction) remain correctly parked, not re-raised.
+
+→ @architect: 2.1–2.2 clear to commit.
+
 ## NEXT
 
 **Resume point: §2 (Repository bootstrap & invariant), first block.** §11 is **closed** — supervisor
@@ -2656,6 +3194,14 @@ exit 0, `openspec validate --strict` valid.
    correct, which is exactly why §11 could not discharge this: `LoginServiceTests.cs:271-289` pins
    `.old.name.` still authenticating, and §6 constructs the address. Also tell §6's brief that the
    username is **immutable by consequence** — a permanent artifact plus no rename path.
+7. **§6 — `GitProcessRunner` does not kill the git subprocess on cancellation.** Parked deliberately in
+   §2's first block, where it is inert: startup passes `CancellationToken.None`, so there is nothing to
+   cancel. §6's abortable commit-on-save is what makes it live, and §6 owns the fix.
+8. **§7 — `GitProcessException`'s message carries the raw argument list.** Also parked from §2's first
+   block, also inert there: bootstrap passes no secrets through the runner. §7 passes token-bearing
+   URLs through the same runner, at which point the exception message — and anything that logs it —
+   becomes a credential leak. `CapturingLoggerProvider` already exists to sweep logs for exactly this,
+   so §7's brief should say *test it*, not merely *avoid it*.
 
 ### Close-out items before archive
 

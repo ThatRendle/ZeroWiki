@@ -23,7 +23,23 @@ public static class ContentStorageStartupExtensions
         services.AddSingleton(sp =>
             new ContentPaths(sp.GetRequiredService<IOptions<ContentStorageOptions>>().Value.DataRoot));
 
+        services.AddSingleton<GitProcessRunner>();
+        services.AddSingleton<ContentRepositoryService>();
+
         return services;
+    }
+
+    /// <summary>
+    /// Detects or initializes the content git repository (D1, D8) before the request pipeline is
+    /// configured — an operator learning about a broken volume from a 500 on page one is the wrong
+    /// failure mode. Resolves <see cref="ContentRepositoryService"/> — and, through it, the
+    /// DI-registered <see cref="ContentPaths"/> singleton — rather than deriving paths a second way.
+    /// </summary>
+    public static async Task EnsureContentRepositoryAsync(this IHost app, CancellationToken cancellationToken = default)
+    {
+        await using var scope = app.Services.CreateAsyncScope();
+        var repository = scope.ServiceProvider.GetRequiredService<ContentRepositoryService>();
+        await repository.EnsureRepositoryAsync(cancellationToken);
     }
 
     /// <summary>
