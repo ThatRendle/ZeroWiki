@@ -3050,10 +3050,15 @@ none need a re-audit. → @architect, clear to promote on archive per the Produc
 
 ## NEXT
 
-**Resume point: COMPLETE — all four sections closed with a supervisor `Approve`. 16/16 tasks, 385/385
-tests.** One Product Owner decision remains before archiving (**N12**, below): whether the promoted
-spec text carries the qualification D1 now states. Everything else is `## NEXT` material for later
-changes, not work outstanding on this one.
+**Resume point: COMPLETE AND CLEARED FOR ARCHIVE — all four sections closed with a supervisor
+`Approve`, 16/16 tasks, 385/385 tests, and no outstanding Product Owner decision.** The last one,
+**N12** (whether the promoted spec text carries the qualification D1 now states), was ruled *qualify
+it now* and landed in `e5413d4`; the reviewer audited that edit and signed off — "clear to promote on
+archive". Everything below is `## NEXT` material for later changes, not work outstanding on this one.
+
+Gates re-run on the final tree before archiving: `dotnet build` clean, `dotnet test` 385/385,
+`dotnet format --verify-no-changes` clean, `openspec validate request-cancellation --strict` valid,
+working tree clean.
 
 | Section | Block | Commit | Reviewer | Supervisor |
 |---|---|---|---|---|
@@ -3066,7 +3071,7 @@ changes, not work outstanding on this one.
 
 Out-of-band commits: `f24c9ab` (§1 close), `0a38e46` (`design.md` polarity fix, §2's base), `2eead9c`
 (`.claude/agents/worker.md`, process), `7f63128` (§3 close), `7a4d6e1` (4.3 re-cut), `7bed029` (§4
-supervisor verdict + record repair).
+supervisor verdict + record repair), `e5413d4` (N12 — qualify the promoted spec text).
 
 **Tests 344 → 385.** Single production change across the whole change: `LoginService.cs`, `+8/-0`.
 
