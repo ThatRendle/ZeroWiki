@@ -230,8 +230,11 @@ public sealed class InvitationService(
         // The same guards bootstrap applies, from the same constants. The username charset and
         // shape are structural invariants — the git remote presents the username as the Basic-auth
         // userid, where RFC 7617 makes a colon illegal, and D10 authors a browser save as
-        // `username@<host domain>`, where a leading or trailing dot is not a legal dot-atom — so
-        // they belong at the boundary unconditionally. AD10's password minimum is here because
+        // `username@<host domain>`, where a dot-atom admits no leading, trailing *or consecutive*
+        // dot (`.` is not `atext`) — so they belong at the boundary unconditionally. What the
+        // pattern accepts is a strict subset of what a dot-atom allows, which is the direction
+        // D10 needs; it is not an equality, and §6 still owes the guarantee for accounts whose
+        // names predate these rules. AD10's password minimum is here because
         // AD10 itself names this path: "applies to every path where a user chooses a password —
         // §3 bootstrap and §4 invitation redemption — so the two cannot diverge". That is the
         // decision scoping itself to both, not §3's exception being widened. All of them sit in

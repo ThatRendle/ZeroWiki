@@ -269,6 +269,11 @@ public sealed partial class RedeemInvitationPageTests : IDisposable
     [InlineData("_abc")]
     [InlineData("abc_")]
     [InlineData("_x_")]
+    // The consecutive-dot rule (D11), refused on this form as on the bootstrap one — the two
+    // surfaces share the pattern, and the matrices have to stay in step for that to mean anything.
+    [InlineData("a..b")]
+    [InlineData("a...b")]
+    [InlineData("ab..cd")]
     public async Task A_username_of_the_wrong_shape_is_rejected_and_creates_nothing(string username)
     {
         var link = await IssueInvitationAsync();

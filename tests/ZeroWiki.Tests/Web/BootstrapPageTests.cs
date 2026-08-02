@@ -92,6 +92,11 @@ public sealed class BootstrapPageTests : IDisposable
     [InlineData("_abc")]
     [InlineData("abc_")]
     [InlineData("_x_")]
+    // The consecutive-dot rule (D11). It lives in the pattern rather than in a service-only check
+    // precisely so the form refuses these too, with the same message from the same constant.
+    [InlineData("a..b")]
+    [InlineData("a...b")]
+    [InlineData("ab..cd")]
     public async Task A_username_of_the_wrong_shape_is_rejected(string username)
     {
         var client = _app.CreateHttpClient();
@@ -162,6 +167,9 @@ public sealed class BootstrapPageTests : IDisposable
     [InlineData("admin")]
     [InlineData("a.b-c_1")]
     [InlineData("abc")]
+    // Single dots stay accepted on the form as well as at the service — the rule forbids two in a
+    // row, not dots.
+    [InlineData("a.b.c")]
     public async Task A_username_within_the_permitted_charset_is_accepted(string username)
     {
         var client = _app.CreateHttpClient();

@@ -1611,6 +1611,825 @@ inspected before committing — 13 files, all expected, no untracked file, no mu
 
 → `@supervisor` for the §11 section review over `bb3cb2c..HEAD`.
 
+**[supervisor]** Section review of **§11**, scope `bb3cb2c..HEAD` — one commit (`70a31aa`), 13 files,
+5 under `src/`. **Verdict: Request changes — one blocker (S1), typed as a design question for the
+Product Owner rather than a worker defect.** Everything the block review certified, I found holding;
+I re-derived rather than relayed only where the answer changes the verdict.
+
+### S1 — the section does not achieve the thing it was sequenced ahead of §2 to achieve
+
+The base post at the top of this section (`DEVLOG.md:845-847`) states §11's purpose: *"so that D10's
+synthetic commit-author address (`<Username> <username@<host domain>>`) has a **legal RFC 5322
+dot-atom localpart**, before any code exists that writes one into permanent history."* D11 gives the
+same reason, and it is repeated in three places in shipped code —
+`src/ZeroWiki/Identity/CredentialPolicy.cs:65-70`, `src/ZeroWiki/Identity/InvitationService.cs:232-234`,
+and the rejection-theory comment at `tests/ZeroWiki.Tests/Identity/CredentialPolicyTests.cs`.
+
+**That property does not hold, in two independent ways.** RFC 5322 `dot-atom-text` is
+`1*atext *("." 1*atext)`; `.` is not `atext`, so a dot-atom admits no leading, trailing **or
+consecutive** dot. D11's pattern fixes the ends and says nothing about the middle. Evaluated against
+the shipped pattern:
+
+| username | `UsernamePattern` | legal dot-atom localpart |
+|---|---|---|
+| `a..b`, `a...b`, `ab..cd` | **ACCEPT** | **no** |
+| `a.-.b`, `a._.b`, `a.b-c_1` | ACCEPT | yes (`-` and `_` are `atext`) |
+| `_legacy_` | **reject** | **yes** |
+| `.old.name.` | reject | no |
+
+- **(a) New accounts.** `a..b` is accepted at both boundaries today, and §6 will stamp
+  `a..b@<domain>` into history this design commits to never rewriting. Note the two rows either
+  side of it: the rule rejects `_legacy_`, which *is* a legal localpart, while accepting `a..b`,
+  which is not. The shape rule is misaligned with the property it claims to enforce **in both
+  directions** — it is not merely under-tight.
+- **(b) Existing accounts, structurally.** Non-retroactivity is correct and I am not questioning it —
+  but D10 stamps author lines for *every* account, including the pre-§11 ones. `LoginServiceTests.cs:271-289`
+  pins `ab`, `_legacy_` and `.old.name.` still authenticating; `.old.name.@<domain>` is exactly the
+  malformed shape D11 exists to prevent. **No rule applied where a username is chosen can ever make
+  D10's precondition universally true**, because the accounts that violate it were not chosen under
+  the rule. §11 could not have closed this, and nothing in the section acknowledges it.
+
+**Why I am blocking on a claim rather than parking it.** No functional breakage exists today — I
+checked the consumer rather than assuming: `GitEmailService.TryNormalize` validates structurally
+(exactly one `@`, non-empty either side, within the column width) and `FindByEmailAsync` is string
+equality, so §8 accepts `a..b@host`; git does not parse author addresses either. The defect is that
+**§6 will inherit a precondition it has been told is true and is not**, and this section was
+resequenced ahead of §2 by an explicit Product Owner call (`DEVLOG.md:849-852`) on precisely the
+grounds that the shape had to be right *before* the first author line is written. Shipping the
+section with its stated purpose unmet defeats the reason it was moved. It also makes this the
+**fourth** claim-about-why in §11 that was wrong while the code was fine — and unlike N1, N3 and the
+architect's brief, this one is not confined to the record: it is load-bearing input to a later
+section.
+
+**❓ @architect → Product Owner.** The resolution amends D11, so it is not mine and not a worker's.
+Framing it open rather than as a pick — three shapes, and they are not mutually exclusive:
+
+1. **Tighten the shape rule** so no two separators are adjacent (or at least no two dots). Must
+   preserve both properties this section established as load-bearing: the single bounded quantifier
+   (constant-time matching, `CredentialPolicyTests.Username_pattern_rejects_a_very_long_input_without_doing_the_work`)
+   and the pattern's tolerance of 1–2 character names (N1 — tightening it re-merges the two messages
+   on the form). Closes (a) only.
+2. **Narrow the claim.** The synthetic address is never delivered and nothing in this system parses
+   it, so "legal dot-atom" may be more than D10 needs. Then D11, the base post and the three code
+   comments say something weaker and true, and §6 inherits an accurate assumption. Closes (a) and (b)
+   as a documentation change, and costs nothing at runtime.
+3. **Move the obligation to the point of use.** §6 renders the localpart from the username rather
+   than assuming it. Only this closes **(b)**, which neither of the others can reach.
+
+A remediation block is small under any of them — under (2) it touches no `src/` behaviour at all.
+What it must cover, whichever is chosen: D11 and the base post's claim, the three code comments
+above, and (under 1 or 3) a `CredentialPolicyTests` case and a scenario in
+`specs/user-accounts/spec.md`. If (2) or (3) is chosen, the honest close-out is a one-line note in
+§6's brief that the username is **not** guaranteed to be a legal localpart, so §6 must not assume it.
+
+### Checked and holding — recorded so it is not re-audited
+
+- **The two boundaries are genuinely symmetric**, which is the whole reason `CredentialPolicy`
+  exists and the thing three editing passes could most easily have broken. Same three checks, same
+  order, same constants, same messages, all three in front of the Argon2id hash, at
+  `BootstrapService.cs:66,71,76` (hash at `:105`) and `InvitationService.cs:246,251,256` (hash at
+  `:282`) — and pinned, not merely true, at both: `Assert.Empty(Derivations)` via
+  `RefusedUsernames()` (`BootstrapServiceTests.cs:299-308`) and at
+  `InvitationRedemptionTests.cs:474/:493/:516/:536`.
+- **No third path exists.** `db.Accounts.Add` occurs at exactly two sites in `src/` — both guarded.
+  No rename path. So "enforce wherever a user chooses a username" is complete, not merely covered
+  where someone thought to look.
+- **The overlap trade-off is accommodated by the amended requirement, not papered over.** *"where it
+  reports a single fault it reports the length rule"* is conditioned, and the form reports two, so
+  the clause is not contradicted. I checked the PO ruling is recorded (`DEVLOG.md:1296-1313`) with
+  the divergence named as accepted rather than discovered afterwards.
+- **No mutation residue.** `git diff -- src` and `git status --short -- src` both empty at `HEAD`.
+- **No dead scaffolding, no duplicated abstraction.** Every constant added has a consumer; the
+  replaced `CredentialPolicyTests` invariant was replaced, not stranded; `_x_` fully migrated.
+- **Login untouched**, so non-retroactivity holds as a matter of code and not just of intent.
+
+### For `## NEXT`, not the fix block — architect's to place
+
+- **The accepted form/service divergence is unasserted in both directions.** That the form lists both
+  messages for `"."` is a PO decision recorded only here; no test pins it, correctly (a test asserting
+  "only length" would pin the opposite). But by this section's own B1 standard — *a property that
+  survives its own violation is not tested* — a later short-circuit on the form would silently
+  contradict a PO decision with the suite green. Worth knowing the standard was applied to the
+  ordering property and not to the trade-off.
+- **Page-test matrices have already drifted between the two surfaces.** `BootstrapPageTests.cs:83-94`
+  includes `"café"` and `"admin\tx"`; `RedeemInvitationPageTests.cs:262-271` omits both. Same rule,
+  two surfaces, two matrices — harmless now, and exactly the shape that lets them diverge later.
+- **The username is now immutable-by-consequence.** §11 makes it load-bearing input to a permanent,
+  never-rewritten artifact, and D10 depends on there being no rename path. Say so in §6's brief, so
+  nobody adds a rename later without confronting history rewriting.
+- **`## NEXT` is stale post-commit** and needs its refresh: it reads "4/39 tasks ticked" and
+  "394/394" (actual: **7/40** ticked, **454/454**), and *"Design questions outstanding: none"* stops
+  being true if S1 is accepted.
+
+→ `@architect`. Section **not** closed. S1 needs the Product Owner before a remediation block can be
+carved; do not open §2 on the assumption it will be resolved cheaply.
+
+**[architect]** S1 **confirmed** — reproduced against the real .NET engine rather than relayed, since
+this section's whole lesson is that a claim and a check are different things. Scratch program under
+the session scratchpad, comparing the shipped `CredentialPolicy.UsernamePattern` against
+`dot-atom-text` restricted to ZeroWiki's charset (`^[A-Za-z0-9_-]+(\.[A-Za-z0-9_-]+)*\z` — runs of
+`atext` separated by single dots; `.` is not `atext`, `_` and `-` are):
+
+| input | shipped | dot-atom | |
+|---|---|---|---|
+| `a..b`, `a...b`, `ab..cd` | accept | **illegal** | ← the defect |
+| `_legacy_`, `-foo`, `foo-`, `_x_` | reject | legal | ← *not* a defect, see below |
+| `.abc`, `abc.`, `a.`, `..` | reject | illegal | agree |
+| `admin`, `a.b`, `a.b.c`, `a-_-b`, `ab`, `a` | accept | legal | agree |
+
+**The blocker is real and I am accepting it.** `a..b` is accepted today, and §6 would stamp
+`a..b@<domain>` into history this design commits to never rewriting. That is exactly the failure D10
+and D11 exist to prevent, and it is not caught anywhere.
+
+**But I do not accept the supervisor's framing that the rule is "misaligned in both directions", and
+the difference decides the size of the fix.** The property D10 needs is *every username we stamp
+yields a legal address* — that is `accepted ⊆ legal`. It does **not** require `legal ⊆ accepted`.
+Being a **strict subset** of dot-atom is not a defect; it is the correct posture for a rule that has
+to be safe rather than maximally permissive. So `_legacy_` and `-foo` being refused is a **style
+choice** — defensible on its own terms and already shipped — not a second half of the bug. Only the
+top row breaks the property, and only the top row needs fixing.
+
+That matters because the supervisor's three framings all follow from the two-directional reading. On
+the one-directional reading a fourth option exists that none of them describe: **keep D11's pattern
+and everything §11 already shipped, and simply forbid consecutive dots.** `_x_` does not flip back,
+no test matrix is re-litigated, and §11's claim becomes true as written rather than needing to be
+narrowed.
+
+**The supervisor's structural half stands and is the more important finding.** Non-retroactivity means
+pre-§11 accounts survive — `LoginServiceTests.cs:271-289` pins `.old.name.` still authenticating — so
+**no rule applied where a username is chosen can make D10's precondition universally true.** §11 could
+never have closed that, and nothing in the section says so. Whatever is decided about the pattern, §6
+constructs the author line and is the only place a universal guarantee can live. That obligation is
+currently owed by nobody, which is precisely the failure mode `## NEXT`'s forward-obligation list
+exists to prevent.
+
+One implementation constraint for whoever gets this, because it is the non-obvious part: the
+consecutive-dot rule is awkward to express as a bounded, constant-time regex, and `CredentialPolicy`'s
+cost is part of its specification (anonymously reachable). A code-level `Contains("..")` in the shape
+rule is linear and unambiguous; a `(?!.*\.\.)` lookahead is not obviously so on a 64 K input, and N1
+established that the **form** runs every attribute regardless of the service's length-before-shape
+order — so the regex cannot assume it only ever sees ≤ 64 characters.
+
+→ **Product Owner.** This amends D11, so it is not mine to decide (`CLAUDE.md` §4: implementation
+reveals the spec itself is wrong). §2 stays shut until it is answered.
+
+**[architect]** **Product Owner ruling: forbid consecutive dots, and give §6 the universal
+obligation.** Both halves, not one — the pattern fix closes it for names chosen from now on, and §6
+closes it for the legacy names no choice-time rule can ever reach.
+
+Explicitly *not* chosen: loosening the ends to admit `_legacy_`. The subset posture stands, so `_x_`
+stays rejected and the four test files that migrated it keep their matrices intact.
+
+**[architect]** Remediation brief → `@worker`. Per `CLAUDE.md` §3c.3 this is a **remediation block**:
+it gets **no new `N.M` numbers and ticks nothing** — every box in §11 is already ticked and the
+findings and the fix live here. It commits as a `fix`, not a `feat`.
+
+### 1. `design.md` — amend D11, and bind §6 in D10
+
+- **D11 gains the rule it was missing.** A chosen username SHALL NOT contain consecutive dots. State
+  the *actual* grammar reason: `dot-atom-text` is `1*atext *("." 1*atext)` and `.` is not `atext`, so
+  a doubled dot is exactly as illegal as a leading or trailing one — D11 fixed the ends and said
+  nothing about the middle.
+- **Correct D11's claim to what it is: a strict subset.** The property D10 needs is
+  `accepted ⊆ legal`, not equality. Say so, and say why the subset posture is deliberate — it is what
+  lets the ends rule stay a legibility choice (`_legacy_` refused) without that being a defect. This
+  is the sentence whose absence let the gap survive three reviews.
+- **D10 gains a `Consequence binding §6`**, in the same form as its existing
+  `Consequence binding §8.3`: the author line §6 constructs MUST be a well-formed address **for every
+  account**, including one whose username predates these rules. Non-retroactivity is correct and stays
+  — `LoginServiceTests.cs:271-289` pins `.old.name.` still authenticating — and it is precisely why
+  §11 cannot discharge this and §6 must.
+
+### 2. `specs/user-accounts/spec.md` — the requirement states the rule
+
+Add consecutive dots to the shape rule in the prose, and one scenario in the file's existing style. A
+username breaking it is a **shape** fault, so the precedence clause already added covers the overlap
+with length; do not restate precedence.
+
+### 3. The implementation, and the one genuinely hard constraint
+
+Fold the rule into `CredentialPolicy.UsernamePattern` **if you can do it safely**, because that keeps
+`CredentialPolicy` the single source and keeps the service boundaries and both form models symmetric —
+the symmetry the supervisor specifically confirmed holding. N1 established the form runs **every**
+attribute regardless of the service's length-before-shape order, so a regex here cannot assume it only
+ever sees ≤ 64 characters.
+
+Candidate to **verify, not to trust** — I have already been wrong once in this section about why
+something holds:
+
+```
+^[A-Za-z0-9](([A-Za-z0-9_-]|\.[A-Za-z0-9_-]){0,125}([A-Za-z0-9]|\.[A-Za-z0-9]))?\z
+```
+
+The two alternation branches are disjoint on their first character, and the outer bound is finite, so
+on paper it cannot examine more than ~253 characters whatever it is handed. **On paper is not
+evidence.** `CredentialPolicyTests.cs:98-101`
+(`Username_pattern_rejects_a_very_long_input_without_doing_the_work`) is the instrument that already
+exists for exactly this — it must still pass, and it is the thing to run *before* you believe the
+paper argument. If it does not hold, say so and propose the alternative (a linear `Contains("..")` in
+the shape rule plus a custom validation attribute so the form keeps parity) rather than shipping a
+pattern you cannot defend.
+
+Keep D11's other properties intact: anchored both ends, `\z` never `$`, and a maximum admissible
+length comfortably above `MaximumUsernameLength` so an over-long name still reports a **length** fault.
+
+### 4. The three comments that assert the false claim
+
+`CredentialPolicy.cs:65-70`, `InvitationService.cs:232-234`, and the rejection-theory comment in
+`CredentialPolicyTests.cs` all state the dot-atom property. Make each true. This is the fourth
+wrong-claim-about-why in §11 and the first that escaped into another section's assumptions, so treat
+the comments as part of the fix, not as tidying.
+
+### 5. Tests
+
+- `a..b`, `a...b`, `ab..cd` refused as a **shape** fault at both service boundaries and both form
+  models; the refusal costs **no password derivation** (extend `RefusedUsernames()` — that is what B1
+  built it for).
+- Everything previously accepted still is: `a.b`, `a.b.c`, `a-_-b`, `admin`, 64-char names.
+- `_x_` and the ends rule unchanged — if any of the four migrated matrices moves, something is wrong.
+- Re-run the old-vs-new differential the reviewer built, this time as
+  *(pre-remediation)* vs *(post-remediation)*: the only permitted change is
+  `accept → refuse` for consecutive-dot names. Any other cell moving is a finding against you.
+
+### Gates and limits
+
+Unchanged: `dotnet build` clean · `dotnet test` full unfiltered (**454** before your work — report the
+new total) · `openspec validate git-backed-content-core --strict` · `dotnet format
+--verify-no-changes`. Mutation capped at 3 runs, security-critical paths only, checksum before and
+after, revert by `cp`-snapshot in a `trap` — **never `git checkout --`**, which cost this section an
+incident already.
+
+Do not tick anything. Do not commit. Post to the DEVLOG under `## 11.` and hand to `@reviewer`.
+
+**[worker]** Remediation block (S1) complete. All five items done. **The candidate pattern verified and
+shipped** — but the verification found the brief's timing instrument is weaker than the claim beside
+it, which changed one of my answers. Nothing ticked, nothing committed.
+
+### The pattern: verified against an oracle, not against my reading of it
+
+`CredentialPolicy.UsernamePattern` is now the brief's candidate verbatim:
+
+```
+^[A-Za-z0-9](([A-Za-z0-9_-]|\.[A-Za-z0-9_-]){0,125}([A-Za-z0-9]|\.[A-Za-z0-9]))?\z
+```
+
+Every branch that starts with a dot also consumes the character after it, and that character is never
+a dot — which is what forbids a doubled dot without a lookahead.
+
+**Correctness.** Differential against an independent oracle (charset + alnum ends + no `..`), on the
+real .NET engine: **666,469 inputs, 0 mismatches** — exhaustive over every string of length ≤ 5 from
+`{a, Z, 0, ., -, _, space, :, \n}` (n = 66,430), 300,000 random strings of length 0–131 with dots
+over-weighted, 300,000 structured dotted names, plus every value this section's record names. The
+pattern is exactly the stated rule, not an approximation of it.
+
+**Max admissible length is 127 unbroken alphanumerics** (253 with a dot between every pair), down from
+128. Still comfortably above `MaximumUsernameLength`, so `Username_pattern_admits_more_than_the_maximum_length`
+holds unchanged and an over-long name still reports a **length** fault. The `126` literal became `125`;
+the doc comment's "must not be made to track the cap" reasoning survives verbatim.
+
+### Regression guard: exactly one cell moved
+
+Re-ran the differential as **pre-remediation vs post-remediation**, both patterns *extracted
+programmatically* — pre from `git show 70a31aa:…/CredentialPolicy.cs`, post from the working tree —
+rather than retyped, and asserted `pre != post` first so a no-op could not masquerade as a pass.
+Modelled the whole service decision including the trim and the length-before-shape order, classifying
+by **rule kind** rather than message text (the shape message's wording changed on purpose, so a text
+comparison would flag an intended edit as drift).
+
+| | |
+|---|---|
+| inputs compared | 666,469 |
+| cells that moved | **`ACCEPT → shape` only**, 37,278 inputs |
+| every one of them | a consecutive-dot name |
+| `refuse → accept` | **0** |
+| length ↔ shape reclassification | **0** |
+
+`_x_`, the ends rule and all four migrated matrices are untouched.
+
+### Mutation — 3 runs, at the cap. One killed, one deliberately left alive.
+
+`cp`-snapshot restored in a `trap … EXIT INT TERM`; **no `git checkout`/`git restore` anywhere**.
+Checksummed before and after, each verified non-no-op, restored byte-identical.
+
+**M1 — revert the pattern to its pre-remediation form (the S1 defect itself): killed, 17 failures**
+across all four layers — `CredentialPolicyTests`, both service boundaries, both form models, plus
+`A_refused_username_costs_no_password_derivation("a..b")`. Full unfiltered, 466/483.
+
+**M2 — the same rule as a `(?!.*\.\.)` lookahead over the old pattern: SURVIVED, 483/483.** Reporting
+it rather than killing it, with the reason:
+
+⚠️ **The finding is about the instrument, and it caught me first.** My initial measurement said the
+lookahead was ~668x slower at a million characters, so I added a scaling assertion to kill it. It
+survived anyway. Cause: I had measured with `new Regex(…)`, the **interpreted** engine — but
+`CredentialPolicy` uses `[GeneratedRegex]`, which emits C# and optimises that lookahead heavily.
+**I measured a different engine from the one that ships.** On the real engine:
+
+| pattern | 1K chars | 1M chars | ratio |
+|---|---|---|---|
+| shipped (bounded), generated | 8.44 us | 7.78 us | **0.9** |
+| lookahead, generated | 8.56 us | 114 us | 13.4 |
+| lookahead, *interpreted* (what I wrongly measured) | 21 us | 14,291 us | 668 |
+
+So the shipped pattern genuinely is constant-time — measured on the right engine this time — but the
+lookahead's real cost is **114 us at a million characters**, which is not a denial-of-service risk. I
+**removed my scaling assertion rather than tighten its threshold to 5x to make M2 die**: that would
+have been tuning a fragile timing ratio until a mutant died, pinning an implementation detail stricter
+than the security property needs. The existing 100 ms test catches the actual hazard (the quadratic
+form: 2.3 s at 64 K). Instead I corrected the doc comment to say what is true — bounded quantifiers
+make it constant, *and* the suite pins only "no input makes matching expensive", so a later reader
+should not assume a test will stop them swapping in the lookahead form.
+
+That is the fifth claim-about-why in §11 to be wrong, and the first of mine. It was caught the same way
+as the other four — by producing the counterfactual — with the twist that **the counterfactual has to
+be produced on the engine that ships**. Two measurements of "the same" regex disagreed by 50x because
+one of them wasn't the regex that runs.
+
+### The rest
+
+- **`design.md`** — D11 restated with the actual grammar reason (`dot-atom-text` is `1*atext *("." 1*atext)`,
+  `.` is not `atext`, so a doubled dot is exactly as illegal as a leading one) and with the
+  **`accepted ⊆ legal`** posture stated explicitly as the sentence whose absence let the gap survive
+  three reviews. **D10 gains `Consequence binding §6`** in the same form as its `§8.3` sibling: the
+  author line must be well-formed *for every account*, non-retroactivity is why §11 cannot discharge
+  it, and §6 must not assume the username is already a legal localpart.
+- **`specs/user-accounts/spec.md`** — consecutive dots added to the shape rule prose plus one scenario
+  in the file's style. It is a **shape** fault, so the existing precedence clause covers the length
+  overlap; precedence not restated.
+- **The three comments that asserted the false claim** — `CredentialPolicy.cs`, `InvitationService.cs`
+  and the `CredentialPolicyTests` rejection theory all now state the middle rule alongside the ends,
+  and the subset direction. `UsernameRuleDescription` also had to change: it is the single message
+  every shape fault reports, so a name refused for `a..b` was being told a rule it had not broken.
+- **Tests (+29 → 483).** `a..b`/`a...b`/`ab..cd` refused as a shape fault at both service boundaries
+  and both form models; `a..b` added to `RefusedUsernames()` so the refusal is pinned to cost no
+  password derivation; `a.b`, `a.b.c`, `a-_-b`, `a.-.b`, `a._.b` pinned as still accepted at the
+  pattern, the service and the form. The hostile-input timing test became a `[Theory]` over three
+  shapes — unbroken run, alternating dots, every separator — because the consecutive-dot rule
+  introduced a pathological shape the all-`a` input does not exercise.
+
+**No control flow changed.** The guards, their order and the length-before-shape precedence are
+byte-identical; this block touched the pattern, the messages, the comments and the tests.
+
+**Gates:** `dotnet build` 0 warnings / 0 errors · `dotnet test` **483/483** full unfiltered (was 454) ·
+`openspec validate git-backed-content-core --strict` → valid · `dotnet format --verify-no-changes`
+exit 0. `git diff --stat -- src tests` shows 7 files and `git status --short --untracked-files=all`
+shows no untracked file — no mutation residue, pattern re-grepped in place.
+
+**For the reviewer, hardest first.** (1) M2 is a live surviving mutant I chose not to kill — the
+judgement call is whether 114 us at a million characters is worth a timing-ratio test, and I say no.
+(2) `UsernameRuleDescription`'s text changed, which is a user-visible string asserted by four page
+tests; I classified the differential by rule kind precisely so that change could not hide drift.
+(3) The max admissible length moved 128 → 127, which no test pins directly — only the ≥ `Maximum`
+direction. (4) D10's new `Consequence binding §6` is an obligation on a section that does not exist
+yet; it needs to actually reach §6's brief.
+
+→ `@reviewer`
+
+**[reviewer]** Audit of the **S1 remediation block**, scope `git diff 70a31aa` (10 files, 2 under
+`src/`).
+
+**Verdict: Request changes — one blocker, documentation-only, three lines in one test file.** The fix
+itself is correct and I confirmed every substantive claim on my own instruments rather than relaying
+the worker's. The blocker is that this block ships a **new** false claim about what a test catches, in
+a comment that directly contradicts the source comment the same block wrote — which is the sixth
+instance in §11 of exactly the defect class S1 was.
+
+### Verified independently — a stronger instrument than last time
+
+I loaded `ZeroWiki.dll` and called `CredentialPolicy.UsernameMatcher()` by reflection, so every check
+below ran against the **actual shipped generated regex**, not a retyped copy of the pattern string.
+Confirmed engine: `System.Text.RegularExpressions.Generated.<RegexGenerator_g>…__UsernameMatcher_0`.
+
+- **Pattern is the brief's candidate verbatim** — read out of the compiled assembly, compared to the
+  D11 literal: `True`. `MinimumUsernameLength=3`, `MaximumUsernameLength=64`.
+- **The pattern is exactly the stated rule.** My own oracle (charset, alnum both ends, no `..`),
+  written from the prose rather than from the regex, against **666,452 inputs** — exhaustive over
+  every string of length ≤ 5 from `{a, Z, 0, ., -, _, space, :, \n}` (66,430), 300k random with dots
+  over-weighted, 300k structured dotted names, plus every value this section's record names:
+  **0 mismatches.** Independent corpus, independent oracle, same answer as your 666,469/0.
+- **Exactly one cell moved.** Pre-pattern taken from `git show 70a31aa:…`, post from the built
+  assembly, `pre != post` asserted first. Classified by rule kind through the full service model
+  (trim, then length-before-shape): the only transition is **`ACCEPT → shape`** (66,182 inputs);
+  **inputs that moved without containing a consecutive dot: 0**; **`refuse → accept`: 0**;
+  **length↔shape reclassification: 0**. The ends rule and the precedence really are untouched.
+- **The N1 lower slack survived the tightening** — the property the supervisor specifically warned a
+  tighter pattern could break. `a` and `ab` still match, so `[MinLength]` remains the only attribute
+  that fails for a 2-character name and form-level one-fault-one-message still holds.
+- **Upper slack intact**: admits `Maximum + 1` = 65. Unbroken-run maximum 128 → 127, dotted maximum
+  253 — your 128 → 127 figure confirmed.
+- **Control flow byte-identical, verifiably**: `BootstrapService.cs` is not in the diff at all, and the
+  `InvitationService.cs` diff is comment-only.
+- **Docs now say what the code does.** D11 carries the real grammar reason and the `accepted ⊆ legal`
+  posture; D10 gains `Consequence binding §6`; the spec gains the consecutive-dot prose and a scenario.
+  All three match the shipped pattern.
+- **Gates re-run**: build 0/0 · format exit 0 · `openspec validate --strict` valid · `dotnet test`
+  **483/483** full unfiltered. No untracked files, no mutation residue.
+
+### Your engine finding is real, and I reproduced it
+
+Measured on both engines, same input shapes:
+
+| pattern / engine | 1K | 1M | ratio |
+|---|---|---|---|
+| shipped (bounded), **generated — ships** | 7.55 us | 8.18 us | **1.1** |
+| shipped (bounded), interpreted | 14.52 us | 13.46 us | 0.9 |
+| lookahead, generated | 7.46 us | **107.68 us** | 14.4 |
+| lookahead, **interpreted** | 14.54 us | **8,789 us** | 604 |
+
+Your diagnosis holds on my instrument: the interpreted engine is ~80x worse on the lookahead and the
+two engines disagree by two orders of magnitude, while the shipped pattern is constant on *both*. That
+is a genuine and well-caught blind spot.
+
+**It does not recur anywhere in the suite** — I checked. `src/` has exactly one `[GeneratedRegex]`
+(`CredentialPolicy.cs:137`), and `Username_pattern_rejects_a_very_long_input_without_doing_the_work`
+measures `CredentialPolicy.UsernameMatcher()` itself, i.e. the shipping engine.
+`StaticSsrForm.cs:74` and `ServiceCallSweep.cs:44` are test-internal parsers, not performance
+measurements. The hazard is confined to ad-hoc harnesses.
+
+### My ruling on M2: **your call is correct — keep the mutant alive**
+
+Judged on its merits, and I would have made the same call.
+
+1. `CLAUDE.md` permits a deliberate surviving mutant recorded with its reason and forbids editing code
+   to make a mutant die. Removing a scaling assertion **you had added during this same block** is not
+   a weakening of the suite — it is declining to manufacture a kill, which is the opposite of the
+   forbidden move. Tuning a ratio to 5x until M2 died would have been the forbidden move.
+2. 108 us at a million characters is not a denial-of-service vector. The **service** never feeds the
+   regex more than 64 characters (length is checked before shape), and even the form path — where N1
+   established every attribute runs regardless — costs a fraction of ordinary request overhead.
+3. A timing-ratio assertion pins an implementation detail, not the security property, and would be
+   flaky on CI.
+
+### Blocker — @worker: this block ships a new false claim about what a test catches
+
+Two parts, both in `tests/ZeroWiki.Tests/Identity/CredentialPolicyTests.cs`, both newly added here.
+
+**(a) `CredentialPolicyTests.cs:128-133`.** The alternating-dots row's comment says that expressing
+the rule as a `(?!.*\.\.)` lookahead "*or letting the dot branch repeat unbounded, reintroduces work
+proportional to the input here while leaving the row above fast — so the run above alone would not
+notice the regression*". Measured on the shipping generated engine against the test's own three
+inputs and its own 100 ms threshold:
+
+| candidate | unbroken run | alternating dots | every separator | |
+|---|---|---|---|---|
+| shipped (bounded) | 0.60 ms | 0.01 ms | 0.01 ms | passes |
+| **M2 lookahead** | 0.81 ms | **0.11 ms** | 0.10 ms | **all pass** |
+| **unbounded dot branch** | **53.5 ms** | 28.2 ms | 28.5 ms | **all pass** |
+| old quadratic form | 23,413 ms | 11,454 ms | 5,739 ms | all fail |
+
+The comment is wrong on both of its claims and wrong about the direction. For the lookahead the
+alternating-dots row is the **fastest** of the three, not the discriminating one; for the unbounded
+variant the unbroken run is the **worse** row, the exact opposite of "leaving the row above fast".
+Neither variant is caught at all — M2 surviving 483/483 is the direct proof for the first, and the
+unbounded dot branch at 53.5 ms is comfortably inside the limit too. That row buys coverage of a shape
+the all-`a` input does not exercise, which is a good reason to keep it; it does not buy what the
+comment says it buys.
+
+This matters because `CredentialPolicy.cs:104-110` — written in this same block, correctly — says
+*"no test refuses it … do not assume a test will stop you replacing it."* The two comments now assert
+opposite things about the same mutant, and a reader who reaches the test comment first gets the
+reassurance the source comment exists to deny.
+
+**(b) `CredentialPolicyTests.cs:124-126`** — "*the unbounded form of this pattern was quadratic on an
+unbroken run: ~2.3 s at 64 K characters*". On the engine that ships, that input costs **100.3 ms**.
+I then measured it interpreted: **2,515 ms**. The `2.3 s` figure is an *interpreted-engine*
+measurement — the same blind spot you correctly diagnosed for M2, still sitting in a comment written
+in the same block. The conclusion is untouched and the test is fine: at the 1M-character input the
+test actually uses, the quadratic form takes **23.4 s**, 234x the limit, so it is caught decisively.
+Only the number and its engine are wrong.
+
+**Fix:** state what the row does (covers a shape the unbroken run does not, so the pattern's cost is
+pinned on dotted input as well), drop the claim that it would catch the lookahead or the unbounded
+branch, and requote (b) on the generated engine. No test or source change — and while you are there,
+`CredentialPolicy.cs:104-110` names only the lookahead as unprotected; the unbounded dot-branch
+variant sits in the same gap at 53.5 ms and is worth naming alongside it, since what the suite pins is
+"no input makes matching *catastrophic*", not "no input makes it *scale*".
+
+→ `@worker` for the comment corrections; re-audit on the fix. Everything else in this block is
+approved.
+
+**[architect]** Brief → `@worker`. Still the **same remediation block** — this is a reviewer iteration
+inside it, not a second supervisor round. The two-rounds-then-stop rule (`CLAUDE.md` §3c.4) counts
+*supervisor* rounds; §11 has had one, and it has not yet re-reviewed.
+
+**Scope: two comments in `tests/ZeroWiki.Tests/Identity/CredentialPolicyTests.cs`. Nothing else.** No
+production code, no test logic, no assertion. The reviewer approved everything else in the block.
+
+**Why this is a blocker and not a nit, despite being three lines of comment.** S1 — the thing that
+reopened this section after it was committed — *was* a false comment. "Legal RFC 5322 dot-atom
+localpart" sat in three places in shipped code, survived three worker passes and two reviewer audits,
+and was wrong. These two comments are the same defect in the same section, and one of them
+(`:128-133`) directly contradicts `CredentialPolicy.cs:104-110`, which you wrote in this same block and
+which is correct. A reader will believe whichever they find first.
+
+1. **`:128-133`** claims the alternating-dots row catches the lookahead form "while leaving the row
+   above fast". Measured on the test's own inputs and its own 100 ms threshold, the alternating-dots
+   row is the **fastest** of the three, and the unbounded dot-branch variant passes on every row too —
+   the unbroken row being the worse one, the reverse of the claim. M2 surviving at 483/483 is direct
+   proof. Say what is true: **no test in this suite refuses the lookahead form**, which is exactly
+   what `CredentialPolicy.cs:104-110` already says.
+2. **`:124-126`** quotes "~2.3 s at 64 K". That is an **interpreted-engine** number. On the
+   `[GeneratedRegex]` engine that actually ships it is ~100 ms at 64 K. This is the very blind spot you
+   diagnosed for M2, left in a comment you wrote in the same block — which is worth noticing rather
+   than being embarrassed by: the diagnosis was right and simply arrived after the comment.
+
+**Measure it yourself on the shipped engine; do not copy the reviewer's figures.** It reached
+`CredentialPolicy.UsernameMatcher()` by reflection off the built `ZeroWiki.dll`, which is the right
+instrument precisely because it cannot accidentally become `new Regex(...)`. Six claims-about-why have
+now been wrong in this section and every single one was settled by producing the counterfactual, never
+by reading — so a seventh comment written from someone else's numbers is not a fix, it is the same
+mistake with a different author.
+
+**Prefer a comment that cannot rot.** Where a figure is load-bearing, name the engine it was measured
+on; where it is only illustrative, consider whether it needs a number at all. The conclusion the tests
+encode — the quadratic form blows the limit by orders of magnitude on any engine — does not depend on
+either disputed figure.
+
+Gates unchanged (`dotnet test` **483/483** before your edit; a comment-only change must not move it).
+No mutation needed for this. Do not tick, do not commit; post under `## 11.` and hand to `@reviewer`.
+
+**[worker]** Both comments corrected in `CredentialPolicyTests.cs`. **Comment-only** — no production
+code, no test logic, no assertion, no `[InlineData]`. `git diff --stat -- src` is byte-identical to
+before this edit (54 insertions / 18 deletions across the same two files); only
+`CredentialPolicyTests.cs` moved, 59 → 68 changed lines. `dotnet test` **483/483**, unmoved.
+
+### Measured myself, on the shipped engine, before writing a word
+
+Reflection off the built `ZeroWiki.dll` rather than a retyped pattern, exactly as briefed — a
+comment written from the reviewer's numbers would have been the same mistake with a different author.
+Instrument confirmed before believing it:
+
+```
+SHIPPED matcher engine : System.Text.RegularExpressions.Generated.<RegexGenerator_g>F8372052…__UsernameMatcher_0
+SHIPPED pattern        : ^[A-Za-z0-9](([A-Za-z0-9_-]|\.[A-Za-z0-9_-]){0,125}([A-Za-z0-9]|\.[A-Za-z0-9]))?\z
+const == matcher       : True
+```
+
+Candidates measured on the generated engine against **the test's own three inputs and its own 100 ms
+threshold** (best of 3):
+
+| candidate | unbroken run | alternating dots | every separator | verdict |
+|---|---|---|---|---|
+| shipped (bounded) | 0.01 ms | 0.01 ms | 0.01 ms | all pass |
+| M2 lookahead | **0.11 ms** | 0.10 ms | 0.10 ms | **all pass** |
+| unbounded dot branch | **16.42 ms** | 8.79 ms | 8.34 ms | **all pass** |
+| old quadratic form | 22,739 ms | 11,327 ms | 5,667 ms | all fail |
+
+**Both halves of (a) are false, confirmed independently.** For the lookahead the alternating-dots row
+is not the discriminating one — it is the *joint fastest*, and the unbroken run is marginally the
+worst. For the unbounded dot branch the unbroken run is the worst row by ~2x, the exact reverse of
+*"leaving the row above fast"*. Neither variant is refused by anything; M2 surviving 483/483 already
+proved the first.
+
+My absolute figures differ from the reviewer's (it read 0.60 / 0.81 / 53.5 ms where I read 0.01 /
+0.11 / 16.42 ms on the unbroken run) — machine load and best-of-3 versus single shot. **The
+directions, the verdicts and the orders of magnitude agree**, and those are what the comment asserts.
+Recording the divergence rather than quietly adopting its numbers, since that is the whole point.
+
+**(b) confirmed.** The quadratic form at 64 K unbroken: **97.2 ms generated (ships)** vs **2,499.6 ms
+interpreted**. So *"~2.3 s at 64 K"* was indeed an interpreted-engine figure sitting in a comment I
+wrote in this same block, one file away from my own correct diagnosis of that exact substitution.
+
+### What the comments now say
+
+- **The quoted number is now the one that carries the conclusion, on the engine that ships**: the
+  quadratic form takes **~23 s** on the 1M-character input the test actually uses, over 200x the
+  limit. The 64 K figure is gone as a headline; the interpreted 2.5 s reading is kept only as an
+  explicit parenthetical naming its engine, so the next reader sees *why* engine-mixing is the trap
+  rather than having to rediscover it.
+- **The dotted rows now claim what they buy** — coverage of shapes the unbroken run does not exercise
+  at all, since the consecutive-dot rule is expressed by alternation — and state plainly that the
+  lookahead and the unbounded dot branch both pass every row, with the unbounded variant's worst row
+  being the unbroken run. That agrees with `CredentialPolicy.cs` instead of contradicting it.
+- The `<summary>` also said *"Both are a million characters"* over three rows; corrected, and it now
+  points at `UsernamePattern`'s remarks for what is deliberately left unguarded.
+
+### ❓ @architect — one reviewer suggestion I did **not** action, deliberately
+
+The reviewer added: *"while you are there, `CredentialPolicy.cs:104-110` names only the lookahead as
+unprotected; the unbounded dot-branch variant sits in the same gap … and is worth naming alongside
+it."* Your brief said **"Nothing else. No production code."** I followed your scope over its
+suggestion rather than splitting the difference silently.
+
+For your call, two small things in that same production comment:
+
+1. It names only the lookahead as the unguarded rewrite. The unbounded dot branch is **worse**
+   (16.4 ms vs 0.11 ms on the unbroken run) and equally unguarded, so the comment is *incomplete*
+   rather than false — a different defect class from S1, which is why I was comfortable leaving it.
+2. Its *"114 us at a million characters"* figure does not name its engine. It is correct
+   (generated; I re-measure 0.11 ms), but by the rule you just set, a load-bearing figure should say
+   which engine it came from.
+
+Neither is a false claim, so neither blocks. Say the word and both are a one-line edit.
+
+**[worker]** Authorised and done — `CredentialPolicy.cs`'s unguarded-rewrites paragraph now names
+both variants and labels its engine. **Comment-only**, and mechanically demonstrated as such: filtering
+the file's diff to non-`///` lines leaves exactly the two changes already approved earlier in this
+block (the pattern literal and `UsernameRuleDescription`). **This edit contributed no non-comment
+line.** `dotnet test` **483/483**, unmoved.
+
+**Measured myself again, same instrument as the test-file pass** — reflection off the built
+`ZeroWiki.dll`, engine `…Generated…__UsernameMatcher_0`, `const == matcher` `True`. I did not reuse
+the reviewer's numbers or my own from an hour ago without re-running them.
+
+Both points were right, and (1) was the more useful of the two: the paragraph named the lookahead as
+the unguarded rewrite and stopped, which invites the inference that the unbounded form *is* guarded.
+It is not, and it is the worse of the two — on the shipped engine at a million characters it costs
+roughly a thousand times what the bounded pattern does, against the lookahead's ten, and still passes
+every row. Both are now named together, with the limit they both sit inside.
+
+**Applied your rule about figures.** No precise value survives in that paragraph: it reads *"roughly
+ten times"* and *"roughly a thousand"* rather than `114 us` and `16.4 ms`. That is deliberate beyond
+style — my shipped-pattern reading at a million characters sits at the stopwatch's resolution floor
+(0.01 ms), so a ratio quoted to two figures would be false precision derived from a number the
+instrument cannot actually resolve. An order of magnitude is what the measurement supports. The
+engine is named inline, with the reason: the two engines disagree by orders of magnitude *here
+specifically*, which is the trap this section fell into twice.
+
+**One observation, not a question, and out of the scope you set.** The paragraph immediately above
+(`CredentialPolicy.cs:94-101`) carries *"(ratio 0.9)"* — engine-labelled, so it satisfies the second
+half of your rule, but a precise value under the first half. It is mine, from this block, and it is
+the only such figure left in the file. Not touching it: you scoped this to the one comment and it is
+not a false claim. Flagging it so the decision is yours rather than an oversight.
+
+**Gates:** `dotnet build` 0 warnings / 0 errors · `dotnet test` **483/483** full unfiltered (unchanged
+across all three passes of this block) · `dotnet format --verify-no-changes` exit 0 ·
+`openspec validate git-backed-content-core --strict` valid. No mutation run — a comment cannot be
+mutated into a behaviour. No untracked files, no residue.
+
+→ `@reviewer` — this plus the test-file corrections, as one audit.
+
+**Gates:** `dotnet build` 0 warnings / 0 errors · `dotnet test` **483/483** full unfiltered
+(unchanged, as required of a comment-only change) · `dotnet format --verify-no-changes` exit 0 ·
+`openspec validate git-backed-content-core --strict` valid. No mutation run — none was needed. No
+untracked files, no residue.
+
+→ `@reviewer`
+
+**[architect]** Answering the worker's question, and **widening my own scope by one edit** — the
+`CredentialPolicy.cs:104-110` comment is in.
+
+The worker was right to ask rather than split the difference silently; "nothing else, no production
+code" is what I wrote, and a worker that quietly exceeds a scope boundary is a worse failure than one
+that stops. But the reviewer's suggestion is sound and I am taking it, because the two defects it
+names are the **same class as the blocker they sit beside**:
+
+- the comment says no test refuses the *lookahead* form, and stops there — while the **unbounded dot
+  branch is worse** (16.4 ms vs 0.11 ms on the shipped engine, measured by the worker) and equally
+  unguarded. A reader who takes "the lookahead is unguarded" as the complete list infers the unbounded
+  form *is* guarded. Incomplete, in a way that misleads in the dangerous direction.
+- its `114 µs` carries **no engine label** — in the file whose section has now been bitten twice by an
+  engine-unlabelled figure, and one file from the comment being corrected for exactly that.
+
+Neither is false, so neither blocked; both are one line. Leaving them to be discovered later, in a file
+this section has already reopened once, is the worse trade.
+
+**On the divergent absolute numbers** — worker 0.01/0.11/16.42 ms where the reviewer read
+0.60/0.81/53.5 ms, same directions and orders of magnitude, different machine load and best-of-3
+versus single-shot. The worker recording the divergence instead of adopting the reviewer's figures is
+the correct handling, and it generalises into the rule the corrected comments already follow: **a
+timing comment may assert a direction or an order of magnitude, never a precise value** — a precise
+value is a measurement of a machine, and it rots silently on someone else's. Two agents agreeing on
+direction while disagreeing on magnitude is exactly what a healthy instrument looks like.
+
+→ `@worker` for the one-line `CredentialPolicy.cs` edit, then `@reviewer` audits both together.
+
+**[architect]** The worker's flagged `(ratio 0.9)` — **fixed by me, and this closes comment work on
+this file.**
+
+It was right to flag rather than act: it was outside the one comment I scoped, and it is not a false
+claim. But it was the last precise timing value left in the file, in the paragraph immediately above
+the rule I had just imposed, so leaving it would have stated a rule and violated it three lines
+earlier. `CredentialPolicy.cs:96-99` now reads *"costs no more than a one-thousand-character one — the
+measured ratio sits at the stopwatch's noise floor rather than above it"*. That is also the more
+honest statement: the worker's shipped-pattern reading at a million characters was **0.01 ms**, the
+stopwatch's resolution floor, so a two-figure ratio was false precision derived from a number the
+instrument cannot resolve. Removing it makes the comment weaker and truer at once.
+
+Verified rather than asserted: `dotnet build` 0/0, `dotnet format --verify-no-changes` exit 0, and
+filtering `git diff 70a31aa -- src/ZeroWiki/Identity/CredentialPolicy.cs` to non-`///` lines leaves
+**exactly the two changes already approved in this block** — the pattern literal and
+`UsernameRuleDescription`. My edit contributed no behaviour, which is the same demonstration the
+worker gave for its own.
+
+**Declaring this closed:** the file now satisfies the rule throughout, and further comment polish is
+out of scope for §11. If a later reader finds another, it is a `## NEXT` note, not a round.
+
+→ `@reviewer` for the combined audit of all three comment edits.
+
+**[reviewer]** Combined audit of the three comment edits. Scope `git diff 70a31aa`; everything else in
+this block I certified in my previous entry and re-checked only where these edits could have disturbed
+it.
+
+**Verdict: Approve.** Both blocker items are fixed, and fixed in the right direction — the test
+comments now *agree* with `CredentialPolicy.cs` rather than contradicting it. Two notes below are for
+the supervisor, not for another round; I agree with closing comment work on this file.
+
+### Behaviour-neutrality — checked, not accepted
+
+I ran the filter myself rather than taking it. Non-`///` changed lines in `src/` since `70a31aa`:
+**exactly two**, both already approved — the `UsernamePattern` literal and `UsernameRuleDescription`.
+`InvitationService.cs` has **zero** non-comment changed lines. Gates re-run: `dotnet build` 0/0 ·
+`dotnet format --verify-no-changes` exit 0 · `openspec validate --strict` valid · `dotnet test`
+**483/483** full unfiltered. No untracked files.
+
+### Blocker (a) — fixed, and independently correct
+
+`CredentialPolicyTests.cs` now states that the dotted rows "*do not discriminate between candidate
+rewrites*", that the lookahead "*passes every row here (~0.1 ms)*", and that the unbounded dot branch
+passes too "*its **worst** row being the unbroken run above rather than either of these*". Every one of
+those matches what I measured (lookahead 0.11 / 0.10 ms on the dotted rows; unbounded worst row the
+unbroken run at 53.5 ms), and the closing sentence — "*Neither is refused by any test in this suite*" —
+now says the same thing as `CredentialPolicy.cs:104-113`. The summary's "*not that any particular
+rewrite of the pattern would be rejected*" is the right place for that claim to live. The row is kept
+for the reason it actually earns: it exercises a shape the unbroken run does not.
+
+### Blocker (b) — fixed, and the engine is now labelled at the point of use
+
+"*~23 s on this row — over 200x the limit below*" matches my 23,413 ms against a 100 ms limit (234x),
+and the parenthetical explicitly marks "*~2.5 s at 64 K characters*" as the **interpreted** figure —
+my measurement was 2,515 ms interpreted against 100.3 ms generated. Quoting both with their engines
+named, and saying that mixing them is what made the replaced claim wrong, is a better fix than deleting
+the number would have been.
+
+### Note 1 (supervisor) — the ratio rule is applied in one paragraph and not in the one nine lines below
+
+`CredentialPolicy.cs:96-99` drops `(ratio 0.9)` on the grounds that its denominator — a 0.01 ms
+reading — is at the stopwatch's resolution floor, so a two-figure ratio is false precision.
+`CredentialPolicy.cs:104-113` then asserts "*roughly ten times*" and "*roughly a thousand*", and both
+are ratios against that **same** unresolvable denominator (0.11/0.01 = 11, 16.42/0.01 = 1642).
+Perturb the denominator within its own noise, 0.005–0.02 ms, and "ten times" swings across 5x–22x.
+
+**Not a false claim** — it is true as measured, and by the standard set for me I am recording it rather
+than blocking. But the file now applies its own rule inconsistently, and there is a form that cannot
+rot: state both against *the limit the timing test asserts* — the lookahead uses well under 1% of it,
+the unbounded form under a fifth — which is the comparison that actually matters to a reader deciding
+whether either is safe, and needs no denominator at the instrument's floor.
+
+### Note 2 (supervisor) — @architect, on edit 3, checked as I would a worker's
+
+**It is sound, and it is doing honest work rather than hedging.** I verified the underlying claim with
+averaging: 1K = 7.55 us, 1M = 8.18 us. The million-character input is ~8% *more*, so a bare "costs no
+more than a one-thousand-character one" would have been literally false by a hair — the noise-floor
+clause is what makes the sentence true. Replacing a rottable falsifiable number with an unrottable one
+was the right call.
+
+One caveat in the other direction, which is why it is a note rather than nothing: averaged over
+repeated runs the ratio resolves cleanly at ~1.1, so "*the stopwatch's noise floor*" describes the
+single-shot harness, not the limit of what can be measured. A reader wanting to re-verify constancy may
+conclude it is unmeasurable when it is not. "Measured with averaging" would carry the same honesty
+without implying the property is out of reach.
+
+### On the divergence between our absolute numbers — your ruling is right, and here is the cause
+
+Mine were single-shot and un-warmed, so every row carried JIT and first-use cost of the generated
+regex; the worker's best-of-3 is nearer steady state, and its 0.01 ms is the better figure. Mine were
+inflated *uniformly*, which is why every direction, every order of magnitude and every pass/fail
+verdict against the 100 ms limit came out identical on both harnesses. So the divergence is explained
+rather than merely tolerated — and it is a concrete case for the rule you imposed, not a hypothetical
+one: two careful measurements of the same regex on the same engine differed 60x on the fast rows and
+agreed on every conclusion that mattered. **A timing comment may assert a direction or an order of
+magnitude; it may not assert a precise value.** Worth carrying into `## NEXT` as a standing rule
+alongside the engine one.
+
+→ `@architect` — approved. Comment work on this file is closed as far as I am concerned; Notes 1 and 2
+are for the supervisor's re-review, not another round.
+
+**[architect]** **Note 1 applied by me after the `Approve`; Note 2 deliberately not.** Recording both
+decisions, because an `Approve` certifies the state it was shown and this edit is not in that state —
+the same declaration made for §1's post-`Approve` README edit.
+
+**Note 1 was mine to fix, and it was not polish.** I dropped `(ratio 0.9)` at `:96-99` on the grounds
+that its 0.01 ms denominator is unresolvable, then left *"roughly ten times"* and *"roughly a
+thousand"* nine lines later — both ratios against **that same denominator**. The reviewer perturbed
+them inside their own noise and "ten times" swings 5x–22x. So the file asserted a rule and broke it in
+the next paragraph, which is precisely the *"an `[architect]` claim the record does not support"*
+failure this change has already had twice. `:109-114` now states both against **the limit the timing
+test asserts** — under a hundredth of it, and under a fifth — with the reason named inline: this
+pattern's own cost is too small to divide by. That is unrottable, because the limit is a constant in
+the test rather than a property of whoever's laptop ran it.
+
+I said comment work was closed and then reopened it once. The distinction I am drawing: *polish* is
+closed, the **rule** is not, and a file that violates the rule it states is not finished. If that
+distinction is too convenient, the supervisor should say so.
+
+**Note 2 stands as written, on the reviewer's own evidence.** It endorsed `:96-99` and improved the
+reason for it: averaged, 1 K = 7.55 µs against 1 M = 8.18 µs, so the million-character input is ~8%
+*more* — a bare "costs no more than" would have been false by a hair, and the noise-floor clause is
+what makes the sentence true. Its caveat is that "noise floor" describes the single-shot harness
+rather than the limit of what is knowable. Fair, and I am leaving it: the sentence is true, the
+clause is load-bearing, and rewriting it to say "~1.1 averaged" would reintroduce exactly the precise
+value both of us have now removed twice. Recorded so the supervisor rules on it rather than finding
+it.
+
+**[architect]** §11 remediation **committed** as `<fix sha>` — a `fix`, ticking nothing, per
+`CLAUDE.md` §3c.3. Gates run by me rather than relayed: `dotnet build` 0/0 · `dotnet test`
+**483/483** full unfiltered · `openspec validate git-backed-content-core --strict` valid ·
+`dotnet format --verify-no-changes` exit 0. Non-`///` diff over `src/` since `70a31aa` is exactly the
+two approved changes — the pattern literal and `UsernameRuleDescription` — so every comment edit in
+this block, mine included, contributed no behaviour. No untracked files anywhere.
+
+→ `@supervisor` for round two over `bb3cb2c..HEAD`.
+
 ## NEXT
 
 **Resume point: §2 (Repository bootstrap & invariant), first block.** §1 is **closed** — supervisor

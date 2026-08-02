@@ -217,9 +217,8 @@ public sealed class BootstrapServiceTests : IDisposable
     [InlineData("café")]
     [InlineData("___")]
     [InlineData("admin\tx")]
-    // D11: an alphanumeric is required at each end, so a leading or trailing separator is a shape
-    // fault — the username is D10's commit-author localpart, where a bare dot at either end is not
-    // a legal dot-atom.
+    // D11: the username is D10's commit-author localpart, and a dot-atom admits a dot only
+    // between runs of other characters — so an alphanumeric is required at each end...
     [InlineData(".abc")]
     [InlineData("abc.")]
     [InlineData("-abc")]
@@ -227,6 +226,11 @@ public sealed class BootstrapServiceTests : IDisposable
     [InlineData("_abc")]
     [InlineData("abc_")]
     [InlineData("_x_")]
+    // ...and two dots may not be adjacent. Same grammar rule, applied to the middle rather than
+    // the ends, and a shape fault for the same reason.
+    [InlineData("a..b")]
+    [InlineData("a...b")]
+    [InlineData("ab..cd")]
     public async Task Username_of_the_wrong_shape_is_rejected_by_the_service_itself(string username)
     {
         // The web form validates too, but the invariant belongs to the store: §8 presents the
@@ -295,10 +299,14 @@ public sealed class BootstrapServiceTests : IDisposable
         Assert.Empty(await _db.Accounts.AsNoTracking().ToListAsync());
     }
 
-    /// <summary>One username per username refusal kind: shape, below the minimum, above the maximum.</summary>
+    /// <summary>
+    /// One username per username refusal kind: shape at the ends, shape in the middle (the
+    /// consecutive-dot rule), below the minimum, above the maximum.
+    /// </summary>
     public static IEnumerable<object[]> RefusedUsernames() =>
     [
         [".abc"],
+        ["a..b"],
         ["ab"],
         [new string('a', CredentialPolicy.MaximumUsernameLength + 1)],
     ];
@@ -327,6 +335,10 @@ public sealed class BootstrapServiceTests : IDisposable
     [InlineData("admin")]
     [InlineData("a.b-c_1")]
     [InlineData("abc")]
+    // Single dots between runs of other characters are legal in a dot-atom and stay accepted; the
+    // consecutive-dot rule must cost nothing here.
+    [InlineData("a.b.c")]
+    [InlineData("a-_-b")]
     [InlineData("  admin  ")]
     // Trimmed first, so a pasted trailing newline is accepted as "admin" rather than refused.
     [InlineData("admin\n")]

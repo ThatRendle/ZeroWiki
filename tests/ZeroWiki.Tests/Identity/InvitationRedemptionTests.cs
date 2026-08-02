@@ -451,8 +451,8 @@ public sealed class InvitationRedemptionTests : IDisposable
     [InlineData("colon:name")]
     [InlineData("___")]
     [InlineData("café")]
-    // D11: an alphanumeric at each end, because D10 makes the username the localpart of the
-    // commit-author address and a leading or trailing dot is not a legal dot-atom.
+    // D11: D10 makes the username the localpart of the commit-author address, and a dot-atom
+    // admits a dot only between runs of other characters — so an alphanumeric at each end...
     [InlineData(".abc")]
     [InlineData("abc.")]
     [InlineData("-abc")]
@@ -460,6 +460,11 @@ public sealed class InvitationRedemptionTests : IDisposable
     [InlineData("_abc")]
     [InlineData("abc_")]
     [InlineData("_x_")]
+    // ...and no two adjacent dots. The same rule in the middle, refused the same way and costing
+    // no password derivation, asserted below.
+    [InlineData("a..b")]
+    [InlineData("a...b")]
+    [InlineData("ab..cd")]
     public async Task A_username_of_the_wrong_shape_is_refused_at_the_boundary(string username)
     {
         // AD11, from the same constant as bootstrap — the git remote presents the username as the
