@@ -17,10 +17,14 @@
 # Runs as the pre-created non-root `app` user ($APP_UID, baked into the base image) rather than
 # root. /data is chowned to that user at build time so that when Docker populates a fresh named
 # volume from the image's /data directory on first mount, the volume comes up already owned by the
-# uid the app runs as — no root step or entrypoint chown is needed. `safe.directory` is set
-# globally for that user as defense in depth against git's "detected dubious ownership" refusal,
-# which triggers whenever a repository's owning uid does not match the process euid (e.g. a volume
-# populated by another means, or restored from a backup taken as a different user).
+# uid the app runs as — no root step or entrypoint chown is needed. `safe.directory` is set at
+# *system* scope (/etc/gitconfig), not per-user, as defense in depth against git's "detected dubious
+# ownership" refusal, which triggers whenever a repository's owning uid does not match the process
+# euid (e.g. a volume populated by another means, or restored from a backup taken as a different
+# user). System scope is deliberate, not cosmetic: §7 shells out to `git http-backend` as a CGI
+# subprocess with a constructed environment that need not include HOME, so a per-user
+# (`--global`) setting — which only ever writes $HOME/.gitconfig — would silently stop applying
+# there and the Smart HTTP remote would fail every dubious-ownership case with a 500.
 
 FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
 WORKDIR /src
@@ -42,9 +46,11 @@ RUN apt-get update \
 RUN mkdir -p /data \
     && chown -R $APP_UID:$APP_UID /data
 
-USER $APP_UID
+# Written as root, before the USER switch, so it lands in /etc/gitconfig (system scope) rather
+# than a per-user $HOME/.gitconfig — see the header comment for why per-user scope is not enough.
+RUN git config --system --add safe.directory '*'
 
-RUN git config --global --add safe.directory '*'
+USER $APP_UID
 
 WORKDIR /app
 COPY --from=build --chown=$APP_UID:$APP_UID /app .
@@ -52,7 +58,10 @@ COPY --from=build --chown=$APP_UID:$APP_UID /app .
 ENV ConnectionStrings__IdentityDb="Data Source=/data/identity.db" \
     ContentStorage__DataRoot="/data"
 
-VOLUME ["/data"]
+# Deliberately no `VOLUME ["/data"]`: named-volume seeding from the image's own /data happens
+# regardless of this instruction, and declaring it means `docker run` without an explicit `-v`
+# silently creates an anonymous volume instead of failing loudly — the wiki appears to work while
+# its data is stranded on the next `docker rm`.
 EXPOSE 8080
 
 ENTRYPOINT ["dotnet", "ZeroWiki.dll"]
