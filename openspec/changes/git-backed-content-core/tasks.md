@@ -17,8 +17,8 @@
 
 - [x] 3.1 Enumerate Markdown pages from the working tree and map paths to routes
 - [x] 3.2 Parse optional YAML frontmatter (tags, etc.); render body even when frontmatter is missing or malformed
-- [ ] 3.3 Render Markdown to HTML in the Blazor shell
-- [ ] 3.4 Expose per-page authorship/last-edit read from `git log`/`blame`
+- [x] 3.3 Render Markdown to HTML in the Blazor shell
+- [x] 3.4 Expose per-page authorship/last-edit read from `git log`/`blame`
 
 ## 4. Derived index
 

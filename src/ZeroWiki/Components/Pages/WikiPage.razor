@@ -1,0 +1,205 @@
+@page "/wiki/{*Route}"
+@* Anonymous requests never reach here — AnonymousGate answers them and the fallback policy would
+   refuse them anyway (AD21). The attribute is kept for the same reason every other protected page
+   keeps it: the page states its own requirement rather than inheriting it from a pipeline it cannot
+   see. *@
+@attribute [Authorize]
+@using ZeroWiki.Content
+@using Markdig
+@using Microsoft.AspNetCore.Diagnostics
+
+@inject PageEnumerationService PageEnumerationService
+@inject PageFrontmatterExtractor PageFrontmatterExtractor
+@inject PageHistoryService PageHistoryService
+@inject MarkdownPipeline MarkdownPipeline
+
+<PageTitle>@PageDisplayTitle</PageTitle>
+
+@if (_renderedBody is { } body)
+{
+    <h1>@PageDisplayTitle</h1>
+
+    @if (_lastEdit is { } lastEdit)
+    {
+        <p class="page-last-edit">
+            Last edited by <strong>@lastEdit.AuthorName</strong> on
+            <time datetime="@lastEdit.EditedAt.ToString("O")">@lastEdit.EditedAt.ToString("f", System.Globalization.CultureInfo.InvariantCulture)</time>
+        </p>
+    }
+
+    @if (_frontmatter is { Tags.Count: > 0 } frontmatter)
+    {
+        <ul class="page-tags">
+            @foreach (var tag in frontmatter.Tags)
+            {
+                <li>@tag</li>
+            }
+        </ul>
+    }
+
+    <div class="page-body">
+        @body
+    </div>
+}
+else if (_ambiguousRoute is { } ambiguous)
+{
+    <h1>This page name is ambiguous</h1>
+    <p>
+        More than one file in the wiki's content resolves to this address, so ZeroWiki cannot tell
+        which one you mean. Rename one of the following so each has its own address, then reload this
+        page:
+    </p>
+    <ul class="ambiguous-route-claimants">
+        @foreach (var path in ambiguous.RelativePaths)
+        {
+            <li><code>@path</code></li>
+        }
+    </ul>
+}
+else
+{
+    <h1>Page not found</h1>
+    <p>There is no page at this address.</p>
+}
+
+@code {
+    [Parameter]
+    public string? Route { get; set; }
+
+    [CascadingParameter]
+    private HttpContext? HttpContext { get; set; }
+
+    private EnumeratedPage? _page;
+    private AmbiguousPageRoute? _ambiguousRoute;
+    private MarkupString? _renderedBody;
+    private PageFrontmatter? _frontmatter;
+    private PageLastEdit? _lastEdit;
+
+    private string PageDisplayTitle =>
+        _frontmatter?.Title is { Length: > 0 } title ? title : _page?.RelativePath ?? "ZeroWiki";
+
+    /// <summary>
+    /// Resolves <see cref="Route"/> against a fresh enumeration (no caching — §4.1 owns the index that
+    /// makes this cheap) and either renders the page, surfaces 3a's refusal for it, or reports it as not
+    /// found. None of these three outcomes collapse into another: an ambiguous or sole-claimant-refused
+    /// route names every file implicated (D12) rather than reading as an ordinary 404.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// D12's ambiguous/sole-claimant-refused routes report <see cref="StatusCodes.Status409Conflict"/> —
+    /// the address exists but resolves to more than one file, a different condition than nothing being
+    /// there at all, and one the purpose-built <see cref="IStatusCodePagesFeature"/> opt-out (see
+    /// <see cref="SetStatusCode"/>) delivers correctly end to end, verified against the real pipeline.
+    /// </para>
+    /// <para>
+    /// A genuinely unmatched, malformed, or vanished-mid-request route stays <b>200</b> — not the honest
+    /// 404 tried first (block 3b round 2, a reviewer finding). <see cref="IStatusCodePagesFeature"/> fixes
+    /// <c>UseStatusCodePagesWithReExecute</c>'s re-execution (confirmed by the 409 path above actually
+    /// working), but 404 specifically also runs into a <i>second</i>, unrelated mechanism, and it is app
+    /// <i>configuration</i>, not a property of Blazor or of HTTP: <c>Routes.razor</c> currently sets
+    /// <c>&lt;Router NotFoundPage="typeof(Pages.NotFound)"&gt;</c>, and <b>while that configuration
+    /// stands</b>, ASP.NET Core's Blazor Web App treats any Static SSR response whose status is set to 404
+    /// as eligible for its own built-in not-found handling — reproducibly, an empty body and a
+    /// <c>blazor-enhanced-nav: allow</c> response header instead of this component's own rendered markup.
+    /// Reproduced against the real app, and isolated to 404 specifically (not to non-2xx statuses
+    /// generally, nor to <see cref="IStatusCodePagesFeature"/>'s absence) by swapping the same code path to
+    /// <see cref="StatusCodes.Status410Gone"/>, which delivered this component's own body correctly. 410
+    /// isn't the honest answer either (410 means something existed and was deliberately removed, not
+    /// "never existed"), so this outcome keeps 200 with distinguishing body content instead — the same
+    /// choice this block made for every outcome before this round, now scoped to only the one case where
+    /// 404 is unusable under today's <c>NotFoundPage</c> setting, not applied everywhere by default. The
+    /// lever this block deliberately did not touch: removing or reworking <c>Routes.razor</c>'s
+    /// <c>NotFoundPage</c> (or the newer <c>NavigationManager.NotFound()</c>-based API it's built for)
+    /// would change this and could make 404 usable here — that is application configuration this block has
+    /// no reason to touch, not evidence the status code itself is unusable in ASP.NET Core or Blazor
+    /// generally. Whether §4 or a later change should make that trade is recorded in <c>## NEXT</c>, not
+    /// settled here.
+    /// </para>
+    /// <para>
+    /// Neither is an AD21 existence-oracle concern: <c>AnonymousGate</c> already makes every anonymous
+    /// response uniform regardless of status, and this page is <c>[Authorize]</c>, so a signed-in member's
+    /// status code carries no information an anonymous visitor could ever observe.
+    /// </para>
+    /// </remarks>
+    protected override async Task OnInitializedAsync()
+    {
+        var context = HttpContext
+            ?? throw new InvalidOperationException("Rendering a wiki page requires the static server-rendered HttpContext.");
+
+        // Route arrives already percent-decoded once by ASP.NET Core routing — TryDecodeRouteValue is
+        // the only correct entry point here; TryDecode would decode it a second time (see its remarks).
+        if (string.IsNullOrEmpty(Route) || !PageRouteCodec.TryDecodeRouteValue(Route, out var relativePath))
+        {
+            return;
+        }
+
+        var canonicalRoute = PageRouteCodec.Encode(relativePath);
+        var enumeration = PageEnumerationService.EnumeratePages();
+
+        var ambiguousMatch = enumeration.AmbiguousRoutes
+            .FirstOrDefault(candidate => string.Equals(candidate.Route, canonicalRoute, StringComparison.Ordinal));
+        if (ambiguousMatch is not null)
+        {
+            _ambiguousRoute = ambiguousMatch;
+            SetStatusCode(context, StatusCodes.Status409Conflict);
+            return;
+        }
+
+        var pageMatch = enumeration.Pages
+            .FirstOrDefault(candidate => string.Equals(candidate.Route, canonicalRoute, StringComparison.Ordinal));
+        if (pageMatch is null)
+        {
+            return;
+        }
+
+        string markdown;
+        try
+        {
+            markdown = await File.ReadAllTextAsync(pageMatch.AbsolutePath, context.RequestAborted);
+        }
+        catch (IOException)
+        {
+            // The file existed when EnumeratePages() walked the tree a moment ago and is gone or
+            // mid-write now — a concurrent save racing this read without D3's lock (a gap 3a's review
+            // already parked for §6). Report not found rather than a 500; the next request re-enumerates.
+            return;
+        }
+
+        _page = pageMatch;
+        _frontmatter = PageFrontmatterExtractor.Extract(markdown);
+        _renderedBody = new MarkupString(Markdown.ToHtml(markdown, MarkdownPipeline));
+
+        // D5: authorship is read from git, never a hand-maintained field. CancellationToken.None, not
+        // context.RequestAborted: GitProcessRunner does not yet kill its subprocess on cancellation
+        // (forward obligation 8, owed to §6) — passing the request token here would imply a cancellation
+        // guarantee that does not exist yet.
+        _lastEdit = await PageHistoryService.GetLastEditAsync(pageMatch.RelativePath, CancellationToken.None);
+    }
+
+    /// <summary>
+    /// Sets <paramref name="statusCode"/> and opts this response out of
+    /// <c>UseStatusCodePagesWithReExecute("/not-found", ...)</c> (<c>Program.cs</c>).
+    /// </summary>
+    /// <remarks>
+    /// Verified against the real application pipeline, not assumed or tried only against a simplified
+    /// probe (block 3b round 2 — a reviewer finding): setting <c>Response.StatusCode</c> alone into the
+    /// 400-599 range, with no opt-out, silently re-executes the request into <c>NotFound.razor</c> and
+    /// discards this component's own rendered body — including the ambiguous-route claimant list D12
+    /// exists to surface. <see cref="IStatusCodePagesFeature"/> exists specifically to opt a response out
+    /// of that re-execution; setting <see cref="IStatusCodePagesFeature.Enabled"/> to <see
+    /// langword="false"/> here, before assigning the status code, was tested end to end through
+    /// <c>WikiPageTests</c> against the real Blazor Static SSR render (not a minimal-API stand-in, whose
+    /// simpler response-writing path does not reproduce the discard at all) and does deliver this
+    /// component's own body at the requested status code.
+    /// </remarks>
+    private static void SetStatusCode(HttpContext context, int statusCode)
+    {
+        var statusCodePagesFeature = context.Features.Get<IStatusCodePagesFeature>();
+        if (statusCodePagesFeature is not null)
+        {
+            statusCodePagesFeature.Enabled = false;
+        }
+
+        context.Response.StatusCode = statusCode;
+    }
+}

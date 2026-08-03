@@ -34,6 +34,10 @@ public static class ContentStorageStartupExtensions
         services.AddSingleton<PageFrontmatterExtractor>();
         services.AddSingleton<PageEnumerationService>();
 
+        // 3b: git-derived authorship/last-edit (D5). Stateless beyond ContentPaths/GitProcessRunner,
+        // both already singletons, so this is one too — no caching (§4.1 owns the index for that).
+        services.AddSingleton<PageHistoryService>();
+
         return services;
     }
 

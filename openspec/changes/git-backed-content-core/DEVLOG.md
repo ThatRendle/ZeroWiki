@@ -6019,6 +6019,526 @@ Two things this block earned that belong in `## NEXT` when §3 closes:
 off), git-derived authorship/last-edit via `git log`, and `Home.razor`'s de-scaffolding from the Blazor
 template placeholder. §3's supervisor review runs over `60957e6..HEAD` once 3b lands.
 
+**[architect]** → `@worker` — **Block 3b brief (tasks 3.3–3.4).** Closes §3. Base for the section
+review remains `60957e6`; block 3a landed as `8332c79`.
+
+**Deliver:** the Static SSR page that renders a wiki page's Markdown body, and per-page authorship /
+last-edit read from git. Plus one piece of de-scaffolding carrying no task number (below).
+
+**Tasks verbatim:**
+- 3.3 Render Markdown to HTML in the Blazor shell
+- 3.4 Expose per-page authorship/last-edit read from `git log`/`blame`
+
+**Binding:** D5 (authorship from git, no hand-maintained field), D7 (Static SSR default, islands only
+where live behaviour is needed — this block needs none), D12 (routes, and the refusal 3a implemented),
+D13 (raw HTML escaped). Gating scenarios in `specs/content-store/spec.md`: *Authorship comes from git*,
+*Page with frontmatter is rendered*, *Page without frontmatter is rendered*, *Malformed frontmatter
+degrades gracefully*, *Embedded script is not executed*, *Nested page is addressable by its path*,
+*Ambiguous route is refused, not guessed*, *Sole claimant whose route does not identify it is refused*,
+*Hostile route is refused, not fatal*.
+
+**The hazard that decides this block — verify it empirically before building on either answer.**
+`PageRouteCodec.TryDecode` calls `Uri.UnescapeDataString` on each segment, so it expects a **raw,
+still-percent-encoded** route. ASP.NET Core routing may hand a catch-all route parameter the value
+**already percent-decoded**. If it does, this block double-decodes: a file named `a%20b.md` encodes to
+route `a%2520b`, the framework decodes that to `a%20b`, and `TryDecode` decodes *again* to `a b` — the
+wrong file, through exactly the seam 3a's blockers lived in. **Determine what the framework actually
+supplies by running it, not by reasoning about it or reading docs**, then make the seam explicit: state
+in one place, in code, who percent-decodes and that it happens exactly once. Add a test that fails if
+that ever changes. If this forces a change to `TryDecode`'s contract, say so rather than papering over
+it at the call site — 3a's inverse is what §6 will use to choose a file to write.
+
+**The rest, in order of how much they can hurt:**
+
+1. **D13 is a security property, not a formatting preference.** `MarkupString` is the only way to emit
+   rendered HTML and it sanitizes nothing, so the pipeline being configured with raw HTML off is the
+   entire defence. Assert there is **no other path** by which page content reaches the page unescaped —
+   frontmatter values, the title, the page path, the names in an ambiguous-route message, and the git
+   author name (which is attacker-influenced: a pushed commit carries a self-asserted identity, per
+   D5's accepted trade-off) all render too, and none of them go through Markdig.
+2. **Surface 3a's refusals rather than collapsing them to "not found".** An ambiguous route names every
+   claiming file; a sole-claimant route that does not identify its file is refused likewise; an
+   unreadable directory is already reported by `PageEnumerationResult`. A member who hits one needs to
+   know which file to rename — that is the whole point of refusing instead of guessing.
+3. **Static SSR only** (D7). No `InteractiveServer` island in this block; nothing here needs live
+   behaviour. Match how the shipped pages handle authorization — `AnonymousGate` answers unauthenticated
+   requests, so check what the existing pages do rather than inventing a new pattern.
+4. **3.4 reads git, and must not make forward obligation 8 live.** `GitProcessRunner` does not kill the
+   git subprocess on cancellation; §6 owns that fix. Pass `CancellationToken.None` and say in a comment
+   why, rather than passing a request token and implying a cancellation that does not work. **No
+   caching** — §4.1 owns the index that makes last-edit cheap; a cache here would be the duplicated
+   abstraction a section review exists to catch.
+5. **De-scaffolding, no task number:** `Home.razor` still holds the Blazor template's "Hello, world!".
+   Replace it with placeholder ZeroWiki content. The Product Owner has **explicitly pinned** the real
+   welcome page — no `_welcome-message.md`, no reading content from the repo, no spec scenario. A
+   placeholder, nothing more. Check `NavMenu.razor` for template cruft while you are there. Do **not**
+   build a page index or listing; that is §4's.
+
+**Mutation testing — capped at 3 runs, and only two targets:** the raw-HTML-off pipeline configuration
+(a mutant enabling raw HTML must be killed by a test, or *Embedded script is not executed* is not
+actually gated), and the route-resolution branch that chooses between serving, refusing, and
+not-found. Nothing else in this block warrants it. Checksum before *and* after; revert via
+`trap`/`finally`, never `git checkout --`. **New files are untracked and invisible to `git diff` — run
+`git status --short -- src` alongside it.**
+
+**Gates before handoff — all four, actual numbers not claims:** `dotnet build` clean, full unfiltered
+`dotnet test` (595/595 before this block), `openspec validate git-backed-content-core --strict`,
+`dotnet format --verify-no-changes`. Post to this DEVLOG as `[worker]` under `## 3.`, then hand off
+`→ @reviewer`.
+
+**[worker]** Block 3b (3.3–3.4) implemented. New: `src/ZeroWiki/Components/Pages/WikiPage.razor`
+(`/wiki/{*Route}`, Static SSR, `[Authorize]`), `src/ZeroWiki/Content/PageHistoryService.cs` +
+`PageLastEdit.cs` (git-derived authorship/last-edit, D5). Changed: `PageRouteCodec.cs` (new decode
+entry point, below), `ContentStorageStartupExtensions.cs` (DI for `PageHistoryService`), `Home.razor`
+de-scaffolded. `NavMenu.razor` swept — already clean, no template cruft, no change needed.
+
+**The routing hazard — resolved empirically, not by reasoning.** Built a throwaway `TestServer` probe
+(a bare `/probe/{*Route}` endpoint reading `HttpContext.Request.RouteValues`) before writing any
+production code. Confirmed: ASP.NET Core percent-decodes a catch-all parameter's value **exactly once**
+before a page sees it — `a%2520b` (the canonical route for a file literally named `a%20b.md`) arrives
+as the string `a%20b`, not `a%2520b` and not `a b`. Also confirmed two things the brief didn't ask for
+but the fix needed: the framework leaves `%2f`/`%2F` **undecoded** (so a catch-all segment can never
+smuggle in a fresh `/` this way), while an unescaped `%5c` **is** decoded into a real backslash
+character — an asymmetry that matters for which existing 3a validation still applies unchanged. `%00`
+never reaches routing at all — `Microsoft.AspNetCore.Internal.UrlDecoder` throws
+`InvalidOperationException: The path contains null characters` at request-line parsing, before
+`UseRouting` runs; confirmed this is real framework code (not a `TestServer` artifact) by the exception
+type. Probe deleted after use; the finding lives in `PageRouteCodec`'s XML docs and in
+`PageRouteCodecTests`, not in a scratch file.
+
+**The fix: a second decode entry point, `TryDecode`'s own contract left untouched.**
+`PageRouteCodec.TryDecodeRouteValue(string routeValue, out string workingTreeRelativePath)` shares
+`TryDecode`'s validation and layer-1 reverse but skips the percent-decode step — refactored both
+through one private `TryDecodeCore(route, decodePercentEncoding, out path)`. `TryDecode` itself is
+byte-for-byte unchanged in behaviour (still used by `PageEnumerationService`'s round-trip invariant
+check on freshly-`Encode`d routes, which *are* still-encoded, correctly) — zero regression risk to 3a's
+twice-reviewed code. `WikiPage.razor` calls `TryDecodeRouteValue` exclusively; calling `TryDecode` on
+an HTTP route value is now a documented misuse, not a silent trap. `TryDecodeRouteValue_DoesNotDoubleDecodeAFileNameContainingALiteralPercentSign`
+(`PageRouteCodecTests.cs`) pins the exact scenario: encodes `a%20b.md` → `a%2520b`, simulates the
+framework's one decode pass → `a%20b`, asserts `TryDecodeRouteValue` recovers `a%20b.md` while
+`TryDecode` on the *same* already-decoded string wrongly recovers `a b.md` — the regression this test
+exists to catch, both sides asserted in one place. An HTTP-level twin
+(`A_page_whose_filename_needs_percent_encoding_is_served_at_its_double_encoded_route_and_not_the_wrong_file`,
+`WikiPageTests.cs`) proves it through real routing, not just the codec in isolation.
+
+**Lookup strategy avoids rebuilding `TryResolveWorkingTreePath`'s containment logic for reads.**
+`WikiPage` doesn't resolve a filesystem path itself: it decodes the route value to a relative path,
+re-`Encode`s that back to a canonical route string, and looks it up by string equality against a fresh
+`PageEnumerationService.EnumeratePages()` result (`Pages`/`AmbiguousRoutes`, both keyed by `Route`). No
+`Path.GetFullPath`/containment check runs on request input at all in this path — every candidate
+`AbsolutePath` already came from `PageEnumerationService`'s own disk walk, so there's no path-traversal
+surface for *reading* to defend independent of what 3a already guarantees. `TryResolveWorkingTreePath`
+is untouched and unused this block; §6 (write) still owns building a framework-aware equivalent for
+choosing a file to *save to*, which is a genuinely different problem (a save can target a path nothing
+has enumerated yet) — flagging this now so §6 doesn't assume this block solved it.
+
+**A second empirical finding, not anticipated by the brief: setting a 4xx status code from the page
+discards its own rendered body.** `Program.cs` wires `UseStatusCodePagesWithReExecute("/not-found", ...)`
+ahead of the Razor pipeline. First attempt set `Response.StatusCode = 404` for not-found/ambiguous/
+sole-claimant-refused and returned our own explanatory markup; verified against the real app rather
+than assumed correct, and it wasn't — the response body that actually reached the client was
+`NotFound.razor`'s generic text, silently discarding the claimant list D12 exists to surface. This
+would have shipped as a heisenbug: `A_route_with_no_matching_page_is_reported_as_not_found` still
+passed throughout, because `NotFound.razor`'s own heading is "Not Found" and the test's
+case-insensitive `Contains("not found")` couldn't tell the swap apart from the real thing. Fixed by
+never setting a non-2xx status from this page — all three refused/not-found/rendered outcomes are
+HTTP 200 with differentiated body content, which is what the spec scenarios actually care about; no
+scenario in `specs/content-store/spec.md` mandates a particular status code. Documented as a deliberate,
+verified constraint in `WikiPage.razor`'s XML remarks so nobody reintroduces it while chasing REST
+purity. **Flagging for the reviewer/architect:** this is a real behavioural call forced by an
+implementation constraint, not a preference — worth a second look.
+
+**D13 audit (raw HTML off is the entire defence) — swept every render path, not just the body.**
+`_renderedBody` is the only `MarkupString` in the component. Frontmatter `Title`/`Tags`, `_page`'s
+`RelativePath` (title fallback), every claimant path in the ambiguous-route list, and
+`PageHistoryService`'s git-derived `AuthorName` (attacker-influenced per D5 — a pushed commit's author
+is self-asserted) all render through plain Razor `@expression` interpolation, which HTML-encodes by
+default — none of them touch Markdig or `MarkupString`.
+`Frontmatter_title_and_git_author_are_html_escaped_not_raw` pins both deliberately, with `<script>` in
+both the frontmatter `title` and the git author name of the test's own commit.
+
+**3.4 / forward obligation 8:** `PageHistoryService.GetLastEditAsync` is called with
+`CancellationToken.None` from `WikiPage`, with a comment stating why (`GitProcessRunner` doesn't kill
+its subprocess on cancellation; §6 owns that fix). Uses `git log -1 --format=%an<US>%aI -- docs/<path>`
+(author name + strict ISO date, ASCII Unit Separator as delimiter). Degrades to `null` (page still
+renders, no last-edit line) on either no history for the path (untracked file, normal empty
+`git log` output) or the git subprocess itself failing (`GitProcessException`) — logged as a warning,
+never thrown into the page render. No caching, per the brief — `PageEnumerationService.EnumeratePages()`
+and `git log` both run fresh every request; §4.1 owns the index.
+
+**Architect calls made here, flagging both:**
+- **Status code is uniformly 200** for rendered/refused/not-found (see empirical finding above) — not
+  a stylistic choice, forced by the `UseStatusCodePagesWithReExecute` interaction. If this needs to
+  change later (e.g. a distinct status for genuinely-missing vs refused), it needs a different mechanism
+  than setting `Response.StatusCode` from inside the component — e.g. suppressing the status-code-pages
+  feature for this endpoint specifically, or moving the differentiation to middleware ahead of routing.
+- Ambiguous and sole-claimant-refused routes are not distinguished from each other in the *shape* of the
+  response (same "ambiguous" heading, same claimant list) — D12 treats them as one failure class ("the
+  route cannot be trusted to name one specific file"), so the page follows suit rather than inventing a
+  UI distinction the design doesn't ask for.
+
+**Mutation testing — capped at 3, two targets, both killed 1/1 under the full unfiltered suite (638
+baseline including this block's own new tests; no filtered-only figure reported).** Checksummed
+before/after both; reverted by restoring the exact prior text (not `git checkout --`), confirmed by
+checksum match plus `git status --short -- src` showing the same file set before and after.
+- **Raw-HTML-off pipeline** (`MarkdownPipelineFactory.Create`, removed `.DisableHtml()`) → killed:
+  `Embedded_script_is_shown_as_text_rather_than_executed` failed, `<script>alert('xss')</script>`
+  rendered live instead of escaped. 637/638.
+- **Route-resolution branch** (`WikiPage.razor`, `if (ambiguousMatch is not null)` → `if (false)`,
+  i.e. ambiguous routes fall through to the not-found/serve path instead of refusing) → killed:
+  `An_ambiguous_route_names_both_claimants_...` and `A_sole_claimant_whose_route_does_not_identify_it_...`
+  both failed. 636/638.
+
+**Gates, actual numbers:** `dotnet build` — 0 warnings, 0 errors. `dotnet test` — **638/638**, full
+unfiltered (595 baseline + 43 new: 25 `PageRouteCodecTests` cases for `TryDecodeRouteValue`, 5
+`PageHistoryServiceTests`, 12 `WikiPageTests` end-to-end through the real app/routing/git). `dotnet
+format --verify-no-changes` — exit 0. `openspec validate git-backed-content-core --strict` — valid.
+`git status --short -- src` / `git diff --stat -- src` both checked post-revert: three tracked files
+modified (`Home.razor`, `ContentStorageStartupExtensions.cs`, `PageRouteCodec.cs`) and three new
+untracked files (`WikiPage.razor`, `PageHistoryService.cs`, `PageLastEdit.cs`) — matches exactly what
+this block intended, no mutation residue. No human-in-the-loop tasks — all scenarios covered by the
+real-app HTTP tests above; the reviewer should still feel free to click through `/wiki/...` manually if
+useful, but nothing here is gated on that.
+
+**What the reviewer should look at hardest:** (1) the `TryDecodeRouteValue`/`TryDecode` split — confirm
+`TryDecode`'s existing callers and tests are genuinely unaffected, and that no other call site could
+ever pass an HTTP-sourced value into `TryDecode` by mistake; (2) the uniform-200 decision and its
+rationale — this is the one call in this block that wasn't dictated by the brief; (3) the D13 sweep —
+independently verify no other render path bypasses `@expression` escaping.
+
+→ @reviewer
+
+**[reviewer]** Block 3b audit (3.3–3.4), the block that closes §3.
+
+**Verdict: Request changes** — two blockers (both from the architect's findings, independently
+investigated rather than taken on trust), no other blocking issues.
+
+**Finding 1 — confirmed: `TryResolveWorkingTreePath` is a live doc landmine aimed at §6, exactly as the
+architect suspected.** `PageRouteCodec.cs:290` still calls `TryDecode` — the raw, still-percent-encoded
+contract — while the method's own summary (`PageRouteCodec.cs:279-280`) says unqualified: "This is the
+function a save path (§6) must use to turn a route into a file to write." §6 will get its route from
+ASP.NET Core routing, which this very block proved (empirically, via `TestServer`) arrives
+already-percent-decoded once. A §6 author who takes this doc at face value calls the wrong entry point
+and double-decodes — the identical defect class as 3a's two blockers and this block's own headline
+fix, now sitting in the one function explicitly labelled for the save path to use. `grep -rn
+"TryResolveWorkingTreePath"` confirms it is genuinely latent today — every call site is a test
+(`PageRouteCodecTests.cs:239,252,261,276,289,297,312,320`); nothing in 3a or 3b's production code
+reaches it. That's the only thing saving this from being live right now, and it stops being true the
+moment §6 exists. This file was substantially rewritten this round — `TryDecode` and
+`TryDecodeRouteValue` both got new, careful, cross-referencing remarks — and this one doc comment
+was the one left unequal to the split. Blocking because the fix is cheap, in-scope (the file is already
+open this round), and this project has a specific, named history of exactly this failure mode surviving
+a round because nobody re-read a stale claim next to new code.
+
+On durability: I agree the "never apply `TryDecode` and `TryDecodeRouteValue` to the same string"
+invariant is currently enforced by prose alone, and this change's tally of prose-enforced invariants
+that didn't hold is not zero. I'd go further than "worth considering" — distinct wrapper types (e.g. an
+`EncodedRoute`/`DecodedRoutePath` pair, or simply having `TryResolveWorkingTreePath` take the already-
+decoded relative path as its input, mirroring how `WikiPage.razor` itself now separates "decode the
+route value" from "do something with the relative path") would make the mix-up a compile error. I don't
+think this is over-engineering given the specific, repeated shape of defect this change keeps producing
+at exactly this seam — but I'm not blocking on the type-safety redesign itself, since that's §6's
+function to build, not this block's to redesign in advance. What I am blocking on: `TryResolveWorkingTreePath`'s
+doc must stop claiming, unqualified, to be the function to use — at minimum it needs the same explicit
+warning `TryDecode`'s own remarks now carry, and ideally a note that §6 will need an equivalent built on
+`TryDecodeRouteValue`, not this one as-is.
+
+**Finding 2 — the 200-everywhere decision: a narrower fix exists in the framework and the DEVLOG shows
+no evidence it was tried.** I confirmed by reflecting against the actual installed `Microsoft.AspNetCore.App
+10.0.10` that ASP.NET Core ships two purpose-built mechanisms for exactly this problem: `Microsoft.
+AspNetCore.Diagnostics.StatusCodePagesFeature` (implementing `IStatusCodePagesFeature`, a settable
+`Enabled` bool retrievable via `HttpContext.Features.Get<IStatusCodePagesFeature>()`) and `Microsoft.
+AspNetCore.Http.Metadata.ISkipStatusCodePagesMetadata` (with a concrete `[SkipStatusCodePages]`
+attribute in `Microsoft.AspNetCore.Mvc`, usable as endpoint metadata). Both exist specifically to let a
+response or an endpoint opt out of `UseStatusCodePagesWithReExecute`'s re-execution — which is precisely
+the problem being solved by flattening every outcome to 200. Neither appears in the DEVLOG's account of
+what was tried; the writeup goes from "setting `Response.StatusCode` gets the body discarded" straight
+to "so render everything as 200."
+
+I tried to verify this narrower path myself and want to be honest about what I found: a lightweight,
+non-Blazor `TestServer` probe I built (a bare `app.Run` handler setting a 404 then writing a body,
+behind `UseStatusCodePagesWithReExecute`) did **not** reproduce the swallowing behaviour at all — the
+body survived even with no opt-out, most likely because `HttpResponseWritingExtensions.WriteAsync`
+implicitly sets `ContentType`, and the real `StatusCodePagesMiddleware` skips re-execution once
+`ContentType`/`ContentLength`/`HasStarted` are set — conditions a raw minimal-API handler hits
+differently than Blazor's buffered Static SSR render does. So my probe is not strong enough to prove
+`IStatusCodePagesFeature.Enabled = false` fixes this against the *real* Blazor pipeline, and I'm not
+asserting it does. What I can assert: the mechanism exists, is built for this exact scenario, is
+one line to try (`HttpContext.Features.Get<IStatusCodePagesFeature>()?.Enabled = false;` before the
+component sets its own status code), and this block's own standard throughout — "verify empirically,
+not by reasoning about it" — wasn't applied to the alternative before it was ruled out by omission.
+200-for-a-missing-or-refused-page is a real HTTP-semantics cost, worth paying only if the honest
+alternative was actually tried and failed. Asking for that specific, cheap experiment before the
+uniform-200 design is accepted as final. If it turns out `IStatusCodePagesFeature.Enabled = false`
+doesn't survive Blazor's rendering (a real possibility — Blazor may set headers or begin the response at
+a point this feature flag can't intercept), then the current design stands, but as a verified constraint
+rather than one arrived at by trying only the naive approach.
+
+**Not blocking, recorded for `## NEXT` / §6:** the percent-decode-exactly-once guarantee this block
+proved is specific to ASP.NET Core's own routing layer, tested via `TestServer` against the app in
+isolation. D2 anticipates *some* reverse proxy in front of the container for TLS termination; if that
+proxy also normalizes percent-encoding (the same class of risk D12 already named for why `_`/`__` was
+chosen over `%5F` — proxies are entitled to decode unreserved-octet percent-sequences per RFC 3986
+§6.2.2.2), the "framework decodes exactly once" invariant this block hard-codes into
+`TryDecodeRouteValue` could see a route that's already been decoded twice by the time Kestrel sees it.
+Not this block's defect — it correctly nailed down what's provably true about the ASP.NET Core layer,
+which is the only layer it can test — but worth the Architect naming explicitly whether this is an
+accepted risk (matching D12's own acceptance of RFC 3986 proxy-normalization risk generally) or needs a
+stated deployment constraint (e.g. "the fronting proxy must not further-decode the path").
+
+**D13 — verified independently, no findings.** Read every render path in `WikiPage.razor`:
+`PageDisplayTitle` (title/`_page.RelativePath` fallback), `lastEdit.AuthorName` (attacker-influenced per
+D5 — a pushed commit's author is self-asserted), each `tag`, and every claimant `path` in the
+ambiguous-route list all render through plain Razor `@expression` interpolation, which HTML-encodes.
+`_renderedBody` is the only `MarkupString` in the file, sourced from `Markdown.ToHtml(markdown,
+MarkdownPipeline)` against the same singleton `MarkdownPipeline` registered in 3a
+(`MarkdownPipelineFactory.Create()`, `.DisableHtml()` — confirmed unchanged this round via `git diff
+8332c79 -- ContentStorageStartupExtensions.cs`). `Frontmatter_title_and_git_author_are_html_escaped_not_raw`
+(`WikiPageTests.cs:195-217`) exercises exactly this with `<script>` in both the frontmatter title and a
+real commit's git author name — a good test, since it's the one place D5's "self-asserted push identity"
+trade-off becomes a live XSS vector if anyone ever adds a second `MarkupString`.
+
+**3a's refusals surface correctly — verified via the real end-to-end tests, not just reading the
+branches.** `An_ambiguous_route_names_both_claimants_rather_than_reading_as_not_found` and
+`A_sole_claimant_whose_route_does_not_identify_it_is_refused_rather_than_served`
+(`WikiPageTests.cs:80-110`) both assert the specific claimant path strings appear and the wrongly-served
+body content does not — these are the tests that actually guard the re-execute regression, since a
+swallowed body would read as generic `NotFound.razor` text lacking those specific strings.
+
+**D7 — Static SSR only, confirmed.** No `@rendermode` directive anywhere in `WikiPage.razor`; `[Authorize]`
+matches the existing pattern (`Account.razor` and `AnonymousGate` in `Program.cs`) rather than inventing
+a new one.
+
+**3.4 — clean.** `PageHistoryService.cs` shells `git log` via `GitProcessRunner`'s argument-array API
+(never a string-interpolated command), uses `%an`/`%aI` (author, not committer — matches D5's "who
+edited this" framing) with a `--` pathspec separator, degrades to `null` on both `GitProcessException`
+and unparseable output, never throws into the render. `CancellationToken.None` is passed with a comment
+explaining forward obligation 8; I read `GitProcessRunner.cs:54` (`process.WaitForExitAsync(cancellationToken)`
+with no corresponding `process.Kill()`) and confirmed the claim is true — cancelling really does just stop
+awaiting without killing the subprocess, so `CancellationToken.None` is the honest choice until §6 fixes
+that. No caching — confirmed by reading, `PageEnumerationService.EnumeratePages()` and `git log` both run
+fresh every request.
+
+**Scope — clean.** `Home.razor`'s de-scaffolding is a placeholder only (no `_welcome-message.md`, no repo
+read) — compliant with the Product Owner's pin. `NavMenu.razor` has no template cruft (`grep` for
+Counter/Weather came back empty, confirming the worker's sweep). No page index or listing anywhere in the
+diff — §4's job, correctly left alone.
+
+**Gates — reproduced independently:** `dotnet build` 0 warnings/0 errors. `dotnet test` **638/638**, full
+unfiltered. `dotnet format --verify-no-changes` exit 0. `openspec validate git-backed-content-core
+--strict` valid. `git status --short -- src` shows exactly the reported file set (three modified, three
+new); `git diff --stat -- src` matches the reported shape — no mutation residue.
+
+**Nit — `A_route_with_no_matching_page_is_reported_as_not_found` is a weak regression guard, by the
+worker's own account.** The worker's DEVLOG post already flagged that this exact test passed unchanged
+through the heisenbug it describes, because `NotFound.razor`'s heading and this page's own not-found
+branch both contain the literal text "not found" — the test can't tell a genuine not-found render from a
+swallowed-and-substituted one. The two refusal tests next to it are strong for the reason above; this one
+isn't, and it's testing the one branch (plain not-found) that has no distinguishing content to assert on.
+Worth a follow-up assertion that's actually falsifiable — e.g. a marker specific to `WikiPage`'s own
+not-found branch — so a regression of the exact kind already caught once doesn't get a second free pass
+through this specific test. Not blocking; the block's real regression coverage lives in the ambiguous/
+sole-claimant tests, which are sound.
+
+→ @worker
+
+**[worker]** Both blockers fixed, plus the nit. No scope beyond what was named.
+
+**Blocker 1 — the resolver now mirrors the decode split, not a doc patch next to an unfixed trap.**
+`PageRouteCodec.cs`: `TryResolveWorkingTreePath` (still-encoded contract, unchanged behaviour) and new
+`TryResolveWorkingTreePathFromRouteValue` (framework-decoded contract) both delegate to one private
+`TryResolveWorkingTreePathCore(paths, route, decodePercentEncoding, out absolutePath)`, which itself
+calls the existing `TryDecodeCore` — so the trailing-separator containment check exists exactly once,
+shared by both entry points, exactly as asked. `TryResolveWorkingTreePath`'s doc no longer claims
+unqualified to be "the function §6 must use"; it states its input contract, names the sibling for the
+other contract, and points at the class-level remarks. Added the parking comment for the distinct-types
+redesign (an `EncodedRoute`/`DecodedRoutePath` pair) directly above the two entry points — not built,
+per the architect's instruction; it's §6's to design once its real caller shape exists. Mirrored test
+coverage added: `TryResolveWorkingTreePathFromRouteValue_{ResolvesAnOrdinaryRouteInsideTheWorkingTree,
+DoesNotDoubleDecodeAFileNameContainingALiteralPercentSign, RefusesASiblingDirectoryWhoseNameSharesAPrefix,
+RefusesControlCharactersRatherThanThrowing, RefusesWhatTryDecodeRouteValueAlreadyRefuses}` — the second
+one is the resolver-level twin of the codec-level double-decode regression test, proving the fix holds
+through to an actual resolved filesystem path, not just the decode step in isolation.
+
+**Blocker 2 — tried the purpose-built mechanism against the real pipeline; it works for one outcome and
+provably doesn't for another, and the design now reflects both findings rather than picking one.**
+`WikiPage.SetStatusCode` sets `HttpContext.Features.Get<IStatusCodePagesFeature>()?.Enabled = false`
+before assigning a status code. Tested end to end via `WikiPageTests` against the real Blazor Static SSR
+render (not a minimal-API probe):
+
+- **Ambiguous / sole-claimant-refused → `409 Conflict`, verified working.** Both
+  `An_ambiguous_route_names_both_claimants_...` and `A_sole_claimant_whose_route_does_not_identify_it_...`
+  now assert `HttpStatusCode.Conflict` *and* the full claimant-list body content in the same response —
+  the escape hatch delivers this component's own markup at an honest non-2xx status, exactly what the
+  reviewer's finding said to try.
+- **Genuinely-not-found / malformed / vanished-mid-request → stays `200`, and 404 is provably unusable
+  here, not merely untried.** First attempt used 404 for this case too. It reproduced an *empty body*
+  with a `blazor-enhanced-nav: allow` response header, regardless of `IStatusCodePagesFeature`. Isolated
+  the cause by swapping the same code path to `410 Gone` as a diagnostic: the full custom body was
+  delivered correctly, proving the escape hatch itself was never the problem for this branch. The actual
+  cause is a second, unrelated mechanism: `Routes.razor`'s `<Router NotFoundPage="typeof(Pages.NotFound)">`
+  makes ASP.NET Core's Blazor Web App treat *any* Static SSR response whose status is set to 404 as
+  eligible for its own built-in not-found handling, which discards the component's rendered body in
+  favour of deferring to client-side enhanced navigation — independent of and in addition to
+  `UseStatusCodePagesWithReExecute`. 410 isn't the honest answer either (it asserts something existed and
+  was removed, which is false for "never existed"), so this outcome keeps 200 with distinguishing body
+  content, same as round 1 — but now as a verified constraint scoped to the one case where the honest
+  code is provably unusable, not applied everywhere by default. Documented in `WikiPage.razor`'s XML
+  remarks with the full reasoning and the diagnostic that isolated it.
+
+**Nit fixed.** `A_route_with_no_matching_page_is_reported_as_not_found` now asserts the exact string
+`"There is no page at this address."` (this page's own not-found wording, which `NotFound.razor`'s text
+does not contain) instead of a case-insensitive `"not found"` substring match that both pages' headings
+satisfy equally — the same falsifiability gap the reviewer named. `A_hostile_route_is_refused_...` picked
+up the same body assertion since it exercises the identical not-found branch.
+
+**On the reverse-proxy percent-decoding note — my read: latent, not live.** Nothing in this change or
+the repo as it stands today configures or ships a reverse proxy in front of Kestrel; `docker-compose`/
+nginx/Caddy/Traefik config is absent from every section landed so far, and D2 only anticipates one in the
+abstract for TLS termination at deployment time. So the "decoded twice before Kestrel sees it" scenario
+has no concrete instance to be live *in*: it's a real constraint on whatever fronting proxy configuration
+ships later, not a defect in what this block delivers today. Agreed it's worth a stated deployment
+constraint once a proxy is actually chosen (e.g. disabling normalization of percent-encoded unreserved
+octets, mirroring D12's own acceptance of the same RFC 3986 §6.2.2.2 risk) — recording that as the
+architect's call, not reopening anything here.
+
+**Gates, re-run in full, actual numbers:** `dotnet build` — 0 warnings, 0 errors. `dotnet test` —
+**647/647**, full unfiltered (638 prior + 9 new `TryResolveWorkingTreePathFromRouteValue` cases in
+`PageRouteCodecTests.cs`; `WikiPageTests.cs`'s count is unchanged at 12, four of them re-asserting status
+codes this round). `dotnet format --verify-no-changes` — exit 0. `openspec validate
+git-backed-content-core --strict` — valid. `git status --short -- src` shows the identical file set from
+before this round (three modified, three new); `git diff --stat -- src` — `PageRouteCodec.cs` grew from
+the resolver split (+55 net lines vs the pre-round-2 diff), `Home.razor`/`ContentStorageStartupExtensions.cs`
+unchanged. No mutation testing re-run this round — the two round-1 mutants (raw-HTML-off,
+ambiguous-route branch) target code whose branch structure is unchanged by this round's fixes (the
+`ambiguousMatch is not null` check itself wasn't touched, only what happens on each side of it), so
+nothing new to confirm; happy to re-run if the reviewer wants it anyway.
+
+→ @reviewer
+
+**[reviewer]** Block 3b re-audit (round 3), against the architect's wider Blocker 1 scope and the split
+Blocker 2 finding.
+
+**Verdict: Approve with nits.**
+
+**Blocker 1 — confirmed fixed, independently re-tested against the resolver level, not just decode.**
+Read `PageRouteCodec.cs:308-349`: `TryResolveWorkingTreePath` and `TryResolveWorkingTreePathFromRouteValue`
+both delegate to one private `TryResolveWorkingTreePathCore`, and the trailing-separator containment
+check (`:334-345`) is written exactly once inside it — structurally impossible for either public entry
+point to bypass, confirmed by reading rather than inferring from the naming. Built a scratch console app
+(`ProjectReference` to the real `ZeroWiki.csproj`) and ran the resolver end to end:
+
+- **Correct pairing, both directions:** encoding `a%20b.md` → canonical route `a%2520b` →
+  `TryResolveWorkingTreePath(paths, "a%2520b")` and, separately, simulating the framework's one decode
+  pass → `TryResolveWorkingTreePathFromRouteValue(paths, "a%20b")` — both resolve to the identical
+  absolute path ending `a%20b.md`. Containment (`docs-evil` sibling) and control-character refusal
+  (`%00` / a literal NUL) behave identically through both entry points, confirming the shared core is
+  genuinely shared, not two copies kept in sync by hand.
+- **Wrong pairing, both directions — checked the specific property the brief asked for.** Passing the
+  *already-decoded* value through the *still-encoded* entry point reproduces the double-decode bug
+  exactly (`a%20b` → `a b.md`, a different real file, if one existed) — this does **not** fail, it
+  silently mis-resolves, and that's inherent to percent-encoding, not a gap this round left open: an
+  already-decoded string with no `%` in it and a still-encoded string with no `%` in it are the same
+  string, so no validation can distinguish "which contract did the caller mean" in general. This is
+  exactly why the class's own new remarks (`PageRouteCodec.cs:51-60`) state plainly that the split is
+  "enforced by naming and documentation, not by the type system" rather than claiming a safety property
+  the code doesn't have. The other wrong-pairing direction (still-encoded route through the no-decode
+  entry point) under-decodes to a literal, non-colliding garbage filename rather than a real different
+  file — a milder failure mode, also not a crash. Both wrong pairings are honestly documented, not
+  overclaimed, and — confirmed via `grep -rn "TryResolveWorkingTreePath"` — neither is reachable from any
+  production code path today; every call site outside `PageRouteCodec.cs` itself is a test. Given that,
+  and given the architect's own instruction that the type-safety redesign is §6's to build once its real
+  caller shape exists, I agree the documentation-plus-shared-core fix is the right scope for this round.
+- **New tests genuinely exercise the resolver, not just decode**, confirmed by reading the diff: all five
+  `TryResolveWorkingTreePathFromRouteValue_*` tests call the resolver function itself and assert on the
+  resolved `absolutePath` (existence-relative-to-a-real-`ContentPaths`, not just the intermediate decoded
+  string) — including a resolver-level twin of the double-decode regression test, proving the fix holds
+  through to a filesystem path.
+
+**Blocker 2 — the split finding checks out; both open questions answered.**
+
+*Is 409 the right code, or borrowed?* Defensible, not a stretch. RFC 9110 §15.5.10 defines 409 as "the
+request could not be completed due to a conflict with the current state of the target resource... the
+user might be able to resolve the conflict and resubmit" — that is a close semantic match for D12's
+ambiguous/sole-claimant-refused routes (the address is claimed by more than one file, or its sole
+claimant doesn't identify it; a member can rename a file and reload). 300 Multiple Choices is the more
+literal textbook fit for "more than one representation" but is barely implemented by real clients and
+doesn't naturally carry explanatory HTML either; 422 doesn't fit a GET. 409 is the better of the
+practical options, and it's recorded with its reasoning in `WikiPage.razor`'s XML remarks
+(`:87-93`) — a deliberate, stated choice, not left implicit.
+
+*Is the 404 constraint really forced, or does it just need `Routes.razor` touched?* This is the sharper
+question and I don't think the current docs fully answer it. Read `Routes.razor:3` —
+`<Router NotFoundPage="typeof(Pages.NotFound)">` — and reasoned through the mechanism: this is Blazor's
+own SSR "not-found" substitution, gated on `NotFoundPage` being configured at all, and it is a *different*
+mechanism from `UseStatusCodePagesWithReExecute` (confirmed independently, since the 409 path proves
+`IStatusCodePagesFeature.Enabled = false` genuinely defeats the *other* mechanism). The
+`blazor-enhanced-nav: allow` header the worker's diagnostic reported is a real, specific artifact of this
+exact feature, which corroborates the isolation rather than leaving it open to a confound — I trust the
+410-swap methodology. But "404 is provably unusable *given the current `Routes.razor` configuration*"
+and "404 is provably unusable, full stop" are different claims, and the current XML remarks
+(`WikiPage.razor:94-110`) read closer to the second than the first — they name `Routes.razor`'s
+`NotFoundPage` as the cause but never say whether touching it was considered and rejected as
+out-of-scope, or simply never in scope to begin with. It's a real constraint *today*, correctly
+diagnosed, but it is not an ASP.NET Core law — it's a consequence of an existing, changeable
+configuration this block didn't create and correctly didn't touch. Not blocking on rewording, but asking
+that `## NEXT` name this explicitly as a revisitable follow-up (removing/adjusting `NotFoundPage`, weighed
+against losing its generic-404 UX for routes outside every `@page` match) rather than something the next
+reader might take as settled forever.
+
+**Rest of the block, rechecked briefly for what these two fixes could have disturbed:**
+
+- **D13** — no new render surface. The only `src` changes this round are inside `PageRouteCodec.cs`
+  (decode/resolve split) and `WikiPage.razor` (the new `SetStatusCode` private method and its two call
+  sites). `_renderedBody` remains the only `MarkupString`; `Frontmatter_title_and_git_author_are_html_escaped_not_raw`
+  and `Embedded_script_is_shown_as_text_rather_than_executed` are untouched and still present. No finding.
+- **`PageRouteCodec` docs** — read the whole file this round. Internally consistent: all four public
+  methods cross-reference their sibling, each states its own input contract, and the type-safety
+  limitation is stated as a limitation rather than papered over. No stale claim found this round — a
+  change from all three prior rounds, each of which found one.
+
+**Gates — reproduced independently:** `dotnet build` 0 warnings/0 errors. `dotnet test` **647/647**, full
+unfiltered. `dotnet format --verify-no-changes` exit 0. `openspec validate git-backed-content-core
+--strict` valid. `git status --short -- src` / `git diff --stat -- src` match the reported shape exactly
+— no mutation residue.
+
+**Nit** (new): frame the 404/`NotFoundPage` constraint in `## NEXT` as a named, revisitable follow-up
+rather than an implicit permanent fact, per the discussion above. Not blocking — §3 can close on this.
+
+→ @architect
+
+**[worker]** Nit closed — wording only, no behaviour change, scoped exactly as asked.
+
+**The 404 constraint now names the mechanism and the lever, not just the conclusion.** Reworded the
+relevant paragraph in `WikiPage.razor`'s XML remarks (`OnInitializedAsync`'s `<remarks>`) and the two
+matching comments in `WikiPageTests.cs`
+(`A_route_with_no_matching_page_is_reported_as_not_found`,
+`A_hostile_route_is_refused_rather_than_raising_an_unhandled_error`). Previously read as "404 is
+provably unusable" without qualification; now states it as **"unusable *under `Routes.razor`'s current
+`NotFoundPage` configuration*"** — app configuration this block correctly chose not to touch, not a
+property of Blazor or of HTTP. The reworded remarks explicitly name the lever: removing or reworking
+`Routes.razor`'s `NotFoundPage` (or moving to the newer `NavigationManager.NotFound()`-based API it's
+built for) would change this and could make an honest 404 usable here — and point at `## NEXT` for
+where that trade is recorded rather than settling it in a code comment. Confirmed with a search that
+no other file in this block's diff repeats the unqualified phrasing
+(`grep -rn "unusable" src/ZeroWiki tests/ZeroWiki.Tests` after the edit shows only the two corrected
+sites, both now qualified).
+
+**Gates, re-run, actual numbers:** `dotnet build` — 0 warnings, 0 errors. `dotnet test` — **647/647**,
+full unfiltered (unchanged — comment/doc-only edit, no test added, none touched beyond their own
+comments). `dotnet format --verify-no-changes` — exit 0. `openspec validate git-backed-content-core
+--strict` — valid. `git status --short -- src` shows the identical six-file set from both prior rounds
+(three modified, three new). Correction while writing this up: `WikiPage.razor` is still untracked
+(`??`, never `git add`ed this block), so `git diff -- src` shows nothing for it — not the "doc-only
+hunk" a first draft of this note claimed, which would have been exactly the git-diff-blind-to-untracked
+mistake this project's own harness warns about. Verified the edit was comment/doc-only the only way
+available for an untracked file: re-read `WikiPage.razor`'s `OnInitializedAsync` in full after editing
+and confirmed the branch structure (which condition sets which status, which fields, which return
+points) is byte-identical to the pre-nit version — only the `<remarks>` prose changed. `git diff -- src`
+on the three genuinely tracked files (`Home.razor`, `ContentStorageStartupExtensions.cs`,
+`PageRouteCodec.cs`) is unchanged from the prior round, as expected for a wording-only nit that touched
+none of them.
+
 ## NEXT
 
 **Resume point: §3 (Content read & render), block 3a (3.1–3.2).** §3 is **open** — base `60957e6`

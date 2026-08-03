@@ -324,4 +324,193 @@ public sealed class PageRouteCodecTests
             Directory.Delete(dataRoot, recursive: true);
         }
     }
+
+    /// <summary>
+    /// Simulates exactly the one percent-decode pass ASP.NET Core routing performs on a catch-all route
+    /// parameter's value — confirmed empirically against a real <c>TestServer</c> (block 3b's DEVLOG
+    /// post), not assumed. Valid for any route <see cref="PageRouteCodec.Encode"/> actually produces:
+    /// <c>Encode</c> never emits a bare <c>%2f</c>/<c>%5c</c> (a literal <c>%</c> is always escaped to
+    /// <c>%25</c> first), so this never collides with the framework's special-cased refusal to decode
+    /// <c>%2f</c>.
+    /// </summary>
+    private static string SimulateFrameworkRouteValue(string canonicalRoute) => Uri.UnescapeDataString(canonicalRoute);
+
+    [Theory]
+    [MemberData(nameof(AwkwardFileNames))]
+    public void TryDecodeRouteValue_RoundTripsAFrameworkAlreadyDecodedRoute(string fileName)
+    {
+        var routeValue = SimulateFrameworkRouteValue(PageRouteCodec.Encode(fileName));
+
+        Assert.True(PageRouteCodec.TryDecodeRouteValue(routeValue, out var decoded));
+        Assert.Equal(fileName, decoded);
+    }
+
+    [Fact]
+    public void TryDecodeRouteValue_DoesNotDoubleDecodeAFileNameContainingALiteralPercentSign()
+    {
+        // The exact hazard the block 3b brief named: a file literally named "a%20b.md" encodes to the
+        // canonical route "a%2520b". ASP.NET Core routing percent-decodes a catch-all parameter's value
+        // exactly once before a page ever sees it, so the page receives "a%20b" — not "a%2520b" and not
+        // "a b". TryDecode (which itself calls Uri.UnescapeDataString) is the wrong function to call on
+        // that value: it would decode the surviving "%20" into a space, resolving the wrong file.
+        const string fileName = "a%20b.md";
+        var canonicalRoute = PageRouteCodec.Encode(fileName);
+        Assert.Equal("a%2520b", canonicalRoute);
+
+        var routeValue = SimulateFrameworkRouteValue(canonicalRoute);
+        Assert.Equal("a%20b", routeValue);
+
+        Assert.True(PageRouteCodec.TryDecodeRouteValue(routeValue, out var correct));
+        Assert.Equal(fileName, correct);
+
+        // The regression this test exists to catch: decoding the already-decoded value a second time
+        // resolves a different file entirely.
+        Assert.True(PageRouteCodec.TryDecode(routeValue, out var wrong));
+        Assert.NotEqual(fileName, wrong);
+        Assert.Equal("a b.md", wrong);
+    }
+
+    [Theory]
+    [InlineData("..")]
+    [InlineData("../secret")]
+    [InlineData("a/../../secret")]
+    [InlineData("/etc/passwd")]
+    [InlineData("a//b")]
+    public void TryDecodeRouteValue_RefusesPathTraversalAttempts(string hostileRouteValue)
+    {
+        Assert.False(PageRouteCodec.TryDecodeRouteValue(hostileRouteValue, out _));
+    }
+
+    [Theory]
+    [InlineData("\0")] // a literal control character - the framework has already decoded it for us
+    [InlineData("a\0b")]
+    [InlineData("\x01")]
+    [InlineData("\x7f")] // DEL is also IsControl
+    public void TryDecodeRouteValue_RefusesControlCharacters(string hostileRouteValue)
+    {
+        Assert.False(PageRouteCodec.TryDecodeRouteValue(hostileRouteValue, out _));
+    }
+
+    [Fact]
+    public void TryDecodeRouteValue_DoesNotPercentDecodeAtAll()
+    {
+        // A route value containing a literal, still-encoded "%2f" (framework routing leaves %2f
+        // undecoded, per the DEVLOG's empirical probe) must not be interpreted as a smuggled separator
+        // by this method either — it treats the input as already fully decoded and never calls
+        // Uri.UnescapeDataString, so "%2f" here is just three ordinary characters.
+        Assert.True(PageRouteCodec.TryDecodeRouteValue("a%2fb", out var decoded));
+        Assert.Equal("a%2fb.md", decoded);
+    }
+
+    // --- TryResolveWorkingTreePathFromRouteValue: the resolver split (reviewer finding 1, block 3b
+    // round 2) mirrors the decode split one layer up. These mirror the TryResolveWorkingTreePath
+    // coverage above, against the same private containment core, using already-decoded input.
+
+    [Fact]
+    public void TryResolveWorkingTreePathFromRouteValue_ResolvesAnOrdinaryRouteInsideTheWorkingTree()
+    {
+        var dataRoot = Path.Combine(Path.GetTempPath(), $"zerowiki-route-test-{Guid.NewGuid():n}");
+        try
+        {
+            Directory.CreateDirectory(Path.Combine(dataRoot, "wiki", "docs"));
+            var paths = new ContentPaths(dataRoot);
+
+            Assert.True(PageRouteCodec.TryResolveWorkingTreePathFromRouteValue(paths, "Project_Notes/Kick_Off", out var resolved));
+
+            var expected = Path.GetFullPath(Path.Combine(paths.WorkingTree, "Project Notes", "Kick Off.md"));
+            Assert.Equal(expected, resolved);
+        }
+        finally
+        {
+            Directory.Delete(dataRoot, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void TryResolveWorkingTreePathFromRouteValue_DoesNotDoubleDecodeAFileNameContainingALiteralPercentSign()
+    {
+        // The resolver-level twin of TryDecodeRouteValue_DoesNotDoubleDecodeAFileNameContainingALiteralPercentSign:
+        // proves the double-decode fix holds all the way through to a resolved filesystem path, not just
+        // through the decode step in isolation.
+        var dataRoot = Path.Combine(Path.GetTempPath(), $"zerowiki-route-test-{Guid.NewGuid():n}");
+        try
+        {
+            Directory.CreateDirectory(Path.Combine(dataRoot, "wiki", "docs"));
+            var paths = new ContentPaths(dataRoot);
+
+            var routeValue = SimulateFrameworkRouteValue(PageRouteCodec.Encode("a%20b.md"));
+            Assert.Equal("a%20b", routeValue);
+
+            Assert.True(PageRouteCodec.TryResolveWorkingTreePathFromRouteValue(paths, routeValue, out var resolved));
+
+            var expected = Path.GetFullPath(Path.Combine(paths.WorkingTree, "a%20b.md"));
+            Assert.Equal(expected, resolved);
+        }
+        finally
+        {
+            Directory.Delete(dataRoot, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void TryResolveWorkingTreePathFromRouteValue_RefusesASiblingDirectoryWhoseNameSharesAPrefix()
+    {
+        var dataRoot = Path.Combine(Path.GetTempPath(), $"zerowiki-route-test-{Guid.NewGuid():n}");
+        try
+        {
+            Directory.CreateDirectory(Path.Combine(dataRoot, "wiki", "docs"));
+            Directory.CreateDirectory(Path.Combine(dataRoot, "wiki", "docs-evil"));
+            var paths = new ContentPaths(dataRoot);
+
+            Assert.True(PageRouteCodec.TryResolveWorkingTreePathFromRouteValue(paths, "ok", out var okPath));
+            Assert.StartsWith(Path.GetFullPath(paths.WorkingTree) + Path.DirectorySeparatorChar, okPath, StringComparison.Ordinal);
+
+            var evilAbsolute = Path.GetFullPath(Path.Combine(dataRoot, "wiki", "docs-evil", "ok.md"));
+            Assert.NotEqual(evilAbsolute, okPath);
+        }
+        finally
+        {
+            Directory.Delete(dataRoot, recursive: true);
+        }
+    }
+
+    [Theory]
+    [InlineData("\0")]
+    [InlineData("a\0b")]
+    [InlineData("\x01")]
+    public void TryResolveWorkingTreePathFromRouteValue_RefusesControlCharactersRatherThanThrowing(string hostileRouteValue)
+    {
+        var dataRoot = Path.Combine(Path.GetTempPath(), $"zerowiki-route-test-{Guid.NewGuid():n}");
+        try
+        {
+            Directory.CreateDirectory(Path.Combine(dataRoot, "wiki", "docs"));
+            var paths = new ContentPaths(dataRoot);
+
+            Assert.False(PageRouteCodec.TryResolveWorkingTreePathFromRouteValue(paths, hostileRouteValue, out _));
+        }
+        finally
+        {
+            Directory.Delete(dataRoot, recursive: true);
+        }
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData("..")]
+    [InlineData("../secret")]
+    public void TryResolveWorkingTreePathFromRouteValue_RefusesWhatTryDecodeRouteValueAlreadyRefuses(string hostileRouteValue)
+    {
+        var dataRoot = Path.Combine(Path.GetTempPath(), $"zerowiki-route-test-{Guid.NewGuid():n}");
+        try
+        {
+            Directory.CreateDirectory(Path.Combine(dataRoot, "wiki", "docs"));
+            var paths = new ContentPaths(dataRoot);
+
+            Assert.False(PageRouteCodec.TryResolveWorkingTreePathFromRouteValue(paths, hostileRouteValue, out _));
+        }
+        finally
+        {
+            Directory.Delete(dataRoot, recursive: true);
+        }
+    }
 }
