@@ -4293,14 +4293,162 @@ justification names a *case*, check the guard's *branch* — the branch is what 
   will care about suite timing, and a future reader meeting a 14-minute run in this log should know it
   was chased down and not reproduced.
 
+**[supervisor]** Section re-review of **§2**, round two, over `7b50e46..HEAD` — now `ef2b75b`,
+`6b82c33`, `2fa3ca5`. Tree clean, `git status --short` empty (tracked and untracked). No mutation run,
+per the ruling; agreed — round one's findings and round two's are all guard *semantics*, which is not
+what mutation measures.
+
+## Verdict: **Approve**
+
+Both blockers are genuinely closed, and the fix to blocker 1 is the right shape rather than the
+shape that happened to make my reproduction pass. Everything below is a `## NEXT` note; nothing in it
+blocks §2 and nothing needs a third round.
+
+### Ask 1 — does the fixture class close the gap, judged as the deliverable?
+
+**Yes for the axis that produced both blockers, and it is a real fixture class rather than two
+regression tests sharing a helper.** `CreateForeignRepositoryAsync` builds outside the service
+entirely — own `init`, own author (`Somebody Else`), and, critically, **own layout**: the no-`docs`
+variant commits a `README.md` at the root rather than being "ZeroWiki's repository minus a directory".
+That distinction is the difference between a fixture and a repro, and it was got right. The happy-path
+test (`ForeignRepositoryWithHistoryAndDocs_…`) earns its place by asserting what the failure tests
+cannot — that the foreign author survives and no commit is added.
+
+Where it stops: *foreignness* has axes beyond structure, and the fixture hardcodes ZeroWiki's own
+values for all of them — `init -b main`, no pre-existing hooks, no pre-existing `receive.*` config, and
+a clean tree. §2 does not owe exhaustiveness there and I am not asking for it, but two of those axes
+have consequences worth booking now rather than rediscovering in §7 (below).
+
+### Ask 2 — is the widened `docs/` posture coherent across the three faults?
+
+**The behaviour is, and the widening is right for a stronger reason than "it follows from the
+finding".** I reproduced the counterfactual rather than accepting the reasoning: on a ZeroWiki-created
+repository with `docs/one.md`, `docs/two.md`, `docs/.gitkeep` tracked, `rm -rf docs` then
+`git add -A` stages
+
+```
+:100644 000000 e69de29 0000000 D	docs/.gitkeep
+:100644 000000 2cbec93 0000000 D	docs/one.md
+:100644 000000 c32a7a3 0000000 D	docs/two.md
+```
+
+and after the recovery commit `git status --porcelain` is **empty** and `git ls-tree -r HEAD` is
+**empty**. Every check in the section reports success and the wiki is gone from `HEAD`. Making the
+guard universal rather than adopt-only is correct, and the spec scenario and design addendum are right
+to say so.
+
+**The ordering, however, is not consistent — and the new prose overclaims it.** The three refusals sit
+at different depths:
+
+- bare repository → `ContentRepositoryService.cs:76`/`:87`, **before any write**;
+- missing `docs/` → `:239`, **after** `ApplyRepositoryConfigurationAsync` and `InstallHooksAsync`;
+- gitlink → `:283`, likewise, plus a `git reset` that undoes only *its own* staging.
+
+So for two of three faults ZeroWiki has already written `receive.denyCurrentBranch` and
+`http.receivepack` into the operator's repository and **unconditionally overwritten**
+`.git/hooks/pre-receive` and `post-receive` (`GitHookInstaller` overwrites by design) before announcing
+it does not touch repositories it did not create. `design.md`'s new addendum states the universal —
+*"ZeroWiki never writes into, or establishes structure inside, a repository whose working tree it did
+not find intact"* — and `MissingWorkingTreeException` states *"does not commit into a repository's
+history that it did not create"*. Neither is a rule the section holds: besides the config and hooks,
+`ReconcileWorkingTreeAsync` runs on adopted repositories and **will** put a
+`System <system@zerowiki.org>` commit into foreign history the moment an adopted tree is dirty. That
+is D9 working exactly as intended — the code is right and the prose is wrong.
+
+**Not blocking, and I want to be explicit about why**, since a Request changes here would escalate to
+the Product Owner. The spec scenario is met precisely as written: refuses, names the missing path,
+creates nothing, commits nothing, records nothing as recovered — all four asserted by
+`ForeignRepositoryWithHistoryAndNoDocs_…` and `DocsDeletedBetweenStarts_…`. No content is touched, no
+commit is made, the config writes are idempotent. It is a wording defect with a modest ordering
+improvement behind it — but `design.md` is **binding**, and this is the text §5–§7 will read, so it
+goes to `## NEXT` flagged as settle-before-§5, not merely noted.
+
+### Ask 3 — is `oldMode != "160000"` the right shape? And the reviewer's supporting claim
+
+**Right shape, and for a statable reason rather than a passing test.** The condition is exactly *"this
+path was not already a gitlink in `HEAD`"* — which is precisely the boundary the Product Owner drew.
+Any entry with `oldMode == 160000` was already outside ZeroWiki's recoverability guarantee before this
+reconciliation ran, so no reconciliation can newly violate D9 there. That argument, not the `M` case,
+is what makes the condition correct, and it generalises to records nobody has constructed yet.
+
+Verified across five record shapes, not the one that failed:
+
+| case | record | guard |
+|---|---|---|
+| new nested repository | `:000000 160000 … A` | **caught** ✅ |
+| tracked file replaced by a nested repository | `:100644 160000 … T` | **caught** ✅ (real content loss) |
+| adopted gitlink advancing its nested `HEAD` | `:160000 160000 … M` | ignored ✅ (blocker 1) |
+| adopted gitlink renamed | `:160000 160000 … R100` (two path fields) | ignored ✅ |
+| nested `.git` removed, files become tracked | `D` + `A`, `newMode ≠ 160000` | ignored ✅ (recovery direction) |
+
+**I refute the reviewer's supporting claim, relayed to me as established.** *"An unrelated nested
+repository swapped in at an existing path produces `D`/`A` records with `oldMode == 000000`, still
+caught"* is false. Reproduced — same path, entirely different nested repository, everything removed and
+replaced:
+
+```
+:160000 160000 4975b50 855b7bf M	docs/vault
+```
+
+One `M` record, `oldMode` `160000`, and the guard does **not** catch it. The *outcome* is still
+correct, for the reason in the paragraph above (already a gitlink, already out of scope) — so the fix
+survives the refutation intact; only its stated justification does not. Recording it because a false
+reason in the log is what a later section builds on.
+
+Smaller instance of the same thing: `FindStagedGitlinksAsync`'s `<remarks>` says a previously tracked
+path replaced by a nested repository is *"an `M` record whose old mode was something else"*. git emits
+**`T`** (typechange), not `M`. The condition tests modes, not status letters, so behaviour is
+unaffected — the letter is simply wrong.
+
+**Worth naming as a pattern rather than three separate nits:** every finding I have made across both
+rounds — the `newMode`-only guard, the `D`/`A` claim, the `T`/`M` letter, and the two overclaiming
+posture statements — is a **wrong justification attached to correct or nearly-correct code**. That is
+this change's named recurring defect (§11 found seven; block 2 spent an entire round on one). §2's
+*code* has converged and is in good shape; its *prose* is what keeps regressing, and prose that lands
+in `design.md` is binding on every section after it. For §5–§7 I would treat a justification as
+something to be reproduced before it is written down, at the same standard as a test.
+
+Also endorsing the handling of the 13m51s gate run: chasing it to 626ms-in-isolation plus a 1m12s
+clean re-run of the same 505 is the right instinct, and the conclusion is supported.
+
+## For `## NEXT`
+
+1. **Settle before §5 — the binding prose overclaims.** Either move the `docs/` probe up beside the
+   bare-repository check (it needs only the `HEAD` probe, so it can run right after
+   `AssertGitResolvesRepositoryRootAsync`, before config and hooks) and make the claim true for two of
+   three faults; or narrow `design.md`'s addendum and `MissingWorkingTreeException`'s wording to what
+   the code does. Note that neither option makes the *"does not commit into a repository's history it
+   did not create"* half true — D9 reconciliation on an adopted repository does exactly that, by
+   design — so that clause needs rewording regardless.
+2. **`FindStagedGitlinksAsync` `<remarks>`** — `T`, not `M`, for a tracked path replaced by a nested
+   repository.
+3. **§7 must read the checked-out branch, not assume `DefaultBranch`.** `DefaultBranch = "main"` is
+   justified as "the app has to know the checked-out branch name", which is false for an adopted
+   repository — the fixture's `init -b main` hides it. A foreign repo on `master` boots fine in §2
+   (`updateInstead` targets whatever is checked out), so this is latent, not live; §7.4 is where it
+   bites.
+4. **Record that `git rev-parse --git-path hooks` honours `core.hooksPath`** in
+   `GitHookInstaller`'s `<remarks>` (verified by execution in round one). §5.3 depends on hooks being
+   installed where git will actually run them, and this is the fact that makes that true.
+5. **Untested foreignness axes**, for whoever extends `CreateForeignRepositoryAsync`: pre-existing
+   `pre-receive`/`post-receive` hooks (silently overwritten), pre-existing
+   `receive.denyCurrentBranch=refuse` (silently overwritten), a non-`main` branch, and an adopted
+   repository with a **dirty** tree — the last is the one that exercises item 1's contradiction.
+6. Carried from round one, unchanged: **§5.1's lockfile must not live under
+   `ContentPaths.RepositoryRoot`** (`add -A` runs from there); **`GitAuthor.cs:13-15`** still calls
+   reconciliation "later"; **`tasks.md:70`** still records 11.1's superseded pattern while `src/` is
+   correct.
+
+§2 is closed from my side. → `@architect`
+
 ## NEXT
 
-**Resume point: §2 (Repository bootstrap & invariant), first block.** §11 is **closed** — supervisor
-`Approve` on round two over `bb3cb2c..HEAD`.
+**Resume point: §3 (Content read & render), first block.** §2 is **closed** — supervisor `Approve` on
+round two over `7b50e46..HEAD`. §11 closed earlier over `bb3cb2c..HEAD`.
 
-**State: 7/40 tasks ticked** *(counted from `tasks.md`, not carried forward)*. Branch
+**State: 12/40 tasks ticked** *(counted from `tasks.md`, not carried forward)*. Branch
 `change/git-backed-content-core`. Gates at close-out, run by the Architect rather than relayed:
-`dotnet build` 0/0, `dotnet test` **483/483** full unfiltered, `dotnet format --verify-no-changes`
+`dotnet build` 0/0, `dotnet test` **505/505** full unfiltered, `dotnet format --verify-no-changes`
 exit 0, `openspec validate --strict` valid.
 
 | Section | Block | Commit | Reviewer | Supervisor |
@@ -4312,46 +4460,86 @@ exit 0, `openspec validate --strict` valid.
 | §1 | close-out (docs) | `bb3cb2c` | — | — |
 | §11 | 11.1–11.3 | `70a31aa` | Request changes → Approve w/ nits | Request changes (S1) → **Approve** |
 | §11 | remediation (S1 + comment corrections) | `2af401c` | Request changes → **Approve** | ↑ |
+| §2 | 2.1–2.2 | `ef2b75b` | Request changes → Approve → **Approve** (re-cert) | Request changes → **Approve** |
+| §2 | 2.3–2.5 | `6b82c33` | Request changes ×2 → **Approve** w/ nit | ↑ |
+| §2 | remediation (2 supervisor blockers) | `2fa3ca5` | **Approve** w/ nit | ↑ |
 
-**Execution order from here: §2 → §3 → … → §10.** §11 is done; the remaining sections run in
+**Execution order from here: §3 → §4 → … → §10.** §11 and §2 are done; the remaining sections run in
 `tasks.md` order.
+
+**One decision is owed before §5 opens** — forward obligation 1 below. It is a Product Owner call, not
+a wording tidy-up, because one of its two options changes shipped behaviour.
 
 ### Forward obligations — each is owed by a specific section
 
-1. **§5 — the lockfile must not live in the working tree.** A lockfile under `/data/wiki/docs` is an
+1. **Settle before §5 — §2's binding prose overclaims, and one fix changes behaviour.** `design.md`'s
+   D9 addendum claims ZeroWiki "never writes into… a repository whose working tree it did not find
+   intact". False of the shipped code: the bare-repository check refuses **before** any write, but the
+   missing-`docs/` and gitlink checks refuse only **after** repo config is written and
+   `.git/hooks/pre-receive`/`post-receive` are unconditionally overwritten. Two options, and they are
+   not equivalent — **the first changes what ships**:
+   - *Move the `docs/` probe up* beside the bare-repository check. It needs only the `HEAD` probe, so
+     it can run straight after `AssertGitResolvesRepositoryRootAsync`, before config and hooks — making
+     the claim true for two of the three faults.
+   - *Narrow the prose* in `design.md` and `MissingWorkingTreeException` to what the code actually does.
+
+   Either way, the addendum's other half — *"does not commit into a repository's history it did not
+   create"* — is false **regardless of ordering**, because D9 reconciliation puts a `System` commit
+   into adopted history whenever the adopted tree is dirty, by design. That clause needs rewording on
+   both paths. Not blocking §3 or §4; §5 is where the lock starts depending on this ordering.
+2. **§5 — the lockfile must not live in the working tree.** A lockfile under `/data/wiki/docs` is an
    untracked file, which makes the tree dirty, which D9 dutifully commits, and `updateInstead` then
    bounces every push against a tree it believes unclean. Put it under `.git/` or beside the
    repository, and **extend `ContentPaths`** rather than growing a parallel notion of where things
    live.
-2. **§8 — the image has no HTTP client.** `curl`, `wget` and `nc` are all absent from the runtime
+3. **§8 — the image has no HTTP client.** `curl`, `wget` and `nc` are all absent from the runtime
    image; `flock` **is** present, so §5.3 is safe. Decide how `post-receive` signals the app **before**
    §8 starts, or it reopens §1's Dockerfile.
-3. **§7 — `git-receive-pack` returns `403 Forbidden` in this image.** git's export policy
-   (`http.receivepack` unset), **not** ownership or auth — setting `http.receivepack=true` flips the
-   identical invocation to 200. Recorded because it reads as an authentication bug to whoever meets it
-   first. Belongs in §2's repo config.
-4. **§2 — resolve `ContentPaths` from DI.** The registered singleton has **zero consumers in `src/`**;
-   only `ResolveContentPaths` at `Program.cs:88` reads the data root, because DataProtection must be
-   configured before `Build()`. §2's brief should say *inject it*.
-5. **A latent trap in the test harness.** `ResolveContentPaths` reading configuration before `Build()`
+4. ~~**§7 — `git-receive-pack` returns `403 Forbidden`**~~ — **discharged in §2** (`ef2b75b`).
+   `http.receivepack=true` is now set as repo configuration on **every** start, not only at init, so a
+   repository made by an earlier image or restored from a backup receives it too. Kept here because the
+   symptom still reads as an authentication bug to whoever meets it first, and §7 should recognise it.
+5. ~~**§2 — resolve `ContentPaths` from DI**~~ — **discharged in §2** (`ef2b75b`).
+   `ContentRepositoryService` and `GitHookInstaller` both take it by injection; `ResolveContentPaths`
+   remains used **only** by the pre-`Build()` DataProtection wiring, which is what it exists for.
+6. **A latent trap in the test harness.** `ResolveContentPaths` reading configuration before `Build()`
    works **only** because `ZeroWikiAppFactory` uses `UseSetting`. A future harness using
    `ConfigureAppConfiguration` would hand the DI singleton the override while the key ring silently
    took the `/data` default. `LoginPageTests.cs:214`'s on-disk assertion is the real guard — **do not
    soften it**.
-6. **§6 — the author line must be well-formed for accounts that predate the username rules.** D10's
+7. **§6 — the author line must be well-formed for accounts that predate the username rules.** D10's
    `Consequence binding §6`, now also a **scenario** in `specs/content-editing/spec.md` so §6's
    section review is gated on it rather than trusting prose. Non-retroactivity is deliberate and
    correct, which is exactly why §11 could not discharge this: `LoginServiceTests.cs:271-289` pins
    `.old.name.` still authenticating, and §6 constructs the address. Also tell §6's brief that the
    username is **immutable by consequence** — a permanent artifact plus no rename path.
-7. **§6 — `GitProcessRunner` does not kill the git subprocess on cancellation.** Parked deliberately in
+8. **§6 — `GitProcessRunner` does not kill the git subprocess on cancellation.** Parked deliberately in
    §2's first block, where it is inert: startup passes `CancellationToken.None`, so there is nothing to
    cancel. §6's abortable commit-on-save is what makes it live, and §6 owns the fix.
-8. **§7 — `GitProcessException`'s message carries the raw argument list.** Also parked from §2's first
+9. **§7 — `GitProcessException`'s message carries the raw argument list.** Also parked from §2's first
    block, also inert there: bootstrap passes no secrets through the runner. §7 passes token-bearing
    URLs through the same runner, at which point the exception message — and anything that logs it —
    becomes a credential leak. `CapturingLoggerProvider` already exists to sweep logs for exactly this,
    so §7's brief should say *test it*, not merely *avoid it*.
+10. **§7 must read the checked-out branch, not assume `DefaultBranch`.** `DefaultBranch = "main"` is
+    justified in `ContentRepositoryService` as "the app has to know the checked-out branch name" —
+    false for an **adopted** repository, which may be on `master` or anything else, and
+    `CreateForeignRepositoryAsync`'s `init -b main` hides it. Latent rather than live: a foreign repo on
+    `master` boots fine in §2 because `updateInstead` targets whatever is checked out. §7.4 is where it
+    bites.
+11. **Untested foreignness axes**, for whoever extends `CreateForeignRepositoryAsync`. §2 covers
+    *structural* foreignness only. Untested: pre-existing `pre-receive`/`post-receive` hooks (silently
+    overwritten), a pre-existing `receive.denyCurrentBranch=refuse` (silently overwritten), a non-`main`
+    branch, and an adopted repository with a **dirty** tree — the last is the one that exercises
+    obligation 1's contradiction, so pair them.
+12. **Two `<remarks>` corrections owed** — neither affects behaviour, both are the recurring
+    wrong-justification defect: `FindStagedGitlinksAsync` says a tracked path replaced by a nested
+    repository yields `M`; git emits `T` (the condition tests modes, not status letters, so behaviour is
+    unaffected). And `GitHookInstaller` should record that `git rev-parse --git-path hooks` honours
+    `core.hooksPath` — verified by execution, and the fact that makes §5.3's hooks land where git will
+    actually run them.
+13. Carried, unchanged: **`GitAuthor.cs:13-15`** still calls reconciliation "later" though it now
+    exists; **`tasks.md:70`** still records 11.1's superseded pattern while `src/` is correct.
 
 ### Close-out items before archive
 
@@ -4369,6 +4557,25 @@ exit 0, `openspec validate --strict` valid.
 
 ### Standing rules earned in §0–§11
 
+- **When a guard's justification names a *case*, check the guard's *branch*** — the branch is what
+  ships. §2 produced five claim-versus-mechanism mismatches, every one with defensible code and a wrong
+  stated reason: the unborn-`HEAD` comment, the index-census docstring, blocker 1's "delta" wording,
+  `EnsureInitialCommitAsync`'s early return, and the `docs/` guard scoped in prose to "adopted" while
+  applying universally (§2).
+- **Treat a justification as something to reproduce before writing it down, at the same standard as a
+  test.** §2's *code* converged; its *prose* kept regressing, and prose that lands in `design.md` binds
+  every later section. Three wrong justifications survived a reviewer `Approve` each, and were caught
+  only when someone ran them (§2).
+- **Mutation measures whether a condition is faithful to its intent; it is silent on whether the intent
+  is the right question.** Every defect §2 actually produced — the index census, `core.quotePath`, the
+  `newMode`-only guard, the missing `docs/` branch — was a gap in *what the condition asks*, and none
+  was reachable by a mutant. Both mutants run were sound and both killed cleanly. **Budget fixture
+  diversity alongside mutants**; here the cheaper instrument was a fixture nobody thought to build (§2).
+- **A fixture built by the code under test cannot falsify that code.** Both §2 supervisor blockers lived
+  on the branch that adopts a foreign repository — the one branch with no fixture of its own, because
+  every "existing repository" test constructed a repository ZeroWiki itself had made. Third instance of
+  the same shape in this change, after §11's service-model differential and §2's
+  `Path.GetTempPath()` roots (§2).
 - **A differential is only as good as the surface it models.** When a rule is enforced on two
   surfaces, run the differential on **both** — two 666k-input runs missed F1 because both classified
   through the service model, in the same section that discovered the form disagrees with it (§11).
@@ -4394,5 +4601,9 @@ exit 0, `openspec validate --strict` valid.
 - **Every instrument failure in this change so far has been in the harness, not the code.** Assume the
   measurement is wrong before assuming the finding is real.
 
-Design questions outstanding: **none.** `design.md`'s Open Questions are fully resolved, and D11 now
-states the `accepted ⊆ legal` posture whose absence was S1.
+Design questions outstanding: **one — forward obligation 1, owed before §5 opens.** `design.md`'s Open
+Questions remain fully resolved and D11 still states the `accepted ⊆ legal` posture whose absence was
+S1; what is open is newer than those. §2's D9 addendum asserts a posture the shipped code does not
+hold, and the two ways to reconcile it are not equivalent — one moves the `docs/` probe ahead of config
+and hooks (changing behaviour), the other narrows the prose (changing only the record). That is a
+Product Owner call. §3 and §4 do not depend on it.
