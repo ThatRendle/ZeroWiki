@@ -5448,6 +5448,577 @@ gated by anything unless a scenario gates it.
 - **3b — 3.3–3.4.** The Static SSR page that renders a body with raw HTML off, plus git-derived
   authorship/last-edit on it. One deliverable a human can open in a browser.
 
+**[architect]** → `@worker` — **Block 3a brief (tasks 3.1–3.2).**
+
+**Deliver:** page enumeration over the working tree, the path↔route mapping with collision detection,
+and frontmatter parsing behind `IFrontmatterParser`. **Service layer only — no Razor components, no
+UI.** Rendering and authorship are block 3b; do not start them.
+
+**Tasks verbatim:**
+- 3.1 Enumerate Markdown pages from the working tree and map paths to routes
+- 3.2 Parse optional YAML frontmatter (tags, etc.); render body even when frontmatter is missing or
+  malformed — *the rendering half is 3b's; 3a owes the parse and the model it produces*
+
+**Binding decisions — read D12, D13, D14 in `design.md` in full.** The scenarios that gate this block
+are in `specs/content-store/spec.md`: *Nested page is addressable by its path*, *Literal underscore
+round-trips*, *Ambiguous route is refused, not guessed*, *Page without frontmatter is rendered*,
+*Malformed frontmatter degrades gracefully*, *Hostile frontmatter cannot take the process down*.
+
+**Five things that decide whether this block is correct:**
+
+1. **Route→path is a path-traversal surface, and it is the sharpest hazard in this block.** §6 will use
+   your inverse to choose a file to *write*. A route carrying `..`, an encoded `%2e%2e`, an absolute
+   path, or a rooted drive-qualified segment MUST NOT resolve outside `ContentPaths.WorkingTree`.
+   Canonicalize with `Path.GetFullPath` and verify containment **against the working tree plus a
+   trailing directory separator** — a bare `StartsWith` lets `/data/wiki/docs-evil` pass as inside
+   `/data/wiki/docs`. Refuse rather than clamp. Test the encoded forms, not just the literal ones.
+2. **Encode and decode must be genuinely inverse, and a test must prove it rather than assert it.** A
+   round-trip property test over awkward names — spaces, underscores, runs of underscores, a name that
+   is only underscores, `%`/`#`/`?`, non-ASCII, a trailing space, a name whose stem is empty — is worth
+   more than a table of hand-picked examples. Layer order per D12: `_`/`__` first, percent-encoding
+   second, and the reverse on the way back.
+3. **Collision detection is D12's whole point.** Group by route during enumeration; a route claimed by
+   more than one file serves no page and names **every** claimant, while every other route is
+   unaffected. `a_ b.md` + `a _b.md` → `a___b` is the canonical fixture. Do **not** implement a greedy
+   "first match wins" decode anywhere, including as a convenience helper.
+4. **Bound frontmatter before parsing it, not after** (D14). Cap block size and nesting depth at the
+   seam. Ordinary malformed YAML throws and is caught → empty metadata; an alias-expansion bomb and
+   deep nesting are the two that the library will not save you from, and `StackOverflowException`
+   cannot be caught in .NET at all. Deserialize into a constrained shape — a fixed POCO or
+   `Dictionary<string, object>` — never a type-resolving deserializer honouring `!!` tags.
+5. **Failure is total, never partial.** On any frontmatter fault the metadata is *empty*. Partially
+   parsed metadata is indistinguishable from real metadata and would silently give a page wrong tags.
+
+**Architect calls, made here so you do not have to guess — flag it if you think either is wrong:**
+- **Skip dot-prefixed files and directories.** An Obsidian vault carries `.obsidian/`, and dot-prefixed
+  is an established hidden convention rather than an invented namespace. This is *not* the `_`-prefix
+  namespace question, which the Product Owner explicitly pinned — do not implement that.
+- **Do not follow directory symlinks**, matching §2's pre-init scan, which declined for two reasons
+  that both still apply: a symlink can loop back on itself, and it can point outside the volume.
+- An **unreadable directory** met during enumeration must not be silently skipped — silently missing
+  pages is the degradation pattern this change refuses everywhere. Handle it explicitly and say in the
+  DEVLOG what you chose and why; a runtime refusal here should be proportionate like D12's, not §2's
+  startup refusal.
+- Configure the Markdig pipeline **once**, with raw HTML already disabled per D13, even though nothing
+  renders until 3b. A wrong default shipping in 3a is harder to see than one that never shipped.
+- `SharpYaml` is the parser and `IFrontmatterParser` is the seam. No other caller may reference
+  SharpYaml types.
+
+**Mutation testing — scoped and capped** (CLAUDE.md): the route decode's containment check and the
+frontmatter bounds are the only parts of this block that warrant it. Cap at **3 confirmation runs** per
+mutant. Verify under the **full unfiltered `dotnet test`**, never a filter. Checksum the target before
+*and* after every mutation, and revert via `trap`/`finally`, never `git checkout --`. **This block adds
+new files, so `git diff -- src` is blind to them — run `git status --short -- src` alongside it, and
+treat a `??` entry as "read it or checksum it", not "it's fine".** Do not expand scope beyond these two
+without asking.
+
+**Gates before handoff — all four, and report the actual numbers:** `dotnet build` clean, full
+`dotnet test` green, `openspec validate git-backed-content-core --strict`, `dotnet format
+--verify-no-changes` clean. Post progress and findings to this DEVLOG as `[worker]` under `## 3.`, then
+hand off `→ @reviewer`.
+
+**[worker]** Block 3a (3.1–3.2) implemented. New files under `src/ZeroWiki/Content/`: `PageRouteCodec`
+(encode/decode + traversal-safe `TryResolveWorkingTreePath`), `EnumeratedPage`/`AmbiguousPageRoute`/
+`PageEnumerationResult`, `PageEnumerationService`, `PageFrontmatter`, `IFrontmatterParser` +
+`SharpYamlFrontmatterParser`, `MarkdownPipelineFactory`, `PageFrontmatterExtractor`. Added `Markdig`
+1.3.2 and `SharpYaml` 3.13.0 package references; registered everything in `AddContentStorage`. Service
+layer only — no Razor, no rendering, nothing from 3b started.
+
+Decisions/findings beyond the brief:
+
+1. **A real round-trip bug the brief's framing didn't quite anticipate, caught by testing rather than
+   assumed.** D12's "residual ambiguity" example (`a_ b.md` vs `a _b.md` → `a___b`) is one instance of a
+   *general* class: any run of two-or-more adjacent `{space, '_'}` characters that is **not** made
+   entirely of literal underscores is ambiguous, because greedy left-to-right decode always maximizes
+   pairing. Concretely, two adjacent literal spaces (`"double  space.md"`) decode back as **one** literal
+   underscore (`"double_space.md"`), not two spaces — verified empirically, not by hand-tracing (hand
+   proofs on this got the direction wrong once). This is not a defect in the codec: a run made **entirely**
+   of literal underscores round-trips exactly regardless of length (even encoded length, greedy pairing
+   leaves nothing over), and `PageEnumerationService`'s route-keyed grouping catches the general case the
+   same way it catches D12's named example — two real files landing on the same route get refused
+   together, whatever caused the collision. Documented in `PageRouteCodec`'s remarks and pinned down with
+   dedicated tests (`IsolatedUnderscoreRunsStillRoundTrip`, `AmbiguousRunsDoNotRoundTripButStayInternallyConsistent`)
+   rather than left implicit. The fuzz test only asserts exact round-trip on generated names without an
+   ambiguous run, and asserts the weaker `Encode(Decode(route)) == route` self-consistency property on the
+   rest — worth the reviewer's attention as the one place this block's understanding of D12 sharpened past
+   the brief.
+2. **Unreadable directory**, per the brief's call: reported in `PageEnumerationResult.UnreadableDirectories`,
+   logged as a warning, every page inside it simply absent from `Pages` — proportionate like an ambiguous
+   route, not a startup refusal, for the reason the brief gave (content arrives continuously by push;
+   refusing the whole wiki over one bad subtree would brick every other page too).
+3. **Symlinks skipped uniformly for files too, not just directories.** The brief scoped the call to
+   directory symlinks (matching §2's git-nesting scan, which only ever reasoned about directories). I
+   extended the same "never follow" rule to a symlinked `.md` file as well: it carries the identical
+   "may point outside the volume" hazard, and there was no narrower reason to trust one reparse-point kind
+   over the other. Flagging in case the architect wants this scoped back — nothing later in 3a/3b depends
+   on it either way.
+4. **SharpYaml 3.13.0 turned out to be a modern, STJ-source-gen-style API**, not the older
+   `Serializer`/`SerializerSettings` surface — verified by reflecting the installed package before writing
+   against it, rather than assuming. It ships real safety knobs used directly: `YamlSerializerOptions.MaxDepth`
+   (explicit `8`, not left at the library's own empirically-confirmed built-in default of `64`) and
+   `ReferenceHandling` (pinned to `None` explicitly, though it's already the default). Empirically confirmed
+   before relying on it: deserializing into `Dictionary<string, object>` makes SharpYaml itself throw a
+   catchable `YamlException` the instant it meets a YAML alias/anchor ("Aliases are not supported when
+   deserializing into object unless ReferenceHandling is Preserve") — a five-level, nine-fold "billion
+   laughs" document failed immediately rather than expanding, and a 2,000-level block-style / 5,000-bracket
+   flow-style document both threw a catchable exception at the configured depth, never a
+   `StackOverflowException`. `MaxSizeBytes` (8 KB) is our own check, ahead of any SharpYaml call — the
+   library has no size guard at all. `UnsafeAllowDeserializeFromTagTypeName` stays at its safe default
+   (`false`), pinned explicitly; a `!!System.IO.FileInfo` tag test never constructs one.
+5. **A test-design gap I found and fixed before it reached the reviewer**: my first draft of the
+   deep-nesting tests buried everything under one key (`a: {a0: {a1: {... leaf: 1}}}`), so a document with
+   the depth cap silently removed would parse successfully but still read back as `PageFrontmatter.Empty`
+   (no top-level `title`/`tags`) — indistinguishable from a correctly-rejected one. Fixed by putting
+   `title: Deep` as a top-level sibling of the deep chain, so a successful (uncapped) parse is visibly
+   `Title = "Deep"`. Mutation-tested both before and after the fix — see below; the fix is what makes the
+   depth-cap mutant actually killable.
+
+**Mutation testing (scoped: route-decode containment check + frontmatter bounds, per the brief).** All
+three runs against the full unfiltered `dotnet test` (584/584 baseline), each 1 confirmation run —
+deterministic code paths, no concurrency, no reason to expect flakiness, so no need to exceed 1. Checksum
+before/after every mutation; reverted via `trap`/`finally`. Both mutated files (`PageRouteCodec.cs`,
+`SharpYamlFrontmatterParser.cs`) are new/untracked this block, so `git diff -- src` can't see them — used
+`git status --short -- src` (`??` on both, as expected) plus MD5 checksum-against-backup as the actual
+verification, matching the brief's warning.
+
+- **Frontmatter size cap** (`SharpYamlFrontmatterParser`, disabled the `> MaxSizeBytes` check) → **killed**:
+  1 test failed (`OversizedBlock_IsRejectedBeforeParsing`), 583/584 passed, exactly the expected single
+  failure.
+- **Frontmatter depth cap** (`MaxDepth = MaxNestingDepth` → `MaxDepth = 0`, i.e. SharpYaml's own unset
+  default) → **killed**: 2 tests failed (`DeeplyNestedBlockStyle_...`, `DeeplyNestedFlowStyle_...`),
+  582/584 passed — both failures showed `Title = "Deep"` instead of empty, exactly the mechanism finding 5
+  above describes. This mutant would have **survived** against my first draft of these tests (finding 5) —
+  confirms the fix was load-bearing, not cosmetic.
+- **Route containment check** (`PageRouteCodec.TryResolveWorkingTreePath`, dropped the trailing-separator
+  addition — `containmentPrefix = workingTree` instead of `workingTree + Path.DirectorySeparatorChar`) →
+  **survived**: 584/584 still passed. Investigated rather than dismissed: `TryDecode` already refuses any
+  route whose decoded form contains `..`, an empty segment, or a smuggled separator (`a%2fb` → `a/b`)
+  *before* `TryResolveWorkingTreePath` ever runs, and on every route that clears those checks,
+  `Path.Combine(workingTree, relativePath)` can only ever produce `workingTree + separator + relativePath`
+  — there is no way through the public API for the candidate to land in a same-prefixed sibling like
+  `docs-evil`. The mutant is genuinely unreachable given `TryDecode`'s upstream guarantees today. Kept
+  deliberately, not deleted: it is correct, matches the brief's explicit instruction verbatim, and is the
+  backstop if `TryDecode`'s validation is ever loosened later without this being revisited — the same
+  reasoning CLAUDE.md gives for the `app.UseRouting()` example. Reviewer: worth confirming you agree this
+  is a legitimate "kept, not silently dropped" case rather than something needing a contrived
+  reflection-based test to force a kill.
+
+**Gates:** `dotnet build` — 0 warnings, 0 errors. `dotnet test` — **584/584** (519 baseline + 65 new),
+full unfiltered. `dotnet format --verify-no-changes` — clean. `openspec validate git-backed-content-core
+--strict` — valid. No human-in-the-loop tasks in this block (no UI to click through).
+
+New/changed files: `src/ZeroWiki/ZeroWiki.csproj` (Markdig, SharpYaml refs);
+`src/ZeroWiki/Content/{PageRouteCodec,EnumeratedPage,AmbiguousPageRoute,PageEnumerationResult,PageEnumerationService,PageFrontmatter,IFrontmatterParser,SharpYamlFrontmatterParser,MarkdownPipelineFactory,PageFrontmatterExtractor}.cs`
+(new); `src/ZeroWiki/Content/ContentStorageStartupExtensions.cs` (DI registrations added);
+`tests/ZeroWiki.Tests/Content/{PageRouteCodecTests,PageEnumerationServiceTests,SharpYamlFrontmatterParserTests,PageFrontmatterExtractorTests}.cs`
+(new).
+
+→ @reviewer
+
+**[reviewer]** Block 3a (3.1–3.2) audit.
+
+**Verdict: Request changes** — two blockers, both independently reproduced against the actual code
+(not taken on trust), plus one confirmed-clean mutation result and clean gates.
+
+**Blocker 1 — the architect's claim is confirmed as described.** `PageEnumerationService`'s collision
+detection (`PageEnumerationService.cs:63–82`) only refuses a route claimed by **two or more enumerated
+files**; it never checks that a single-claimant route's own inverse (`PageRouteCodec.TryDecode`)
+reproduces the file that produced it. Reproduced with a scratch console app referencing the real
+project (`ContentPaths` + `PageEnumerationService` + `PageRouteCodec`, no mocks):
+
+```
+Working tree contains only "Chapter  1.md" (two spaces).
+Pages: 1  — route=Chapter__1 relativePath=Chapter  1.md
+AmbiguousRoutes: 0
+TryResolveWorkingTreePath("Chapter__1") => ok=True path=".../docs/Chapter_1.md"
+Resolved path exists on disk: False
+Resolved == Original: False
+```
+
+One file, no collision reported, page served without complaint at `/wiki/Chapter__1` — and the class's
+own documented save-path entry point (`PageRouteCodec.cs:199–206`, `TryResolveWorkingTreePath`)
+resolves that exact route to `Chapter_1.md`, a file that does not exist and is not the file that
+produced the route. This is exactly the D12 hazard ("a silent wrong-file write... is the failure class
+§2 refused four separate times") except manifesting through a route with only one *current* claimant
+rather than two.
+
+The test suite's own comment names the gap without closing it —
+`PageRouteCodecTests.cs:84–86` states "PageEnumerationService is what actually protects a real save
+from writing into the wrong file, by detecting the collision between whichever two *files* land on the
+same route" — that sentence is false for this case; there is only one file, and the protection doesn't
+fire. The stronger, correct invariant (matching the architect's framing) is per-route: for every route
+with exactly one claimant, `TryDecode(route)` must reproduce that claimant's own relative path, not
+merely "no second file also produced this route." `AmbiguousRunsDoNotRoundTripButStayInternallyConsistent`
+proves half of what's needed (decode always returns *some* preimage that re-encodes to the same route)
+but that preimage is never checked against the actual enumerated file when there's only one.
+
+**Suggested shape** (not prescribing the diff): after grouping in `EnumeratePages`, for the
+single-claimant branch (`PageEnumerationService.cs:65–70`), also require
+`PageRouteCodec.TryDecode(route, out var roundTrip) && roundTrip == relativePath`; on failure, route
+the page into `AmbiguousRoutes` (or a distinct third bucket, if the architect wants the operator-facing
+message to read differently from a genuine two-file collision) rather than `Pages`. Any run of two or
+more adjacent `{space, '_'}` characters not made entirely of literal underscores is affected — `"a  b.md"`,
+`"a_ b.md"` alone, `"mixed_ _underscore and_space.md"` alone — whether or not a second file happens to
+exist yet. A file landing later with the "canonical" spelling would then silently create the exact
+two-file collision D12 describes, except the save transactionally already happened against the wrong
+target in the interim.
+
+**Blocker 2 — a new finding, not in the architect's brief: `TryResolveWorkingTreePath` throws an
+unhandled `ArgumentException` on a route that decodes to a NUL byte, instead of refusing.** The brief
+named this method as "the sharpest hazard in this block" and its own XML remarks
+(`PageRouteCodec.cs:22–33`) claim "both layers refuse rather than clamp: a hostile route is never
+silently rewritten into something safe, it is rejected outright." That claim is false for this input.
+`TryDecodeSegment` (`PageRouteCodec.cs:141–197`) checks a decoded segment for `/`, `\`, and equality
+with `.`/`..`, but never for control characters — so `route = "%00"` percent-decodes via
+`Uri.UnescapeDataString` to a literal NUL character, passes every check, and `TryDecode` returns `true`
+with a working-tree-relative path containing `\0`. `TryResolveWorkingTreePath` then calls
+`Path.GetFullPath` on the combined candidate (`PageRouteCodec.cs:222`), which throws
+`System.ArgumentException: Null character in path.` — uncaught. Reproduced directly against the real
+class:
+
+```
+route="%00"   => Unhandled exception: System.ArgumentException: Null character in path. (Parameter 'path')
+   at System.IO.Path.GetFullPath(String path)
+   at ZeroWiki.Content.PageRouteCodec.TryResolveWorkingTreePath(...) line 222
+```
+
+I also fuzzed a broader set of hostile/adversarial inputs against the public API directly (double
+percent-encoding, overlong UTF-8 dot sequences, sibling-directory names, drive-style prefixes, UNC-style
+prefixes, encoded slash/backslash combinations, `docs-evil`-shaped names) — none of them escaped the
+working tree; every one either refused cleanly or resolved to a harmless path *inside* it. So this is
+specifically a NUL-byte gap, not a wider containment failure — but it is a real one: every other
+hostile input in this method fails closed (`false`), and this one crashes instead. Every route this
+method's callers see is attacker-controlled content by design (§6's save target, and plausibly a future
+GET route parameter), so an uncaught exception here is a real robustness/DoS surface even though it
+doesn't escape containment. Fix should reject a decoded segment containing `'\0'` (or, more generally,
+any `char.IsControl` character, mirroring `EncodeSegment`'s own symmetric treatment on the encode side)
+inside `TryDecodeSegment`, so this returns `false` like every other hostile input rather than throwing.
+
+**Mutation testing — re-ran the kept ("survived") mutant independently rather than accepting the
+worker's reachability argument on trust.** Fuzzed `TryResolveWorkingTreePath` directly against ~25
+adversarial routes including sibling-prefixed names (`docs-evil`, `-evil/x`), double percent-encoding,
+and overlong-UTF-8 dot sequences, with a real `docs`/`docs-evil` sibling pair on disk. Every route that
+`TryDecode` accepts resolves through `Path.Combine(workingTree, relativePath)` with `relativePath`
+already guaranteed free of `/`, `\`, and any leading/rooted form (each per-segment check runs before
+the join), so `Path.Combine` can only ever produce `workingTree + separator + relativePath` — there is
+no way through the public API today to land in a same-prefixed sibling. I agree with the worker: the
+trailing-separator containment check is genuinely unreachable given `TryDecode`'s current guarantees,
+and keeping it as a named, documented backstop (rather than deleting it or contriving a
+reflection-based test to force a kill) is the right call — consistent with the `app.UseRouting()`
+precedent CLAUDE.md cites. Not re-litigating this one; recorded as confirmed-clean.
+
+**Gates — reproduced independently, not relayed:** `dotnet build` — 0 warnings, 0 errors. `dotnet test`
+— **584/584**, full unfiltered. `dotnet format --verify-no-changes` — exit 0. `openspec validate
+git-backed-content-core --strict` — valid. `git status --short -- src` shows exactly the ten new files
+the worker reported and nothing else; `git diff -- src` on the two tracked files is a clean 9-line DI
+registration + two `PackageReference` additions — no mutation residue.
+
+**D14 (`SharpYamlFrontmatterParser`) and D13 (`MarkdownPipelineFactory`) — compliant, no findings.**
+Size cap checked before `YamlSerializer.Deserialize` runs; `MaxDepth`, `ReferenceHandling.None`, and
+`UnsafeAllowDeserializeFromTagTypeName: false` all pinned explicitly rather than left at library
+defaults; target type is the non-polymorphic `Dictionary<string, object>`, closing the type-resolving-tag
+hazard structurally rather than by convention; failure path is a single broad `catch (Exception)` to
+`PageFrontmatter.Empty`, matching D14's "failure is total" requirement and documented as deliberate.
+`MarkdownPipelineFactory.Create()` calls `.DisableHtml()` and is registered once as a singleton shared
+with 3b. No Razor component, no `MarkupString`, nothing renders in this block — correctly deferred to
+3b, out of scope here.
+
+**OpenSpec scope — clean.** No Razor components, no rendering, no `git log`/authorship work; everything
+delivered is `Content/` service-layer code plus its DI registration and package references. Task 3.1
+and 3.2 are genuinely represented by the diff (3.2's rendering half correctly deferred to 3b per the
+brief). `git status --short` shows nothing outside `src/ZeroWiki/Content/`, `src/ZeroWiki/ZeroWiki.csproj`,
+`tests/ZeroWiki.Tests/Content/`, and this DEVLOG.
+
+**C# idiom — clean.** `Nullable` enabled project-wide; no `!` null-forgiving operators anywhere in the
+new files; no `.Result`/`.Wait()`/`GetAwaiter().GetResult()`; file-scoped namespaces; one top-level type
+per file matching its filename; sealed records for the immutable DTOs; PascalCase/camelCase conventions
+observed throughout.
+
+**Architectural note (not blocking this block):** `PageEnumerationService.Walk` calls
+`Directory.EnumerateFileSystemEntries` then `File.GetAttributes(entry)` on each result
+(`PageEnumerationService.cs:105–121`) without holding D3's write lock. A file removed or replaced
+between those two calls (a concurrent commit-on-save write, once §6 exists) could throw
+`FileNotFoundException` uncaught, or enumerate a transient mid-write state. Not this block's problem to
+solve — 3a has no write path and nothing calls this concurrently with a save yet — but worth §6 or
+whoever wires enumeration into a live request path re-examining whether a scan needs the shared `flock`
+or a snapshot/retry around transient filesystem races.
+
+Reproduction script used for both blockers: a scratch console app (`ProjectReference` to
+`src/ZeroWiki/ZeroWiki.csproj`) exercising `PageEnumerationService`/`PageRouteCodec` directly against a
+real temp filesystem tree — not committed, not part of this repo.
+
+→ @worker
+
+**[architect]** Block `3.1–3.2` — **held, not remediated.** Two reviewer blockers stand (round one), and
+one of them reaches past the code into D12 itself, so the fix is **not** the Architect's to brief yet.
+
+**D12's stated collision rule is wrong, and it is the Architect's error, not the worker's.** D12 names
+`a_ b.md` vs `a _b.md` — the example the Product Owner supplied when accepting the scheme, and which
+they characterised as pathological. Worked properly, the rule is *any run of two or more adjacent
+`{space, '_'}` characters*:
+
+| filename | route | greedy decode | |
+|---|---|---|---|
+| `a b` | `a_b` | `a b` | round-trips |
+| `a_b` | `a__b` | `a_b` | round-trips |
+| `a  b` *(two spaces)* | `a__b` | `a_b` | **lost — collides with `a_b`** |
+| `a_ b` | `a___b` | `a_ b` | round-trips |
+| `a _b` | `a___b` | `a_ b` | **lost** |
+| `a   b` | `a___b` | `a_ b` | **lost** |
+
+A run of *n* underscores has Fibonacci(*n*+1) preimages, and greedy decode always wins the all-underscores-
+first one. So **a double space collides with a single underscore** — `Chapter  1.md` against
+`Chapter_1.md`. That is a typo meeting an ordinary filename, not a diseased mind, and the Product
+Owner accepted the scheme on a frequency estimate the Architect gave them and got wrong.
+
+**The defect this exposed is worse than the widened collision class**, and neither the worker's
+grouping nor D12's prose reaches it: a *single* file can fail to round-trip **with no collision at
+all**. A tree holding only `Chapter  1.md` enumerates as one non-colliding page at `Chapter__1`;
+that route decodes to `Chapter_1.md`. `PageRouteCodec`'s own XML docs advertise
+`TryResolveWorkingTreePath` as the function §6 must use to pick a file to **write**, so the save would
+land in a phantom `Chapter_1.md` — after which the two files genuinely collide and D12's refusal makes
+both unreachable. Silent wrong-file write, arriving through a door D12 did not describe. The invariant
+D12 needs is per-route and stronger than it states: **a route must decode back to exactly the file that
+produced it**, not merely "no second file claimed it".
+
+Recorded as the fourth instance in this change of the standing rule *"when a guard's justification
+names a case, check the guard's branch"* — and the first where the wrong justification was written by
+the Architect into `design.md` rather than by a worker into a comment. It survived the Architect writing
+it, a spec delta built to gate it, and a worker implementing against it; it was caught by working the
+encoding arithmetic rather than by reading either.
+
+**Escalated to the Product Owner (CLAUDE.md §4 — implementation reveals the spec itself is wrong).**
+The per-route round-trip invariant and reviewer blocker 2 (a `%00` route crashing `Path.GetFullPath`
+with an unhandled `ArgumentException`) are both worth fixing under *any* outcome, and blocker 2 is
+independent of the encoding entirely. But whether `_`/`__` survives at all is the Product Owner's call
+on a bargain that has changed since they took it, so **no remediation block is briefed and nothing is
+committed or ticked** until they rule. WIP stays in the working tree.
+
+**[architect]** → `@worker` — **Product Owner ruled: keep the `_`/`__` scheme.** They re-affirmed it
+knowing the true collision class (double space vs single underscore), not the mistaken one they were
+originally given. So D12's *mechanism* stands and its *prose* was wrong; `design.md` D12 and
+`specs/content-store/spec.md` are now corrected, and the corrected text is what block 3a is judged
+against. Re-read D12 before touching code — the invariant it states has changed.
+
+This is the ordinary block-3a review loop, **not** a remediation block: fix both blockers, hand back to
+`@reviewer`, and the whole of 3a still lands as **one** commit. No task numbers change and nothing is
+ticked yet.
+
+**Blocker 1 — the invariant is per-route, and grouping by claimant count does not implement it.** A
+route is servable only when **exactly one file claims it *and* `TryDecode(route)` reproduces that
+claimant's own path**. `Chapter  1.md` alone is the fixture: one claimant, no collision reported today,
+and a route that decodes to `Chapter_1.md`. Both conditions are one property — *the route identifies
+exactly this file* — so express them as one check rather than two adjacent ones that a later reader
+could think are alternatives. A route failing either is reported with every path implicated and serves
+no body. Also fix `tests/ZeroWiki.Tests/Content/PageRouteCodecTests.cs:84-86`, whose comment asserts
+this protection already exists: a false claim in a test is the defect this change keeps producing, and
+it is worth more than the code fix as a habit.
+
+**Blocker 2 — `%00` crashes `Path.GetFullPath` with an unhandled `ArgumentException`.** Independent of
+the encoding, and it contradicts `PageRouteCodec`'s own documented "rejected outright" contract.
+`TryDecodeSegment` must refuse decoded segments containing control characters — reject the class, not
+the single byte the reviewer happened to fuzz. Spec now gates this: *Hostile route is refused, not
+fatal*.
+
+**Do not** widen scope beyond these two and the spec scenarios that gate them (*Sole claimant whose
+route does not identify it is refused*, *Hostile route is refused, not fatal*). The reviewer's parked
+note about `Walk` racing a concurrent write without D3's lock belongs to §6 — leave it. Re-run all four
+gates and report actual numbers; `git status --short -- src` alongside `git diff -- src`, since most of
+this block is still untracked.
+
+**[worker]** Both blockers fixed, corrected D12/spec re-read first. No scope beyond the two blockers and
+their gating scenarios.
+
+**Blocker 1 fix — `PageEnumerationService.EnumeratePages`.** Replaced the claimant-count-only branch with
+one boolean expressing D12's actual invariant:
+
+```csharp
+var identifiesExactlyOneFile =
+    relativePaths.Count == 1 &&
+    PageRouteCodec.TryDecode(route, out var roundTrippedPath) &&
+    string.Equals(roundTrippedPath, relativePaths[0], StringComparison.Ordinal);
+```
+
+A route failing this (either two-plus claimants, or a sole claimant whose own route doesn't decode back
+to it) goes into `AmbiguousRoutes`, unchanged from before structurally — just gated on the corrected
+property. Updated `AmbiguousPageRoute`'s and `PageEnumerationResult`'s XML docs, which previously said
+"claimed by more than one file" — no longer true, so they now describe the actual invariant ("the route
+identifies exactly this file") and both ways it can fail. Added
+`PageEnumerationServiceTests.SoleClaimantWhoseRouteDoesNotIdentifyIt_IsRefused` using the reviewer's exact
+`Chapter  1.md` fixture, plus a companion positive case (`Chapter 1.md`, one space, still serves normally)
+so the stricter check doesn't read as "reject anything with an underscore-ish route."
+
+**Fixed the false test comment** (`PageRouteCodecTests.cs`, was lines 84–86): it claimed
+`PageEnumerationService` protects a save "by detecting the collision between whichever two files land on
+the same route" — false for the zero-collision case this whole round is about. Rewritten to point at
+`PageEnumerationServiceTests` for the actual (per-route, not per-collision) invariant, and to name the
+`Chapter  1.md` fixture as the proof it's stronger than "no second file claimed it."
+
+**Blocker 2 fix — `PageRouteCodec.TryDecodeSegment`.** Added, right after the existing `/`/`\` smuggled-
+separator check:
+
+```csharp
+if (percentDecoded.Any(char.IsControl))
+{
+    return false;
+}
+```
+
+Rejects the class (mirrors `EncodeSegment`'s own `char.IsControl` check on the way in), not just the NUL
+byte the reviewer fuzzed — `%01`, `%1f`, `%7f` all refuse the same way now. Updated the class-level and
+`TryDecode` XML remarks, which previously claimed "rejected outright" as a blanket fact when it wasn't yet
+true for this input.
+
+**Verified the fixes are load-bearing, not decorative** — reverted both (script, `trap`-based, checksum
+before/after) and reran just the new tests: all 10 failed without the fix, including the exact
+`ArgumentException: Null character in path.` at `PageRouteCodec.cs:231` the reviewer reported, reproduced
+verbatim. Re-applied and confirmed checksums match the fixed state. This isn't the scoped mutation testing
+(no new mutants introduced beyond what's already recorded above) — it's confirming these specific new
+tests aren't vacuous, using the same discipline.
+
+**Gates, actual numbers:** `dotnet build` — 0 warnings, 0 errors. `dotnet test` — **595/595**, full
+unfiltered (584 prior + 11 new: 6 `TryDecode_RefusesControlCharacters` cases, 3
+`TryResolveWorkingTreePath_RefusesControlCharactersRatherThanThrowing` cases, 2 sole-claimant cases).
+`dotnet format --verify-no-changes` — exit 0. `openspec validate git-backed-content-core --strict` —
+valid. `git status --short -- src` shows exactly the same ten new files plus the same two modified files
+as before this round; `git diff -- src` is unchanged (DI registrations + package refs only) — this round
+only touched files `git diff` can't see, confirmed clean by the revert-and-diff check above rather than
+by `git diff` itself.
+
+→ @reviewer
+
+**[reviewer]** Block 3a re-audit, against the corrected D12 / spec text (re-read in full — the
+Fibonacci-preimage table, the "one property, not two independent checks" language, and the two new
+scenarios: *Sole claimant whose route does not identify it is refused*, *Hostile route is refused, not
+fatal*).
+
+**Verdict: Approve with nits.**
+
+**Blocker 1 — confirmed fixed, independently re-tested.** Re-ran my original `Chapter  1.md` (two
+spaces) reproduction against the fixed `PageEnumerationService.EnumeratePages`
+(`src/ZeroWiki/Content/PageEnumerationService.cs:80-83`) — now correctly refused: `Pages: 0`,
+`AmbiguousRoutes: 1 (route=Chapter__1, claimants=Chapter  1.md)`. Also tested the **nested-path** case
+the coordinator specifically asked me to check, which no existing test in this block covers directly —
+`docs/Project Notes/Chapter  1.md` alongside `docs/Project Notes/Unaffected.md` — and the fix holds
+there too: `Project_Notes/Chapter__1` is refused while `Project_Notes/Unaffected` is served normally,
+confirming the per-route isolation promised by D12 ("every other route is unaffected") survives
+nesting.
+
+On "one property, not two adjacent checks": `identifiesExactlyOneFile` (`PageEnumerationService.cs:80-83`)
+is a single boolean computed by conjunction and then branched on once (`PageEnumerationService.cs:85`)
+— there is no code path where the claimant-count check gates a *different* downstream consequence than
+the round-trip check; `&&` short-circuits only in the direction that's always safe (a route with >1
+claimant never needs the round-trip check to already be ambiguous). This reads as a faithful
+implementation of the single predicate D12 now names, not two adjacent checks wearing a shared `if`.
+
+**Blocker 2 — confirmed fixed, independently re-tested, and re-verified reachability was not
+narrowed away.** Re-ran my original NUL-byte reproduction (`%00`) — refused cleanly, no exception. Then
+re-ran my full adversarial set from the first round (~29 routes: double percent-encoding, overlong
+UTF-8 dot sequences, `docs-evil`/`-evil` sibling-prefix attempts, drive-style and UNC-style prefixes,
+`%00`/`%01`/`%1f`/`%7f`) directly against `TryResolveWorkingTreePath` with a real `docs`/`docs-evil`
+sibling pair on disk: **0 escapes, 0 crashes.** The control-character check
+(`PageRouteCodec.cs:171-180`) runs on `percentDecoded`, immediately after the separator-smuggling check
+and *before* the `_`/`__` layer-1 reverse — correctly positioned, and unbypassable by construction: the
+layer-1 reverse only ever substitutes `_`/`__` with `_`/space, so it cannot introduce a control
+character from input that had none. Confirmed empirically that `Path.GetFullPath` on this platform only
+throws for NUL specifically (tab/CR/LF pass through unmolested), so rejecting the whole `IsControl`
+class is strictly broader than the minimum fix — but the corrected spec's own new scenario (*Hostile
+route is refused, not fatal*) names "a control character" as its own case alongside NUL, not
+conditioned on "unless a real file could have produced it," so this is compliant with the
+now-authoritative spec text as written, not overreach invented by the worker.
+
+**One theoretical, non-blocking edge case worth recording rather than acting on:** a real file whose
+name contains a *literal* non-NUL control character (e.g. an embedded tab) would, before this round,
+have round-tripped correctly through `PageRouteCodec` — `EncodeSegment` already percent-encodes any
+`IsControl` character on the way in, and decoding that specific percent sequence back would have
+reproduced it. After this round's fix, such a file's route is now refused as "not identifying exactly
+one file," even though no second file is involved and the round trip would in fact have succeeded. This
+is a real, if vanishingly unlikely, behavioral narrowing — no ordinary OS file manager or Obsidian
+creates filenames containing raw control bytes — and the corrected spec's own premise ("no enumerated
+file could have produced" a control character) doesn't hold in the fully general case. Not asking for a
+change: the corrected spec explicitly directs exactly this behavior, and refusing a technically-servable
+route is the same fail-closed posture D12 uses everywhere else. Recording it so it isn't rediscovered as
+a surprise later if someone ever populates a vault with such a filename.
+
+**Gates — reproduced independently:** `dotnet build` 0 warnings/0 errors. `dotnet test` **595/595**,
+full unfiltered. `dotnet format --verify-no-changes` exit 0. `openspec validate
+git-backed-content-core --strict` valid. `git status --short -- src` shows the identical file set from
+round one (no mutation residue, no scope widening); `git diff -- src` on the two tracked files is
+unchanged from round one.
+
+**Nit — one XML doc was missed in this round's sweep.** `EnumeratedPage.cs:4` still reads "whose route
+is claimed by no other file," the pre-fix half of D12's invariant — not false (every `Pages` entry does
+satisfy that), but incomplete next to the now-accurate docs on `PageRouteCodec`, `PageEnumerationService`,
+`AmbiguousPageRoute`, and `PageEnumerationResult`, which all correctly state the full "identifies exactly
+this file" property. Given this project's recurring pattern of a doc comment's stated justification
+outliving the code it describes, worth a one-line fix: "...whose route identifies it and only it (D12) —
+claimed by no other file, and its own route decodes back to this file's path." Not blocking; flagging
+because it's precisely the class of gap this round's re-audit was asked to check for.
+
+**No scope widening confirmed.** The parked `PageEnumerationService.Walk`-vs-D3-lock architectural note
+from round one stays parked for §6 — nothing in this round touches locking, and the diff to
+`ContentStorageStartupExtensions.cs`/`ZeroWiki.csproj` is byte-identical to round one.
+
+→ @architect
+
+**[worker]** Nit closed, scoped exactly as directed (nothing beyond this and the sweep).
+
+**`EnumeratedPage.cs:4`** now states the full conjoined invariant, not just the claimant-count half:
+
+> A Markdown file found under `ContentPaths.WorkingTree` whose route identifies exactly this file (D12):
+> it is the route's sole claimant, *and* `PageRouteCodec.TryDecode` applied to `Route` reproduces
+> `RelativePath`. Both hold for every instance of this type — `PageEnumerationService` never constructs
+> one otherwise — so a caller (e.g. a future §6 save) can invert `Route` and trust the result names this
+> exact file.
+
+Named `PageEnumerationService` as the type that guarantees it and `TryDecode`/`Route`/`RelativePath` by
+name, since the reviewer's concern was specifically that §6 will read this doc to learn what the route
+guarantees.
+
+**Swept the rest of the block** (`grep` across every `.cs` file under `src/ZeroWiki/Content/` and
+`tests/ZeroWiki.Tests/Content/` for `claim`/`collision`/`identif`) rather than trusting that this was the
+only instance. `PageRouteCodec.cs`, `PageEnumerationService.cs`, `AmbiguousPageRoute.cs`, and
+`PageEnumerationResult.cs` all already state the full property from the previous round's fixes — checked
+each one directly rather than taking the grep hit count as sufficient. `PageRouteCodecTests.cs`'s two
+remaining mentions ("no second file claimed it") are the corrected comment from the earlier blocker-1
+fix, asserting the invariant is *stronger* than claimant-count — accurate, not stale. No other file in the
+block references the invariant at all. `EnumeratedPage.cs` was the only doc actually behind.
+
+**Gates, actual numbers:** `dotnet build` — 0 warnings, 0 errors. `dotnet test` — **595/595**, full
+unfiltered (unchanged — doc-only change, no test added or touched). `dotnet format --verify-no-changes`
+— exit 0. `openspec validate git-backed-content-core --strict` — valid. `git status --short -- src`
+shows the identical ten new files and two modified files as both prior rounds; `git diff -- src` is
+byte-identical to round one and two (`ContentStorageStartupExtensions.cs` DI registrations +
+`ZeroWiki.csproj` package refs only) — this change is invisible to `git diff` since `EnumeratedPage.cs`
+is still untracked, confirmed via `git status --short` instead.
+
+Per the architect: not routing back through `@reviewer` for this one.
+
+**[architect]** Block `3.1–3.2` — **closed and committed.** Reviewer `Approve` after two rounds
+(two blockers, both independently re-tested by the reviewer rather than accepted on report), plus one
+doc nit swept afterwards. Gates run by the Architect, not relayed: `dotnet build` 0 warnings / 0
+errors, `dotnet test` **595/595** full unfiltered, `dotnet format --verify-no-changes` exit 0,
+`openspec validate --strict` valid. `git status --short -- src` and `git diff -- src` both checked —
+no mutation residue, and the file set is unchanged across all three rounds.
+
+Two things this block earned that belong in `## NEXT` when §3 closes:
+
+- **Verify a claim about a *mapping* by enumerating it, not by reading it.** D12's injectivity claim was
+  wrong in `design.md`, written by the Architect, and it survived being written, a spec delta built to
+  gate it, and a worker implementing against it. Nobody caught it by reading; it fell out of computing
+  the encoding over a handful of awkward filenames. Prose about a mapping reads as true right up until
+  it is enumerated — this is the fifth claim-versus-mechanism defect in this change and the first
+  authored at the design layer, where it binds every later section rather than one file.
+- **Grouping is not identity.** "No two files share a route" and "this route identifies this file" look
+  like the same property and are not; the first is implied by the second and does not imply it. The
+  single-claimant failure was invisible to the check that was supposed to prevent exactly it, and the
+  test suite carried a comment asserting the protection existed. When a guard is built from a
+  *relation between items*, ask what it says about **one** item on its own.
+
+**§3 status: 3.1–3.2 done, 3.3–3.4 remain.** Block 3b next — Markdown rendering under D13 (raw HTML
+off), git-derived authorship/last-edit via `git log`, and `Home.razor`'s de-scaffolding from the Blazor
+template placeholder. §3's supervisor review runs over `60957e6..HEAD` once 3b lands.
+
 ## NEXT
 
 **Resume point: §3 (Content read & render), block 3a (3.1–3.2).** §3 is **open** — base `60957e6`

@@ -135,9 +135,22 @@ Layer 2 cannot disturb layer 1 because `_` is RFC 3986 *unreserved*, so no encod
 
 *Why not `%5F` for a literal underscore*, which would be unambiguous and keep the common case `%`-free: RFC 3986 §6.2.2.2 tells normalizers to decode percent-encoded **unreserved** octets, so a reverse proxy is entitled to rewrite `a_%5Fb` → `a__b` and hand the ambiguity back from outside the application's control. `__` is two ordinary unreserved characters and survives any normalizer. **A scheme that depends on a proxy declining to normalize is not a scheme.**
 
-**The residual ambiguity is real, and it refuses rather than resolves.** The escape character is also the substitute character, so a run of underscores is ambiguous: `a_ b.md` encodes to `a___b` (`a` + `__` + `_` + `b`) and `a _b.md` encodes to the same `a___b` (`a` + `_` + `__` + `b`). A greedy left-to-right decode is *deterministic* but not *injective* — it always yields `a_ b`, silently making `a _b.md` unreachable, and §6 inverts route→path to find the file it saves, so the losing file's route would write to the winning file. A silent wrong-file write is the failure class §2 refused four separate times.
+**The residual ambiguity is real, it is wider than it first looks, and it refuses rather than resolves.** The escape character is also the substitute character, so **any run of two or more adjacent `{space, '_'}` characters is ambiguous** — not merely a run of underscores. A run of *n* underscores in a route has Fibonacci(*n*+1) preimages (the compositions of *n* into parts of 1 and 2), and a greedy left-to-right decode always yields the one that takes underscores first:
 
-**Product Owner decision:** detect the collision during enumeration — which already walks the whole tree, so grouping by route is free — and refuse **at that route only**. Both files stay enumerated and indexed; the route reports that it is claimed by more than one file and names every claiming path; neither body renders. The rest of the wiki is unaffected.
+| filename | route | greedy decode | |
+|---|---|---|---|
+| `a b` | `a_b` | `a b` | round-trips |
+| `a_b` | `a__b` | `a_b` | round-trips |
+| `a  b` *(two spaces)* | `a__b` | `a_b` | **lost — collides with `a_b`** |
+| `a_ b` | `a___b` | `a_ b` | round-trips |
+| `a _b` | `a___b` | `a_ b` | **lost** |
+| `a   b` | `a___b` | `a_ b` | **lost** |
+
+So the realistic collision is **a double space against a single underscore** — `Chapter  1.md` against `Chapter_1.md` — a typo meeting an ordinary filename, not the pathological case this decision was originally framed around. *An earlier revision of this decision named only `a_ b.md` vs `a _b.md` and characterised the class as absurd; that estimate was wrong, and the Product Owner re-affirmed the scheme knowing the true frequency rather than inheriting the mistaken one.*
+
+**The failure does not require two files.** A tree containing only `Chapter  1.md` produces exactly one claimant for `Chapter__1`, so detecting collisions by grouping files per route sees nothing wrong — yet that route decodes to `Chapter_1.md`. Since §6 inverts route→path to choose the file it *writes*, the save lands in a phantom `Chapter_1.md` while the member believes they edited `Chapter  1.md`; the two files then genuinely collide and both become unreachable. A silent wrong-file write is the failure class §2 refused four separate times, and grouping alone does not prevent it.
+
+**Product Owner decision:** enumeration — which already walks the whole tree, so this is free — refuses a route unless **exactly one file claims it *and* decoding that route reproduces that file's own path**. Both conditions are one property: *the route identifies exactly this file*. A route failing either is reported with every path implicated and serves no body; every other route is unaffected, and the rest of the wiki is untouched. Grouping by claimant count is necessary but **not** sufficient, and an implementation that checks only the count satisfies the letter of this decision while leaving the defect it exists to prevent.
 
 Refusing at the route rather than at startup is the point, and it is a deliberate departure from §2's posture rather than an inconsistency with it. §2's refusals guard the *volume's structure*, are seen once by an operator who is standing there, and are fixed before the app serves anything. A route collision is *content*, and content arrives at runtime by push from a laptop: a startup refusal would let any pushed filename brick the whole wiki for everyone until someone reached the server. The shared principle is that the system never silently picks one of two readings — where it refuses is set by what the fault can reach.
 

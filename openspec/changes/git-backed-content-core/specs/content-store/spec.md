@@ -50,7 +50,7 @@ The system SHALL read Markdown files from the working tree and parse optional YA
 
 ### Requirement: Pages are addressable by a route derived from their path
 
-The system SHALL derive each page's route from its working-tree path relative to `docs/` with the `.md` extension removed, under a `/wiki/` prefix, encoding a space as `_` and a literal `_` as `__`. Where two files would claim the same route, the system SHALL refuse to serve that route rather than choose between them, leaving every other route unaffected.
+The system SHALL derive each page's route from its working-tree path relative to `docs/` with the `.md` extension removed, under a `/wiki/` prefix, encoding a space as `_` and a literal `_` as `__`. The system SHALL serve a route only when exactly one file claims it **and** decoding that route reproduces that file's own path; a route failing either condition SHALL be refused rather than resolved, naming every file implicated and leaving every other route unaffected. The system SHALL refuse a malformed or hostile route rather than failing the request with an unhandled error.
 
 #### Scenario: Nested page is addressable by its path
 
@@ -66,6 +66,16 @@ The system SHALL derive each page's route from its working-tree path relative to
 
 - **WHEN** two files in the working tree encode to the same route (for example `a_ b.md` and `a _b.md`, which both encode to `a___b`)
 - **THEN** the system serves neither page at that route, names every file claiming it, and continues to serve every other page normally
+
+#### Scenario: Sole claimant whose route does not identify it is refused
+
+- **WHEN** the working tree contains a single file whose route decodes to a different path than the file's own (for example `Chapter  1.md`, with two spaces, whose route `Chapter__1` decodes to `Chapter_1.md`), and no other file claims that route
+- **THEN** the system refuses that route rather than serving the file, so that no later save can resolve the route to a different file than the one being read
+
+#### Scenario: Hostile route is refused, not fatal
+
+- **WHEN** a request supplies a route containing a percent-encoded NUL byte, a control character, or another sequence that no enumerated file could have produced
+- **THEN** the system refuses the route and continues serving, rather than raising an unhandled error
 
 ### Requirement: Raw HTML in page content is not rendered
 

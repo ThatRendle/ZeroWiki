@@ -27,6 +27,13 @@ public static class ContentStorageStartupExtensions
         services.AddSingleton<GitHookInstaller>();
         services.AddSingleton<ContentRepositoryService>();
 
+        // §3: page enumeration/routing and frontmatter parsing (D12, D14). The Markdown pipeline is
+        // built once here — raw HTML already disabled per D13 — and shared with body rendering in 3b.
+        services.AddSingleton(MarkdownPipelineFactory.Create());
+        services.AddSingleton<IFrontmatterParser, SharpYamlFrontmatterParser>();
+        services.AddSingleton<PageFrontmatterExtractor>();
+        services.AddSingleton<PageEnumerationService>();
+
         return services;
     }
 
