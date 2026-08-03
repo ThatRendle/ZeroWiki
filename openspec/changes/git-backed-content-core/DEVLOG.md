@@ -4965,6 +4965,291 @@ No mutation testing, per the brief.
 
 Not committing — architect verifies and commits.
 
+**[supervisor]** Section re-review of **§2**, round three, over `7b50e46..HEAD` — six commits. Tree
+clean, `git status --short` empty. No mutation run, per the ruling.
+
+## Verdict: **Request changes** — one blocker, and it is the only outstanding item in §2
+
+Everything else below is approved, including both things I was asked to be adversarial about — the
+second instrument is genuine, and the method has not accreted. The blocker is narrow, its fix is small,
+and it is the same *shape* of decision the Product Owner has already taken twice (make the claim true,
+or narrow it), so it should not take long. I am raising it rather than filing it because I was asked to
+trace the claim rather than trust it, and the claim is false.
+
+### Blocker — "every refusal precedes every write" is false on a third path, which neither addendum enumerates
+
+The two addenda enumerate **adopt** and **initialise**. There is a third: **`.git` present with an
+unborn `HEAD`** — a repository that exists but has no commits. `AssertNoNestedGitRepository` is gated
+on `HasOwnGitEntry(repositoryRoot) == false` (`ContentRepositoryService.cs:107`, inside the `else`),
+but the write it protects against — `git init` plus the initial commit — is gated on **unborn `HEAD`**
+(`:397`). Those two predicates coincide on a fresh volume and diverge the moment a `.git` exists
+without commits. On that path the scan never runs, and the gitlink refusal is back behind a write.
+
+**Reproduced, not reasoned.** Volume prepared as `git init` with no commit, an Obsidian-style vault
+copied to `docs/vault` with its own `.git`, then the shipped sequence run step by step:
+
+```
+1 HasOwnGitEntry(.git dir exists) : TRUE   -> ADOPT branch; AssertNoNestedGitRepository NOT called
+2 rev-parse --is-bare-repository  : false
+4 EnsureInitialCommitAsync: HEAD  : UNBORN -> proceeds to WRITE
+   ...wrote docs/.gitkeep and committed. commits now = 1
+5 ReconcileWorkingTreeAsync       : :000000 160000 0000000 9f17a90 A  docs/vault
+   -> gitlink found; git reset; THROW
+
+AFTER THE REFUSAL — left behind in a repository ZeroWiki did not create:
+  commits      : 1  (Initial commit by System <system@zerowiki.org>)
+  docs/.gitkeep: CREATED
+```
+
+A commit into someone else's repository, in service of a start that was never going to complete —
+the precise damage `f50f1ca`'s addendum was written to eliminate, and the thing the previous addendum
+says it will not do ("committing would be writing to a repository ZeroWiki did not create").
+
+**Three ways in, and the third is self-inflicted.** An operator preparing the volume by hand
+(`git init`, then copy content in); a clone of an empty remote; and — the one that makes this more
+than an operator-preparation edge — **ZeroWiki's own crash window**. On the initialise branch the
+order is scan → `git init` → … → initial commit. A process death between `git init` and that commit
+(container OOM, restart — exactly the crash premise D9 exists for) leaves `.git` present and `HEAD`
+unborn, and **the scan never runs on that volume again**. `git init` is itself what disables the
+guard, and nothing re-arms it.
+
+**Why I am not filing this as a note.** The magnitude is genuinely small — an empty `.gitkeep` and one
+commit, nothing destroyed, the vault untouched, and the refusal still fires. On magnitude alone this
+would be `## NEXT`. What moves it is that `design.md` now states an unqualified absolute — *"every
+refusal on **both** paths — adopt and initialise — precedes every write"* — that is demonstrably
+false, in **binding** text, at the third attempt, after I named "wrong justification attached to
+correct code" as this section's recurring defect in round two. §5–§7 will read that sentence as a
+guarantee. The spec is unaffected: `specs/content-store/spec.md` makes no ordering claim, so no spec
+requirement is unmet and no design *decision* is violated by the code — the code refuses safely on
+every path. It is the design document that is wrong, plus a small write on an unenumerated path.
+
+**Fix shape — one call site, and a Product Owner choice between two options.** The scan is gated on
+the wrong predicate. Either (a) gate it on the condition that actually governs the write — run
+`AssertNoNestedGitRepository` whenever `EnsureInitialCommitAsync` is about to take its unborn-`HEAD`
+branch, rather than only when `.git` is absent, which makes the absolute true on all three paths; or
+(b) narrow the sentence to name the third path and accept the empty commit. (a) is a few lines and
+lands naturally with the refactor in ask 3 below. Either way the fixture is the same and it is
+missing: **`.git` present, `HEAD` unborn, nested repository present.**
+
+### Ask 2 — two instruments: genuine, not duplication with a justification attached
+
+Genuine, on every test I can put to it. They ask different questions (filesystem "is there a nested
+repository here", ignoring `.gitignore` — versus index "would committing now store a gitlink",
+respecting both `.gitignore` and the `HEAD` delta); they have different lifetimes (the scan runs at
+most once in a volume's life, because the branch it guards stops existing the moment a repository is
+there — the index check runs at every reconciliation forever); and neither can stand in for the other
+(the scan cannot see content arriving after bootstrap; the index check cannot run before `git init`).
+The one deliberate disagreement is documented at both sites and in `design.md`, and pinned by
+`GitignoredNestedGitRepositoryOnAFreshVolume_IsStillRefusedByTheScan` — a divergence with a test is a
+decision, not drift.
+
+Worth noting the connection to the blocker, because it is the same observation from the other side:
+the stated justification is *"the scan guards the initialise branch, the index check guards every
+reconciliation."* That is exactly right, and following it is what exposes the gap — "the initialise
+branch" is defined in the code by `.git`-absence rather than by "about to create the initial commit",
+so there is a sliver between the two instruments that belongs to neither. The coexistence is sound;
+the seam is what needs the one-line move.
+
+Also verified clean while I was in there: the symlink handling. `File.GetAttributes` returns
+`ReparsePoint=True` without throwing for a **dangling** symlink as well as a live one (checked by
+execution on this platform, both `dangling` → `/nonexistent/target` and a live directory symlink), so
+a copied-in vault containing broken links is skipped rather than crashing the walk. That was a real
+candidate for an unhandled exception and it is not one.
+
+### Ask 3 — has §2 accreted? No, and it is now better organised than the version I approved
+
+Nine steps is more than seven, but accretion is growth *without an organising principle*, and this
+version has one the seven-step version lacked: **every refusal precedes every write**. Config and
+hooks previously sat in the middle for no reason except the order the tasks were written in; they are
+now at the end for a stated, load-bearing reason. That is a sequence that got a spine, not one that
+got longer.
+
+Two honest signs of strain, neither blocking:
+
+- The ordering now needs two multi-line comment blocks inside `EnsureRepositoryAsync` (`:123-128`,
+  `:139-141`) to survive. When ordering has to be defended in prose, it is a candidate for being
+  expressed structurally — an `AcceptRepositoryAsync` phase (classify, resolve, accept-or-refuse,
+  reconcile, assert) followed by a `ConfigureRepositoryAsync` phase (config, hooks). The invariant
+  then lives in the shape rather than in comments a later editor can move past.
+- The classify `else` branch now does two jobs — classification *and* guarding — which is precisely
+  where the blocker lives. The split above is the natural home for its fix, which is why I would do
+  both in one go rather than patch the call site alone.
+
+### Ask 4 — `## NEXT` reconciliation: all four discharges verified, nothing dropped
+
+Checked the diffs rather than the claims. Discharged in `f50f1ca`: the `T`-versus-`M` remark
+(`:526`, now correctly "a `T` (typechange) record"), `core.hooksPath` recorded in
+`GitHookInstaller`'s `<remarks>` with the §5.3 consequence spelled out, `GitAuthor`'s "later", and
+`tasks.md:70`'s superseded D11 pattern. All four genuinely landed.
+
+Two of my item-11 axes are also now covered, which the summary did not claim:
+`ForeignRepositoryWithPreExistingHooksAndNoDocs_RefusesLeavingTheHooksByteForByteUnchanged` and
+`ForeignRepositoryWithDenyCurrentBranchRefuseAndANewGitlink_RefusesLeavingTheConfigUnchanged`. Still
+open from that item: a foreign repository on a **non-`main` branch**, and an adopted repository with a
+**dirty tree**.
+
+Still standing, correctly: item 3 (§7 must read the checked-out branch, not assume `DefaultBranch` —
+the fixtures' `init -b main` still hides it) and §5.1's lockfile not living under `RepositoryRoot`.
+
+The two newly filed items are correctly scoped, with one sharpening:
+
+- **`git add -A`'s unreadable-directory blind spot** — right that no C# scan can close it and right
+  that the resolution is a Product Owner call. One correction to the framing: it is described as owed
+  by §6, but the exposure exists **today**, on the adopt path, where the pre-init scan never runs at
+  all — an unreadable directory inside an adopted repository means reconciliation silently skips that
+  content while `status --porcelain` also cannot see it, so `AssertWorkingTreeIsCleanAsync` passes.
+  That is §2 behaviour, not §6 behaviour. It should still not be fixed here, but the item should say
+  the gap is live rather than anticipated, or §6 will inherit it thinking it starts clean.
+- **Unbounded recursion on a pathologically deep non-symlinked tree** — judged-and-left is right. The
+  realistic version of that hazard is a symlink loop, which is handled and tested
+  (`SymlinkedDirectoryThatLoops_DoesNotHangStartup`); a genuinely pathological non-symlinked depth is
+  not a threat model for this deployment.
+
+### Mutation judgement — endorsed, and now with three rounds of evidence behind it
+
+Running none in the three new blocks was right, and for a sharper reason than "these were ordering
+changes": this round's blocker is *itself* immune to mutation. `AssertNoNestedGitRepository` runs
+faithfully and does exactly what it says; the defect is that it is **called under the wrong
+condition**, and no mutant of a method's body can reach its call site's predicate. That is now three
+rounds where the finding was a gap in what is asked rather than in how faithfully it runs, and three
+rounds where the instrument that found it was a **missing fixture** — the foreign repository, then the
+advancing gitlink, now the unborn `HEAD`. Two mutants, both 3/3, remain the right total for §2. For
+§5–§7 the transferable rule is the one this section has now demonstrated three times: enumerate the
+*states the subject can be in* and build a fixture per state, then mutate the conditions that survive.
+
+→ `@architect` — this is remediation round three, so per CLAUDE.md §3c.4 this goes to the Product
+Owner rather than a fourth carve. The decision needed is small and binary-with-a-third-answer, as
+usual here: make the absolute true (gate the scan on unborn-`HEAD`, ideally with the accept/configure
+split), narrow the sentence and accept the empty commit, or tell me the magnitude does not justify
+either and I will record it as accepted and approve on that basis.
+
+**[worker]** Per the brief: the Product Owner's decision on the round-three blocker above is **fix the
+gate** — a targeted fix, not the accept/configure split (filed to `## NEXT` instead). No new `N.M`
+numbers, nothing ticked. Base `2c70e05`.
+
+Blocker fixed — the scan is gated on "the repository has no commits yet," expressed once.
+
+**The fix.** `EnsureRepositoryAsync` now computes `repositoryHasNoCommitsYet` exactly once, in the
+classification step: trivially `true` when `.git` doesn't exist yet (the initialise branch), or the
+result of a new `RepositoryHeadIsUnbornAsync` git probe when `.git` already exists (only ever called
+once `HasOwnGitEntry` has confirmed `.git` is present at `repositoryRoot` itself, for the same
+ancestor-discovery reason every other git call in this class requires that confirmation first). The one
+`if (repositoryHasNoCommitsYet) { AssertNoNestedGitRepository(repositoryRoot); }` that follows now runs
+the scan in exactly the two circumstances that matter: before `git init` (no `.git` yet) and before the
+adopt branch's initial commit (`.git` present, `HEAD` unborn) — never during a genuinely-adopted
+repository with history, where `FindStagedGitlinksAsync` already governs. The same
+`repositoryHasNoCommitsYet` value is threaded straight into `EnsureInitialCommitAsync` as a parameter,
+replacing its own internal `headProbe` — the two decisions (scan-or-not, write-or-not) are now literally
+the same boolean, not two independently-derived conditions that merely happened to agree on a fresh
+volume, which is what let the third path through undetected.
+
+**Caught while implementing, not after:** calling the scan against an already-existing `repositoryRoot`
+means `Directory.EnumerateFileSystemEntries(repositoryRoot)` now includes `repositoryRoot`'s own
+top-level `.git` in the very first pass — which `CollectNestedGitEntries` would have flagged as
+"nested," since it only checked the filename, not the depth. That would have refused startup on *every*
+adopted repository with an unborn `HEAD`, nested vault or not — the opposite failure mode. Fixed by
+excluding a `.git` entry found exactly at `repositoryRoot`'s own top level (`directory ==
+repositoryRoot`) from what counts as nested; only a `.git` found inside a subdirectory still is. The new
+`GitInitializedButUnbornHead_WithOrdinaryMarkdownAndNoNestedRepository_InitializesNormally` test is what
+would have caught this had it shipped broken — confirmed by temporarily reverting just that exclusion
+and rerunning it: false refusal, exactly as predicted.
+
+**Tests**, all in `ContentRepositoryServiceTests.cs` under a new "the scan's gating predicate" comment
+block: `.git` present + unborn `HEAD` + nested repository at depth 1, as a gitfile, and more than one
+level deep — each refuses **and asserts `HEAD` is still unborn** (`rev-parse --verify -q HEAD` still
+fails), not merely that the refusal fired; and the crash-mid-init regression (`.git` present + unborn
+`HEAD` + ordinary Markdown, no nested repository) — still initializes correctly, doubling as the fixture
+that exercises the top-level-`.git` exclusion above.
+
+**Confirmed the first three fail against `2c70e05`**, via a checksummed `cp` swap of
+`ContentRepositoryService.cs` only (never `git checkout`/`restore`): all three failed exactly as
+predicted (`Assert.False(headProbe.Succeeded)` came back `True` — a commit *was* silently created around
+the nested repository), and the fourth (no nested repository) passed at both revisions, as expected for
+a compatibility fixture rather than a regression pin. Restored the fixed file via `cp` from a
+pre-checksummed backup and confirmed the checksum matched before continuing.
+
+**`design.md`** — new addendum: states the rule ("the scan runs whenever ZeroWiki is about to create the
+initial commit," true in exactly two circumstances) rather than enumerating "adopt and initialise" as
+the covered paths, which is exactly what missed the third state. Names this as the third attempt at
+making the sentence true and records that the accept/configure split was the supervisor's suggested
+durable shape, filed to `## NEXT` instead of taken here.
+
+No mutation testing, per the brief — the supervisor's own note that this blocker is immune to mutation
+(faithful method, wrong call-site predicate) still holds; nothing here changes that.
+
+**Gates:** `dotnet build` 0 warnings/0 errors · `dotnet test` **519/519** full unfiltered (515 at
+`2c70e05` + 4 new) · `dotnet format --verify-no-changes` clean · `openspec validate
+git-backed-content-core --strict` valid. `git status --short` / `git diff --stat 2c70e05` show exactly
+the four files this round touches (`ContentRepositoryService.cs`, `ContentRepositoryServiceTests.cs`,
+`design.md`, DEVLOG) — no residue from either scratch reproduction, checksum-verified restored before
+this post.
+
+→ @reviewer
+
+**[reviewer]** Third-path fix (unborn-`HEAD` gate unification) — **Approve.** All four scrutiny points
+verified by reproduction, including reconstructing the exact pre-fix file via `git show 2c70e05:...`
+rather than hand-reverting, which is the strongest form of the "does it fail before, pass after" check.
+
+**1 (hardest, checked hardest) — the top-level-`.git` exclusion is exact, not approximately right.**
+Checksummed `cp`-swapped the fix aside and removed *only* the exclusion (`if (!string.Equals(directory,
+repositoryRoot, ...))`), leaving detection otherwise untouched, then ran all four new tests:
+`GitInitializedButUnbornHead_WithOrdinaryMarkdownAndNoNestedRepository_InitializesNormally` fails
+immediately — `AssertNoNestedGitRepository` throws naming `.git` itself (the repository's own top-level
+entry) as the offending "nested" path — while the other three (nested at depth 1, gitfile form, three
+levels deep) all still pass, confirming the exclusion is neither needed for, nor interferes with,
+detecting a genuinely nested `.git` one level down. The boundary is exactly what it claims: `directory
+== repositoryRoot` excludes only the scan's very first call, and every recursive call thereafter (any
+subdirectory, including one path segment down) has `directory != repositoryRoot` and is caught
+normally. Restored via `cp`, checksum confirmed identical before continuing.
+
+**2. The predicate is genuinely single — confirmed by exhaustive grep, not sampling.** `grep -n
+"EnsureInitialCommitAsync\|RepositoryHeadIsUnbornAsync\|rev-parse.*verify.*HEAD\|repositoryHasNoCommitsYet"`
+over the whole file: exactly one call site for `EnsureInitialCommitAsync` (`:155`, passing the local
+`repositoryHasNoCommitsYet` computed at `:65`), exactly one call site for `RepositoryHeadIsUnbornAsync`
+(`:89`), and exactly one `rev-parse --verify -q HEAD` invocation anywhere in the class (inside that one
+method). Read `EnsureInitialCommitAsync`'s body directly rather than trusting the grep alone: it uses
+only its `repositoryHasNoCommitsYet` parameter, no internal probe of its own. No path reaches it with a
+value derived any other way.
+
+**3. The crash-mid-init regression genuinely regresses, for the reason claimed.** Same mutation as
+point 1 answers this directly: the failure mode the mutation reproduces is exactly "a recoverable
+interrupted start turned into a permanent refusal" — the ordinary-Markdown fixture, which has every
+right to initialise normally, gets refused instead, citing the repository's own `.git` as if it were a
+nested repository. That is precisely the risk named in the brief, and the test that catches it is
+testing the exclusion specifically, not passing for an unrelated reason.
+
+**4. `design.md`'s restated rule is true of the shipped code and does not overclaim.** Traced
+`repositoryHasNoCommitsYet == true` against every branch: it is set `true` in exactly the two places
+`design.md` now names (`.git` absent, or present with unborn `HEAD` via the probe) and never otherwise
+— both bare-repository branches throw before the variable is ever used, so they're correctly excluded
+from "exactly two circumstances." `EnsureInitialCommitAsync` writes the initial commit if and only if
+this same value is `true` when it's called, and the scan runs if and only if it's `true` before that —
+so "the scan runs whenever ZeroWiki is about to create the initial commit" is exact, not roughly true,
+and the paragraph doesn't restate or re-broaden the earlier "every refusal precedes every write"
+absolute beyond what this fix actually establishes.
+
+**Independently reconstructed the worker's fail-before claim rather than trusting the report.** Used
+`git show 2c70e05:src/ZeroWiki/Content/ContentRepositoryService.cs` to get the *exact* pre-fix file
+(not a hand-reversion, which risks subtly recreating a different bug), swapped it in, and ran all four
+new tests: the same three fail (`Assert.False(headProbe.Succeeded)` came back `True` in each — a
+commit was silently created around the nested repository, exactly the reported failure) and the fourth
+(no nested repository) passes, matching the report exactly. Restored via `cp`, checksum confirmed.
+
+**Confirmed independently:** `dotnet test --filter
+"FullyQualifiedName~ContentRepositoryServiceTests|FullyQualifiedName~ContentRepositoryStartupTests"`
+36/36; `openspec validate git-backed-content-core --strict` valid; `dotnet format --verify-no-changes`
+clean; `dotnet build` 0/0; `git status --short` / `git diff --stat 2c70e05` show exactly the four
+files, no residue from any scratch reproduction (all removed, checksum-verified restored).
+
+No mutation this round — agreed with the supervisor's own note: the scan runs faithfully and does
+exactly what it says, the defect was in the call-site predicate, and no mutant of a method body reaches
+that. Not re-raised: the `AcceptRepositoryAsync`/`ConfigureRepositoryAsync` split and the `git add -A`
+unreadable-directory gap, both correctly filed to `## NEXT` rather than this block's scope.
+
+**This block is clear to commit.**
+
+→ @architect
+
 ## NEXT
 
 **Resume point: §3 (Content read & render), first block.** §2 is **closed** — supervisor `Approve` on
@@ -5065,8 +5350,12 @@ a wording tidy-up, because one of its two options changes shipped behaviour.
 13. ~~Carried: `GitAuthor.cs` "later"; `tasks.md:70`'s superseded 11.1 pattern~~ — **both discharged in
     `f50f1ca`**, along with the `T`-vs-`M` and `core.hooksPath` remarks from obligation 12.
 14. **`git add -A` has the same unreadable-directory blind spot the scan just closed in C#, and no C#
-    scan can reach it.** Found by `@reviewer` while auditing the pre-init scan. `git add -A` warns on
-    stderr and **exits 0** when it cannot read a directory, so content behind it is silently not staged
+    scan can reach it. It is LIVE TODAY, not merely owed** — sharpened by `@supervisor`: the scan runs
+    only where ZeroWiki creates the initial commit, so on an **adopted** repository it never runs at
+    all, and an unreadable directory there means reconciliation silently skips content while
+    `AssertWorkingTreeIsCleanAsync` still passes. §6 must not inherit this thinking it starts clean.
+    `git add -A` warns on stderr and **exits 0** when it cannot read a directory, so content behind it
+    is silently not staged
     — which means reconciliation reports success, the tree reports clean, and D9's "never discard"
     quietly does not hold for that subtree. Distinct from the scan blocker: the scan guards the
     *initialise* path only, while this touches **every** path, including a push-updated tree in §8. The

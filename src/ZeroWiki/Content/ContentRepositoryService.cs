@@ -61,7 +61,10 @@ public sealed class ContentRepositoryService
         var repositoryRoot = _paths.RepositoryRoot;
         Directory.CreateDirectory(repositoryRoot);
 
-        if (HasOwnGitEntry(repositoryRoot))
+        var hasOwnGitEntry = HasOwnGitEntry(repositoryRoot);
+        bool repositoryHasNoCommitsYet;
+
+        if (hasOwnGitEntry)
         {
             // repositoryRoot has its own .git — git's discovery, run with this as the working
             // directory, will find this entry first regardless of any ancestor repository, so it is
@@ -77,6 +80,13 @@ public sealed class ContentRepositoryService
             }
 
             _logger.LogInformation("Existing non-bare git repository detected at '{RepositoryRoot}'.", repositoryRoot);
+
+            // .git existing here does not mean a commit exists: a process that died between `git init`
+            // and the initial commit (or a `.git` created some other way) leaves exactly this shape —
+            // .git present, HEAD unborn. EnsureInitialCommitAsync below is about to write the initial
+            // commit into this repository in that case, so it needs the same nested-repository scan a
+            // freshly-initialized repository gets, before that write happens.
+            repositoryHasNoCommitsYet = await RepositoryHeadIsUnbornAsync(repositoryRoot, cancellationToken);
         }
         else if (LooksLikeBareGitDirectory(repositoryRoot))
         {
@@ -95,18 +105,33 @@ public sealed class ContentRepositoryService
             // ContentStorage:DataRoot resolved under a developer's own checkout) would report the
             // ancestor's repository as "found" instead of "absent". Both checks above are answered
             // entirely in C#, before any git process runs, so this branch is only ever taken when
-            // repositoryRoot truly has no repository of its own.
-            //
-            // Before ever running `git init`: a folder copied onto the volume before ZeroWiki's first
-            // start can already contain a nested git repository (e.g. a copied-in Obsidian vault). The
-            // reconciliation-time gitlink check further down can only see that once something has been
-            // staged, which on this branch means only after `git init` has already created a `.git`
-            // here and an initial commit already exists — this call would then be refusing to serve a
-            // repository it just created around someone else's content. Scanning the filesystem first
-            // means the refusal below runs before `git init`, so nothing is left behind at all.
-            AssertNoNestedGitRepository(repositoryRoot);
+            // repositoryRoot truly has no repository of its own — and trivially has no commits either,
+            // since nothing has been written here at all yet.
+            repositoryHasNoCommitsYet = true;
 
             _logger.LogInformation("No git repository found at '{RepositoryRoot}'; initializing.", repositoryRoot);
+        }
+
+        // The single predicate that governs whether ZeroWiki is about to write the initial commit into
+        // this repository — computed once above, true whether .git does not exist yet or it does but
+        // HEAD never advanced past `git init`. An earlier version of this method gated the scan on "no
+        // .git entry" alone, which is a *different* condition that only coincides with this one on a
+        // fresh volume; the moment .git exists without a commit in it, the two diverge, and that
+        // divergence is exactly what let a nested repository through undetected. Gating on this single,
+        // shared value — also passed into EnsureInitialCommitAsync below — is what keeps them from
+        // drifting apart again. A folder copied onto the volume before ZeroWiki's first start can
+        // already contain a nested git repository (e.g. a copied-in Obsidian vault); the
+        // reconciliation-time gitlink check further down can only see that once something has been
+        // staged, which requires a commit to diff against, so this scan is what catches it before then.
+        if (repositoryHasNoCommitsYet)
+        {
+            AssertNoNestedGitRepository(repositoryRoot);
+        }
+
+        if (!hasOwnGitEntry)
+        {
+            // Scanning above happens before this call: leaving nothing behind if it refuses is the
+            // entire point of running the scan first on this branch.
             await _git.RunOrThrowAsync(
                 repositoryRoot,
                 ["init", "-b", DefaultBranch],
@@ -120,13 +145,14 @@ public sealed class ContentRepositoryService
         // reporting that damage after it already happened.
         await AssertGitResolvesRepositoryRootAsync(repositoryRoot, cancellationToken);
 
-        // Every refusal this method can raise — bare repository (above), missing docs/, and a staged
-        // gitlink — happens before any write below. This ordering is load-bearing, not incidental
-        // (design.md D9 addendum): the docs/ probe below needs only a HEAD read, and the gitlink probe
-        // is intrinsically a staging-and-diff operation, so both can and must run before configuration
-        // or hooks touch the repository at all. A repository this method is about to refuse never has
-        // anything written to it first.
-        await EnsureInitialCommitAsync(repositoryRoot, cancellationToken);
+        // Every refusal this method can raise — bare repository (above), a nested repository (above),
+        // missing docs/, and a staged gitlink — happens before any write below. This ordering is
+        // load-bearing, not incidental (design.md D9 addendum): the docs/ probe below needs only the
+        // already-computed repositoryHasNoCommitsYet value, and the gitlink probe is intrinsically a
+        // staging-and-diff operation, so both can and must run before configuration or hooks touch the
+        // repository at all. A repository this method is about to refuse never has anything written to
+        // it first.
+        await EnsureInitialCommitAsync(repositoryRoot, repositoryHasNoCommitsYet, cancellationToken);
 
         // D9: a dirty tree at startup (e.g. Markdown copied onto the volume before first start, or an
         // interrupted save) is always committed as a recovery commit, never discarded.
@@ -179,20 +205,26 @@ public sealed class ContentRepositoryService
         Directory.Exists(Path.Combine(repositoryRoot, "refs"));
 
     /// <summary>
-    /// Refuses, before <c>git init</c> ever runs, if <paramref name="repositoryRoot"/>'s directory
-    /// tree already contains a nested git repository — a <c>.git</c> directory or gitfile at any
-    /// depth. This is the <em>initialise</em> path's only guard against gitlinking a copied-in vault:
-    /// <see cref="FindStagedGitlinksAsync"/> answers the same underlying worry from git's index, but
-    /// there is no index yet here — nothing has been staged, because nothing has been written yet.
+    /// Refuses if <paramref name="repositoryRoot"/>'s directory tree contains a nested git repository —
+    /// a <c>.git</c> directory or gitfile at any depth <em>below</em> <paramref name="repositoryRoot"/>
+    /// itself (its own top-level <c>.git</c>, if it already has one, is never itself "nested" — see
+    /// <see cref="CollectNestedGitEntries"/>). Called by <see cref="EnsureRepositoryAsync"/> whenever
+    /// the repository has no commits yet — before it creates the initial commit, whether that is
+    /// because <c>.git</c> does not exist yet (before <c>git init</c> runs) or because it does but
+    /// <c>HEAD</c> is unborn (e.g. a process that died between <c>git init</c> and the initial commit
+    /// that should have followed it). <see cref="FindStagedGitlinksAsync"/> answers the same underlying
+    /// worry from git's index once a commit exists to diff against; this scan exists because there is no
+    /// index yet in either case here — nothing has been staged, because nothing has been written yet.
     /// </summary>
     /// <remarks>
     /// <para>
     /// <b>This is a second instrument, deliberately, not a duplicate of <see cref="FindStagedGitlinksAsync"/>.</b>
     /// This scan asks "is there a nested repository in this folder", walking the filesystem directly,
-    /// and guards only the initialise branch, once, before any write. <see cref="FindStagedGitlinksAsync"/>
-    /// asks "would committing right now store a gitlink", from git's index, and guards every branch at
-    /// every reconciliation — including content that arrives long after bootstrap, on a repository this
-    /// scan never runs against again. Neither subsumes the other.
+    /// and guards <see cref="EnsureRepositoryAsync"/> only when it is about to create the initial
+    /// commit, before any write. <see cref="FindStagedGitlinksAsync"/> asks "would committing right now
+    /// store a gitlink", from git's index, and guards every reconciliation once a commit already exists
+    /// — including content that arrives long after bootstrap, on a repository this scan never runs
+    /// against again. Neither subsumes the other.
     /// </para>
     /// <para>
     /// The two deliberately disagree in one case (Product Owner decision, recorded in
@@ -275,7 +307,15 @@ public sealed class ContentRepositoryService
 
             if (Path.GetFileName(entry) == ".git")
             {
-                found.Add(RelativePath(repositoryRoot, entry));
+                // At repositoryRoot's own top level, a .git entry is this repository's own git
+                // directory (or gitfile) — relevant now that this scan also runs against an already-
+                // -adopted repository whose HEAD is unborn (see AssertNoNestedGitRepository's remarks).
+                // Only a .git found inside a subdirectory is nested.
+                if (!string.Equals(directory, repositoryRoot, StringComparison.Ordinal))
+                {
+                    found.Add(RelativePath(repositoryRoot, entry));
+                }
+
                 continue;
             }
 
@@ -379,22 +419,43 @@ public sealed class ContentRepositoryService
     }
 
     /// <summary>
-    /// On a freshly initialized repository (no <c>HEAD</c> yet), creates <c>docs/</c> and commits it.
-    /// On a repository that already has history — one this call did not create, whether a previous
-    /// start of this app or a repository adopted from elsewhere — does neither: if
-    /// <see cref="ContentPaths.WorkingTree"/> is absent, refuses to start rather than silently
-    /// establish one (Product Owner decision), and does so before <see cref="EnsureRepositoryAsync"/>
-    /// has written any configuration or hooks — the same before-any-write posture as the
-    /// bare-repository and gitlink refusals elsewhere in this class.
+    /// Whether <paramref name="repositoryRoot"/>'s <c>HEAD</c> is unborn: <c>.git</c> exists, but no
+    /// commit has been made yet — for example a process that died between <c>git init</c> and the
+    /// initial commit that should have followed it. Only ever called once <c>.git</c> is already
+    /// confirmed present at <paramref name="repositoryRoot"/> itself (see <see cref="HasOwnGitEntry"/>),
+    /// for the same reason every other git invocation in this class requires that confirmation first:
+    /// without it, discovery could resolve to an unrelated ancestor repository instead.
     /// </summary>
-    private async Task EnsureInitialCommitAsync(string repositoryRoot, CancellationToken cancellationToken)
+    private async Task<bool> RepositoryHeadIsUnbornAsync(string repositoryRoot, CancellationToken cancellationToken)
     {
         var headProbe = await _git.RunAsync(
             repositoryRoot,
             ["rev-parse", "--verify", "-q", "HEAD"],
             cancellationToken: cancellationToken);
 
-        if (headProbe.Succeeded)
+        return !headProbe.Succeeded;
+    }
+
+    /// <summary>
+    /// On a repository with no commits yet (<paramref name="repositoryHasNoCommitsYet"/>), creates
+    /// <c>docs/</c> and commits it. On a repository that already has a commit — one this call did not
+    /// create, whether a previous start of this app or a repository adopted from elsewhere — does
+    /// neither: if <see cref="ContentPaths.WorkingTree"/> is absent, refuses to start rather than
+    /// silently establish one (Product Owner decision), and does so before
+    /// <see cref="EnsureRepositoryAsync"/> has written any configuration or hooks — the same
+    /// before-any-write posture as the bare-repository and gitlink refusals elsewhere in this class.
+    /// </summary>
+    /// <param name="repositoryHasNoCommitsYet">
+    /// Computed once by <see cref="EnsureRepositoryAsync"/> and passed in rather than re-derived here,
+    /// so it is the same value that also gates <see cref="AssertNoNestedGitRepository"/> — the two
+    /// decisions share one predicate and cannot drift apart.
+    /// </param>
+    private async Task EnsureInitialCommitAsync(
+        string repositoryRoot,
+        bool repositoryHasNoCommitsYet,
+        CancellationToken cancellationToken)
+    {
+        if (!repositoryHasNoCommitsYet)
         {
             // Already has history — this call did not create the repository, or a previous start did.
             // Either way, ZeroWiki does not create docs/ here: doing so on an adopted repository would
@@ -447,10 +508,11 @@ public sealed class ContentRepositoryService
     /// no shipped build has ever created one, and doing so would refuse to start a wiki that already
     /// has one in its history, which is a worse outcome than leaving the pre-existing gap undetected.
     /// <para>
-    /// This index-based check is not this repository's only nested-repository guard: the initialise
-    /// branch of <see cref="EnsureRepositoryAsync"/> also runs <see cref="AssertNoNestedGitRepository"/>,
-    /// a filesystem scan, before <c>git init</c> — because on that branch nothing has been staged yet
-    /// for this check to see. See <see cref="AssertNoNestedGitRepository"/>'s remarks for why both
+    /// This index-based check is not this repository's only nested-repository guard:
+    /// <see cref="EnsureRepositoryAsync"/> also runs <see cref="AssertNoNestedGitRepository"/>, a
+    /// filesystem scan, whenever the repository has no commits yet — before it creates the initial
+    /// commit — because there is no index yet at that point for this check to see. See
+    /// <see cref="AssertNoNestedGitRepository"/>'s remarks for exactly which cases that covers, why both
     /// checks stay, and for the one case where they deliberately disagree.
     /// </para>
     /// </remarks>

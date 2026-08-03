@@ -887,6 +887,122 @@ public sealed class ContentRepositoryServiceTests : IDisposable
         Assert.Equal("docs/hello.md", lsFiles.StandardOutput.Trim());
     }
 
+    // The scan's gating predicate: "the repository has no commits yet", not "repositoryRoot has no
+    // .git of its own". The two coincide on a fresh volume (every fixture above) but diverge whenever
+    // .git exists with HEAD still unborn — most plausibly a process that died between `git init` and
+    // the initial commit. Before this fix, that state took the "existing repository" branch, the scan
+    // was never called, and EnsureInitialCommitAsync wrote docs/.gitkeep and committed it as System
+    // before the index-based gitlink check ever got a chance to fire.
+
+    [Fact]
+    public async Task GitInitializedButUnbornHead_WithNestedGitRepository_RefusesWithoutCreatingACommit()
+    {
+        var repositoryRoot = RepositoryRoot;
+        Directory.CreateDirectory(repositoryRoot);
+        // .git present, HEAD unborn: stands in for a process that died between `git init` and the
+        // initial commit that should have followed it.
+        await _git.RunOrThrowAsync(repositoryRoot, ["init", "-b", "main"]);
+        var nestedPath = Path.Combine(repositoryRoot, "copied-vault");
+        await CreateNestedGitRepositoryDirectoryAsync(nestedPath);
+
+        var service = CreateService();
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() => service.EnsureRepositoryAsync());
+        Assert.Contains("copied-vault", exception.Message, StringComparison.Ordinal);
+
+        // The whole point of this fixture: HEAD must still be unborn — no initial commit was created
+        // around the nested repository before the refusal fired. The refusal alone already passes
+        // without the fix (FindStagedGitlinksAsync would eventually have caught this too, just after
+        // the initial commit had already landed), so this is the assertion that actually matters.
+        var headProbe = await _git.RunAsync(repositoryRoot, ["rev-parse", "--verify", "-q", "HEAD"]);
+        Assert.False(headProbe.Succeeded);
+
+        // The offending content itself is untouched — the operator can still fix it.
+        Assert.True(File.Exists(Path.Combine(nestedPath, "note.md")));
+    }
+
+    [Fact]
+    public async Task GitInitializedButUnbornHead_WithNestedGitRepositoryAsAGitfile_RefusesWithoutCreatingACommit()
+    {
+        var repositoryRoot = RepositoryRoot;
+        Directory.CreateDirectory(repositoryRoot);
+        await _git.RunOrThrowAsync(repositoryRoot, ["init", "-b", "main"]);
+
+        var realGitDirectory = Path.Combine(_dataRoot, "real-vault-gitdir");
+        Directory.CreateDirectory(realGitDirectory);
+        await _git.RunOrThrowAsync(realGitDirectory, ["init", "-b", "main"]);
+        await File.WriteAllTextAsync(Path.Combine(realGitDirectory, "note.md"), "# Note\n");
+        await _git.RunOrThrowAsync(realGitDirectory, ["add", "note.md"]);
+        await _git.RunOrThrowAsync(
+            realGitDirectory,
+            ["commit", "-m", "inner commit"],
+            new Dictionary<string, string>
+            {
+                ["GIT_AUTHOR_NAME"] = "Inner",
+                ["GIT_AUTHOR_EMAIL"] = "inner@example.com",
+                ["GIT_COMMITTER_NAME"] = "Inner",
+                ["GIT_COMMITTER_EMAIL"] = "inner@example.com",
+            });
+
+        var nestedPath = Path.Combine(repositoryRoot, "copied-vault");
+        Directory.CreateDirectory(nestedPath);
+        await File.WriteAllTextAsync(
+            Path.Combine(nestedPath, ".git"),
+            $"gitdir: {Path.Combine(realGitDirectory, ".git")}\n");
+        await File.WriteAllTextAsync(Path.Combine(nestedPath, "note.md"), "# Note\n");
+
+        var service = CreateService();
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() => service.EnsureRepositoryAsync());
+        Assert.Contains("copied-vault", exception.Message, StringComparison.Ordinal);
+
+        var headProbe = await _git.RunAsync(repositoryRoot, ["rev-parse", "--verify", "-q", "HEAD"]);
+        Assert.False(headProbe.Succeeded);
+    }
+
+    [Fact]
+    public async Task GitInitializedButUnbornHead_WithNestedGitRepositoryMoreThanOneLevelDeep_RefusesWithoutCreatingACommit()
+    {
+        var repositoryRoot = RepositoryRoot;
+        Directory.CreateDirectory(repositoryRoot);
+        await _git.RunOrThrowAsync(repositoryRoot, ["init", "-b", "main"]);
+        var nestedPath = Path.Combine(repositoryRoot, "a", "b", "copied-vault");
+        await CreateNestedGitRepositoryDirectoryAsync(nestedPath);
+
+        var service = CreateService();
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() => service.EnsureRepositoryAsync());
+        Assert.Contains("a/b/copied-vault", exception.Message, StringComparison.Ordinal);
+
+        var headProbe = await _git.RunAsync(repositoryRoot, ["rev-parse", "--verify", "-q", "HEAD"]);
+        Assert.False(headProbe.Succeeded);
+    }
+
+    [Fact]
+    public async Task GitInitializedButUnbornHead_WithOrdinaryMarkdownAndNoNestedRepository_InitializesNormally()
+    {
+        // The crash-mid-init shape without any nested repository at all: this must not turn a
+        // recoverable interrupted start into a permanent refusal. It also pins that the scan does not
+        // mistake repositoryRoot's own top-level .git — which now exists before the scan ever runs, on
+        // this branch — for a nested repository of its own.
+        var repositoryRoot = RepositoryRoot;
+        Directory.CreateDirectory(repositoryRoot);
+        await _git.RunOrThrowAsync(repositoryRoot, ["init", "-b", "main"]);
+        Directory.CreateDirectory(Path.Combine(repositoryRoot, "docs"));
+        await File.WriteAllTextAsync(Path.Combine(repositoryRoot, "docs", "hello.md"), "# Hello\n");
+
+        var service = CreateService();
+        await service.EnsureRepositoryAsync();
+
+        Assert.True(Directory.Exists(Path.Combine(repositoryRoot, ".git")));
+        await AssertIsNonBareAsync(repositoryRoot);
+        await AssertConfigurationIsAppliedAsync(repositoryRoot);
+        await AssertPorcelainIsEmptyAsync(repositoryRoot);
+
+        // At least the initial commit (docs/.gitkeep) landed; hello.md, pre-existing outside what the
+        // initial commit stages, is picked up by D9 reconciliation as a second commit — the same shape
+        // as OrdinaryMarkdownCopiedOntoAFreshVolumeWithNoNestedRepository_InitializesNormally above.
+        var lsFiles = await _git.RunOrThrowAsync(repositoryRoot, ["ls-files", "docs/hello.md"]);
+        Assert.Equal("docs/hello.md", lsFiles.StandardOutput.Trim());
+    }
+
     [Fact]
     public async Task ForeignRepositoryWithDenyCurrentBranchRefuseAndANewGitlink_RefusesLeavingTheConfigUnchanged()
     {
