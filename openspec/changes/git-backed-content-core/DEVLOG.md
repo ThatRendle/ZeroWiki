@@ -5250,6 +5250,127 @@ unreadable-directory gap, both correctly filed to `## NEXT` rather than this blo
 
 → @architect
 
+**[supervisor]** Section re-review of **§2**, round four, over `7b50e46..HEAD` — seven commits. Tree
+clean, `git status --short` empty. No mutation run, per the ruling.
+
+## Verdict: **Approve** — §2 closes
+
+The blocker is genuinely closed, and closed at the right level: not by adding a fourth path to a list,
+but by deleting the list. Nothing below blocks; the items are for `## NEXT`.
+
+### Ask 1 — is the claim true now, including a state neither of us named?
+
+**Yes.** I applied the same lens rather than re-reading the sentence: enumerate every *write* in
+`EnsureRepositoryAsync`, ask which predicate gates it, then pair each with the refusals that follow it.
+
+| write | gated on | refusals that can still follow it |
+|---|---|---|
+| `Directory.CreateDirectory(repositoryRoot)` `:62` | unconditional | all of them |
+| `git init` `:133` | `!hasOwnGitEntry` | resolve-mismatch |
+| `docs/`, `.gitkeep`, `add`, `commit` `:470-490` | `repositoryHasNoCommitsYet` | staged gitlink |
+| recovery commit | staged diff non-empty | — |
+| config + hooks | last | — |
+
+Two residual write-before-refusal pairs, and both are **provably** benign rather than merely unlikely:
+
+- `Directory.CreateDirectory` precedes the bare-repository refusal — but that refusal requires `.git`
+  or the bare markers to already exist, which means the directory already existed and the call was a
+  no-op. The write cannot occur in any case where the refusal can fire.
+- `git init` precedes the resolve-mismatch assertion — but that assertion can only fail if `.git` is
+  not where `init` just put it. It is defence-in-depth for the *adopt* branch and unreachable on this
+  one by construction.
+
+The pair that actually mattered — initial commit before the staged-gitlink refusal — is closed for a
+structural reason, not a coincidental one: `!hasOwnGitEntry ⟹ repositoryHasNoCommitsYet == true`, so
+the scan runs on **every** path where either `git init` or the initial commit runs. For the gitlink
+check to fire after those writes, the scan would have to have passed over a nested repository that
+`git add -A` then staged. It cannot: the scan is strictly *stricter* than `add -A` on every axis I
+could construct — it ignores `.gitignore` (the documented divergence, in the safe direction), it
+refuses on unreadable subtrees where `add -A` warns and proceeds, and it skips symlinks exactly where
+git stores a symlink as a blob rather than descending. I could not build a fourth state.
+
+### Ask 2 — does the single boolean remove the drift, or move it?
+
+**Removes it.** This is not two conditions kept in agreement, which is what would drift — it is one
+value computed once and consumed twice. The `!hasOwnGitEntry` branch asserts it `true` a priori rather
+than probing, which is sound because `git init` cannot create a commit, so there is no gap between
+"what the probe said" and "what `git init` left behind" for it to disagree across.
+
+The one thing it *does* change is worth recording: `repositoryHasNoCommitsYet` is now a **snapshot**.
+`EnsureInitialCommitAsync` no longer independently verifies `HEAD` immediately before committing; it
+trusts a value computed up to four git invocations earlier. That is correct today only because nothing
+between the probe and the write can create a commit — startup is single-threaded and takes no lock.
+It is not a defect now, but it widens a window that §5 should absorb rather than inherit (see `## NEXT`).
+
+**Verified the new exclusion by execution, not by the reviewer's account** — transcribed
+`CollectNestedGitEntries` verbatim and ran it against constructed trees:
+
+```
+A) own .git + ordinary content          nested=[]                                  visits=2
+B) + nested .git dir one segment down   nested=[docs/vault/.git]                   visits=3
+C) + nested gitfile four segments down  nested=[docs/a/b/c/.git, docs/vault/.git]  visits=6
+D) root passed WITH trailing separator  nested=[docs/a/b/c/.git, docs/vault/.git]
+```
+
+Two things the reviewer's swap could not show. First, `visits=2` in (A) — root plus `docs` — proves the
+repository's own `.git` is not merely excluded from the result but **never descended into**; had it
+fallen through to the directory check, every unborn-`HEAD` start would walk git's entire object store.
+Second, (D): the boundary is exact for a stronger reason than "it was tested". The top-level call
+passes the same string as both `root` and `dir`, so the depth-0 comparison is an identity, and every
+deeper call has a separator plus a name appended and can never equal it. The exclusion therefore cannot
+drift with path normalisation, trailing separators, or case-insensitive filesystems — which an
+empirical check on one platform would not have established.
+
+### Ask 3 — accretion, and whether the split is now overdue
+
+**The Product Owner's choice of the targeted fix was right for this round**, and I'd have argued for it:
+bundling a structural refactor with a correctness fix would have made the correctness fix unreviewable,
+and this change has been consistently good about not doing that. The organising principle also survived
+the change — the fix *strengthened* it, by replacing "every refusal precedes every write" as a property
+someone has to maintain with a single predicate that makes it hold mechanically.
+
+But **the split has moved from optional to overdue**, and for a concrete reason rather than an
+aesthetic one. `git init` now sits in its own `if (!hasOwnGitEntry)` outside the classify block that
+computed that boolean, because the scan had to be interposed between them. The classify block no longer
+owns its own action, and a reader must carry two booleans across three separate `if`s to see the order.
+The forcing function is §5.1: a cross-process `flock` will want to wrap exactly the accept-and-write
+phase and not the configure phase, so `AcceptRepositoryAsync` / `ConfigureRepositoryAsync` is the shape
+the lock is about to ask for anyway. Doing it as part of §5.1 costs nearly nothing; doing it later means
+threading a lock through the current shape first.
+
+### Ask 4 — `## NEXT`
+
+Item 14's sharpening is recorded correctly — "live today on the adopt path" is the part that stops §6
+inheriting it on a false premise. Nothing from my earlier lists was dropped. Adding three:
+
+- **§5.1 should take the write lock across bootstrap's accept-and-write phase.**
+  `repositoryHasNoCommitsYet` is now a snapshot (ask 2), so two containers starting concurrently on one
+  volume — a plausible Docker restart overlap — could both observe an unborn `HEAD`. The window existed
+  before and is now a little wider; §5.1 is where it should close, together with the phase split.
+- **The unreadable-directory refusal's cost argument is now out of scope with its own trigger.**
+  `design.md` justifies it as running "once per volume, on content an operator has just copied in, most
+  likely while they are still watching". True when the scan only ran on a fresh volume; the scan now
+  also runs on every restart of a crash-interrupted volume, where nobody is watching and the refusal
+  repeats until permissions are fixed. The **decision** is still right — refusing beats silently
+  skipping content, which is item 14 — but the rationale should say so on its own terms rather than
+  leaning on "the operator is present". Prose, not behaviour, and explicitly **not** blocking.
+- Carried unchanged: §7 must read the checked-out branch rather than assume `DefaultBranch`; the
+  remaining foreign-repository axes (non-`main` branch, adopted dirty tree); §5.1's lockfile must not
+  live under `RepositoryRoot`.
+
+### Mutation judgement
+
+Endorsed, and the record now supports it four rounds deep. Every defect §2 produced was a gap in *what
+is asked* rather than in how faithfully a shipped condition runs, and this round's fix is the clearest
+case yet: the scan's body was always correct: what was wrong was the predicate at its call site, which
+no mutant of that body can reach. Two mutants remains the right total for §2. The instrument that found
+every one of these was a fixture for a state nobody had enumerated — foreign repository, advancing
+gitlink, unborn `HEAD` — and the four new `GitInitializedButUnbornHead_*` tests are that state finally
+having one. For §5–§7: enumerate the states the subject can be in, build a fixture per state, then
+mutate the conditions that survive.
+
+§2 is closed. → `@architect` — open §3.
+
 ## NEXT
 
 **Resume point: §3 (Content read & render), first block.** §2 is **closed** — supervisor `Approve` on
@@ -5257,8 +5378,13 @@ round two over `7b50e46..HEAD`. §11 closed earlier over `bb3cb2c..HEAD`.
 
 **State: 12/40 tasks ticked** *(counted from `tasks.md`, not carried forward)*. Branch
 `change/git-backed-content-core`. Gates at close-out, run by the Architect rather than relayed:
-`dotnet build` 0/0, `dotnet test` **505/505** full unfiltered, `dotnet format --verify-no-changes`
+`dotnet build` 0/0, `dotnet test` **519/519** full unfiltered, `dotnet format --verify-no-changes`
 exit 0, `openspec validate --strict` valid.
+
+**§2 took four supervisor rounds and seven commits.** Worth stating plainly, because the shape repeated:
+every one of the four findings was a gap in **what a condition asks**, not in how faithfully it runs —
+so all four were invisible to mutation, and all four were found by building a fixture for a state
+nobody had enumerated. The fourth was closed by deleting the enumeration rather than extending it.
 
 | Section | Block | Commit | Reviewer | Supervisor |
 |---|---|---|---|---|
@@ -5272,6 +5398,10 @@ exit 0, `openspec validate --strict` valid.
 | §2 | 2.1–2.2 | `ef2b75b` | Request changes → Approve → **Approve** (re-cert) | Request changes → **Approve** |
 | §2 | 2.3–2.5 | `6b82c33` | Request changes ×2 → **Approve** w/ nit | ↑ |
 | §2 | remediation (2 supervisor blockers) | `2fa3ca5` | **Approve** w/ nit | ↑ |
+| §2 | close-out (docs) | `85d2b7f` | — | — |
+| §2 | D9 reorder — no write precedes any refusal | `f50f1ca` | **Approve** | Request changes (round 3) |
+| §2 | pre-init nested-repo scan | `2c70e05` | Request changes → **Approve** w/ nit | ↑ |
+| §2 | gate the scan on the write's predicate | `1253ff5` | **Approve** | → **Approve** (round 4) |
 
 **Execution order from here: §3 → §4 → … → §10.** §11 and §2 are done; the remaining sections run in
 `tasks.md` order.
@@ -5367,6 +5497,23 @@ a wording tidy-up, because one of its two options changes shipped behaviour.
     tree. Assessed by `@reviewer` as closer to noise than a live risk for this product's content, and
     left unguarded deliberately rather than by oversight — recorded so that judgement is visible rather
     than implicit. Symlink loops are already handled, and are the realistic case.
+16. **§5.1 — `repositoryHasNoCommitsYet` is now a snapshot.** Unifying the scan's gate with the write's
+    predicate (`1253ff5`) means `EnsureInitialCommitAsync` no longer verifies `HEAD` immediately before
+    committing; it trusts a value computed earlier in the call. Correct **today** only because startup
+    is single-threaded and unlocked. §5.1 is where that stops being true, and this is the assumption it
+    invalidates.
+17. **§5.1 — the `AcceptRepositoryAsync`/`ConfigureRepositoryAsync` split has gone from optional to
+    overdue, and §5.1 is its forcing function.** The Product Owner's call to keep `1253ff5` targeted was
+    right — bundling a refactor with a correctness fix would have made the fix unreviewable — but
+    `git init` now sits in its own `if` outside the block that computed its boolean, so the classify
+    block no longer owns its own action. A cross-process `flock` wants to wrap exactly the
+    accept-and-write phase and **not** the configure phase, which is the shape the split already has.
+    Nearly free now; more expensive once a lock is threaded through the current shape.
+18. **A rationale that no longer covers its own trigger** (prose, non-blocking). The
+    unreadable-directory refusal is justified partly by "the scan runs once per volume, while the
+    operator is most likely still watching". Since `1253ff5` the scan also runs on an **unattended
+    crash-recovery restart** — `.git` present, `HEAD` unborn — where nobody is watching. The decision
+    stays right on its other grounds; the stated reason should stand on its own terms.
 
 ### Close-out items before archive
 
