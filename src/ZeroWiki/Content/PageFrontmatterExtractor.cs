@@ -23,6 +23,14 @@ public sealed class PageFrontmatterExtractor
     }
 
     /// <summary>
+    /// Passes through the bound <see cref="IFrontmatterParser"/>'s <see cref="IFrontmatterParser.MaxSizeBytes"/>
+    /// — so a caller that reads a bounded prefix of a file before calling <see cref="Extract"/> (D15's
+    /// index builder) sizes that read from whichever parser is actually injected here, not a hardcoded
+    /// implementation's constant.
+    /// </summary>
+    public int MaxFrontmatterSizeBytes => _frontmatterParser.MaxSizeBytes;
+
+    /// <summary>
     /// Returns <see cref="PageFrontmatter.Empty"/> when <paramref name="markdownContent"/> has no
     /// frontmatter block — indistinguishable, by design (D14), from a block that failed to parse.
     /// </summary>

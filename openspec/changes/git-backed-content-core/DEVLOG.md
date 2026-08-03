@@ -7289,6 +7289,315 @@ history walk, the startup build and full rebuild) and **B = 4.3** (the stamp che
 re-index off `git diff`, and `WikiPage` reading the index). B is where the section stops being
 scaffolding, so A must not wire the read path and B must not leave a second one behind.
 
+**[architect]** Brief — block A, tasks **4.1–4.2**: build the index and be able to rebuild it from the
+repository. → @worker
+
+**Deliver**
+
+- An **immutable snapshot** type carrying, for every page: route, working-tree-relative path, absolute
+  path, title, tags, last-edit (author name + time). Plus, in the *same* snapshot, D12's refusals —
+  ambiguous routes with every claimant, and unreadable directories — and the **commit sha the snapshot
+  was built from**. The stamp field is written in this block; nothing *checks* it until block B.
+- A **builder** that produces one from the repository: `PageEnumerationService` for the walk (do not
+  write a second walker), frontmatter for title/tags, one bulk history walk for last-edit.
+- A **singleton holder** built at startup, with the snapshot swappable. Registration goes beside the rest
+  of the content wiring in `ContentStorageStartupExtensions`, after repository bootstrap.
+- Tests.
+
+**Binding constraints — each of these has a scar behind it**
+
+1. **One bulk history walk, not one `git log` per page** (D15). A single `git log --name-status` pass over
+   history, newest-first, attributing each commit's `%an`/`%aI` to the paths it lists; the first record
+   per path wins. Put it on `PageHistoryService` next to the existing per-path reader — git-log knowledge
+   stays in one class, and a second git-log service is exactly the duplicated abstraction the supervisor
+   looks for.
+2. **`core.quotePath` will bite you.** Git quotes non-ASCII paths in `--name-status` output by default, and
+   an Obsidian vault is full of accented filenames. §2 shipped a defect on precisely this. Use NUL-delimited
+   output (`-z`) and/or `-c core.quotePath=false`, and **prove it with a test whose filename is non-ASCII** —
+   a test with only ASCII fixtures cannot see this fault.
+3. **`--no-renames`.** `diff.renames` defaults on, so rename records appear with two path fields under `-z`
+   and will silently corrupt your parse. With renames off, a rename is an add on the new path, which is the
+   correct last-edit anyway.
+4. **Paths from git are repository-relative** (`docs/Foo.md`); the snapshot's are working-tree-relative.
+   `PageHistoryService` already derives that prefix — reuse it, do not re-derive it.
+5. **Bounded prefix read** (D15). Frontmatter is at the head of the file, so read at most enough
+   *characters* (via `StreamReader` — never a raw byte slice, which splits a UTF-8 codepoint) to contain a
+   legal block, reusing whatever cap D14's parser already enforces rather than introducing a second
+   number. A block truncated by the cap yields **no** complete frontmatter block and therefore empty
+   metadata, which is D14's total-failure posture holding by construction. This does **not** cap the render
+   path; do not touch it.
+6. **Title is the frontmatter title, nullable.** No H1 extraction, no filename fallback baked into the
+   entry — `WikiPage`'s existing display fallback is a presentation choice and stays where it is.
+7. **A tree with no pages is an empty snapshot; a build that could not be performed throws**, naming what
+   failed. Do not invent a silent empty-index fallback — an empty wiki that looks fine is the silent
+   degradation this project refuses everywhere else. An unborn `HEAD` (no commits) is "no pages", not a
+   failure.
+8. **Do not wire `WikiPage.razor`, do not add a staleness check, do not add incremental update.** All three
+   are block B. A block that quietly does B's work makes B unreviewable.
+
+**Scope and limits**
+
+- **No mutation testing in this block.** Per CLAUDE.md it is for auth, concurrency and data-integrity
+  paths; a derived, rebuildable index is none of those. Ordinary unit tests with normal coverage are the
+  correct instrument here.
+- Spec: `specs/content-store/spec.md`, *Derived index rebuildable from the repository* — the two existing
+  scenarios are yours; *Content changed by an unannounced writer* is block B's. *Refused routes survive
+  indexing* and *Index holds no content* are yours to satisfy structurally.
+- Design: `design.md` **D15** (and D6, D14 for the cap, D12 for what enumeration already guarantees).
+- Gates before handoff: `dotnet build` clean, `dotnet test` green **unfiltered**, `dotnet format
+  --verify-no-changes` clean, `openspec validate git-backed-content-core --strict`.
+- Post what you did and anything you had to decide to this DEVLOG under `## 4.`, then hand to
+  @reviewer.
+
+**[worker]** Block A (4.1–4.2) implemented.
+
+- `PageIndexEntry`/`PageIndexSnapshot` (new): the immutable per-page shape plus D12's refusals and
+  `CommitSha`, all in one snapshot. `PageIndexSnapshot.Empty` is the stamp-less snapshot for an unborn
+  `HEAD`.
+- `PageIndexBuilder` (new): `BuildAsync` probes `git rev-parse --verify -q HEAD` first (the same idiom
+  `ContentRepositoryService.RepositoryHeadIsUnbornAsync` already uses) and short-circuits to
+  `PageIndexSnapshot.Empty` on an unborn `HEAD` without walking anything. Otherwise it calls
+  `PageEnumerationService.EnumeratePages()` unchanged, `PageHistoryService.GetAllLastEditsAsync` once for
+  every page's last-edit, and reads a bounded prefix of each file for frontmatter.
+- `PageHistoryService.GetAllLastEditsAsync` (new method, same class as the existing per-path
+  `GetLastEditAsync` — no second git-log service): one `git -c core.quotePath=false log --no-renames
+  --name-status -z --format=<SOH>%an%x1f%aI -- docs` pass, newest-first, `Dictionary.TryAdd` per path so
+  the first (newest) sighting wins. Parsed the actual `-z` byte shape empirically first (scratch repo,
+  `od -c`) rather than assuming: a NUL-split of the stream alternates header/status/path tokens, except
+  the first status token after each header carries a stray leading `\n` (git's usual blank separator
+  line, still emitted verbatim under `-z`) that must be stripped before inspecting it. A leading `\x01`
+  marker on the header format (never a legal `--name-status` status code) tells a header token from a
+  status token without lookahead.
+- `PageIndex` (new): the singleton holder, `Volatile.Read`/`Write` for a lock-free atomic reference swap.
+  Registered in `ContentStorageStartupExtensions.AddContentStorage` beside `PageIndexBuilder`, right after
+  the rest of §3/§4's content wiring. `ContentStorageStartupExtensions.BuildPageIndexAsync` (new, mirrors
+  `EnsureContentRepositoryAsync`'s shape) builds the initial snapshot and installs it; `Program.cs` calls
+  it right after `EnsureContentRepositoryAsync()`, before `LogBootstrapStateAsync()`.
+
+Decisions:
+
+- **Bounded-prefix cap**: reused `SharpYamlFrontmatterParser.MaxSizeBytes` directly as the character count
+  for `StreamReader`'s read window (`private const int FrontmatterPrefixReadCapChars =
+  SharpYamlFrontmatterParser.MaxSizeBytes;` in `PageIndexBuilder`), rather than adding a `MaxSizeBytes`
+  member to `IFrontmatterParser`. It's a bare `int` reference, not a SharpYaml type — D14's "only
+  `SharpYamlFrontmatterParser` may reference a SharpYaml type" is about the library's own types
+  (exceptions, serializer options), not an unrelated class reading its public size constant. Flagging in
+  case @reviewer reads this differently.
+- **Unreadable/vanished file during the frontmatter read** (enumeration-to-read race, same class of race
+  `WikiPage.razor`'s render path already tolerates): caught `IOException`/`UnauthorizedAccessException`,
+  logged, and treated as `PageFrontmatter.Empty` for that one page rather than failing the whole rebuild
+  — not the "build throws" case in constraint 7, which I read as a genuine git/process fault, not a single
+  file's transient race.
+- Verified the `-z`/`--no-renames`/`core.quotePath=false` shape against a real `git log` first (non-ASCII
+  filename, a rename, an empty commit, a commit outside the pathspec) before writing the parser, per the
+  binding constraints' warning.
+
+Tests added: `PageHistoryServiceTests` (bulk multi-path, non-ASCII filename, rename attributes to the new
+path, HEAD born but no docs history yet); `PageIndexBuilderTests` (title/tags/last-edit from the
+repository incl. commit sha, no-frontmatter page, non-ASCII filename through the full builder, frontmatter
+over the cap yields empty metadata, ambiguous route + unaffected page surviving into the snapshot, unborn
+`HEAD` → `PageIndexSnapshot.Empty`, HEAD born with no pages → empty `Pages` with a real sha);
+`PageIndexTests` (holder default and swap). No mutation testing, per scope.
+
+Gates: `dotnet build` clean (0 warnings), `dotnet test` green unfiltered (694/694), `dotnet format
+--verify-no-changes` clean, `openspec validate git-backed-content-core --strict` valid.
+
+Did not touch `WikiPage.razor`, add a staleness check, or add incremental update — all block B.
+
+→ @reviewer
+
+**[reviewer]** Block A (4.1–4.2) audit — **Request changes.** Two blockers, both cheap to fix; everything
+else checked out, including the block's own highest-risk claim (the `-z` parse), reproduced independently
+rather than trusted.
+
+**Blockers**
+
+1. **`PageIndexBuilder.cs:65–73` — the unborn-`HEAD` probe silently swallows any git failure, not only a
+   genuinely unborn `HEAD`, which is exactly the "silent empty-index fallback" binding constraint 7
+   forbids.** The code checks only `!headProbe.Succeeded` and returns `PageIndexSnapshot.Empty` on any
+   non-zero exit from `git rev-parse --verify -q HEAD`. I built a fresh scratch repo and reproduced both
+   cases directly: a genuinely unborn `HEAD` exits **1** with no output; running the same command against
+   a path with **no** `.git` at all exits **128** and prints `fatal: not a git repository...` to stderr —
+   `-q` does **not** suppress that message, contrary to the method's own comment ("`-q` suppresses git's
+   error text for the one case this checks... so a non-zero exit here means exactly that, not some other
+   git fault"). That claim is factually wrong, verified by direct reproduction, and this project's own §2
+   thread (line ~3025) already recorded this exact 1-vs-128 distinction for a sibling `rev-parse` probe —
+   the knowledge needed to get this right was already in the repo's own history.
+   - Currently unreachable at the one wired call site: `Program.cs` only calls `BuildPageIndexAsync` after
+     `EnsureContentRepositoryAsync` has guaranteed a valid repository, mirroring what makes
+     `ContentRepositoryService.RepositoryHeadIsUnbornAsync` safe *there*. But that safety comes from the
+     **caller's** structural precondition, not from anything `PageIndexBuilder.BuildAsync` itself asserts —
+     and D15 explicitly designates this same method as block B's full-rebuild-fallback caller ("gives 4.3
+     a real caller inside this change"). Nothing currently stops a future call (or a corrupted/deleted
+     `.git` mid-run) from hitting exit 128 and silently reporting "no pages" instead of throwing, naming
+     what failed.
+   - Fix: distinguish the exit code (1 = unborn `HEAD`; anything else throws, naming the failure — e.g. via
+     `GitProcessException`), or make the "repository already known to exist" precondition explicit and
+     enforced on `BuildAsync`, not just implied by call order. Either resolves it; please don't leave the
+     comment's disproven claim in place either way.
+
+2. **`PageIndexBuilderTests.cs:154–169`, `Build_AmbiguousRouteAndUnreadableDirectory_SurviveIntoTheSnapshot`
+   — the name promises unreadable-directory coverage the body doesn't deliver.** The test creates two
+   ambiguous-route fixtures and one unaffected page; it never creates an unreadable directory, and never
+   asserts on `snapshot.UnreadableDirectories` at all. I grepped the whole test tree —
+   `UnreadableDirectories` is asserted in `PageEnumerationServiceTests.cs` (§3's territory) but nowhere in
+   this block's tests. The pass-through itself is correct (`PageIndexBuilder.cs:95` forwards
+   `enumeration.UnreadableDirectories` straight into the snapshot — I read it and it's right), so this is a
+   test-only gap, not a shipped bug: but *Refused routes survive indexing* is one of the two scenarios the
+   brief named as "yours to satisfy structurally" for this block, and a test claiming to cover it while
+   silently not doing so is exactly the "what can this assertion not see" trap this project has been bitten
+   by before. Please extend the test with a genuine unreadable-directory fixture (§3's own tests show the
+   pattern) and an assertion on `snapshot.UnreadableDirectories`, or split it into two named tests.
+
+**Nits**
+
+3. **The D14 seam question the worker flagged (`PageIndexBuilder.cs:18–26`, referencing
+   `SharpYamlFrontmatterParser.MaxSizeBytes` directly): compliant with the letter of D14, weakens its
+   intent.** `MaxSizeBytes` is a bare `int`, not a SharpYaml type, so this doesn't violate "only
+   `SharpYamlFrontmatterParser` may reference a SharpYaml type" as literally written. But D14's stated
+   purpose is that the parser can be "swapped without touching any calling code" — and this reference
+   *would* require touching `PageIndexBuilder.cs` the day `SharpYamlFrontmatterParser` is ever replaced
+   (the constant would either vanish or silently stop tracking the active parser's real cap). Recommend
+   moving the cap onto `IFrontmatterParser` itself (an `int` property needs no SharpYaml type to cross the
+   seam) so the coupling is formal rather than incidental. Not blocking — no functional issue today, and
+   it's exactly the kind of judgment call the worker was right to flag rather than decide unilaterally.
+
+4. **`-c core.quotePath=false` (`PageHistoryService.cs`, `GetAllLastEditsAsync`) is redundant given `-z`,
+   and the doc comment misattributes the mechanism.** I built my own scratch repo (a non-ASCII filename,
+   a multi-file commit, a deletion, and a delete-then-re-add of the same path — deliberately not reusing
+   the worker's fixture) and confirmed empirically that `-z` alone disables git's default path-quoting
+   regardless of `core.quotePath`'s value — with the flag removed, the café filename still comes through
+   unquoted under `-z`, and only reappears quoted once `-z` itself is also removed. This matches documented
+   git behaviour and matches what this project's own §2 thread already established (line ~3751: "`-z`
+   disables `core.quotePath`'s default octal-escaping"). I then made a single targeted check (not a
+   mutation-testing campaign — this is ordinary test-quality verification, and the block is explicitly
+   out of mutation-testing scope): removed `-c core.quotePath=false` from the shipped code, ran only the
+   two non-ASCII tests, watched them still pass, then reverted and confirmed the file's checksum matched
+   the pre-check value exactly. So per the brief's own item 2 ("prove... that the test would fail if the
+   flag were removed") — it wouldn't, because `-z` is the actual load-bearing mechanism, not the explicit
+   `-c` override. This isn't a bug — the flag is harmless belt-and-braces, not a source of corruption — but
+   the class remarks (`PageHistoryService.cs`, the `-c core.quotePath=false` `<b>` block) attribute the fix
+   to the flag rather than to `-z`, which is the same shape of "comment asserts a causal mechanism that
+   isn't the true one" this project has been bitten by before (D13's addendum; §2's reordering fix).
+   Recommend correcting the comment (or dropping the now-admittedly-redundant flag) — worker/architect's
+   call which, not blocking either way.
+
+**Checked and clean — recorded so it isn't re-litigated**
+
+- **The `-z` parse itself, re-derived independently.** Built my own scratch repository (not the worker's
+  fixture) with a two-file commit, a non-ASCII filename, a modify-both-files commit, a deletion, and a
+  re-add of the deleted path, then ran an exact copy of `GetAllLastEditsAsync`'s parsing body against the
+  real captured `git log --no-renames --name-status -z --format=...` output. Result matched exactly: the
+  re-added path attributed to its newest (re-add) commit rather than the earlier delete or original add —
+  "first record per path wins" holds against a real re-add, not just a same-path double-edit.
+- **`--no-renames`** appears exactly once as an actual argument (`PageHistoryService.cs`); every other hit
+  in the diff is prose/test-name. Nothing re-enables `diff.renames`.
+- **Bounded-prefix cap (chars vs. bytes) is sound.** Reading `MaxSizeBytes` *characters* always consumes
+  **at least** that many bytes from the file (a UTF-8 character is never smaller than a byte), so any
+  frontmatter block within the parser's own byte cap is guaranteed to fit inside the character read window.
+  `SharpYamlFrontmatterParser.Parse` independently re-checks the UTF-8 byte count before ever handing text
+  to SharpYaml, so even a pathological all-multibyte prefix that reads more bytes than `MaxSizeBytes`
+  cannot bypass D14's actual bound — worst case it's a little wasteful, never unsound.
+- **No duplicated abstraction.** `PageIndexBuilder` calls `PageEnumerationService.EnumeratePages()` and
+  `PageHistoryService.GetAllLastEditsAsync` only; no second walker, no second git-log service.
+- **Scope held.** No `WikiPage.razor` changes, no staleness check, no incremental update — confirmed
+  absent from the diff.
+- **Per-file frontmatter-read race handling** (catch `IOException`/`UnauthorizedAccessException` →
+  `PageFrontmatter.Empty` for that one page, not a whole-build failure) is a reasonable, well-justified
+  distinction from constraint 7's "build throws" case — agreed with the worker's reasoning as posted.
+- **DI graph** is singleton-consistent throughout (`PageIndexBuilder`/`PageIndex` alongside the services
+  they depend on) — no captive-dependency risk.
+- **Gates, re-run myself:** `dotnet build` clean (0 warnings), `dotnet test` **694/694 unfiltered**,
+  `dotnet format --verify-no-changes` clean, `openspec validate git-backed-content-core --strict` valid.
+  `git diff -- src` / `git status --short -- src` show only this block's expected files — no mutation
+  residue (the one targeted quotePath check above was reverted and checksum-verified before these gates
+  were re-run).
+
+→ @worker
+
+**[worker]** Both blockers and both nits fixed.
+
+- **Blocker 1** (`PageIndexBuilder.BuildAsync`): `git rev-parse --verify -q HEAD` now branches on exit
+  code, not merely non-zero — `ExitCode == 1` is the unborn-`HEAD` "no pages" case (D15); any other
+  non-zero (e.g. 128, "not a git repository") now throws `GitProcessException(headProbeArguments,
+  ExitCode, StandardError)`, naming the failure instead of folding it into an empty snapshot. Rewrote the
+  comment to state what the two codes actually mean, verified against a real repo both ways (unborn:
+  exit 1, no stderr; not-a-repository: exit 128, `fatal:` text intact) before writing it. New test
+  `Build_RepositoryRootIsNotAGitRepository_ThrowsRatherThanReturningTheEmptySnapshot` asserts the throw.
+- **Blocker 2**: `Build_AmbiguousRouteAndUnreadableDirectory_SurviveIntoTheSnapshot` now actually creates
+  an unreadable directory — reused `PageEnumerationServiceTests.UnreadableDirectory_IsReportedAndOtherPagesStayServed`'s
+  `File.SetUnixFileMode(..., UnixFileMode.None)` fixture idiom verbatim (same root-bypass/stillReadable
+  guard, same `finally`-restore) rather than inventing a second one — and asserts
+  `snapshot.UnreadableDirectories` contains it and no page under it is served. Confirmed the assertion is
+  live by temporarily changing `PageIndexBuilder.BuildAsync`'s pass-through to `[]` and re-running: the
+  test failed as expected, then reverted (checksum/`git diff` clean before re-running the real gates).
+- **Nit 1 (required)**: moved the cap off `SharpYamlFrontmatterParser.MaxSizeBytes` and onto the seam.
+  Added `int MaxSizeBytes { get; }` to `IFrontmatterParser`; `SharpYamlFrontmatterParser` implements it
+  explicitly (`int IFrontmatterParser.MaxSizeBytes => MaxSizeBytes;`, coexisting with its own `public
+  const int MaxSizeBytes` — verified this compiles and resolves correctly both ways before relying on it).
+  `PageFrontmatterExtractor` gained a passthrough `MaxFrontmatterSizeBytes => _frontmatterParser.MaxSizeBytes`;
+  `PageIndexBuilder` now sizes its read buffer from that instead of the concrete parser's constant, so a
+  future swapped-in `IFrontmatterParser` with a different cap is what the read follows.
+- **Nit 2**: rewrote the `GetAllLastEditsAsync` remarks — confirmed empirically (accented filename,
+  `-z` with `core.quotePath` left at its default) that `-z` alone already emits unquoted UTF-8 paths;
+  `-c core.quotePath=false` is now documented as redundant belt-and-braces, kept for defence-in-depth but
+  no longer credited as the mechanism. Flag itself unchanged.
+
+Gates, re-run unfiltered: `dotnet build` clean (0 warnings), `dotnet test` **695/695**, `dotnet format
+--verify-no-changes` clean, `openspec validate git-backed-content-core --strict` valid.
+
+→ @reviewer
+
+**[reviewer]** Re-audit of block A (4.1–4.2) — **Approve.** Re-read the block as a whole, not just the
+delta, since three files hadn't been in front of me before (`IFrontmatterParser.cs`,
+`SharpYamlFrontmatterParser.cs`, `PageFrontmatterExtractor.cs`); all four findings independently
+re-verified rather than taken on the worker's report.
+
+- **Blocker 1.** Reproduced the exit-code split myself in a fresh scratch directory: `git rev-parse
+  --verify -q HEAD` against a plain (non-`.git`) directory exits **128** with `fatal: not a git
+  repository...`, distinct from the unborn-`HEAD` case's exit **1** — matches `PageIndexBuilder.cs:49–69`'s
+  new branch exactly. `GitProcessException`'s message embeds the full argument list, exit code, and
+  stderr text (`GitProcessException.cs:6–7`), so the throw genuinely names what failed rather than just
+  signalling that something did. Checked there's no second `_git.RunAsync` call anywhere else in the
+  file that could still fold a failure into an empty result — there is exactly one, and it's the one
+  that got fixed.
+- **Blocker 2.** Independently mutated the fix myself rather than trusting the worker's report: changed
+  `PageIndexBuilder.cs:91`'s `enumeration.UnreadableDirectories` to `[]`, ran
+  `Build_AmbiguousRouteAndUnreadableDirectory_SurviveIntoTheSnapshot` alone — it failed exactly as
+  expected (`Assert.Contains() Failure: ... Not found: "locked"`) — then reverted via `Edit` and
+  confirmed the file's md5 matched what it was before my mutation. The new unreadable-directory half of
+  the test faithfully reuses §3's own `UnixFileMode.None` idiom (root-tolerant skip, try/finally
+  permission restore), not a second one.
+- **Nit 1 (made required).** Traced the whole chain: `IFrontmatterParser.MaxSizeBytes` (new interface
+  member) → `SharpYamlFrontmatterParser`'s explicit `int IFrontmatterParser.MaxSizeBytes => MaxSizeBytes;`
+  returns the class's own `public const int MaxSizeBytes = 8 * 1024` directly, so the two can never drift
+  — one is a forwarding read of the other, not an independently-maintained second number. Confirmed
+  nothing still reaches past the seam: grepped every `MaxSizeBytes`/`MaxFrontmatterSizeBytes` reference
+  in `src/` and `tests/` — `PageIndexBuilder.cs` now sizes its read from
+  `_frontmatterExtractor.MaxFrontmatterSizeBytes` only, no direct `SharpYamlFrontmatterParser` reference
+  remains in it. The two test-side references to `SharpYamlFrontmatterParser.MaxSizeBytes`
+  (`PageIndexBuilderTests.cs:141`, `SharpYamlFrontmatterParserTests.cs:60`) are fine — both construct a
+  concrete `SharpYamlFrontmatterParser` directly and are sizing a fixture against the parser they know
+  they're using, not reaching around the interface in production code.
+- **Nit 2.** `GetAllLastEditsAsync`'s remarks now correctly credit `-z` as what disables path-quoting and
+  document `-c core.quotePath=false` as redundant, kept anyway as free belt-and-braces — matches what I
+  verified independently last round.
+
+**Gates, re-run myself, not relayed:** `dotnet build` clean (0 warnings), `dotnet test` **695/695
+unfiltered**, `dotnet format --verify-no-changes` clean, `openspec validate git-backed-content-core
+--strict` valid. `git status --short -- src tests` / `git diff --stat -- src` show exactly this block's
+expected file set and nothing else — no residue from either of my two targeted mutation checks, both
+reverted and checksum-confirmed clean before these gates ran.
+
+**This Approve certifies the working tree exactly as it stands now** — `HEAD` `c59ce13`, uncommitted:
+`ContentStorageStartupExtensions.cs`, `IFrontmatterParser.cs`, `PageFrontmatterExtractor.cs`,
+`PageHistoryService.cs`, `SharpYamlFrontmatterParser.cs`, `Program.cs`, `PageHistoryServiceTests.cs`
+(modified) plus `PageIndex.cs`, `PageIndexBuilder.cs`, `PageIndexEntry.cs`, `PageIndexSnapshot.cs`,
+`PageIndexBuilderTests.cs`, `PageIndexTests.cs` (new). Any further edit before commit is uncertified and
+needs its own pass.
+
+→ @architect: block A clear to commit.
+
 ## NEXT
 
 **Resume point: §4 (Derived index), first block.** §3 is **closed** — supervisor `Approve` on round

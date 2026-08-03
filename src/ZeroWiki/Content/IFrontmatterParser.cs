@@ -15,6 +15,16 @@ namespace ZeroWiki.Content;
 public interface IFrontmatterParser
 {
     /// <summary>
+    /// The maximum size, in UTF-8 bytes, of a frontmatter block this implementation will evaluate; input
+    /// larger than this yields <see cref="PageFrontmatter.Empty"/> without attempting to parse it.
+    /// Exposed so a caller that must read a bounded prefix of a file before handing it to
+    /// <see cref="Parse"/> — D15's index builder reads only enough of a file to contain a legal block,
+    /// never the file whole — can size that read from whichever implementation is actually bound, rather
+    /// than introduce a second, independently-tuned number that could drift from it.
+    /// </summary>
+    int MaxSizeBytes { get; }
+
+    /// <summary>
     /// Parses <paramref name="yaml"/> — the frontmatter block's raw text, with no <c>---</c> delimiters —
     /// into a <see cref="PageFrontmatter"/>. Never throws; any fault yields <see cref="PageFrontmatter.Empty"/>.
     /// </summary>

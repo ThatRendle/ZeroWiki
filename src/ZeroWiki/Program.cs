@@ -95,6 +95,7 @@ var app = builder.Build();
 
 await app.MigrateIdentityDbAsync();
 await app.EnsureContentRepositoryAsync();
+await app.BuildPageIndexAsync();
 await app.LogBootstrapStateAsync();
 
 // Configure the HTTP request pipeline.

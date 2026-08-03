@@ -134,4 +134,78 @@ public sealed class PageHistoryServiceTests : IDisposable
         Assert.Equal("New Author", lastEdit.AuthorName);
         Assert.NotEqual("Old Author", lastEdit.AuthorName);
     }
+
+    [Fact]
+    public async Task BulkLastEdits_ReturnsTheMostRecentAuthorAndDatePerPath()
+    {
+        await InitializeRepositoryAsync();
+        var firstEdit = new DateTimeOffset(2026, 1, 1, 9, 0, 0, TimeSpan.Zero);
+        var secondEdit = new DateTimeOffset(2026, 2, 3, 14, 30, 0, TimeSpan.Zero);
+
+        await CommitPageAsync("page.md", new GitAuthor("Alice", "alice@zerowiki.example"), firstEdit, "first");
+        await CommitPageAsync("page.md", new GitAuthor("Bob", "bob@zerowiki.example"), secondEdit, "second");
+        await CommitPageAsync("other.md", new GitAuthor("Carol", "carol@zerowiki.example"), firstEdit, "third");
+
+        var lastEdits = await CreateService().GetAllLastEditsAsync(CancellationToken.None);
+
+        Assert.Equal("Bob", lastEdits["page.md"].AuthorName);
+        Assert.Equal(secondEdit, lastEdits["page.md"].EditedAt);
+        Assert.Equal("Carol", lastEdits["other.md"].AuthorName);
+    }
+
+    [Fact]
+    public async Task BulkLastEdits_NonAsciiFilename_IsNotCorruptedByGitsDefaultPathQuoting()
+    {
+        // core.quotePath defaults on, so git quotes any non-ASCII byte in --name-status output as a
+        // C-style octal escape unless the caller overrides it — an ASCII-only fixture cannot see this
+        // fault (§2 shipped exactly this defect, and an Obsidian vault is full of accented filenames).
+        await InitializeRepositoryAsync();
+        var editedAt = new DateTimeOffset(2026, 3, 4, 10, 0, 0, TimeSpan.Zero);
+
+        await CommitPageAsync("Café Notes.md", new GitAuthor("Alice", "alice@zerowiki.example"), editedAt, "unicode");
+
+        var lastEdits = await CreateService().GetAllLastEditsAsync(CancellationToken.None);
+
+        Assert.True(lastEdits.ContainsKey("Café Notes.md"));
+        Assert.Equal("Alice", lastEdits["Café Notes.md"].AuthorName);
+    }
+
+    [Fact]
+    public async Task BulkLastEdits_RenamedFile_AttributesToTheNewPathNotTheOld()
+    {
+        // --no-renames turns a rename into a delete-on-old-path + add-on-new-path pair; under -z a
+        // rename record instead carries two NUL-delimited path fields for one status code, which would
+        // silently misalign the status/path alternation if renames were left enabled.
+        await InitializeRepositoryAsync();
+        var createdAt = new DateTimeOffset(2026, 1, 1, 9, 0, 0, TimeSpan.Zero);
+        var renamedAt = new DateTimeOffset(2026, 4, 5, 11, 0, 0, TimeSpan.Zero);
+
+        await CommitPageAsync("Old Name.md", new GitAuthor("Alice", "alice@zerowiki.example"), createdAt, "create");
+
+        var repositoryRoot = Paths.RepositoryRoot;
+        await _git.RunOrThrowAsync(repositoryRoot, ["mv", "docs/Old Name.md", "docs/New Name.md"]);
+        var env = new Dictionary<string, string>(new GitAuthor("Bob", "bob@zerowiki.example").ToEnvironmentVariables())
+        {
+            ["GIT_AUTHOR_DATE"] = renamedAt.ToString("O"),
+            ["GIT_COMMITTER_DATE"] = renamedAt.ToString("O"),
+        };
+        await _git.RunOrThrowAsync(repositoryRoot, ["commit", "-m", "rename"], env);
+
+        var lastEdits = await CreateService().GetAllLastEditsAsync(CancellationToken.None);
+
+        Assert.True(lastEdits.ContainsKey("New Name.md"));
+        Assert.Equal("Bob", lastEdits["New Name.md"].AuthorName);
+        Assert.Equal(renamedAt, lastEdits["New Name.md"].EditedAt);
+    }
+
+    [Fact]
+    public async Task BulkLastEdits_HeadBornButNoHistoryUnderDocs_ReturnsEmptyRatherThanThrowing()
+    {
+        await InitializeRepositoryAsync();
+        await _git.RunOrThrowAsync(Paths.RepositoryRoot, ["commit", "--allow-empty", "-m", "init"]);
+
+        var lastEdits = await CreateService().GetAllLastEditsAsync(CancellationToken.None);
+
+        Assert.Empty(lastEdits);
+    }
 }

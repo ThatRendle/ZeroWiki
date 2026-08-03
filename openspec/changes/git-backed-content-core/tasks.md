@@ -22,8 +22,8 @@
 
 ## 4. Derived index
 
-- [ ] 4.1 Build an index (path, title, tags, last-edit) from the repository
-- [ ] 4.2 Support full rebuild of the index from the repo when absent or deleted
+- [x] 4.1 Build an index (path, title, tags, last-edit) from the repository
+- [x] 4.2 Support full rebuild of the index from the repo when absent or deleted
 - [ ] 4.3 Incrementally update index entries for changed files
 
 ## 5. Write lock

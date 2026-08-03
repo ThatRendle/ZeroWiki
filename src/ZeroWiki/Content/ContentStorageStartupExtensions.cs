@@ -38,6 +38,12 @@ public static class ContentStorageStartupExtensions
         // both already singletons, so this is one too — no caching (§4.1 owns the index for that).
         services.AddSingleton<PageHistoryService>();
 
+        // §4.1-4.2: the derived index (D6, D15) — a builder that composes the services registered above
+        // rather than duplicating any of them, and the process-memory singleton it fills at startup
+        // (BuildPageIndexAsync, called after EnsureContentRepositoryAsync below).
+        services.AddSingleton<PageIndexBuilder>();
+        services.AddSingleton<PageIndex>();
+
         return services;
     }
 
@@ -52,6 +58,20 @@ public static class ContentStorageStartupExtensions
         await using var scope = app.Services.CreateAsyncScope();
         var repository = scope.ServiceProvider.GetRequiredService<ContentRepositoryService>();
         await repository.EnsureRepositoryAsync(cancellationToken);
+    }
+
+    /// <summary>
+    /// Builds the initial <see cref="PageIndexSnapshot"/> and installs it into the <see cref="PageIndex"/>
+    /// singleton (D15, §4.1-4.2). Must run after <see cref="EnsureContentRepositoryAsync"/> — building the
+    /// index assumes the repository (and its <c>docs/</c> working tree) already exists.
+    /// </summary>
+    public static async Task BuildPageIndexAsync(this IHost app, CancellationToken cancellationToken = default)
+    {
+        await using var scope = app.Services.CreateAsyncScope();
+        var builder = scope.ServiceProvider.GetRequiredService<PageIndexBuilder>();
+        var index = scope.ServiceProvider.GetRequiredService<PageIndex>();
+        var snapshot = await builder.BuildAsync(cancellationToken);
+        index.Replace(snapshot);
     }
 
     /// <summary>

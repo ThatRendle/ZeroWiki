@@ -62,6 +62,13 @@ public sealed class SharpYamlFrontmatterParser : IFrontmatterParser
         UnsafeAllowDeserializeFromTagTypeName = false,
     };
 
+    /// <summary>
+    /// Explicit interface implementation so <see cref="MaxSizeBytes"/> stays available as the class's own
+    /// <see langword="const"/> (used directly below) while also being reachable, unqualified, through
+    /// <see cref="IFrontmatterParser"/> for a caller — D15's index builder — that only knows the interface.
+    /// </summary>
+    int IFrontmatterParser.MaxSizeBytes => MaxSizeBytes;
+
     public PageFrontmatter Parse(string yaml)
     {
         if (string.IsNullOrWhiteSpace(yaml))
