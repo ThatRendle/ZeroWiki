@@ -134,6 +134,19 @@ else
         }
 
         var canonicalRoute = PageRouteCodec.Encode(relativePath);
+
+        // S2 (block 3 remediation): Encode is not injective, so decode-then-re-Encode alone can land a
+        // request on a different file's canonical route than the one it actually named — e.g. a route
+        // value carrying two literal spaces re-encodes to the same route a single literal underscore
+        // does, resurrecting D12's own collision through the request rather than the filename. Refusing
+        // here, before any enumeration lookup, means a non-canonical request can never resolve to a
+        // different file than a canonical one would — the request-side twin of enumeration's own "the
+        // route identifies exactly this file" invariant.
+        if (!PageRouteCodec.IsCanonicalRouteValue(Route, canonicalRoute))
+        {
+            return;
+        }
+
         var enumeration = PageEnumerationService.EnumeratePages();
 
         var ambiguousMatch = enumeration.AmbiguousRoutes
@@ -157,11 +170,14 @@ else
         {
             markdown = await File.ReadAllTextAsync(pageMatch.AbsolutePath, context.RequestAborted);
         }
-        catch (IOException)
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
-            // The file existed when EnumeratePages() walked the tree a moment ago and is gone or
-            // mid-write now — a concurrent save racing this read without D3's lock (a gap 3a's review
-            // already parked for §6). Report not found rather than a 500; the next request re-enumerates.
+            // The file existed when EnumeratePages() walked the tree a moment ago and is gone, mid-write,
+            // or newly unreadable now — a concurrent save racing this read without D3's lock (a gap 3a's
+            // review already parked for §6). UnauthorizedAccessException does not derive from IOException
+            // (S3, block 3 remediation) and was previously uncaught here, producing a 500 instead of the
+            // clean not-found this comment already promised. Report not found rather than a 500; the next
+            // request re-enumerates.
             return;
         }
 

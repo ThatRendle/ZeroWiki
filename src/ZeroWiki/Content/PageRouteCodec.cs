@@ -58,6 +58,15 @@ namespace ZeroWiki.Content;
 /// §3, and the redesign is §6's to make when the save path exists and the real shape of that caller is
 /// known, not to guess at in advance.
 /// </para>
+/// <para>
+/// <b>Decoding a route value is not the same question as whether it is the *right* route value for a
+/// page a caller has already found</b> (S2, block 3 remediation) — <see cref="Encode"/>'s
+/// non-injectivity means a decode-then-re-<see cref="Encode"/> round trip can land on the same canonical
+/// route two different request strings would never both legitimately produce, re-opening D12's own
+/// collision through whichever caller resolves a route value to a specific page.
+/// <see cref="IsCanonicalRouteValue"/> is that check, and it is the one every such caller must reuse
+/// rather than re-derive; see its own remarks for why re-encoding is not an adequate substitute.
+/// </para>
 /// </remarks>
 public static class PageRouteCodec
 {
@@ -188,6 +197,30 @@ public static class PageRouteCodec
     /// </remarks>
     public static bool TryDecodeRouteValue(string routeValue, out string workingTreeRelativePath) =>
         TryDecodeCore(routeValue, decodePercentEncoding: false, out workingTreeRelativePath);
+
+    /// <summary>
+    /// Whether <paramref name="routeValue"/> — a value ASP.NET Core routing has already percent-decoded
+    /// once — is exactly the received form of <paramref name="canonicalRoute"/> (a still-encoded,
+    /// canonical route such as <see cref="EnumeratedPage.Route"/>): the request-side twin of
+    /// <see cref="PageEnumerationService"/>'s enumeration-side "the route identifies exactly this file"
+    /// check (D12, S2 — block 3 remediation).
+    /// </summary>
+    /// <remarks>
+    /// <b>Why a decode-then-<see cref="Encode"/> round trip is not this check.</b> <see cref="Encode"/> is
+    /// not injective (this class's own remarks, above) — a request that decodes to a relative path other
+    /// than the one that produced <paramref name="canonicalRoute"/> can still re-<see cref="Encode"/> to
+    /// the identical string, which is exactly how the read path re-admitted D12's own collision through
+    /// the request door (a route value carrying two literal spaces re-encodes to the same route a single
+    /// literal underscore does). Comparing the *request* against <c>Uri.UnescapeDataString</c> of the
+    /// *canonical route* — the value the framework would have delivered for the one true URL of that page —
+    /// sidesteps the many-to-one collapse entirely rather than trying to detect it after the fact: no
+    /// re-encoding happens on this path at all, so there is nothing for two different requests to collide
+    /// into. Every caller that resolves a route value to a specific, already-identified page (the read path
+    /// here; a save path, later) MUST apply this check before treating the match as trustworthy — reuse it
+    /// rather than re-deriving the same comparison.
+    /// </remarks>
+    public static bool IsCanonicalRouteValue(string routeValue, string canonicalRoute) =>
+        string.Equals(Uri.UnescapeDataString(canonicalRoute), routeValue, StringComparison.Ordinal);
 
     private static bool TryDecodeCore(string route, bool decodePercentEncoding, out string workingTreeRelativePath)
     {

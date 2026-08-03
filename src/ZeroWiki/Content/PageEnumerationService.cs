@@ -93,12 +93,32 @@ public sealed class PageEnumerationService
                 var claimants = relativePaths.OrderBy(path => path, StringComparer.Ordinal).ToArray();
                 ambiguousRoutes.Add(new AmbiguousPageRoute(route, claimants));
 
-                _logger.LogWarning(
-                    "Route '{Route}' does not identify exactly one file ({Count} claimant(s): {Claimants}); " +
-                    "refusing to serve it (D12).",
-                    route,
-                    claimants.Length,
-                    string.Join(", ", claimants));
+                // A sole claimant whose only discrepancy from its own round trip is the case of its
+                // extension (e.g. "Page.MD") is refused for the same D12 reason as any other
+                // route-doesn't-identify-the-file case, but the *fault* is different: it is never a
+                // route collision (block 3 remediation, lower-severity finding) — Walk matches ".md"
+                // case-insensitively, but TryDecodeCore always reconstructs a lowercase extension, so
+                // this file can never round-trip regardless of what any other file in the tree does.
+                // Naming that explicitly saves an operator from hunting for a second claimant that does
+                // not exist.
+                if (claimants.Length == 1 && HasNonLowercaseMarkdownExtension(claimants[0]))
+                {
+                    _logger.LogWarning(
+                        "'{RelativePath}' has a Markdown extension that is not exactly lowercase '.md' " +
+                        "(route '{Route}'); its route can never resolve back to this exact file, so it " +
+                        "is never served. Rename the extension to lowercase to make it addressable.",
+                        claimants[0],
+                        route);
+                }
+                else
+                {
+                    _logger.LogWarning(
+                        "Route '{Route}' does not identify exactly one file ({Count} claimant(s): {Claimants}); " +
+                        "refusing to serve it (D12).",
+                        route,
+                        claimants.Length,
+                        string.Join(", ", claimants));
+                }
             }
         }
 
@@ -130,6 +150,15 @@ public sealed class PageEnumerationService
             unreadableDirectories.Add(ToRoutePath(Path.GetRelativePath(workingTreeRoot, directory)));
             return;
         }
+        catch (DirectoryNotFoundException)
+        {
+            // This directory existed when the parent listing found it a moment ago and is gone now --
+            // a concurrent git push removing or renaming it under us (S3, block 3 remediation): the
+            // per-request walk has no guard against the tree mutating while it runs (parked for §6's
+            // lock). Not "unreadable" -- there is nothing here to report as a permissions problem an
+            // operator should fix, and nothing to serve, so this is an empty subtree, not a fault.
+            return;
+        }
 
         foreach (var entry in entries)
         {
@@ -139,7 +168,19 @@ public sealed class PageEnumerationService
                 continue;
             }
 
-            var attributes = File.GetAttributes(entry);
+            FileAttributes attributes;
+            try
+            {
+                attributes = File.GetAttributes(entry);
+            }
+            catch (Exception ex) when (ex is FileNotFoundException or DirectoryNotFoundException or UnauthorizedAccessException)
+            {
+                // Same race as above, one level down: this specific entry existed in the listing a
+                // moment ago and is gone, renamed, or newly inaccessible now. Skip it as if it was
+                // never here rather than failing the whole walk over one vanished entry.
+                continue;
+            }
+
             if ((attributes & FileAttributes.ReparsePoint) != 0)
             {
                 continue;
@@ -172,4 +213,14 @@ public sealed class PageEnumerationService
     private static string ToRoutePath(string path) => path.Replace(Path.DirectorySeparatorChar, '/');
 
     private static string ToPlatformPath(string path) => path.Replace('/', Path.DirectorySeparatorChar);
+
+    /// <summary>
+    /// Whether <paramref name="relativePath"/> ends with <c>.md</c> case-insensitively (so <see cref="Walk"/>
+    /// enumerated it) but not with exactly lowercase <c>.md</c> — the one and only way a sole claimant can
+    /// fail its own round trip without any other file being involved, since <see cref="PageRouteCodec.TryDecode"/>
+    /// always reconstructs a lowercase extension.
+    /// </summary>
+    private static bool HasNonLowercaseMarkdownExtension(string relativePath) =>
+        relativePath.EndsWith(".md", StringComparison.OrdinalIgnoreCase)
+        && !relativePath.EndsWith(".md", StringComparison.Ordinal);
 }

@@ -219,6 +219,79 @@ public sealed class WikiPageTests : IDisposable
     }
 
     [Fact]
+    public async Task A_script_bearing_link_destination_is_refused_end_to_end()
+    {
+        // S1 (block 3 remediation) end to end: DisableHtml() never governed link/image *destinations*,
+        // so a real request through the real pipeline is what actually proves the allow-list is wired
+        // in, not just that MarkdownLinkAllowList works in isolation (MarkdownLinkAllowListTests covers
+        // that). Asserts on the rendered attribute, not merely the absence of a tag.
+        await SeedAccountAsync("alice");
+        await WritePageAsync("page.md", "[click me](javascript:alert(1)) and ![img](javascript:alert(1))");
+
+        var response = await (await SignInAsync("alice")).GetAsync("/wiki/page");
+        var body = await response.Content.ReadAsStringAsync();
+
+        Assert.DoesNotContain("javascript:", body, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("href=\"\"", body, StringComparison.Ordinal);
+        Assert.Contains("src=\"\"", body, StringComparison.Ordinal);
+        Assert.Contains("click me", body, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Ordinary_link_and_image_destinations_still_work()
+    {
+        await SeedAccountAsync("alice");
+        await WritePageAsync(
+            "page.md",
+            "[external](https://example.com) [mail](mailto:me@example.com) [other](/wiki/other) [frag](#section)");
+
+        var response = await (await SignInAsync("alice")).GetAsync("/wiki/page");
+        var body = await response.Content.ReadAsStringAsync();
+
+        Assert.Contains("href=\"https://example.com\"", body, StringComparison.Ordinal);
+        Assert.Contains("href=\"mailto:me@example.com\"", body, StringComparison.Ordinal);
+        Assert.Contains("href=\"/wiki/other\"", body, StringComparison.Ordinal);
+        Assert.Contains("href=\"#section\"", body, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Every_response_carries_a_script_blocking_content_security_policy()
+    {
+        await SeedAccountAsync("alice");
+        await WritePageAsync("page.md", "Body.");
+
+        var response = await (await SignInAsync("alice")).GetAsync("/wiki/page");
+
+        Assert.True(response.Headers.TryGetValues("Content-Security-Policy", out var values));
+        var csp = Assert.Single(values);
+        Assert.Contains("script-src 'self'", csp, StringComparison.Ordinal);
+        Assert.DoesNotContain("unsafe-inline", csp, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task A_non_canonical_route_value_is_refused_even_though_it_would_re_encode_to_a_real_pages_route()
+    {
+        // S2 (block 3 remediation) — the exact spec fixture (specs/content-store/spec.md, "Only a
+        // page's own canonical route serves it"): only "Chapter_1.md" exists, whose canonical route is
+        // "Chapter__1". Requesting "/wiki/Chapter%20%201" (two literal spaces once ASP.NET Core routing
+        // decodes it) decodes to "Chapter  1.md" and re-encodes to the same "Chapter__1" route — the
+        // pre-remediation read path served this file anyway. It must not: the request's own route value
+        // is not the received form of "Chapter_1.md"'s canonical route.
+        await SeedAccountAsync("alice");
+        await WritePageAsync("Chapter_1.md", "Should never be served by the wrong route value.");
+
+        var response = await (await SignInAsync("alice")).GetAsync("/wiki/Chapter%20%201");
+        var body = await response.Content.ReadAsStringAsync();
+
+        Assert.DoesNotContain("Should never be served by the wrong route value.", body, StringComparison.Ordinal);
+
+        // The canonical route for the same file still works.
+        var canonical = await (await SignInAsync("alice")).GetAsync("/wiki/Chapter__1");
+        var canonicalBody = await canonical.Content.ReadAsStringAsync();
+        Assert.Contains("Should never be served by the wrong route value.", canonicalBody, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task Frontmatter_title_and_git_author_are_html_escaped_not_raw()
     {
         // D13 is a security property: the Markdig pipeline's raw-HTML-off setting must be the *only*

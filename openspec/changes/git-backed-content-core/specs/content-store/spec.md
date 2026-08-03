@@ -72,19 +72,39 @@ The system SHALL derive each page's route from its working-tree path relative to
 - **WHEN** the working tree contains a single file whose route decodes to a different path than the file's own (for example `Chapter  1.md`, with two spaces, whose route `Chapter__1` decodes to `Chapter_1.md`), and no other file claims that route
 - **THEN** the system refuses that route rather than serving the file, so that no later save can resolve the route to a different file than the one being read
 
+#### Scenario: Only a page's own canonical route serves it
+
+- **WHEN** a request supplies a route that is not the exact route the requested file produces — for example `/wiki/Chapter%20%201` (two spaces) where only `Chapter_1.md` exists, both encoding to `Chapter__1`
+- **THEN** the system does not serve that file, so that a request can never reach a page by a route that would resolve elsewhere on a later save
+
 #### Scenario: Hostile route is refused, not fatal
 
 - **WHEN** a request supplies a route containing a percent-encoded NUL byte, a control character, or another sequence that no enumerated file could have produced
 - **THEN** the system refuses the route and continues serving, rather than raising an unhandled error
 
-### Requirement: Raw HTML in page content is not rendered
+### Requirement: Page content cannot execute script
 
-The system SHALL render Markdown with raw HTML disabled, so that inline and block HTML in page content appears as text rather than as markup, and SHALL NOT rely on sanitizing HTML instead.
+The system SHALL render Markdown with raw HTML disabled, so that inline and block HTML in page content appears as text rather than as markup, and SHALL NOT rely on sanitizing HTML instead. The system SHALL additionally permit a link or image destination only when it is relative or carries an explicitly allowed scheme, refusing every other destination, and SHALL serve a Content-Security-Policy that blocks inline script.
 
 #### Scenario: Embedded script is not executed
 
 - **WHEN** a page's Markdown contains a raw HTML element such as `<script>` or an element carrying an event-handler attribute
 - **THEN** the rendered page displays that markup as visible text and the browser executes none of it
+
+#### Scenario: Script-bearing link destination is refused
+
+- **WHEN** a page's Markdown contains a link or image whose destination carries a scheme outside the allowed set — for example `javascript:`, `data:`, or `vbscript:` — including forms that reach that scheme only after entity decoding, case changes, or embedded whitespace
+- **THEN** the rendered page does not emit that destination as a live link or image source
+
+#### Scenario: Ordinary destinations still work
+
+- **WHEN** a page's Markdown contains a relative link to another page, a bare fragment, or an `http`, `https`, or `mailto` destination
+- **THEN** the rendered page emits it unchanged as a working link
+
+#### Scenario: Response carries a script-blocking policy
+
+- **WHEN** any page is served
+- **THEN** the response carries a Content-Security-Policy header whose `script-src` does not permit inline script
 
 ### Requirement: Derived index rebuildable from the repository
 

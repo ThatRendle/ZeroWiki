@@ -18,11 +18,25 @@ public sealed class PageHistoryService
     private readonly GitProcessRunner _git;
     private readonly ILogger<PageHistoryService> _logger;
 
+    /// <summary>
+    /// The working tree's path relative to the repository root (e.g. <c>docs</c>) — derived from
+    /// <see cref="ContentPaths"/> rather than hardcoded (S3 lower-severity finding, block 3 remediation):
+    /// a hardcoded <c>"docs/"</c> here was a second, independently-maintained spelling of the same fact
+    /// <see cref="ContentPaths.WorkingTree"/> already owns, and if the two ever diverged, <c>git log</c>
+    /// would silently return empty output for every page — indistinguishable from the legitimate
+    /// "no history yet" case, since git does not treat an unmatched pathspec as an error. Deriving it
+    /// removes the divergence this failure depended on rather than adding a second check to detect it.
+    /// </summary>
+    private readonly string _repositoryRelativeWorkingTree;
+
     public PageHistoryService(ContentPaths paths, GitProcessRunner git, ILogger<PageHistoryService> logger)
     {
         _paths = paths;
         _git = git;
         _logger = logger;
+        _repositoryRelativeWorkingTree = Path
+            .GetRelativePath(paths.RepositoryRoot, paths.WorkingTree)
+            .Replace(Path.DirectorySeparatorChar, '/');
     }
 
     /// <summary>
@@ -41,7 +55,8 @@ public sealed class PageHistoryService
     /// </remarks>
     public async Task<PageLastEdit?> GetLastEditAsync(string workingTreeRelativePath, CancellationToken cancellationToken)
     {
-        var repositoryRelativePath = "docs/" + workingTreeRelativePath.Replace(Path.DirectorySeparatorChar, '/');
+        var repositoryRelativePath = _repositoryRelativeWorkingTree + "/" +
+            workingTreeRelativePath.Replace(Path.DirectorySeparatorChar, '/');
 
         GitProcessResult result;
         try

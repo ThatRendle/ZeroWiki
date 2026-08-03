@@ -136,6 +136,53 @@ public sealed class PageEnumerationServiceTests : IDisposable
     }
 
     [Fact]
+    public void MixedCaseExtension_IsRefusedWithAMessageNamingTheRealFault()
+    {
+        // Block 3 remediation, lower-severity finding: "Page.MD" is enumerated (Walk matches ".md"
+        // case-insensitively) but can never round-trip (TryDecodeCore always reconstructs a lowercase
+        // extension), so it is refused exactly like a D12 route collision even though no second file is
+        // involved and no space/underscore ambiguity exists at all -- the fault is the extension's case,
+        // not a routing collision. Asserts the corrected message names the real fault rather than just
+        // pinning the (unchanged) refusal outcome.
+        WriteFile("Page.MD");
+        WriteFile("unaffected.md");
+
+        var logs = new CapturingLogger<PageEnumerationService>();
+        var result = new PageEnumerationService(Paths, logs).EnumeratePages();
+
+        Assert.DoesNotContain(result.Pages, p => p.Route == "Page");
+        var refused = Assert.Single(result.AmbiguousRoutes);
+        Assert.Equal("Page", refused.Route);
+        Assert.Equal(["Page.MD"], refused.RelativePaths);
+
+        var unaffected = Assert.Single(result.Pages);
+        Assert.Equal("unaffected", unaffected.Route);
+
+        var message = Assert.Single(logs.Messages);
+        Assert.Contains("extension", message, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("Page.MD", message, StringComparison.Ordinal);
+        Assert.DoesNotContain("D12", message, StringComparison.Ordinal);
+    }
+
+    /// <summary>Records formatted log messages so a test can assert on their text, not just that logging happened.</summary>
+    private sealed class CapturingLogger<T> : Microsoft.Extensions.Logging.ILogger<T>
+    {
+        public List<string> Messages { get; } = [];
+
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+
+        public bool IsEnabled(Microsoft.Extensions.Logging.LogLevel logLevel) => true;
+
+        public void Log<TState>(
+            Microsoft.Extensions.Logging.LogLevel logLevel,
+            Microsoft.Extensions.Logging.EventId eventId,
+            TState state,
+            Exception? exception,
+            Func<TState, Exception?, string> formatter) =>
+            Messages.Add(formatter(state, exception));
+    }
+
+    [Fact]
     public void SymlinkedDirectory_IsNotFollowed()
     {
         WriteFile(Path.Combine("real", "page.md"));

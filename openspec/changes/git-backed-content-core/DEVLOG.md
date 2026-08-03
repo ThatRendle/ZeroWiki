@@ -6539,6 +6539,554 @@ on the three genuinely tracked files (`Home.razor`, `ContentStorageStartupExtens
 `PageRouteCodec.cs`) is unchanged from the prior round, as expected for a wording-only nit that touched
 none of them.
 
+**[supervisor]** §3 section review — `60957e6..e9bfea0` (`50da7b0` D12–D14 + spec delta, `8332c79`
+block 3a, `e9bfea0` block 3b).
+
+**Verdict: Request changes.** Three findings, all cross-block. Tree is clean at `e9bfea0` —
+`git status --short --untracked-files=all` is empty, so no mutation residue and no untracked file
+hiding one. Mutation evidence is coherent across both blocks: security-critical targets only, full
+unfiltered suite, checksums before and after, `trap`-based revert, no filtered figure posted. The
+per-block reviews were sound; nothing below is a second opinion on them.
+
+---
+
+### S1 (blocker) — D13's mechanism does not deliver D13's stated property: link URIs are an open stored-XSS channel
+
+`MarkdownPipelineFactory.cs:14-18` calls `.DisableHtml()`, which escapes raw HTML exactly as the spec
+requirement words it. It does **not** touch link or image destinations, and Markdig has no default
+URI allow-list. Probed against the real `MarkdownPipelineFactory.Create()` (a scratch project
+compiling the shipped source, not a reimplementation):
+
+```
+[click me](javascript:alert(1))        -> <p><a href="javascript:alert(1)">click me</a></p>
+<javascript:alert(1)>                  -> <p><a href="javascript:alert(1)">javascript:alert(1)</a></p>
+[click me](javascript&#58;alert(1))    -> <p><a href="javascript:alert(1)">click me</a></p>   (entity resolved back to ':')
+![img](javascript:alert(1))            -> <p><img src="javascript:alert(1)" alt="img" /></p>
+[click](data:text/html;base64,PHNj...) -> <p><a href="data:text/html;base64,...">click</a></p>
+[click](vbscript:msgbox(1))            -> <p><a href="vbscript:msgbox(1)">click</a></p>
+<script>alert(1)</script>              -> <p>&lt;script&gt;alert(1)&lt;/script&gt;</p>          (correct)
+<img src=x onerror=alert(1)>           -> <p>&lt;img src=x onerror=alert(1)&gt;</p>            (correct)
+```
+
+`grep -rn 'Content-Security-Policy' src/` returns nothing — there is no CSP anywhere in the app, so a
+`javascript:` href executes on click. This is stored XSS against every reader including the
+administrator, reachable by any git-token holder pushing a page: precisely the threat `design.md:163`
+names and does **not** accept. It is not on the Product Owner's accepted-risks list.
+
+`design.md:163` — "Escaping needs no dependency and **has no bypass surface**" — is false as a
+stored-XSS claim. That is the change's seventh claim-versus-mechanism defect and the second in
+`design.md`. Applying §2's standing rule, *when a guard's justification names a case, check the
+guard's branch*: the justification names stored XSS; the branch covers raw HTML only.
+
+**Why no block review could catch it.** The worker (this thread, block 3b) and the reviewer
+(block 3b audit, "**D13 — verified independently, no findings**") both audited D13 by enumerating
+*which values reach the browser un-encoded* and answering "only `_renderedBody`, and Markdig has raw
+HTML off". Both are correct. Both measured raw HTML tags. The tests match the same instrument —
+`Embedded_script_is_shown_as_text_rather_than_executed` and
+`Frontmatter_title_and_git_author_are_html_escaped_not_raw` (`WikiPageTests.cs:206-244`) assert only
+on `<script>`. Two measurements agreeing is not corroboration when they share an instrument.
+
+Answering the Architect's Q4 directly: the **other** channels are clean, and I verified every one
+rather than taking the sweep on trust. Frontmatter title, tags, `_page.RelativePath`, each claimant
+path in the ambiguous-route list, and `PageHistoryService`'s git-derived `AuthorName` all render
+through plain Razor `@expression` (`WikiPage.razor:16,20,25,34,55`), which HTML-encodes;
+`_renderedBody` (`:41`, set at `:170`) is the file's only `MarkupString`. The sweep was right about
+the channels it enumerated. The body channel is the one that is not closed.
+
+❓ **@architect / Product Owner** — closing this changes D13, which currently says nothing about link
+destinations, so it is a decision, not just a fix. The shape is a URI allow-list at the pipeline
+(scheme-restricting `LinkInline`/`AutolinkInline` before render) and/or a CSP, plus a spec scenario so
+the property is gated rather than asserted. Which, and whether both, is the Product Owner's call —
+but the section cannot close claiming *Raw HTML in page content is not rendered* delivers D13's
+stated purpose while this is live.
+
+---
+
+### S2 (blocker) — the read path resolves routes many-to-one, re-opening the collision D12's correction closed, and disagreeing with the resolver §3 ships for §6
+
+`WikiPage.razor:131-149` resolves a request as decode → `Encode` → string-match against enumeration:
+
+```
+TryDecodeRouteValue(Route, out relativePath)      // :131
+var canonicalRoute = PageRouteCodec.Encode(relativePath);   // :136
+... FirstOrDefault(c => c.Route == canonicalRoute)          // :140, :149
+```
+
+`Encode` is not injective — the class's own remarks say so at `PageRouteCodec.cs:13-15` — so this
+composition is not injective either, and the enumeration-side round-trip check (which *is* exact)
+never sees the request. Probed against the shipped codec:
+
+```
+routeValue 'a  b'  (two literal spaces, /wiki/a%20%20b)
+  -> decoded 'a  b.md' -> re-encoded 'a__b' -> SERVES a_b.md
+```
+
+So with only `Chapter_1.md` in the tree, `/wiki/Chapter%20%201` renders it. That is the exact pairing
+the corrected `design.md:138-152` calls "**the realistic collision** — a double space against a single
+underscore, `Chapter  1.md` against `Chapter_1.md`, a typo meeting an ordinary filename". §3 refuses
+that pairing on the enumeration side (3a) and re-admits it on the request side (3b). D12's principle
+is *never silently pick one of two readings*; `/wiki/Chapter  1` has two readings and the section
+picks one.
+
+It also breaks the contract §3 ships for §6. Same probe, same route values, through the resolver
+`PageRouteCodec.cs:320` documents as §6's entry point:
+
+```
+routeValue 'a  b' | read-path serves route 'a__b' (file a_b.md) | TryResolveWorkingTreePathFromRouteValue -> a  b.md
+routeValue 'a__b' | read-path serves route 'a__b' (file a_b.md) | TryResolveWorkingTreePathFromRouteValue -> a_b.md
+routeValue 'a b'  | read-path serves route 'a_b'  (file a b.md) | TryResolveWorkingTreePathFromRouteValue -> a b.md
+```
+
+One URL, two answers. `PageRouteCodec.cs:46-49` claims the resolvers "mirror this same split one layer
+up" — they do not mirror the read path, because the read path does not use them and does not share
+their semantics. D12's binding consequence, "§6 inherits an inverse that is total on every route it
+can actually be reached from", is not what §3 built.
+
+Blocks 3a (codec + enumeration) and 3b (lookup). Invisible in either diff: 3a's round trip is exact;
+3b's re-encode reads as a way to *avoid* re-deriving 3a's containment check, which the reviewer
+correctly confirmed it does. It takes both diffs at once.
+
+**Remediation shape.** The property to establish is: *there is exactly one function from a route value
+to a page, and every caller — read now, save in §6 — goes through it.* Concretely, the read path must
+refuse a route value that is not the canonical form of the page it would serve (e.g. require
+`Uri.UnescapeDataString(pageMatch.Route) == Route` before serving; non-canonical addresses become
+not-found). A test for a non-canonical route value is the coverage gap — `WikiPageTests` has twelve
+cases and not one of them requests a page by a non-canonical address.
+
+---
+
+### S3 (medium) — a per-request tree walk with no guard for the writer it shares the tree with
+
+3a wrote `Walk` for a service-layer caller that owned the tree. 3b made it run on **every page view**
+(`WikiPage.razor:137`) against a tree a concurrent `git push` mutates. `PageEnumerationService.cs:124-132`
+catches only `UnauthorizedAccessException`, and only around `EnumerateFileSystemEntries`. Probed:
+
+```
+File.GetAttributes(entry) on an entry deleted after enumeration (:142) -> FileNotFoundException
+EnumerateFileSystemEntries on a directory removed mid-walk             -> DirectoryNotFoundException
+  caught by Walk's only catch (UnauthorizedAccessException)?           -> False, both
+```
+
+Both propagate out of `EnumeratePages()` → `OnInitializedAsync` → unhandled 500 on every page view for
+the duration of a push that deletes or renames anything. This is a different failure from the parked
+`Walk`-vs-D3-lock race (that one is about *what* is read; this is about not surviving the read) and
+from the window `WikiPage.razor:162` names — which is the later enumerate→read gap. Answering the
+Architect's question on that comment: it is honest about the window it names and understates the
+surface. Its `catch (IOException)` at `:160` also misses `UnauthorizedAccessException`, which is not an
+`IOException` (verified) — an unreadable file yields a 500 rather than the clean not-found the comment
+promises. The earlier window, inside the walk itself, is neither named nor handled.
+
+---
+
+### Q1 / Q2 — `PageRouteCodec`'s surface, and the two resolvers
+
+**Q1: accreted, not designed.** Five public members over one private core, reached across three review
+rounds. As a design there is one job (route ↔ path) and two orthogonal axes — which decode contract,
+and does it resolve to an absolute path — a 2×2 currently spelled as four separately-named methods, of
+which two have no production caller. The tell is the doc-to-code ratio: ~190 of 350 lines are comment,
+and most of it exists to prevent a mix-up the type system permits, with 60 lines of class remarks
+before the first member. The reviewer's judgement that the distinct-types redesign is §6's is right
+*given the resolvers stay*. It stops being right under S2's fix: once one canonical route→page
+resolution exists, the natural shape is that resolution on the enumeration side, with the codec
+shrinking to `Encode`/`TryDecode`. Worth settling while carving S2 rather than deferring to §6.
+
+**Q2: yes — and worse than dead.** Neither resolver has a production caller (confirmed; the reviewer
+found the same). They carry the section's most security-critical logic and its only surface never
+exercised in anger. That would be tolerable as "built for §6" if their semantics matched what §3
+ships — S2 shows they do not, so what is being carried forward is a *wrong* contract with
+authoritative-looking documentation aimed at the section least able to question it. My recommendation
+with the S2 fix: keep at most one, reached through the canonical resolution, and let §6 build against
+a contract that has a live caller. Shipping two zero-caller functions whose only purpose is a section
+that has not been designed is the thing 3a's own brief told the worker to avoid.
+
+---
+
+### Q3 — per-request enumeration
+
+Correct as an interim and unlikely to become permanent: it is stated in three places (`WikiPage.razor:82-86`,
+the DI comment, this thread) and §4.1 is the next section. It does **not** build something §4 must
+unpick — §4 replaces the lookup, it does not undo it. But §4 will index against whatever contract §3
+settles, which is the second reason S2 should be fixed here rather than inherited: an index keyed on a
+many-to-one lookup bakes the aliasing in. Cost noted for `## NEXT`: a full tree walk plus a `git log`
+subprocess spawn per page view, and no cap anywhere on page size — a pushed multi-hundred-MB `.md`
+is read whole into memory and Markdig-parsed on every request.
+
+### Q5 — do D12, D13, D14 say what the code does?
+
+- **D12 — code right, rule sentence wrong (again).** `design.md:138`: "any run of two or more adjacent
+  `{space, '_'}` characters is ambiguous — not merely a run of underscores" excludes a run of length
+  **one** consisting of a single literal `_`, which encodes to `__` — a route run of two, which by
+  D12's own Fibonacci(*n*+1) formula in the very next sentence has two preimages (`a_b` and `a  b`).
+  The table immediately below shows exactly that collision. Table and rule sentence disagree; the
+  correction widened the alphabet and narrowed the run length. The code does not depend on the
+  sentence — enumeration checks the actual round trip — but §6 will read it, and this is the second
+  time D12's collision class has been understated in prose. State it where it is exact: **a route
+  containing two or more consecutive `_` is ambiguous.** (S2 is the same arithmetic arriving through
+  the request door rather than the filename door.)
+- **D13 — no.** See S1.
+- **D14 — yes, and the implementation exceeds it.** Bounds set explicitly at the seam rather than
+  inherited (`MaxSizeBytes` 8 KiB checked pre-parse, `MaxDepth` 8), `Dictionary<string, object>`
+  target, `ReferenceHandling.None` and `UnsafeAllowDeserializeFromTagTypeName = false` both pinned
+  rather than defaulted, `catch (Exception)` → `PageFrontmatter.Empty` so failure is total, and the
+  alias-bomb closure evidenced empirically rather than assumed. One imprecision, not blocking:
+  `PageFrontmatterExtractor.Extract` runs `Markdown.Parse` over the whole page *before* the 8 KiB cap
+  applies, so D14's "bound the input before parsing it" is true of the seam it names and silent about
+  the document parse ahead of it.
+
+---
+
+### Clean — checked and no finding
+
+- **D7 render-mode discipline.** No `@rendermode` anywhere in the section; `WikiPage.razor` is Static
+  SSR, `[Authorize]` matches the existing pattern. No circuit widened.
+- **Identity/access uniformity.** One new route, `[Authorize]`, covered by `AnonymousGate`, with an
+  anonymous test. No new differential and no new redirect shape.
+- **D5.** `git log -1 --format=%an<US>%aI -- <path>` via the argument-array API, author not committer,
+  degrades to `null` on both subprocess failure and unparseable output, never throws into the render.
+  No hand-maintained author field anywhere.
+- **`Home.razor`.** Compliant with the Product Owner's pin — three static lines, no
+  `_welcome-message.md`, no repo read, no page listing.
+- **Integrated coverage exists** and is better than most sections get: `WikiPageTests` drives real
+  routing, real git and real Static SSR end to end. Its two gaps are named in S1 and S2.
+- **Human-in-the-loop.** None in 3.1–3.4; no box ticked without evidence.
+
+### Lower-severity, for the fix block if one is carved, else `## NEXT`
+
+- **`PageHistoryService.cs:44` hardcodes `"docs/"`** to rebuild a repo-relative path, while
+  `ContentPaths.cs:23` owns that segment. Two blocks, two spellings of one fact — and the failure is
+  **silent**: if the working-tree directory ever moves, `git log` returns empty for every page and
+  `GetLastEditAsync` cannot distinguish "no history" from "wrong path", so every page quietly loses
+  its last-edit line with no warning. Derive it (`Path.GetRelativePath(RepositoryRoot, WorkingTree)`).
+- **Mixed-case extensions are enumerated but can never be served.** `PageEnumerationService.cs:154`
+  matches `.md` `OrdinalIgnoreCase`, `Encode` strips it case-insensitively, and `TryDecodeCore`
+  re-appends lowercase `.md` — so `Page.MD` round-trips to `Page.md` and is refused (verified). On a
+  case-sensitive volume an Obsidian vault of `.MD` files serves nothing and logs every file as a D12
+  route collision. Refuse-not-guess is the right posture; the message misdescribes the fault.
+
+→ @architect
+
+**[architect]** → `@worker` — **§3 remediation block** (supervisor round one). Per CLAUDE.md §3c.3 this
+takes **no new `N.M` numbers and ticks nothing** — every §3 box is already ticked. It commits as a
+`fix`, and then the supervisor re-runs over the same `60957e6..HEAD` range.
+
+**The Product Owner has ruled on S1: both a URI allow-list and a CSP header.** `design.md` D13 now
+carries that as an addendum, D12's rule sentence is corrected (third attempt — it is now stated
+route-side), and four new gating scenarios exist in `specs/content-store/spec.md`. **Re-read D12 and
+D13 before starting; both changed since you implemented against them.**
+
+**S1 (high) — script-bearing URLs. The primary fix is the allow-list; the CSP is defence in depth.**
+`DisableHtml()` never governed link and image *destinations*, so the shipped pipeline renders
+`[x](javascript:alert(1))` as a live `<a href>`, `![x](javascript:…)` as an `<img src>`, and resolves
+`javascript&#58;` back to a working scheme.
+- **Allow-list, failing closed:** a destination is permitted only if relative (including a bare
+  fragment) or carrying `http`, `https`, or `mailto`. Everything else — *including schemes nobody has
+  thought of* — is refused. Apply it **after Markdig has parsed and resolved entities**, never against
+  raw Markdown: `javascript&#58;` is not `javascript:` until Markdig has decoded it. Normalize before
+  matching (leading/trailing whitespace, embedded control characters, case).
+- **CSP header:** `default-src 'self'`, `script-src 'self'`, `style-src 'self'`, `img-src 'self'`,
+  `object-src 'none'`, `base-uri 'self'`, `frame-ancestors 'none'`, `form-action 'self'`. Remove the
+  inline `onclick` at `NavMenu.razor:15` — Blazor template scaffolding that `script-src 'self'` blocks,
+  and worth deleting on its own merits.
+- **Test the class, not the examples.** The reason this survived three audits is that worker, reviewer
+  and Architect all asked "which values reach the browser un-encoded", which only ever inspects *tags*;
+  the tests asserted on `<script>` alone. Assert on rendered **attributes**, and include the
+  entity-encoded, mixed-case and whitespace-padded forms.
+
+**S2 (high) — the read path resolves many-to-one, reopening what D12's correction closed.**
+`WikiPage.razor:131-149` does decode → `Encode` → string-match. `Encode` is not injective, so neither
+is the composition, and enumeration's own round-trip check never sees the request: `/wiki/Chapter%20%201`
+serves `Chapter_1.md`. It also contradicts the resolver §3 ships for §6, which targets the *other* file
+from that same URL.
+- **Invariant:** a request serves a page only when its route is exactly the received form of that
+  page's canonical route — the request-side twin of enumeration's "the route identifies exactly this
+  file". `/wiki/Chapter__1` serves `Chapter_1.md`; `/wiki/Chapter%20%201` refuses.
+- **Reuse the identity logic; do not write a second copy.** Two implementations of this rule that can
+  disagree is the defect, not the cure.
+
+**S3 (medium) — the per-request walk is unguarded against its co-writer.** `PageEnumerationService`
+catches only `UnauthorizedAccessException`, but `File.GetAttributes` on an entry that vanished throws
+`FileNotFoundException`, and a removed directory throws `DirectoryNotFoundException` — both unhandled,
+both a 500, on a tree `git push` mutates under us. Also `WikiPage.razor:160`'s `catch (IOException)`
+misses `UnauthorizedAccessException`, which does not derive from it.
+
+**Lower severity, same block:**
+- `PageHistoryService.cs:44` hardcodes `"docs/"` instead of deriving from `ContentPaths`, and fails
+  **silently** — every page loses its last-edit line, indistinguishable from "no history". Derive it,
+  and make the failure distinguishable from the legitimate no-history case.
+- Mixed-case `.MD` files are enumerated but can never be served, and are reported as D12 route
+  collisions. The posture is right and the message is wrong; say what actually happened.
+
+**Do not** build the distinct-types redesign or touch `Routes.razor`'s `NotFoundPage` — both parked.
+Re-run all four gates and report actual numbers (647/647 before this block); `git status --short -- src`
+alongside `git diff -- src`. Post to the DEVLOG as `[worker]` under `## 3.`, then `→ @reviewer`.
+
+**[worker]** §3 remediation block implemented — no new task numbers, nothing ticked, per CLAUDE.md §3c.3.
+Re-read the corrected D12/D13 and the four new `specs/content-store/spec.md` scenarios first, as
+instructed; confirmed I never touched `design.md` or `spec.md` myself — `git diff` on both shows only
+the Architect's own pre-brief amendment, already in place before this block started.
+
+**S1 — allow-list, applied post-parse, wired so no caller can skip it.** New
+`src/ZeroWiki/Content/MarkdownLinkAllowList.cs`: `IsAllowedDestination` permits a relative destination
+(including a bare fragment) or an explicitly allowed scheme (`http`, `https`, `mailto`); everything else
+is refused, including schemes nobody has thought of. `Enforce(MarkdownDocument)` walks
+`LinkInline`/`AutolinkInline` descendants and sets `Url = string.Empty` on anything refused —
+`MarkdownPipelineFactory.Create()` subscribes it to the pipeline's `DocumentProcessed` event rather than
+requiring each call site to invoke it explicitly, so a future caller can't render through this pipeline
+while forgetting D13, the exact failure shape that let the original gap survive three audits.
+
+Three things found empirically, not assumed:
+1. **`Uri.TryCreate(s, UriKind.Absolute, ...)` treats a root-relative string like `/wiki/other-page` as
+   an absolute `file:` URI** — confirmed by direct reflection/probing before writing the classifier, not
+   discovered by a failing test. Using `Uri` for the allow-list decision would have refused every
+   ordinary wiki link. Scheme extraction instead follows RFC 3986's own grammar directly
+   (`ALPHA *( ALPHA / DIGIT / "+" / "-" / "." ) ":"`) with no `Uri` involved in the classification.
+2. **A real browser strips embedded tab/CR/LF from anywhere in a URL, not just the ends, before reading
+   its scheme** — so `java\tscript:alert(1)` genuinely is `javascript:` once rendered. Checking the
+   un-normalized string would have been a bypass, not a refusal; the brief's own callout ("normalize
+   embedded control characters") is what pointed at this. Any *other* embedded control character is
+   refused outright rather than modeled further.
+3. **Setting `LinkInline`/`AutolinkInline.Url` to `""` and re-rendering** produces `href=""`/`src=""`
+   with the visible link text intact for a `LinkInline`, and an empty `<a href=""></a>` for an
+   `AutolinkInline` (its inner text is derived from `Url` too, not a separate literal — confirmed by
+   probing the renderer output directly). No exception, no reintroduction of the original destination
+   via `GetDynamicUrl` (never set by this pipeline).
+
+Entity resolution is handled for free: `[x](javascript&#58;alert(1))` parses to a `LinkInline.Url` of the
+literal string `javascript:alert(1)` — Markdig itself does the entity decode during parsing, and
+`Enforce` runs on `DocumentProcessed` (post-parse), so checking `Url` rather than source text is what
+makes the entity form and the literal form indistinguishable to the check, as the brief required.
+
+**CSP**, `Program.cs`: `default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self';
+object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'`, set via
+`Response.OnStarting` in the first middleware in the pipeline, so it applies to every response
+(confirmed against the anonymous landing page too, not just authenticated pages) and survives whatever
+downstream middleware does, including `UseStatusCodePagesWithReExecute`'s re-execution. Removed the
+inline `onclick` at `NavMenu.razor:15` (Blazor template scaffolding `script-src 'self'` blocks) without
+reimplementing the mobile-menu-collapse behaviour it provided — the brief said it should go regardless,
+not be replaced.
+
+**S2 — one check, reused, not a second copy.** New `PageRouteCodec.IsCanonicalRouteValue(routeValue,
+canonicalRoute)`: `string.Equals(Uri.UnescapeDataString(canonicalRoute), routeValue, Ordinal)`. `WikiPage`
+calls it once, right after computing `canonicalRoute` and before any enumeration lookup, so a
+non-canonical request refuses before it can even reach the ambiguous/page-match branches. Deliberately
+*not* a decode-then-re-`Encode` comparison against the original request string — `Encode`'s own
+non-injectivity is what caused S2, so re-deriving the request's own re-encoded form doesn't close the gap
+(that's the exact composition that reopened D12's collision); comparing the *canonical route already
+found* against what the framework would have delivered for its one true URL sidesteps the many-to-one
+collapse entirely, since no re-encoding of the request happens on this path at all. Traced by hand against
+the brief's own fixture before trusting the test: `/wiki/Chapter%20%201` decodes to `"Chapter  1.md"`,
+re-encodes to `"Chapter__1"` (same route `"Chapter_1.md"` claims), but
+`Uri.UnescapeDataString("Chapter__1") == "Chapter__1" != "Chapter  1"` — refused, correctly.
+Mutation-confirmed (below) that the new `WikiPageTests` case is what actually catches a regression here,
+not merely present.
+
+**S3 — both named exception gaps closed.** `PageEnumerationService.Walk`: `EnumerateFileSystemEntries`
+now also catches `DirectoryNotFoundException` (a subdirectory removed between the parent listing seeing
+it and the recursive call reading it) — treated as an empty subtree, not reported as unreadable, since
+there's nothing there to name as a permissions fault. `File.GetAttributes(entry)` is now wrapped in its
+own try/catch for `FileNotFoundException`, `DirectoryNotFoundException`, and `UnauthorizedAccessException`
+— an entry that vanished, was renamed, or became inaccessible between being listed and being examined is
+skipped as if it was never there. `WikiPage.razor`'s markdown-read catch is now
+`catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)` —
+`UnauthorizedAccessException` does not derive from `IOException` (confirmed against the BCL type
+hierarchy, matching the supervisor's finding) and was previously falling through to an unhandled 500
+despite the existing comment already promising a clean not-found.
+
+**Honest gap, not a fabricated test:** I could not construct a deterministic, non-flaky reproduction of
+the exact race these catches guard — `Directory.EnumerateFileSystemEntries(dir).ToList()` materializes
+eagerly with no yield point before the loop, so triggering `FileNotFoundException`/
+`DirectoryNotFoundException` on a *specific* entry requires a real concurrent delete landing in a window
+between two synchronous statements with nothing to synchronize against. I tried a dangling-symlink
+reproduction first (plausible-looking, since a broken symlink is the closest *static*, non-racy analogue)
+and it does not reproduce the fault: `File.GetAttributes` on a dangling symlink succeeds and returns
+`ReparsePoint` rather than throwing, confirmed empirically, and `Walk`'s existing reparse-point check
+already skips it before any recursion would occur. A genuine reproduction would need either accepting
+test flakiness (which this project's evidence standard rejects) or a filesystem-abstraction seam
+(dependency-injecting `IFileSystem` or similar) purely to make `Walk` mockable — a structural change well
+outside this remediation's scope. The fix itself is mechanically low-risk: two well-known BCL exception
+types added to existing catch blocks, matching the exact types the supervisor's own probe found, with no
+new branching logic to get subtly wrong. Recording this rather than shipping a race-prone test or
+silently skipping the question.
+
+**Lower severity, both closed.**
+- `PageHistoryService`: `_repositoryRelativeWorkingTree` is now derived once in the constructor via
+  `Path.GetRelativePath(paths.RepositoryRoot, paths.WorkingTree)` instead of a hardcoded `"docs/"`
+  literal — removes the two-independently-maintained-spellings-of-one-fact structure the silent failure
+  depended on, rather than adding a second check to detect a divergence after the fact. Not
+  independently testable against the *old* behaviour today: `ContentPaths` always names the segment
+  `"docs"` with no public way to construct one that doesn't, so every existing `PageHistoryServiceTests`
+  case is bug-for-bug identical whether the path is derived or hardcoded. The fix is defensive/structural
+  rather than something a test can currently distinguish — noted rather than claiming coverage that isn't
+  real.
+- `PageEnumerationService`: a sole claimant whose *only* discrepancy from its own round trip is a
+  non-lowercase extension (`Page.MD`) now logs "has a Markdown extension that is not exactly lowercase
+  '.md' ... its route can never resolve back to this exact file" instead of the generic D12
+  claimant-count warning — `HasNonLowercaseMarkdownExtension` checks `EndsWith(".md", OrdinalIgnoreCase)
+  && !EndsWith(".md", Ordinal)`, the one and only way this specific fault can occur with a single
+  claimant. `MixedCaseExtension_IsRefusedWithAMessageNamingTheRealFault` asserts the actual message text
+  via a small capturing `ILogger<T>` test double (the existing tests all use `NullLogger`, which discards
+  everything), not just the unchanged refusal outcome.
+
+**Mutation testing — two targets, capped at 3, both killed 1/1 under the full unfiltered suite.**
+Checksummed before/after both; reverted by restoring the exact prior text, confirmed by checksum match.
+- **S2** (`WikiPage.razor`, the `IsCanonicalRouteValue` check → `if (false)`) → killed:
+  `A_non_canonical_route_value_is_refused_even_though_it_would_re_encode_to_a_real_pages_route` failed,
+  serving the wrong file's body. 680/681.
+- **S1** (`MarkdownLinkAllowList.cs`, the scheme-membership check → unconditional `true`) → killed
+  thoroughly: 16 tests failed across both the unit suite (`MarkdownLinkAllowListTests`, all the
+  scheme-refusal and neutralization cases) and the end-to-end suite (`WikiPageTests`), confirming the
+  allow-list is load-bearing at both layers, not just correct in isolation. 665/681.
+
+**Gates, actual numbers:** `dotnet build` — 0 warnings, 0 errors. `dotnet test` — **681/681**, full
+unfiltered (647 baseline + 34 new: 29 `MarkdownLinkAllowListTests`, 1 `PageEnumerationServiceTests`
+mixed-case case, 4 new `WikiPageTests` cases; 1 existing test —
+`AnonymousAccessTests.The_anonymous_response_carries_exactly_the_headers_it_declares` — updated to
+include `Content-Security-Policy` in its pinned exact-header-set, since CSP now applies to every response
+including the anonymous landing page, per spec). `dotnet format --verify-no-changes` — exit 0.
+`openspec validate git-backed-content-core --strict` — valid. `git status --short -- src` shows seven
+modified files (`NavMenu.razor`, `WikiPage.razor`, `MarkdownPipelineFactory.cs`,
+`PageEnumerationService.cs`, `PageHistoryService.cs`, `PageRouteCodec.cs`, `Program.cs`) and one new file
+(`MarkdownLinkAllowList.cs`); `git diff --stat -- src` matches exactly what's described above — no
+mutation residue, `design.md`/`spec.md` untouched by this block.
+
+**What the reviewer should look at hardest:** (1) the `Uri`-avoidance in `MarkdownLinkAllowList` — confirm
+the root-relative-link finding independently rather than trusting the DEVLOG account of it; (2) S2's
+comparison direction — confirm comparing the *found page's* canonical route against the request (not a
+re-encode of the request) is genuinely what closes the gap, not merely a rephrasing of the same buggy
+composition; (3) the S3 honest-gap call — whether a race-based test should be demanded anyway, or whether
+the reasoning for skipping one holds.
+
+→ @reviewer
+
+**[reviewer]** §3 remediation block audit — against the supervisor's three blockers (S1–S3) and two
+lower-severity findings, all independently re-verified with instruments different from the ones that
+missed S1 the first three times.
+
+**Verdict: Approve.**
+
+**S1 — confirmed fixed, verified with a different instrument (attributes, not tags) and a real browser.**
+
+Probed `MarkdownPipelineFactory.Create()` directly (scratch console app, `ProjectReference` to the real
+`ZeroWiki.csproj`, `Markdown.ToHtml` + regex over rendered `href="…"`/`src="…"` attribute values — the
+instrument the supervisor named, not "does the output contain `<script>`"): every attack form neutralizes
+to `href=""`/`src=""` — bare `javascript:`, `JAVASCRIPT:`, leading/trailing whitespace, entity-encoded
+`javascript&#58;`, `data:`, `vbscript:`, and image destinations. Ordinary relative links, `#fragment`,
+`http`, `https`, `mailto` all render unchanged.
+
+*Both empirical claims verified independently, not accepted on report:*
+- `Uri.TryCreate("/wiki/other-page", UriKind.Absolute, out var uri)` → `ok=True, scheme=file,
+  uri=file:///wiki/other-page` — confirmed exactly as claimed; using `Uri` for classification would have
+  refused every ordinary wiki link.
+- **The browser-stripping claim — verified in a real Chrome tab, not just reasoned about.** Built an
+  `<a>` element at runtime with `href` set to `"java" + String.fromCharCode(9) + "script:window.__xssFired
+  = true"`, checked `.href` (the browser's own parsed form): `"javascript:window.__xssFired = true"` — the
+  tab is stripped and the scheme recognized. Then a real CDP-level trusted click (not a script-triggered
+  `.click()`, which Chrome's synthetic-navigation heuristics suppressed on the first attempt) —
+  `window.__xssFired` came back `true`. The embedded-tab bypass is real and would have executed on a
+  genuine user click; `RemoveEmbeddedTabCrLf` is closing a live hole, not a theoretical one.
+
+*Wiring verified by grep across the whole `src/` tree, not by reading the allow-list's own doc claim:*
+exactly one `MarkdownPipelineBuilder` construction site (`MarkdownPipelineFactory.cs`) and exactly two
+`Markdown.Parse`/`Markdown.ToHtml` call sites (`PageFrontmatterExtractor.cs`,
+`WikiPage.razor:186`), both consuming the one DI-registered singleton. No bypass path exists anywhere in
+the codebase today.
+
+*Coverage confirmed for links, images, and autolinks*, including reference-style link definitions (traced
+by hand and independently reproduced: `[click]\n\n[click]: javascript:alert(1)` neutralizes identically
+to the inline form) — the brief named all three and the tests (`MarkdownLinkAllowListTests.cs`,
+`WikiPageTests.cs:226-254`) assert on rendered attribute values throughout, not tag presence.
+
+*One curiosity, not a finding:* a destination containing a raw NUL byte (CommonMark's own NUL→U+FFFD
+substitution) produces a scheme token containing U+FFFD, which fails `IsValidSchemeToken` and is
+classified as "relative" rather than refused outright — but a browser's URL parser can no more recognize
+`java<FFFD>script` as the `javascript` scheme than this classifier can, so it isn't exploitable. Recorded
+so it isn't mistaken for a gap later, not asking for anything.
+
+CSP verified structurally: the `app.Use` registering `Response.OnStarting` is the first middleware in
+`Program.cs`, ahead of `UseExceptionHandler`, `UseStatusCodePagesWithReExecute`, and `UseRouting` — since
+`OnStarting` attaches to the response object itself rather than a specific middleware's continuation, it
+fires regardless of which downstream stage ultimately writes the response, including redirects and
+re-executed status-code pages. `AnonymousAccessTests.cs`'s exact-header-set assertion now includes
+`Content-Security-Policy` for the anonymous landing page, matching my own reasoning about the header's
+reach. `NavMenu.razor`'s inline `onclick` is removed, not reimplemented, exactly as briefed — the
+mobile-menu-collapse-on-click UX is a deliberate, documented, architect-sanctioned loss, not an oversight.
+
+**S2 — confirmed fixed, both required fixtures independently reproduced against the real codec, not hand-traced only.**
+
+Replicated `WikiPage.razor`'s exact decode → `Encode` → `IsCanonicalRouteValue` sequence in a scratch
+console app against the real `PageRouteCodec`:
+
+```
+/wiki/Chapter__1            -> decoded Chapter_1.md, canonical Chapter__1, IsCanonicalRouteValue = True  -> serves Chapter_1.md
+/wiki/Chapter%20%201        -> decoded Chapter  1.md, canonical Chapter__1 (same route!), IsCanonicalRouteValue = False -> refused
+```
+
+Both match the coordinator's required fixtures and the spec's own "Only a page's own canonical route
+serves it" scenario exactly. Worked through *why* the check is sound rather than fixture-specific: since
+`Encode`'s percent-encoding layer is a true bijection (established extensively in 3a), `IsCanonicalRouteValue`
+reduces to asking whether `routeValue` is a fixed point of `substitute ∘ reverse` — and the set of fixed
+points of that composition is exactly the set of well-formed canonical routes, since `Encode` never emits
+a raw space character. A route value containing a literal space (the shape every instance of this bug
+takes) can therefore never pass, independent of which specific file happens to collide with it — this
+generalizes past the one named fixture.
+
+On "reuses rather than duplicates enumeration's identity rule": `IsCanonicalRouteValue` does **not**
+call the same code path as `PageEnumerationService`'s round-trip check (`TryDecode`-based, comparing a
+decoded path) — it's a distinct predicate (`Uri.UnescapeDataString`-based, comparing route strings). But
+it isn't re-implementing D12's ambiguity logic either: it delegates the actual route computation to the
+same shared `Encode`/`TryDecodeRouteValue` primitives, and closes the gap through a narrower, independently-sound
+property (percent-encoding-layer equality) rather than re-deriving "is this route ambiguous" a second
+time. Two distinct checks answering two genuinely different questions (file self-consistency at
+enumeration time vs. request-vs-canonical equality at request time) sharing their primitives is not the
+same risk as two copies of one rule that can drift — worth stating precisely rather than either waving it
+through or over-crediting it as literal code reuse.
+
+**S3 — the honest-gap call holds; I could not find a deterministic reproduction either, and I looked for one specifically.**
+
+Independently reproduced the worker's exact negative result: `File.GetAttributes` on a dangling symlink
+succeeds and returns `ReparsePoint` rather than throwing (confirmed on this machine), so that static
+analogue genuinely cannot stand in for the race. `Directory.EnumerateFileSystemEntries(dir).ToList()`
+materializes eagerly with no yield point for a black-box test to synchronize against, and there is no
+seam to inject a callback mid-loop without either accepting a timing-dependent flaky test (this project's
+evidence standard rejects that) or adding a filesystem-abstraction seam purely for this one test (a
+structural change disproportionate to a two-clause exception-type widening). I agree with the worker's
+conclusion: not achievable without one of those two costs, and the fix itself — catching the exact BCL
+exception types the supervisor's own probe found, added to existing catch blocks with no new branching —
+is low-risk enough that verified-by-reasoning-plus-type-matching is an acceptable substitute for a test
+here specifically. This is a narrow exception, not a precedent: it holds because the fix is mechanical and
+the reproduction cost is structural, not because "hard to test" is generally sufficient.
+
+**Lower severity — both checked.**
+
+- `PageHistoryService`'s path is now derived from `ContentPaths` (`:37-39`), not hardcoded — confirmed.
+  The brief's second half ("make the failure distinguishable from the legitimate no-history case") was
+  **not** implemented as a runtime distinguishing signal — the worker addressed it structurally instead
+  (eliminating the divergence that made the two failure modes confusable, rather than adding a check to
+  tell them apart after the fact) and said so plainly rather than silently substituting one for the other.
+  I read this as a reasonable engineering trade-off given `ContentPaths` hardcodes `"docs"` with no way to
+  construct a divergent instance today (confirmed), making the distinguishing signal harder to justify
+  than removing the divergence risk it would have detected. Worth the architect's explicit sign-off that
+  this reading of the brief is accepted, since it is a real, disclosed deviation from the literal ask.
+- Mixed-case `.MD` extension now logs the real fault (`PageEnumerationService.cs:104-112`), verified via
+  `MixedCaseExtension_IsRefusedWithAMessageNamingTheRealFault`'s capturing-logger test, which asserts the
+  message text itself (`"extension"`, the filename, absence of `"D12"`) rather than just the unchanged
+  refusal outcome.
+
+**Not addressed, and worth naming rather than silently letting slide:** the supervisor's Q1/Q2 (the
+codec's five-method, ~190-comment-line surface, and the two resolvers with no production caller) were not
+in this remediation's brief and remain exactly as they were — `PageRouteCodec.cs` in fact grew another
+public member (`IsCanonicalRouteValue`) this round. Not blocking: the architect scoped this remediation to
+S1–S3 plus two lower-severity items deliberately, and Q1/Q2 were framed by the supervisor as worth
+settling rather than as blockers. But it should be a conscious carry-forward into `## NEXT` or the next
+supervisor pass, not something that reads as resolved because this round touched the file again.
+
+**Gates — reproduced independently:** `dotnet build` 0 warnings/0 errors. `dotnet test` **681/681**, full
+unfiltered. `dotnet format --verify-no-changes` exit 0. `openspec validate git-backed-content-core
+--strict` valid. `git status --short -- src` / `git diff --stat -- src` match the reported shape exactly
+(seven modified, one new) — no mutation residue.
+
+→ @architect
+
 ## NEXT
 
 **Resume point: §3 (Content read & render), block 3a (3.1–3.2).** §3 is **open** — base `60957e6`

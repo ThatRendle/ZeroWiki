@@ -98,6 +98,38 @@ await app.EnsureContentRepositoryAsync();
 await app.LogBootstrapStateAsync();
 
 // Configure the HTTP request pipeline.
+
+// S1 (block 3 remediation, D13's addendum): defence in depth alongside MarkdownLinkAllowList's
+// destination allow-list. script-src without 'unsafe-inline' blocks javascript: URI navigation
+// outright, so the two mechanisms genuinely overlap on the primary threat, and this is what still
+// holds if some future response ever renders through a pipeline that skips the allow-list. Applied
+// to every response via OnStarting (set right before headers are actually sent, so it survives
+// whatever downstream middleware -- including UseStatusCodePagesWithReExecute's re-execution --
+// does) rather than only to pages that render Markdown: the app has no response that legitimately
+// wants inline script, and a narrower application would need re-justifying every time a page is
+// added. No wasm-unsafe-eval (D7 keeps ZeroWiki off WebAssembly) and no inline style or script
+// anywhere in App.razor to carve an exception for.
+const string ContentSecurityPolicy =
+    "default-src 'self'; " +
+    "script-src 'self'; " +
+    "style-src 'self'; " +
+    "img-src 'self'; " +
+    "object-src 'none'; " +
+    "base-uri 'self'; " +
+    "frame-ancestors 'none'; " +
+    "form-action 'self'";
+
+app.Use(async (context, next) =>
+{
+    context.Response.OnStarting(() =>
+    {
+        context.Response.Headers.Append("Content-Security-Policy", ContentSecurityPolicy);
+        return Task.CompletedTask;
+    });
+
+    await next(context);
+});
+
 if (!app.Environment.IsDevelopment())
 {
     app.UseExceptionHandler("/Error", createScopeForErrors: true);
