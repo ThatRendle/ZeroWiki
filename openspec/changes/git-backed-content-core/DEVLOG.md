@@ -7087,21 +7087,157 @@ unfiltered. `dotnet format --verify-no-changes` exit 0. `openspec validate git-b
 
 → @architect
 
+**[supervisor]** §3 section review, **round two** — `60957e6..7ca5b76`, now four commits with the
+remediation block on top.
+
+**Verdict: Approve.** All three blockers are closed, and I verified each independently rather than
+reading the fix and agreeing with it — the S1 defect existed precisely because three audits shared one
+instrument, so corroborating this fix with the same method would have proved nothing. Tree clean at
+`7ca5b76` (`git status --short --untracked-files=all` empty). Nothing below blocks; everything
+outstanding is `## NEXT`.
+
+---
+
+### S1 — closed. 30 bypass attempts, 0 live destinations
+
+I probed the **shipped** pipeline (a scratch project compiling `MarkdownLinkAllowList.cs` and
+`MarkdownPipelineFactory.cs` verbatim), asserting on emitted **`href`/`src` attribute values**, and
+checked the instrument first against a known-good link before trusting any negative result. Everything
+neutralized to `href=""`/`src=""`:
+
+- entity forms (`&#58;`, `&colon;`, `&#9;`, `&#10;`, `&#13;`, `&#32;`, `&#0;`), embedded literal tab,
+  mixed case, `data:`, `vbscript:`, double colon, `java.script:`
+- **reference-style links and images** — `[x][r]` with `[r]: javascript:alert(1)`, and the collapsed
+  form. This is the path no prior audit named and the one I most expected to leak, since the
+  destination lives in a `LinkReferenceDefinition` rather than the inline; Markdig resolves it into
+  `LinkInline.Url` before `DocumentProcessed` fires, so `Enforce` sees it.
+- traversal completeness — links inside headings, blockquotes, list items, emphasis, and an image
+  nested inside an allowed link (`['https://ok.test', '']` — outer kept, inner neutralized)
+- angle-bracket destinations, autolinks, images, titles
+
+Two non-empty residuals, both correctly *relative* rather than missed: `&#0;` becomes U+FFFD per
+CommonMark, so the destination is not a valid scheme token and emits
+`href="%EF%BF%BDjavascript:alert(1)"`; and `javascript%3Aalert(1)` keeps its percent-encoded colon. A
+browser's URL parser does not decode percent-escapes before scheme detection and does not strip
+U+FFFD, so both resolve as relative paths. Refusing-as-relative is the right answer for each.
+
+Ordinary destinations all still work — a fail-closed list that broke the wiki would be a regression,
+and it does not: relative, `./`, `../`, bare fragment, query-only, `http`, `https`, `mailto`,
+protocol-relative, percent-encoded and accented relatives, and `https`/relative images all emit
+unchanged.
+
+`DocumentProcessed` wiring is the right shape — it removes the class of failure entirely rather than
+adding a call every future render site must remember. CSP checked as deployed: no inline `<style>`,
+no `style="…"` attribute and no inline handler survives anywhere in `Components/` (only
+`App.razor`'s external `blazor.web.js`), so `script-src 'self'`/`style-src 'self'` costs nothing;
+registering `OnStarting` in middleware placed *ahead* of `UseStatusCodePagesWithReExecute` is what
+makes it survive re-execution, and that ordering is correct as written. Tests assert on
+`href=""`/`src=""` and `href="http://example.com"` — attribute values, not tags, so the instrument
+that missed this three times is not the one now guarding it. `AnonymousAccessTests`'s pinned
+header set was **extended** to include the new header rather than loosened.
+
+### S2 — closed, and it does not break reachability
+
+`IsCanonicalRouteValue` compares the request against `Uri.UnescapeDataString(canonicalRoute)` — the
+*found page's* one true URL as the framework would deliver it — instead of re-encoding the request.
+That sidesteps `Encode`'s many-to-one collapse rather than trying to detect it downstream, which is
+the correct shape. Verified against the real codec:
+
+```
+a_b.md   routeValue 'a  b'  -> refused   (the S2 alias)
+a_b.md   routeValue 'a__b'  -> serves
+a b.md   routeValue 'a b'   -> refused
+a%20b.md via canonical 'a%2520b' -> 'a%20b' -> serves
+Café.md / a#b.md / a?b.md / sub/a b.md   -> all still serve
+```
+
+The half worth checking was the second one — a fail-closed canonicity test is exactly the kind of fix
+that quietly 404s legitimate pages. It does not.
+
+### S3 — closed, and **I accept the disclosed gap**
+
+`Walk` now catches `DirectoryNotFoundException` around the listing and
+`FileNotFoundException`/`DirectoryNotFoundException`/`UnauthorizedAccessException` around
+`GetAttributes`; `WikiPage`'s read catch adds `UnauthorizedAccessException`. That is exactly the
+surface I found, including the ENOTDIR case (a `git push` replacing a directory with a file maps to
+`DirectoryNotFoundException`, so it is covered).
+
+On accepting "mechanically correct, no regression test" — **yes, and the reasoning is not just
+proportionality.** The risk of an untested `catch` runs in two directions and both are closed by
+reading: it cannot catch *too much*, because it names three specific types rather than `Exception`, so
+no unrelated fault can hide behind it; and it does not catch *too little*, because the thrown types
+were established empirically rather than guessed. A deterministic reproduction would need a
+filesystem seam injected purely for the test — at which point it stops exercising the real
+`File.GetAttributes` and tests the seam instead — or a timing loop, and a flaky test in a 681-case
+suite that gates every future block is a worse outcome than an honest gap. Recorded in `## NEXT` for
+§6: once D3's lock exists the race is closable properly, and a test becomes possible then.
+
+### Lower-severity — both closed; the `null`-return sign-off is right
+
+`PageHistoryService` derives the working-tree segment from `ContentPaths`, and the mixed-case `.MD`
+case now reports its actual fault instead of a route collision. On the return value staying `null` in
+all cases: **I agree with the Architect's sign-off, and would not overrule it.** My original finding
+was that the failure was *silent* — a wrong path indistinguishable from no history. That is closed at
+the source: the path can no longer be wrong, and genuine faults now log. What remains is a return-type
+shape with no consumer that needs the distinction, and §4.1 owns last-edit. A discriminated result
+built now would be designed against a guess.
+
+### D12 and D13 — confirmed, both now say what the code does
+
+- **D12.** "A route containing two or more consecutive `_` is ambiguous" is exactly right with no
+  exclusions: a route run of *n* underscores has Fib(*n*+1) preimages, so *n*=1 is unique and every
+  *n*≥2 is ambiguous. The filename-side corollary added beside it — "a filename is ambiguous exactly
+  when its encoding produces two consecutive underscores" — is also exact (single `_` → `__`,
+  ambiguous; single space → `_`, not). Fourth revision, and the first that is a statement about the
+  mechanism rather than a sample of it. Recording *why* the filename-side framings kept failing is
+  what should stop a fifth.
+- **D13.** The false "no bypass surface" clause is struck from the *Why* paragraph where it was
+  asserted, not merely contradicted later — leaving it standing next to its own correction would have
+  been the weaker fix. The addendum's four requirements each match shipped code: allow-list contents
+  (`http`/`https`/`mailto` + relative + fragment), applied after entity resolution
+  (`DocumentProcessed`), normalization of whitespace/control characters/case
+  (`RemoveEmbeddedTabCrLf` + `Trim` + control refusal + `OrdinalIgnoreCase`), and CSP without
+  `'unsafe-inline'`. Confirmed.
+
+### Q1 / Q2 carried to §6 — I agree, and it is now a *better* deferral than in round one
+
+Not a blocker. My round-one position was that S2's fix removes the premise for keeping the resolvers,
+and §6 is where the real caller appears — the Architect's reasoning is that argument, so overruling it
+would be overruling myself. One fact strengthens it: §6 now inherits a *stated, live* contract
+(`IsCanonicalRouteValue`, documented as the check every route-resolving caller must reuse rather than
+re-derive) instead of a guess, which is what made collapsing the API early risky.
+
+Stated plainly so it is not lost: the codec now carries **six** public members, **two** with no
+production caller. The accretion got one member worse — but it got worse in the right place, since
+`IsCanonicalRouteValue` closes a blocker and has a caller. §6 should **delete or wire** the two
+resolvers, not add a third.
+
+→ @architect
+
 ## NEXT
 
-**Resume point: §3 (Content read & render), block 3a (3.1–3.2).** §3 is **open** — base `60957e6`
-posted, D12–D14 landed with spec scenarios. §2 is **closed** — supervisor `Approve` on round **four**
-over `7b50e46..HEAD`. §11 closed earlier over `bb3cb2c..HEAD`.
+**Resume point: §4 (Derived index), first block.** §3 is **closed** — supervisor `Approve` on round
+two over `60957e6..HEAD`. §2 closed over `7b50e46..HEAD` (round four); §11 closed over `bb3cb2c..HEAD`.
 
-**State: 12/40 tasks ticked** *(counted from `tasks.md`, not carried forward)*. Branch
+**State: 16/40 tasks ticked** *(counted from `tasks.md`, not carried forward)*. Branch
 `change/git-backed-content-core`. Gates at close-out, run by the Architect rather than relayed:
-`dotnet build` 0/0, `dotnet test` **519/519** full unfiltered, `dotnet format --verify-no-changes`
+`dotnet build` 0/0, `dotnet test` **681/681** full unfiltered, `dotnet format --verify-no-changes`
 exit 0, `openspec validate --strict` valid.
 
 **§2 took four supervisor rounds and seven commits.** Worth stating plainly, because the shape repeated:
 every one of the four findings was a gap in **what a condition asks**, not in how faithfully it runs —
 so all four were invisible to mutation, and all four were found by building a fixture for a state
 nobody had enumerated. The fourth was closed by deleting the enumeration rather than extending it.
+
+**§3 took two supervisor rounds and four commits, and its defining finding was different in kind.**
+§2's defects were gaps in what a condition asked. §3's worst was a gap in **what the audit could
+see**: D13 claimed escaping had "no bypass surface", and a worker, the reviewer and the Architect each
+audited it competently by asking *"which values reach the browser un-encoded"* — a question that only
+ever inspects **tags**, while the live stored XSS lived in link *destinations*. Three independent
+audits corroborated each other while sharing one instrument and one blind spot. The tests asserted on
+`<script>` alone. It was found only when a fourth reader used a different instrument, and closed only
+after the reviewer proved the bypass fired on a real trusted click in Chrome **before** checking the
+fix stopped it.
 
 | Section | Block | Commit | Reviewer | Supervisor |
 |---|---|---|---|---|
@@ -7119,9 +7255,14 @@ nobody had enumerated. The fourth was closed by deleting the enumeration rather 
 | §2 | D9 reorder — no write precedes any refusal | `f50f1ca` | **Approve** | Request changes (round 3) |
 | §2 | pre-init nested-repo scan | `2c70e05` | Request changes → **Approve** w/ nit | ↑ |
 | §2 | gate the scan on the write's predicate | `1253ff5` | **Approve** | → **Approve** (round 4) |
+| §2 | close-out (docs) | `60957e6` | — | — |
+| §3 design | D12–D14 + spec delta | `50da7b0` | — | Request changes (S1–S3) → **Approve** |
+| §3 | 3.1–3.2 enumeration + frontmatter | `8332c79` | Request changes ×2 → **Approve** w/ nit | ↑ |
+| §3 | 3.3–3.4 rendering + git authorship | `e9bfea0` | Request changes ×2 → **Approve** w/ nit | ↑ |
+| §3 | remediation (3 supervisor blockers) | `7ca5b76` | **Approve** w/ 2 nits | → **Approve** (round 2) |
 
-**Execution order from here: §3 → §4 → … → §10.** §11 and §2 are done; the remaining sections run in
-`tasks.md` order.
+**Execution order from here: §4 → §5 → … → §10.** §11, §2 and §3 are done; the remaining sections run
+in `tasks.md` order.
 
 **One decision is owed before §5 opens** — forward obligation 1 below. It is a Product Owner call, not
 a wording tidy-up, because one of its two options changes shipped behaviour.
@@ -7232,6 +7373,44 @@ a wording tidy-up, because one of its two options changes shipped behaviour.
     crash-recovery restart** — `.git` present, `HEAD` unborn — where nobody is watching. The decision
     stays right on its other grounds; the stated reason should stand on its own terms.
 
+19. **§6 — the codec has six public members and two of them have no caller.** `PageRouteCodec` grew
+    across three review rounds rather than being designed: `Encode`, `TryDecode`, `TryDecodeRouteValue`,
+    `IsCanonicalRouteValue`, and **two** resolvers — `TryResolveWorkingTreePath` and
+    `TryResolveWorkingTreePathFromRouteValue` — neither of which any production code calls. They exist
+    for §6's save path. **§6 must delete or wire them, not add a third.** The distinct-types redesign
+    (a canonical-route type versus a bound-value type, making a contract mix-up a compile error) is the
+    durable fix and belongs here too: the split is currently enforced only by naming, and the reviewer
+    established that a wrong pairing *cannot* be detected at runtime, because an encoded and a decoded
+    string containing no `%` are the same string.
+20. **§4/§6 — `img-src 'self'` and the link allow-list disagree about external images.** The allow-list
+    permits an `https` image destination; the CSP blocks its load. Moot today because nothing serves
+    static content, live the moment §4 or §6 does. The spec scenario *Ordinary destinations still work*
+    is true of links and **not** of external images — reconcile the two rather than discovering it as a
+    broken image.
+21. **§6 — the per-request cost is real and unbounded.** Every page view walks the whole working tree
+    *and* spawns a `git log`, and there is **no page-size cap anywhere**: a pushed multi-hundred-megabyte
+    `.md` is read whole and parsed on every request. §4.1's index is the answer to the walk; the size cap
+    and the `git log` spawn are not, and neither has an owner yet.
+22. **§6 — S3's race has no regression test, deliberately.** Enumeration walks a tree `git push` mutates;
+    the fix names three specific exception types established empirically, but neither worker nor reviewer
+    could build a deterministic non-flaky reproduction, and both independently found dangling symlinks do
+    not reproduce it. Accepted by the supervisor on the reasoning that a flaky test gating every future
+    block is worse than an honest gap, and that an untested `catch` risks catching too much or too little
+    — both closed by reading, since it names types rather than `Exception`. **Revisit once §6's D3 lock
+    makes the race closable and therefore testable.**
+23. **The editor change — D13 records a `style-src` forward cost, already investigated.** CodeMirror 6's
+    `style-mod` writes `styleTag.textContent` when mounted into a document, which `style-src 'self'`
+    blocks, but takes a constructable-stylesheet path — not an inline style, so not governed by
+    `style-src` — when mounted into a **shadow root**. It is a mounting decision, not a reason to weaken
+    the CSP or choose a different editor. The "constructable stylesheets escape `style-src`" half is read
+    from the spec, **not** browser-tested; test it when the editor lands.
+24. **Latent, deployment-level — a reverse proxy that normalizes percent-encoding breaks the routing
+    seam.** ASP.NET Core percent-decodes a catch-all route value exactly once, and D12's whole scheme is
+    built on that being exactly once. A proxy that decodes before forwarding makes it twice. Nothing in
+    the repo configures a proxy today, so this is a constraint on a future deployment rather than a
+    defect — but it is the same seam D12 chose `__` over `%5F` to protect, and it should be stated
+    wherever deployment is documented.
+
 ### Close-out items before archive
 
 - **F2 (nit, pre-existing from `bd2eeea`)** — `specs/user-accounts/spec.md`, scenario *"Well-formed
@@ -7248,6 +7427,28 @@ a wording tidy-up, because one of its two options changes shipped behaviour.
 
 ### Standing rules earned in §0–§11
 
+- **Agreement between audits is worthless when they share an instrument — and the instrument is the
+  *question*, not the tool.** D13's link-destination XSS survived a worker, the reviewer and the
+  Architect because all three asked *"which values reach the browser un-encoded"*, which only ever
+  inspects tags. Three independent competent audits, one blind spot, mutual corroboration. **Before
+  trusting a clean audit, name what its question cannot see.** Second instance of this exact shape after
+  §0's `href=""` anchor regex, and the more expensive one (§3).
+- **Verify the threat exists before verifying it is closed.** The reviewer settled S1 by building the
+  `java\tscript:` link in a real Chrome tab, confirming the browser's own parser strips the tab and
+  recognises the scheme, and firing it with a trusted click — *then* checking the fix. A test that only
+  ever shows the fix passing cannot distinguish a real defence from a fixture that never attacked (§3).
+- **Verify a claim about a *mapping* by enumerating it, not by reading it.** D12's injectivity claim was
+  wrong in `design.md`, written by the Architect, and survived being written, a spec delta built to gate
+  it, and a worker implementing against it. It fell out of computing the encoding over a handful of
+  awkward filenames. Related: **grouping is not identity** — "no two files share a route" and "this route
+  identifies this file" look like one property and are not; the second implies the first, never the
+  reverse (§3).
+- **State a rule on the side where the property lives.** D12's ambiguity rule was wrong three times while
+  stated filename-side and correct the first time it was stated route-side. Each filename-side attempt
+  *sampled* the mechanism; the route-side one *is* the mechanism (§3).
+- **A library's guarantee covers what its API names, not what you wanted.** Markdig's `DisableHtml()`
+  disables HTML; it never claimed to sanitize URLs, and `MarkupString` never claimed to sanitize
+  anything. Both were true; the composition was not what D13 assumed (§3).
 - **When a guard's justification names a *case*, check the guard's *branch*** — the branch is what
   ships. §2 produced five claim-versus-mechanism mismatches, every one with defensible code and a wrong
   stated reason: the unborn-`HEAD` comment, the index-census docstring, blocker 1's "delta" wording,
