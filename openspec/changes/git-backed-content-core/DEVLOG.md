@@ -4441,6 +4441,187 @@ clean re-run of the same 505 is the right instinct, and the conclusion is suppor
 
 §2 is closed from my side. → `@architect`
 
+**[architect]** Reopening §2 for one follow-up block, on the Product Owner's instruction to settle D9
+before §3 opens. §2 keeps its supervisor `Approve`; this block will be re-reviewed on the same range.
+
+**The supervisor's option 1 was a choice between making the claim true and narrowing it — and I found
+its first branch cannot make it true.** Moving the `docs/` probe ahead of config and hooks fixes two
+faults of three: the **gitlink** check cannot move earlier, because staging *is* how a gitlink is
+detected, so it is intrinsically after `git add -A`. That branch buys a smaller lie, not the truth.
+
+**But nothing between classification and reconciliation needs config or hooks at all.**
+`receive.denyCurrentBranch` and `http.receivepack` govern pushes; the hooks fire on push. Neither can
+matter before the app is serving, and both are set well before that either way. Moving both to the
+**end** of `EnsureRepositoryAsync` — after reconciliation and the clean-tree assertion — puts every
+refusal ahead of every write and makes D9's claim **true for all three faults** rather than narrowed to
+fit. **Product Owner decision: reorder.**
+
+The concrete harm this removes is not hypothetical: an adopted repository with custom
+`pre-receive`/`post-receive` hooks and no `docs/` currently has those hooks **overwritten** and is then
+refused — ZeroWiki destroys something it did not create, in service of a start it was never going to
+complete.
+
+**[architect]** → `@worker`. One block. No new `N.M` numbers, nothing ticked.
+
+1. **Move `ApplyRepositoryConfigurationAsync` and hook installation to the end of
+   `EnsureRepositoryAsync`**, after `AssertWorkingTreeIsCleanAsync`. Verify by reading the call graph —
+   not by assuming — that nothing between classification and the clean-tree assertion depends on either.
+2. **Correct D9's addendum in `design.md`.** The "never writes into…" half becomes true and should say
+   *why* it is true (every refusal precedes every write, and the ordering is load-bearing rather than
+   incidental). The **other half is false regardless of ordering** and must be reworded: *"does not
+   commit into a repository's history it did not create"* is contradicted by D9 reconciliation itself,
+   which commits a `System` recovery commit into adopted history whenever the adopted tree is dirty —
+   deliberately. State the real posture: ZeroWiki does not write to an adopted repository **until it has
+   accepted it**, and thereafter D9 governs what it writes.
+3. **Tests are the point of this block, and they are the missing foreignness axes** (`## NEXT`
+   obligation 11): an adopted repository with **pre-existing `pre-receive`/`post-receive` hooks** and no
+   `docs/` → refuses **and the hooks are byte-for-byte untouched**; an adopted repository with
+   **`receive.denyCurrentBranch=refuse`** plus a nested gitlink → refuses **and the config is
+   unchanged**. Assert the *absence of the write*, not merely the refusal — the refusal already passes
+   today.
+4. **Fold in the two `<remarks>` corrections** (obligation 12), since the same files are open:
+   `FindStagedGitlinksAsync` says `M` where git emits `T` for a tracked path replaced by a nested
+   repository; and `GitHookInstaller` should record that `git rev-parse --git-path hooks` honours
+   `core.hooksPath`, which is what makes §5.3's hooks land where git will run them.
+5. **Fold in obligation 13's two stale comments**: `GitAuthor.cs:13-15` still calls reconciliation
+   "later" though it now exists, and `tasks.md:70` still records 11.1's superseded pattern while `src/`
+   is correct.
+6. **No mutation testing.** This is ordering and prose; the item-3 tests assert the ordering directly,
+   so a mutant here is the tautological kind. The instrument that matters is the fixture.
+
+**[worker]** Implemented. `EnsureRepositoryAsync` reordered: `AssertGitResolvesRepositoryRootAsync` →
+`EnsureInitialCommitAsync` → `ReconcileWorkingTreeAsync` → `AssertWorkingTreeIsCleanAsync` →
+`ApplyRepositoryConfigurationAsync` → `_hooks.InstallHooksAsync`. Verified by reading the call graph,
+not assuming: neither config write (`receive.denyCurrentBranch`, `http.receivepack`) nor hook
+installation is read by anything between classification and the clean-tree assertion — both govern
+pushes/hook firing, which cannot happen before the app finishes starting. Every refusal
+(`AssertGitResolvesRepositoryRootAsync`, the missing-`docs/` throw in `EnsureInitialCommitAsync`, the
+gitlink throw in `ReconcileWorkingTreeAsync`) now runs before any write.
+
+`design.md` D9 gets a third addendum: the ordering fix, stated as load-bearing (a future change moving
+config/hooks earlier reopens the defect), plus the correction that "does not commit into a repository's
+history it did not create" was always false regardless of ordering — D9 reconciliation itself commits
+into adopted history by design. Restated posture: ZeroWiki does not write to an adopted repository until
+it has accepted it; thereafter D9 governs what it writes. `MissingWorkingTreeException` reworded to
+match; `EnsureInitialCommitAsync`'s XML doc too.
+
+Two new tests, each confirmed to fail against the pre-reorder ordering (verified by temporarily
+swapping the source back via `cp`, never `git checkout`/`restore`, and restoring the fix the same way —
+`git diff -- src` checked clean and matches exactly the 3 intended files before this post):
+- `ForeignRepositoryWithPreExistingHooksAndNoDocs_RefusesLeavingTheHooksByteForByteUnchanged` — operator
+  hooks with distinct bodies + exec bit, no `docs/`; asserts refusal **and** the hook files unchanged
+  byte-for-byte and mode-for-mode. Failed pre-fix (hooks were the "Managed by ZeroWiki" body).
+- `ForeignRepositoryWithDenyCurrentBranchRefuseAndANewGitlink_RefusesLeavingTheConfigUnchanged` —
+  pre-existing `receive.denyCurrentBranch=refuse` + a staged gitlink; asserts refusal **and** the config
+  value unchanged (plus `http.receivepack` still entirely unset). Failed pre-fix
+  (`receive.denyCurrentBranch` was `updateInstead`).
+
+Folded in the two `<remarks>` corrections (`FindStagedGitlinksAsync`: `T`, not `M`, for a tracked path
+replaced by a nested repository — condition tests modes, not letters, so no behaviour change;
+`GitHookInstaller`: noted `--git-path hooks` honours `core.hooksPath`) and the two stale comments
+(`GitAuthor.cs:13-15` no longer says "later"; `tasks.md:70` now records D11's actual shipped pattern,
+including the no-consecutive-dots rule).
+
+No mutation testing run, per the brief.
+
+Gates: `dotnet build` 0 warnings/0 errors · `dotnet test` **507/507** unfiltered (505 baseline + 2 new)
+· `openspec validate git-backed-content-core --strict` valid · `dotnet format --verify-no-changes`
+exit 0. Nothing ticked, no new `N.M` numbers.
+
+→ @reviewer
+
+**[architect]** Product Owner decision, raised by the PO from the edge I flagged to `@reviewer` in the
+reorder audit: **a pre-init filesystem scan for nested `.git` entries.**
+
+**The gap.** The reorder puts every refusal before every write on the *adopt* path, but not on the
+*initialise* path. A plain folder copied onto the volume has no `.git`, so ZeroWiki runs `git init` and
+makes an initial commit, and only then can the gitlink refusal fire — leaving a `.git` and one commit
+in a directory it did not create, immediately before declining to serve it.
+
+**Cost is not the objection it looks like.** The scan sits on the initialise branch, which by
+definition stops existing once a repository is there, so it runs **once in the life of a volume** — not
+per startup, and never on a populated vault.
+
+**The real cost is a second instrument, and it must be named as such in the code.** The shipped
+index-based check (`git diff --cached --raw -z`, mode `160000`) answers *"would committing now store a
+gitlink"*. A filesystem scan answers *"is there a nested repository here"*. These are **not** the same
+question and they disagree in a specific case: a nested repository the operator has **gitignored** is
+skipped entirely by `add -A`, so no gitlink is ever created and the index check stays silent — while
+the scan finds the `.git` and refuses. The Product Owner accepted that divergence knowingly: refusing
+is recoverable and legible, and a gitignored nested repository inside a wiki's content folder is a
+configuration worth stopping on.
+
+Both checks therefore stay, and **the code must say why each exists**, or the next reviewer will
+correctly read them as one abstraction duplicated. The scan guards the initialise path *before* any
+write; the index check guards every path *at the moment of committing*, including content that arrives
+long after bootstrap. Neither subsumes the other.
+
+**[reviewer]** Reorder block — **Approve.** Certifying the diff against `85d2b7f` (six files:
+`ContentRepositoryService.cs`, `GitAuthor.cs`, `GitHookInstaller.cs`, `ContentRepositoryServiceTests.cs`,
+`design.md`, `tasks.md`), all four scrutiny points checked by reproduction, not by reading.
+
+**1. Both new tests genuinely fail against the pre-reorder ordering.** Reverted
+`EnsureRepositoryAsync` to the pre-fix sequence (config + hooks before the initial-commit/reconcile/
+assert-clean steps) via a checksummed `cp` swap, restored after — never `git checkout`. Both
+`ForeignRepositoryWithPreExistingHooksAndNoDocs_RefusesLeavingTheHooksByteForByteUnchanged` and
+`ForeignRepositoryWithDenyCurrentBranchRefuseAndANewGitlink_RefusesLeavingTheConfigUnchanged` fail
+against it, on exactly the assertions that matter — the operator's hooks come back as ZeroWiki's
+"Managed by ZeroWiki" body, and `receive.denyCurrentBranch` comes back `updateInstead` instead of the
+operator's `refuse`. Real teeth, not incidental passes.
+
+**2. The copy-a-folder edge — confirmed real by my own reproduction, independently of what's now
+recorded above.** I found the identical mechanism before reading the architect's post that now sits
+just above this one: on a fresh volume with content (including a nested `.git`) already copied under
+where `docs/` will go, `git init` and one commit (containing only `.gitkeep`, never the nested vault's
+files) land before the gitlink refusal fires — reproduced end to end, confirmed the nested vault is
+never captured in that or any commit and the index carries no gitlink afterward. My own read, reasoned
+before I saw the PO's decision: `design.md`'s "does not write to a repository it did not create" is
+technically true of this path in a narrow sense — the repository itself was created by ZeroWiki in this
+same call via `git init`, so the initial commit is a write into ZeroWiki's own freshly-created
+repository, not an adopted one; only the gitlink *content* (which the guard never commits) is genuinely
+foreign. But the architect's post immediately above records the Product Owner going further than that
+narrow reading and deciding the gap is real enough to warrant an actual mechanism — a pre-init
+filesystem scan — rather than a wording-only fix, which is the stronger and more conservative answer
+and the one I'd defer to. That scan isn't in this diff and doesn't need to be: this block's own scope
+was the adopt-path reorder, the initialise-path gap is now explicitly acknowledged and scheduled for a
+follow-up rather than silently left, and nothing in this block's own claims is falsified by that —
+`design.md`'s current wording will need the follow-up block's correction, not this one's.
+
+**3. No path serves with mismatched config/hooks state — confirmed by reproduction, both halves.**
+`Program.cs:97` still awaits `EnsureContentRepositoryAsync()` with no surrounding try/catch, so any
+exception anywhere in `EnsureRepositoryAsync` — including from `ApplyRepositoryConfigurationAsync` or
+`InstallHooksAsync` themselves, neither of which catches anything internally — propagates uncaught and
+prevents `app.Run()` from ever being reached; there is no state in which the app serves with only one
+of the two applied. Also checked the restart case directly: built a repository through one successful
+start (config + hooks applied), introduced a fresh gitlink, and confirmed a second, refused start
+leaves the earlier run's config and hook bodies byte-for-byte untouched — the failed run never reaches
+the config/hooks steps, and nothing else touches them either.
+
+**4. All four folded-in corrections verified true, not merely re-read.**
+`FindStagedGitlinksAsync`'s `<remarks>` now says a previously-tracked path replaced by a nested
+repository is a `T` (typechange) record, not `M` — reproduced directly (a tracked file replaced by a
+nested `.git` at the same path yields `:100644 160000 … T`), confirmed. `GitHookInstaller`'s new
+`core.hooksPath` remark — reproduced directly (`git config core.hooksPath <path>` →
+`rev-parse --git-path hooks` returns that path), confirmed, and it matters: `ResolveHooksDirectoryAsync`
+already handles a rooted path returned this way. `GitAuthor.cs`'s wording no longer calls reconciliation
+"later" — accurate, both are shipped now. `tasks.md:70`'s pattern now matches
+`CredentialPolicy.UsernamePattern` in `src/` exactly, confirmed by direct comparison.
+
+**Confirmed independently:** `dotnet test --filter
+"FullyQualifiedName~ContentRepositoryServiceTests|FullyQualifiedName~ContentRepositoryStartupTests"`
+24/24; `openspec validate git-backed-content-core --strict` valid; `dotnet format --verify-no-changes`
+clean; `dotnet build` 0/0; `git status --short` / `git diff --stat 85d2b7f` show exactly the seven
+files (six source/spec + DEVLOG), no residue from any of my scratch reproductions (all removed,
+checksum-verified restored before this post).
+
+No mutation this round, per the ruling — agreed: this is ordering and prose, item 1's tests assert the
+ordering directly, and the fixture (foreign repository with pre-existing hooks/config) is the
+instrument that matters here, not a mutant.
+
+**This follow-up block is clear to commit.**
+
+→ @architect
+
 ## NEXT
 
 **Resume point: §3 (Content read & render), first block.** §2 is **closed** — supervisor `Approve` on

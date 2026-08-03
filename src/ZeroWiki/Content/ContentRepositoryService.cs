@@ -105,21 +105,32 @@ public sealed class ContentRepositoryService
 
         // Every branch above that did not throw leaves .git present at repositoryRoot — found as-is,
         // or just created by init — so the assertion has what it needs here. Run it before any write:
-        // if classification ever regresses, this is what stops ApplyRepositoryConfigurationAsync from
-        // writing receive.denyCurrentBranch/http.receivepack into a repository git merely discovered
-        // (e.g. an ancestor's), rather than reporting that damage after it already happened.
+        // if classification ever regresses, this is what stops the configuration/hooks writes below
+        // from landing in a repository git merely discovered (e.g. an ancestor's), rather than
+        // reporting that damage after it already happened.
         await AssertGitResolvesRepositoryRootAsync(repositoryRoot, cancellationToken);
 
-        await ApplyRepositoryConfigurationAsync(repositoryRoot, cancellationToken);
-        await _hooks.InstallHooksAsync(repositoryRoot, cancellationToken);
+        // Every refusal this method can raise — bare repository (above), missing docs/, and a staged
+        // gitlink — happens before any write below. This ordering is load-bearing, not incidental
+        // (design.md D9 addendum): the docs/ probe below needs only a HEAD read, and the gitlink probe
+        // is intrinsically a staging-and-diff operation, so both can and must run before configuration
+        // or hooks touch the repository at all. A repository this method is about to refuse never has
+        // anything written to it first.
         await EnsureInitialCommitAsync(repositoryRoot, cancellationToken);
 
         // D9: a dirty tree at startup (e.g. Markdown copied onto the volume before first start, or an
         // interrupted save) is always committed as a recovery commit, never discarded.
         await ReconcileWorkingTreeAsync(repositoryRoot, cancellationToken);
 
-        // Runs last: its whole job is to check that everything above actually achieved a clean tree.
+        // Confirms reconciliation actually achieved a clean tree before anything further runs against
+        // this repository.
         await AssertWorkingTreeIsCleanAsync(repositoryRoot, cancellationToken);
+
+        // Runs last, now that every refusal above has had its chance to fire first: neither writes
+        // anything a refusal above needs to be true of, and receive.denyCurrentBranch/http.receivepack
+        // govern pushes while the hooks fire on push — neither can matter before the app is serving.
+        await ApplyRepositoryConfigurationAsync(repositoryRoot, cancellationToken);
+        await _hooks.InstallHooksAsync(repositoryRoot, cancellationToken);
     }
 
     private static InvalidOperationException BareRepositoryException(string repositoryRoot) =>
@@ -130,10 +141,10 @@ public sealed class ContentRepositoryService
     private InvalidOperationException MissingWorkingTreeException(string repositoryRoot) =>
         new(
             $"The content repository at '{repositoryRoot}' has commit history but no " +
-            $"'{_paths.WorkingTree}' working tree. ZeroWiki does not create one in a repository it " +
-            "did not itself initialize, and does not commit into a repository's history that it did " +
-            "not create. Create the 'docs' directory at the repository root (it can be empty) and " +
-            "restart the application.");
+            $"'{_paths.WorkingTree}' working tree. ZeroWiki does not write to a repository it did " +
+            "not itself initialize until it has accepted it, and a repository missing its working " +
+            "tree is never accepted. Create the 'docs' directory at the repository root (it can be " +
+            "empty) and restart the application.");
 
     /// <summary>
     /// Whether <paramref name="repositoryRoot"/> has a <c>.git</c> entry of its own — a directory for
@@ -222,9 +233,9 @@ public sealed class ContentRepositoryService
     /// On a repository that already has history — one this call did not create, whether a previous
     /// start of this app or a repository adopted from elsewhere — does neither: if
     /// <see cref="ContentPaths.WorkingTree"/> is absent, refuses to start rather than silently
-    /// establish one (Product Owner decision). ZeroWiki never writes into, or commits into, a
-    /// repository it did not itself create — the same posture as the bare-repository and gitlink
-    /// refusals elsewhere in this class.
+    /// establish one (Product Owner decision), and does so before <see cref="EnsureRepositoryAsync"/>
+    /// has written any configuration or hooks — the same before-any-write posture as the
+    /// bare-repository and gitlink refusals elsewhere in this class.
     /// </summary>
     private async Task EnsureInitialCommitAsync(string repositoryRoot, CancellationToken cancellationToken)
     {
@@ -355,8 +366,9 @@ public sealed class ContentRepositoryService
     /// moves, which is exactly the bricking this check exists to prevent, arriving through the one
     /// status (<c>M</c>, not <c>A</c>) an earlier version of this method did not distinguish. A gitlink
     /// genuinely being introduced now is an <c>A</c> record (<c>old mode 000000</c>) or, in principle,
-    /// an <c>M</c> record whose *old* mode was something else (a previously tracked path replaced by a
-    /// nested repository) — both have <c>old mode != 160000</c>, which is the actual condition below.
+    /// a <c>T</c> (typechange) record for a previously tracked path replaced by a nested repository —
+    /// both have <c>old mode != 160000</c>, which is the actual condition below (it tests modes, not
+    /// status letters, so this correction does not change behaviour).
     /// <para>
     /// This call always sees a <em>born</em> <c>HEAD</c> — <see cref="EnsureInitialCommitAsync"/> runs
     /// unconditionally before reconciliation in <see cref="EnsureRepositoryAsync"/> and either creates

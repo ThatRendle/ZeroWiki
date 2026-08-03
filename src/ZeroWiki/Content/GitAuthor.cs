@@ -10,8 +10,7 @@ public sealed record GitAuthor(string Name, string Email)
 {
     /// <summary>
     /// The software's own identity — used for commits that belong to ZeroWiki rather than to a
-    /// member: the repository's initial commit (D9, extended) and, later, startup reconciliation of
-    /// orphaned changes.
+    /// member: the repository's initial commit and startup reconciliation of orphaned changes (D9).
     /// </summary>
     public static readonly GitAuthor System = new("System", "system@zerowiki.org");
 

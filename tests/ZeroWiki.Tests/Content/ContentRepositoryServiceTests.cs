@@ -566,6 +566,72 @@ public sealed class ContentRepositoryServiceTests : IDisposable
         Assert.NotEqual(gitlinkShaBeforeAdvance, gitlinkShaAfterAdvance);
     }
 
+    [Fact]
+    public async Task ForeignRepositoryWithPreExistingHooksAndNoDocs_RefusesLeavingTheHooksByteForByteUnchanged()
+    {
+        // Executable-bit hooks are a POSIX filesystem concept with no Windows equivalent, matching
+        // GitHookInstaller's own PlatformNotSupportedException guard; nothing to assert on Windows.
+        if (OperatingSystem.IsWindows())
+        {
+            return;
+        }
+
+        var repositoryRoot = RepositoryRoot;
+        await CreateForeignRepositoryAsync(repositoryRoot, withDocsDirectory: false);
+
+        var hooksDirectory = Path.Combine(repositoryRoot, ".git", "hooks");
+        Directory.CreateDirectory(hooksDirectory);
+        var preReceivePath = Path.Combine(hooksDirectory, GitHookInstaller.PreReceiveHookName);
+        var postReceivePath = Path.Combine(hooksDirectory, GitHookInstaller.PostReceiveHookName);
+        const string preReceiveBody = "#!/bin/sh\necho 'operator-owned pre-receive'\nexit 0\n";
+        const string postReceiveBody = "#!/bin/sh\necho 'operator-owned post-receive'\nexit 0\n";
+        await File.WriteAllTextAsync(preReceivePath, preReceiveBody);
+        await File.WriteAllTextAsync(postReceivePath, postReceiveBody);
+        var operatorMode = UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute;
+        File.SetUnixFileMode(preReceivePath, operatorMode);
+        File.SetUnixFileMode(postReceivePath, operatorMode);
+
+        var service = CreateService();
+
+        // The refusal itself already passed before this block's fix — asserting only this would prove
+        // nothing. What matters is that nothing was written before it fired.
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() => service.EnsureRepositoryAsync());
+        Assert.Contains(Path.Combine(repositoryRoot, "docs"), exception.Message, StringComparison.Ordinal);
+
+        Assert.Equal(preReceiveBody, await File.ReadAllTextAsync(preReceivePath));
+        Assert.Equal(postReceiveBody, await File.ReadAllTextAsync(postReceivePath));
+        Assert.Equal(operatorMode, File.GetUnixFileMode(preReceivePath));
+        Assert.Equal(operatorMode, File.GetUnixFileMode(postReceivePath));
+    }
+
+    [Fact]
+    public async Task ForeignRepositoryWithDenyCurrentBranchRefuseAndANewGitlink_RefusesLeavingTheConfigUnchanged()
+    {
+        var repositoryRoot = RepositoryRoot;
+        await CreateForeignRepositoryAsync(repositoryRoot, withDocsDirectory: true);
+
+        // An operator's own export policy, predating adoption by ZeroWiki — must survive a refused
+        // start untouched, not be overwritten to updateInstead before the gitlink check gets to run.
+        await _git.RunOrThrowAsync(repositoryRoot, ["config", "receive.denyCurrentBranch", "refuse"]);
+
+        var nestedPath = Path.Combine(repositoryRoot, "docs", "copied-vault");
+        await CreateNestedGitRepositoryDirectoryAsync(nestedPath);
+
+        var service = CreateService();
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() => service.EnsureRepositoryAsync());
+        Assert.Contains("docs/copied-vault", exception.Message, StringComparison.Ordinal);
+
+        Assert.Equal(
+            "refuse",
+            (await _git.RunOrThrowAsync(repositoryRoot, ["config", "receive.denyCurrentBranch"])).StandardOutput.Trim());
+
+        // http.receivepack was never set by the operator either; it must still be entirely absent,
+        // not written and then abandoned mid-refusal.
+        var receivepackConfig = await _git.RunAsync(repositoryRoot, ["config", "--get", "http.receivepack"]);
+        Assert.False(receivepackConfig.Succeeded);
+    }
+
     /// <summary>
     /// Builds a repository entirely outside <see cref="ContentRepositoryService"/> — its own
     /// initialization, its own author, its own layout — standing in for one adopted from elsewhere

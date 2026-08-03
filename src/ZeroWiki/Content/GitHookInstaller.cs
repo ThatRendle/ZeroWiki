@@ -13,7 +13,10 @@ namespace ZeroWiki.Content;
 /// The hooks directory is located via <c>git rev-parse --git-path hooks</c> rather than assumed to be
 /// <c>&lt;repositoryRoot&gt;/.git/hooks</c> — correct whether <c>.git</c> is an ordinary directory or a
 /// gitfile (worktree/submodule layout), and always outside <see cref="ContentPaths.WorkingTree"/>, so
-/// installing a hook can never dirty the tree the working-tree-clean invariant governs.
+/// installing a hook can never dirty the tree the working-tree-clean invariant governs. This form also
+/// honours <c>core.hooksPath</c> when a repository sets one — verified by execution — which is what
+/// makes §5.3's lock-acquiring <c>pre-receive</c> land wherever git will actually run it, rather than
+/// at a fixed path git itself may not consult.
 /// </remarks>
 public sealed class GitHookInstaller
 {
