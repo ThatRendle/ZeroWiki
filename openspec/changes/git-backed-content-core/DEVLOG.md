@@ -7942,6 +7942,437 @@ rather than a per-block one:
 
 → @architect
 
+**[supervisor]** §4 section review over `35dde44..HEAD` (`c59ce13`, `fe3496f`, `ad7934f`).
+
+## Verdict: **Request changes** — three blockers, all prose, none in mechanism
+
+The mechanism is the strongest this change has produced. **§4 genuinely stopped being scaffolding** —
+verified against the shipped code, not the reports: `WikiPage.razor` injects `PageIndex` and
+`MarkdownPipeline` only; `PageEnumerationService`, `PageFrontmatterExtractor` and `PageHistoryService`
+have exactly one consumer left in `src/` (`PageIndexBuilder`, plus their DI registrations), so a page
+view no longer walks the tree and no longer spawns a `git log`. One `git rev-parse` on the fresh path,
+body still `File.ReadAllTextAsync` from the working tree. No second read path survives anywhere.
+
+What I am blocking is narrower and, on this change's own record, the expensive kind: **`design.md`'s
+D15 no longer describes the section that shipped**, and it binds §5, §6 and §8. D15 was written in
+`c59ce13`, *before* block B; block B then changed the mechanism in three places and added a fourth
+one, and nothing went back. No block review could have caught this — the design commit predates block
+B, and `design.md` is not in block B's diff.
+
+### B1 — D15 describes a mechanism §4 does not ship (`design.md`, D15; blocks A+B)
+
+Four discrepancies between the binding prose and `PageIndexBuilder.cs`:
+
+1. **The full-rebuild trigger list is incomplete, and the omitted one is the one that can fire
+   forever.** D15: *"A full rebuild is the fallback for a stamp git cannot resolve — no previous stamp,
+   history rewritten, or a `reset --hard` behind the app's back."* Block B added a **fourth**, on the
+   reviewer's blocker: `PageIndexBuilder.cs:144` falls back to a full `BuildAsync` whenever
+   `current.UnreadableDirectories.Count > 0`. Unlike the other three, this one is not a one-off — it
+   fires on **every** `HEAD` advance for as long as an operator leaves one directory unreadable, so a
+   full tree walk plus a full history walk becomes the steady state on the request path while D15 still
+   asserts the steady state is one `rev-parse`. §6 and §8 will be briefed from this paragraph.
+2. **"where it is both cheap and unconditionally correct"** — a full rebuild is `EnumeratePages()` over
+   the whole tree plus `GetAllLastEditsAsync` over the whole history plus a bounded read per page.
+   D15's own preceding paragraphs are what establish that this is the expensive path. It is
+   *unconditionally correct*; it is not cheap, and with (1) it is not rare either.
+3. **`--name-status` vs `--name-only`.** D15 names `git diff --name-status <stamped>..<current>`;
+   `PageIndexBuilder.cs:161–167` ships `--name-only`. The reviewer verified the deviation is sound
+   (membership is re-derived from disk via `StillExistsAsOrdinaryFile`, so git's status letter is never
+   needed) and accepted it — correctly. Nobody updated the decision it deviates from.
+4. **Minor, same paragraph family:** *"reads only enough **bytes**"* — `ReadFrontmatterAsync`
+   (`PageIndexBuilder.cs:377`) reads that many **characters**. The reviewer's soundness argument for
+   chars-vs-bytes is right and should be what D15 says.
+
+### B2 — D15's freshness design is self-healing only under an invariant it never states, and §6 breaks it (`design.md`, D15; block B)
+
+The reviewer recorded the TOCTOU window as *"self-corrects within one request … no permanent wrong
+state"*. That is right for the variant it examined — the one where `HEAD` moved. It is **not** right
+for the variant where `HEAD` does not move, and that is the one §6 creates.
+
+`GetCurrentAsync` only ever re-reads a page when the stamp differs from `HEAD`. So the design is
+self-healing exactly while *every working-tree content change is eventually followed by a `HEAD`
+advance the app observes*. `specs/content-editing/spec.md:54` requires the opposite for one path:
+*"if the commit fails, the system SHALL restore the working tree so no uncommitted change remains"* —
+`design.md:249`'s `git checkout -- <file>` rollback. Write file → refresh reads its frontmatter →
+commit fails → file restored → **`HEAD` never moved**. The index now holds the aborted save's
+title/tags, stamped at a `HEAD` that is still current, and nothing will re-read that path: the next
+`HEAD` advance takes the *incremental* branch, which only re-reads the paths the diff names, and the
+aborted file is in no diff. It is wrong until a full rebuild or until some later commit happens to
+touch that exact file.
+
+Inert today (the only writers are pushes, which under `updateInstead` settle the tree before the ref,
+and startup reconciliation, which commits). Live the moment §6 lands. D15 is what §6 will be briefed
+from and it says nothing about this; the fix is one paragraph naming the dependency, plus a forward
+obligation so §6's brief carries it.
+
+*This also answers @reviewer's cross-block note 2:* accepted trade-off today, gap at §6 — and larger
+than the note describes, because the non-self-healing variant is the one where `HEAD` stays put.
+
+### B3 — superseded block-A scaffolding prose still shipping, and now false (`PageIndexSnapshot.cs:16–19`; blocks A+B)
+
+> *"Nothing in this snapshot type — nor anything that builds one — compares `CommitSha` against the
+> repository's current `HEAD`; that comparison, and the incremental re-index it drives, is block B
+> (4.3)."*
+
+`PageIndexBuilder` builds them and `RefreshAsync` (`PageIndexBuilder.cs:130`) is precisely that
+comparison. Block A wrote this to record what it had deliberately *not* done; block B did it and left
+the sentence behind, so shipped code now states a false invariant and forward-references work that has
+landed. I grepped `src/` for every other `4.3`/`block B`/§-forward reference — this is the **only**
+one that reads as pending; the rest are legitimate cross-references. Delete or rewrite to what the
+type actually guarantees (it is metadata-only, and it does not itself compare anything).
+
+## Suggested remediation shape — one fix block, prose only
+
+`design.md` D15 (B1, B2) and `PageIndexSnapshot.cs`'s remarks (B3). No behaviour change, no new tests
+— **B1(1) is the one to get right**, because the omitted trigger is a cost characteristic §6/§8 will
+plan against. Worth pairing with a reviewer pass on the D15 wording specifically, given this change's
+record: five claim-versus-mechanism mismatches in §2, and §3's worst finding was an audit-question
+blind spot.
+
+## Required `## NEXT` corrections before the section closes (Architect, not the fix block)
+
+- **Obligation 8 is still tracked, but its justification is now false** (@reviewer's note 4). It reads
+  *"Parked deliberately in §2's first block, where it is inert: startup passes `CancellationToken.None`,
+  so there is nothing to cancel. §6's abortable commit-on-save is what makes it live."* **§4 made it
+  live**, from the request path, for `rev-parse`, `diff` and `log`. The shipped comments
+  (`PageIndex.cs`, `PageHistoryService.cs:70`, `WikiPage.razor:152`) all say this correctly; only
+  `## NEXT` still says "inert". Same defect shape as B1–B3, in the other durable artefact.
+- **Obligation 21 is now two-thirds discharged.** The whole-tree walk and the per-view `git log` are
+  gone; what remains unowned is the page-size cap on the render path, which §4 correctly did **not**
+  half-fix (`WikiPage.razor:176` still `ReadAllTextAsync` on the whole file, exactly as D15 promises).
+  Rewrite it to the one remaining item so §6 doesn't inherit a discharged obligation.
+- **A §3 requirement was dropped and `WikiPage.razor:114` now asserts otherwise.** The comment says
+  the `Routes.razor` `NotFoundPage`/404 trade is *"recorded in `## NEXT`"*. It is not — I searched the
+  whole `## NEXT` block for `NotFoundPage`/`404`/`not-found`/`410`: zero hits, while §3's own thread
+  (DEVLOG ~6485, ~6505) required it be named there as a revisitable follow-up. §4 rewrote this
+  component, so the false pointer is now §4's to close. Add the entry.
+- **§6 inherits a mutation-testing obligation §4 correctly declined.** Scoping §4 out was right and I
+  am not re-opening it: a derived, rebuildable index is a read path, and the section's one real defect
+  (the unreadable-directory census gap) was found by asking what the condition *cannot see* — the
+  instrument CLAUDE.md says mutation is silent on. But `ApplyIncrementalUpdateAsync` maintains D12's
+  route-identity invariant, and D12's *Consequence binding §6* makes a wrong answer there a wrong-file
+  **write**. The day §6 resolves a save through this snapshot, it becomes a data-integrity path in
+  CLAUDE.md's sense. Record it now rather than rediscovering it.
+
+## Findings that don't block — for `## NEXT`
+
+1. **The `HEAD` probe now exists twice with divergent semantics, and the known-wrong one ships.**
+   Block A's reviewer proved by reproduction that `git rev-parse --verify -q HEAD` exits **1** for an
+   unborn `HEAD` and **128** for a repository fault, and block A hardened
+   `PageIndexBuilder.ProbeCurrentHeadShaAsync` (`PageIndexBuilder.cs:100–108`) accordingly.
+   `ContentRepositoryService.RepositoryHeadIsUnbornAsync` (`ContentRepositoryService.cs:429–436`) still
+   returns `!headProbe.Succeeded` — i.e. it reads 128 as "unborn", which is the exact defect block A
+   was blocked on. Latent, not live: on that path a genuine fault is caught by
+   `AssertGitResolvesRepositoryRootAsync` before any write. But the same question is now answered two
+   ways in two classes, with the correct answer documented only in the new one, and the next section
+   that needs the probe will copy whichever it finds first. Out of §4's scope — §2's class — so this
+   is a `## NEXT` item, not a fix-block item.
+2. **`GetAllLastEditsAsync` keys on the platform separator; every other path in the section uses `/`.**
+   `PageHistoryService.cs:255–256` converts `/` → `Path.DirectorySeparatorChar` and the docstring
+   (`:130–132`) claims the keys match `EnumeratedPage.RelativePath`. They do not by construction —
+   `PageEnumerationService.ToRoutePath` produces forward slashes — they coincide only because the
+   container and both dev platforms are POSIX. Its sibling `GetLastEditAsync` is separator-agnostic
+   (`:80` normalises whatever it is given), so two methods in one class, added in two sections, now
+   disagree about their path convention while a docstring asserts they agree. On Windows every nested
+   page would silently lose its last-edit and no test would say why. Normalise the key to `/` or
+   correct the claim.
+3. **Nothing in the test suite can see `BuildPageIndexAsync`.** `Program.cs:98`'s startup build is not
+   referenced by any test, and it cannot be observed indirectly either: with `GetCurrentAsync` in
+   place, deleting the call would make the first request rebuild lazily and every test would still
+   pass. Spec scenario *Index rebuilt from repository* is genuinely gated at the unit level by
+   `PageIndexBuilderTests.Build_*`; it is the **"at startup"** clause that nothing gates. Keeping the
+   call is right — it fails a broken volume fast at startup instead of on page one, which is
+   `EnsureContentRepositoryAsync`'s whole rationale — but that is now an undefended property.
+4. **The single-flight gate re-probes git while holding the exclusive lock.** `PageIndex.cs:66` runs a
+   fresh `ProbeCurrentHeadShaAsync` inside `_refreshGate`, so a burst of N concurrent requests on a
+   stale stamp costs up to 2N `git` spawns, N of them serialized one-at-a-time under a global lock on
+   the read path. Correct, and the `Assert.Same` single-flight test cannot see it — that assertion
+   measures correctness, not the gate's cost. Comparing `Current.CommitSha` against the `headSha` this
+   caller *already* probed before waiting would settle the common case with no spawn at all.
+5. **Route lookup is a linear scan.** `WikiPage.razor:157,166` are `FirstOrDefault` over
+   `snapshot.AmbiguousRoutes` and `snapshot.Pages`. Fine at this wiki's size and far cheaper than what
+   it replaced; worth a dictionary the day the index is asked to back a page list or search.
+6. **`PageIndex.Current` is public with no production consumer outside its own class** — read
+   internally by `GetCurrentAsync`, and externally only by `PageIndexTests`. This is a much milder
+   instance of obligation 19's shape, and it is the *only* one: I enumerated every public member
+   §4 added (`PageIndexEntry`'s six, `PageIndexSnapshot`'s five, `PageIndexBuilder`'s three,
+   `EvaluateRouteClaim`/`RouteClaimEvaluation`, `RepositoryRelativeWorkingTree`,
+   `GetAllLastEditsAsync`, `IFrontmatterParser.MaxSizeBytes`,
+   `PageFrontmatterExtractor.MaxFrontmatterSizeBytes`) and every other one has a production caller.
+   **§4 did not repeat §3's unwired-API shape.**
+
+## Answers to @reviewer's cross-block notes
+
+1. **`PageIndexBuilder`'s five responsibilities — coherent, keep it.** All five are "construct a
+   `PageIndexSnapshot` from the repository"; splitting refresh out would need the same five
+   collaborators plus the builder. The one seam that reads slightly wrong is that the *holder* depends
+   on the *builder* for a fact that has nothing to do with building (`PageIndex` →
+   `ProbeCurrentHeadShaAsync`), which is also where finding 1's duplicate probe would naturally live if
+   it were ever extracted. Not worth doing now.
+2. **TOCTOU — see B2.** Accepted trade-off today; a gap at §6, and a different one than the note
+   describes.
+3. **D12 via three mechanisms — I looked for the fourth gap and did not find one.** The property that
+   makes the incremental reconstruction sound is that `current` is a complete census of every candidate
+   file, and I checked the exhaustiveness of that census rather than the arithmetic: `EnumeratePages`
+   puts **every** claimant into `Pages` or `AmbiguousRoutes`, including the sole-claimant-that-doesn't-
+   round-trip case (`PageEnumerationService.cs:82–85`, and `EvaluateRouteClaim`'s zero-claimant branch
+   at `:239`) — so a non-canonical sole claimant is *not* the second census hole I was hunting for.
+   Symlinks and dot-prefixed segments are excluded identically on both sides
+   (`PageIndexBuilder.cs:226–227, 328` vs `PageEnumerationService.cs:157,175,186`). Routes are a pure
+   function of the path, so an affected path can never move between routes. The **only** census hole is
+   `UnreadableDirectories`, and block B's guard closes exactly it. What this check cannot see: it
+   reasons about the census, so it would be blind to a defect in how a *complete* census is combined —
+   the arithmetic the reviewer already reproduced.
+4. **Obligation 8 is tracked but mis-stated** — see the `## NEXT` corrections above.
+5. **Agreed and confirmed independently:** `RepositoryRelativeWorkingTree` is derived once
+   (`PageHistoryService.cs:47–49`) and is the only prefix derivation in the section.
+
+## Checked clean — recorded so it isn't re-litigated
+
+- **No mutation residue.** `git status --short -- src tests` clean, and I re-read all three targets from
+  the review loop in their committed state rather than trusting the reports: `PageIndexBuilder.cs:75`
+  passes `enumeration.UnreadableDirectories` (not `[]`), the `UnreadableDirectories` guard is present at
+  `:144`, and `PageIndex.cs:60–70`'s gate + re-check are intact.
+- **Static SSR discipline held.** §4 added no page, no component, and no `@rendermode`; there is no
+  render-mode directive anywhere under `src/ZeroWiki/Components`. No circuit was widened.
+- **Identity surface untouched.** §4 added no route; `WikiPage`'s `[Authorize]` and the AD21 anonymous
+  reasoning are unchanged, and the index is behind it.
+- **All five spec scenarios are gated by a test**, checked one at a time rather than as a set:
+  *Index rebuilt from repository* — `PageIndexBuilderTests.Build_*` (the "at startup" clause excepted,
+  finding 3); *Index updated after a content change* — `Refresh_Added/Modified/Deleted*`;
+  *Content changed by an unannounced writer* — `PageIndexTests.GetCurrentAsync_ContentChangedBy…` plus
+  `WikiPageTests.Content_changed_directly_with_git_…`, which asserts new body **and** new author, so it
+  gates the scenario's "content *and metadata*" rather than half of it; *Refused routes survive
+  indexing* — `Build_AmbiguousRouteAndUnreadableDirectory_…`, `Refresh_NewFileColliding…`,
+  `Refresh_RemovingOneOfTwoColliding…`, and §3's `An_ambiguous_route_names_both_claimants…` still green
+  through the new index-backed resolution; *Index holds no content* — structural (`PageIndexEntry` has
+  no body field) plus `WikiPageTests`' end-to-end reflection.
+  **What that set cannot see:** every scenario-3 test moves `HEAD`. Nothing tests a working-tree
+  content change with `HEAD` held still — which is B2's window, and is why it survived the block review.
+- **D15's cost claim, verified rather than read.** On the fresh path a page view is exactly one git
+  spawn (`ProbeCurrentHeadShaAsync`), no tree walk, no `git log` — so "materially cheaper even while
+  gaining a spawn" holds for the steady state. It is B1(1)/(2) that break it for the stale and
+  degraded paths.
+- **Obligation 21 was not quietly half-fixed.** The render path still reads the whole file
+  (`WikiPage.razor:176`); the bounded prefix is confined to the indexer. D15's disclaimer matches the
+  code exactly.
+
+→ @architect
+
+**[worker]** Remediation for the supervisor's §4 review — prose only, no behaviour change, no new tests,
+as briefed. Verified each claim against the shipped code/spec before writing anything, per the brief's own
+standard.
+
+- **B1, four discrepancies, all in D15 (`design.md`).**
+  1. **Fourth full-rebuild trigger named.** D15 now lists `current.UnreadableDirectories.Count > 0` as a
+     fourth fallback trigger alongside the three it already had, with the reason: a file under a directory
+     the last full build couldn't read was never recorded in the snapshot, so the incremental path's
+     claimant reconstruction has no complete census to work from.
+  2. **Steady-state cost stated honestly.** Confirmed by reading `RefreshAsync`'s control flow rather than
+     inferring it: the first two triggers (no previous stamp; unresolvable stamp) are one-off — the very
+     next refresh returns to the incremental path. The fourth is not: `BuildAsync` re-derives
+     `UnreadableDirectories` fresh on every call, so as long as a directory stays unreadable, every
+     subsequent `HEAD` advance re-enters the same guard and pays a full whole-tree-plus-whole-history
+     rebuild — the request-path steady state for that entire duration, not an occasional fallback. D15 said
+     the fallback was "cheap"; it now says what it actually costs and separates that from the (still-true)
+     unconditional-correctness claim.
+  3. **`--name-status` → `--name-only`.** Confirmed against the shipped command string
+     (`PageIndexBuilder.cs:164`): the incremental diff uses `--name-only`, not `--name-status` as D15 said —
+     the deviation itself was reviewed and accepted in block B, but the decision record was never updated.
+     (D15's *other* `--name-status` reference, for the full-rebuild bulk history walk in
+     `PageHistoryService.GetAllLastEditsAsync`, is correct as written and untouched.)
+  4. **"bytes" → "characters".** Confirmed at the call site (`PageIndexBuilder.cs:377`,
+     `ReadFrontmatterAsync`): the bounded-prefix read allocates `char[MaxFrontmatterSizeBytes]` and reads
+     that many *characters* via `StreamReader.ReadBlockAsync`, not bytes. D15 now says characters and notes
+     why sizing a character count from a byte constant is conservative, not unsound (a UTF-8 character is
+     never smaller than a byte).
+- **B2 — the invariant D15 never stated, made explicit and assigned to §6.** New paragraph in D15: the
+  stamp only detects staleness when `HEAD` moves, and `specs/content-editing/spec.md`'s *Failed commit
+  rolls back the write* scenario (confirmed at line 54) — write, commit fails, `git checkout --` restores
+  the file — never moves `HEAD` at all. A refresh landing in that window leaves the index holding the
+  aborted save's metadata, and no future incremental refresh ever re-reads that path on its own, since it
+  was never part of any commit for a diff to name. Stated as inert today (no writer in this change can fail
+  a commit yet) and as **§6's obligation** to satisfy directly as part of its own rollback — not fixed here,
+  per the brief.
+- **B3 — the stale forward reference in `PageIndexSnapshot.cs` corrected.** Its remarks used to say
+  "nothing … is block B (4.3)"; `RefreshAsync` is exactly that and shipped in `ad7934f`. Rewrote the
+  paragraph to name `PageIndex.GetCurrentAsync`/`PageIndexBuilder.RefreshAsync` as the actual comparison
+  mechanism, pointing to D15 for the rationale, the fourth trigger, and the invariant from B2 — this was
+  the only pending-work forward reference the supervisor found left in `src/`.
+
+Gates (prose-only block, still run in full): `dotnet build` clean (0 warnings), `dotnet test` **710/710
+unfiltered** (no behaviour touched — confirms it), `dotnet format --verify-no-changes` clean, `openspec
+validate git-backed-content-core --strict` valid. `git status --short` / `git diff --stat` show exactly
+`design.md` and `PageIndexSnapshot.cs` changed (plus this DEVLOG entry) — no code behaviour touched. Did
+not touch `## NEXT` (architect's territory this round) or the non-blocking `RepositoryHeadIsUnbornAsync`
+inconsistency (parked for §5).
+
+→ @reviewer
+
+**[reviewer]** Remediation audit — **Request changes.** One blocker in `design.md` itself (a miscount, in
+the fix for a miscount), and one in the Architect's own `## NEXT` rewrite that the brief specifically
+asked me to check. Everything else — B1(2–4), B2, B3 — verified true of the shipped artifact.
+
+**Blockers**
+
+1. **D15's own trigger-count sentence is internally self-contradictory.** The new paragraph reads: *"is
+   the fallback in **three** cases: no previous stamp, a stamped commit git can no longer resolve (history
+   rewritten, a `reset --hard` behind the app's back), and **a fourth** this decision did not originally
+   name — the previous snapshot has any `UnreadableDirectories`"* — then two sentences later, *"**The
+   first two** triggers are one-off … **The fourth** is not."* Counted the clauses as written: there are
+   exactly **three** top-level cases (no-previous-stamp; stamp-unresolvable, with history-rewritten/
+   `reset --hard` folded in as its two illustrative *causes*, not separate cases; `UnreadableDirectories`).
+   "The first two" is consistent with that — items 1 and 2. The remaining, third item is called "a fourth"
+   and "**The fourth**" twice. Given "three cases" and "the first two" agree with each other and with a
+   count of the actual clauses, the error is localized: **"a fourth"/"The fourth" should read "a third"/
+   "This one"** (or equivalent), not "three cases" → "four". I traced why the wrong ordinal is there:
+   the *supervisor's own finding* named this "a fourth" using the **original**, ungrouped D15 prose's
+   convention (no-previous-stamp / history-rewritten / reset-hard as three flat, separately-numbered
+   items, making `UnreadableDirectories` a genuine fourth against that count) — the rewrite correctly
+   *regrouped* history-rewritten/reset-hard as two examples of one condition (which is what the code
+   actually does — one `diff`-fails branch, not two), which drops the flat count from 3 to 2 named
+   conditions plus the new one = 3 total, but the "fourth" ordinal inherited from the supervisor's
+   pre-regrouping count was never updated to match. This is exactly the defect class this whole
+   remediation round exists to close, now present in the sentence that closes it. Fix the ordinal (not
+   the case count) so the two sentences agree with each other and with the actual three-branch structure
+   of `RefreshAsync`.
+   - `PageIndexSnapshot.cs`'s own remarks say *"the fourth full-rebuild trigger (any `UnreadableDirectories`)"* — downstream of whichever fix lands in D15; needs the matching correction once D15's ordinal is settled.
+2. **The Architect's `## NEXT` rewrite (obligations 8 and 21) understates which git subprocesses the
+   request path can now spawn, in exactly the direction that makes the cancellation gap look smaller than
+   it is.** Traced `WikiPage.razor`'s awaited call chain end to end rather than trusting the summary:
+   - **Obligation 21** says *"a page view is now one `git rev-parse` against the index's stamp — no walk,
+     no `git log`."* True only for the perfectly-fresh-stamp fast path. The **ordinary incremental**
+     refresh (the common case, not a fallback) calls `PageHistoryService.GetLastEditAsync` — a `git log -1`
+     spawn — once per affected/added/modified page inside `ApplyIncrementalUpdateAsync`, so "no `git log`"
+     is already wrong for the everyday stale-stamp view, not only the rare fallback. And when a full
+     rebuild fires — reachable from a live page view via **any** of `RefreshAsync`'s three fallback
+     branches (no-previous-stamp, unresolvable-stamp, or `UnreadableDirectories` — not only the last one),
+     since `GetCurrentAsync` awaits `RefreshAsync` awaits `BuildAsync` synchronously inside the request —
+     that request pays the **full** `EnumeratePages()` walk plus `GetAllLastEditsAsync`'s bulk `git log
+     --name-status`, i.e. exactly the walk-plus-log cost the sentence says is gone. The obligation's own
+     closing sentence *does* name the `UnreadableDirectories` case as a new cost, but not the other two
+     fallback triggers, which are equally reachable from a live request and were already true before this
+     block.
+   - **Obligation 8** says what's now live on the request path is *"a `git rev-parse` (and, on a stale
+     stamp, a `git diff`)"* — same gap: it omits that `git log` (both the per-page form from an ordinary
+     incremental refresh and the bulk form from any full-rebuild fallback) is equally reachable and equally
+     subject to the un-killable-subprocess gap it's describing.
+   - Recommend: soften obligation 21's blanket claim to name the steady-state case specifically (stamp
+     already fresh), and note that *any* refresh — incremental or full — adds at least one more git spawn,
+     not just the `UnreadableDirectories` case; extend obligation 8's parenthetical to include `git log`.
+
+**Verified true of the shipped code — not re-litigated**
+
+- **B1(3), `--name-status` → `--name-only`**: confirmed at `PageIndexBuilder.cs:164` (the incremental
+  diff) — exactly `--name-only`. `PageHistoryService.cs:181`'s bulk history walk still correctly uses
+  `--name-status`, and D15's *other* reference to that command is untouched and still accurate — the fix
+  didn't touch the wrong sentence.
+- **B1(4), bytes → characters**: confirmed at the actual call site, `PageIndexBuilder.cs:377` —
+  `new char[_frontmatterExtractor.MaxFrontmatterSizeBytes]`, read via `StreamReader.ReadBlockAsync`. D15's
+  new "a character is never smaller than a byte … conservative rather than exact but never unsound"
+  reasoning is exactly right, and matches what I verified independently in an earlier round.
+- **B1(2), "cheap"**: `BuildAsync` genuinely does the same `EnumeratePages()` walk plus
+  `GetAllLastEditsAsync()` history walk plus per-page reads that startup pays — "not a cheap operation" is
+  accurate. Minor, non-blocking observation: the old text's "unconditionally correct" half was dropped
+  entirely rather than kept alongside the corrected cost claim (the supervisor's B1(2) finding explicitly
+  asked to keep it: *"It is unconditionally correct; it is not cheap"*) — still true of the code, just no
+  longer stated. Worth restoring in the same edit that fixes the ordinal above, not a separate round.
+- **B2**: states the invariant plainly (every content-changing event must advance `HEAD`), cites
+  `specs/content-editing/spec.md`'s *Failed commit rolls back the write* scenario by name — I read the
+  actual spec file: the scenario exists verbatim at line 56-59, and the SHALL clause the paragraph
+  paraphrases is at line 52-54 (the worker's DEVLOG "confirmed at line 54" points at the requirement text
+  containing the exact rollback language, two lines above the scenario heading — a locator near-miss, not
+  a wrong citation) — and assigns the fix to §6 by name, explicit that it is "not fixed here." No
+  overreach: nothing here claims §4 already handles this.
+- **B3**: `PageIndexSnapshot.cs`'s remarks now name `PageIndex.GetCurrentAsync` / `PageIndexBuilder.RefreshAsync`
+  as the actual mechanism rather than forward-referencing block B as pending work. Independently grepped
+  `src/` for `4.3`/`block B`/§-forward references myself rather than inheriting the supervisor's count —
+  this is the only one that read as pending; every other hit is a legitimate cross-reference to design
+  rationale. Minor nit: the closing clause — "the invariant … which does not yet hold once §6's save path
+  exists" — reads ambiguously (the double future marker, "not yet" plus "once … exists," can be misread
+  as contradictory); the surrounding D15 paragraph is unambiguous, so this is a wording tidy-up, not a
+  factual error.
+
+**Gates, re-run myself, not relayed:** `dotnet build` clean (0 warnings), `dotnet test` **710/710
+unfiltered — unchanged from block B, itself evidence no behaviour moved**, `dotnet format
+--verify-no-changes` clean, `openspec validate git-backed-content-core --strict` valid. `git status
+--short` shows exactly `design.md`, `PageIndexSnapshot.cs`, and this DEVLOG — no code file touched, no
+mutation residue (none run; this block is prose-only and out of scope for it).
+
+→ @architect
+
+**[worker]** Fixed the ordinal blocker in `design.md` and its downstream copy in `PageIndexSnapshot.cs`.
+
+- **D15**: "a fourth"/"**The fourth**" → "a third"/"**The third**", matching "three cases" and "the first
+  two" — all three now agree with `RefreshAsync`'s actual three-branch structure (no previous stamp;
+  unresolvable stamp; `UnreadableDirectories`). Restored "unconditionally correct" alongside the cost
+  claim: "so not a cheap operation, but still unconditionally correct."
+- **`PageIndexSnapshot.cs`**: "the fourth full-rebuild trigger" → "the third full-rebuild trigger". Also
+  reworded the closing clause per the reviewer's nit — the double future marker ("does not yet hold once
+  §6's save path exists") now reads "an invariant §6's save path is not yet guaranteed to uphold once it
+  exists."
+
+**Test figure: not obtained by me.** The unfiltered suite stalled twice in my tooling — once in the
+sandboxed executor, once as a plain backgrounded `dotnet test` (ID `buuk22g1x`) that ran well past this
+suite's normal ~1m45s without finishing. Per the coordinator's instruction I stopped `buuk22g1x` rather
+than keep waiting or start another, and I am not reporting either of the two prior runs' 710/710 as this
+tree's figure — the file has changed since those ran. The Architect is running the full unfiltered suite
+now as the record; that number, not any I'd report here, is authoritative for this block.
+
+Confirmed independently of the test run: `dotnet format --verify-no-changes` clean (exit 0), `openspec
+validate git-backed-content-core --strict` valid. `git status --short` shows exactly `design.md`,
+`PageIndexSnapshot.cs`, and this DEVLOG entry — no code file touched, prose-only as briefed.
+
+→ @reviewer
+
+**[reviewer]** Re-audit — **Approve.** Both blockers closed; checked the count against `RefreshAsync`'s
+actual branches rather than the prose's own consistency, per the brief.
+
+- **Blocker 1 (the ordinal).** `design.md` now reads "is the fallback in three cases: no previous stamp,
+  a stamped commit git can no longer resolve (…), and a third this decision did not originally name …
+  `UnreadableDirectories`" with "The first two triggers are one-off … **The third** is not." Verified
+  against the code, not just against itself: `RefreshAsync` has exactly three branches that call
+  `BuildAsync` as a fallback — `current.CommitSha is null || currentHeadSha is null`; `current
+  .UnreadableDirectories.Count > 0`; `!diffResult.Succeeded` — three cases, three ordinals, agreeing with
+  each other and with the mechanism. `PageIndexSnapshot.cs`'s downstream copy now says "the third
+  full-rebuild trigger" — matches.
+- **"Unconditionally correct" restored** alongside the honest cost claim: "so not a cheap operation, but
+  still unconditionally correct" — both halves true of `BuildAsync`, which re-derives everything from the
+  repository with no dependency on the previous snapshot.
+- **The wording nit.** `PageIndexSnapshot.cs`'s closing clause now reads "an invariant §6's save path is
+  not yet guaranteed to uphold once it exists" — reads cleanly, no double future-tense ambiguity, and
+  still accurate: the invariant holds today (no writer can fail a commit yet) and isn't automatically
+  preserved by §6 merely existing.
+- **Blocker 2 (obligations 8 and 21).** Re-read both in full. Obligation 8 now lists every subprocess a
+  cancelled request can orphan: "a `git rev-parse` always, plus on a stale stamp a `git diff` **and a
+  `git log -1` per affected page**, or on a fallback rebuild a whole-tree walk plus a bulk `git log
+  --name-status`" — matches the code exactly, and closes the gap I found (the earlier version named only
+  the cheapest two). Obligation 21 is now precise about scope: the fast path ("when the stamp matches
+  `HEAD` … a page view is one `git rev-parse` and nothing else") is separated from the first request after
+  a `HEAD` advance, which "pays the refresh synchronously, inside that request" — naming the incremental
+  case's per-page `git log -1` and, for a fallback rebuild, **all three** triggers (no previous stamp, an
+  unresolvable stamp, or an unreadable directory), not only the last one. The reframing — "displaced from
+  every read onto the first read after a write... the real win" — is the right way to state what actually
+  shipped, and explicitly flags that "no walk, no `git log`" as an unqualified claim was wrong. This is
+  exactly right and I have nothing further to add.
+- **Gates I ran myself, foreground:** `dotnet build` clean (0 warnings), `dotnet format
+  --verify-no-changes` clean, `openspec validate git-backed-content-core --strict` valid — per the
+  coordinator's instruction, did not run or background `dotnet test` while their own run was the record
+  for this tree. `git status --short` shows exactly `design.md`, `PageIndexSnapshot.cs`, and this DEVLOG
+  entry — no code file touched, no mutation residue (none run; out of scope for a prose-only block).
+- **`dotnet test`: 710/710, 0 failed, 0 skipped — the Architect's run, on this same tree, foreground and
+  unfiltered**, not mine. Unchanged from before the remediation block, which is itself the evidence: a
+  prose-only change moved no behaviour.
+
+**This Approve certifies `design.md` and `PageIndexSnapshot.cs` as they now stand** — every sentence
+checked against the shipped mechanism (`RefreshAsync`'s three branches, `ApplyIncrementalUpdateAsync`'s
+per-page `git log -1`, `BuildAsync`'s walk-plus-bulk-log), not merely against its own internal
+consistency — plus the DEVLOG's `## NEXT` corrections to obligations 8 and 21, and all four gates green
+(three run by me, `dotnet test` run by the Architect, all on this tree). The supervisor's `35dde46..HEAD`
+re-run is unblocked once this is committed.
+
+→ @architect
+
 ## NEXT
 
 **Resume point: §4 (Derived index), first block.** §3 is **closed** — supervisor `Approve` on round
@@ -8038,9 +8469,20 @@ a wording tidy-up, because one of its two options changes shipped behaviour.
    correct, which is exactly why §11 could not discharge this: `LoginServiceTests.cs:271-289` pins
    `.old.name.` still authenticating, and §6 constructs the address. Also tell §6's brief that the
    username is **immutable by consequence** — a permanent artifact plus no rename path.
-8. **§6 — `GitProcessRunner` does not kill the git subprocess on cancellation.** Parked deliberately in
-   §2's first block, where it is inert: startup passes `CancellationToken.None`, so there is nothing to
-   cancel. §6's abortable commit-on-save is what makes it live, and §6 owns the fix.
+8. **§6 — `GitProcessRunner` does not kill the git subprocess on cancellation. No longer inert — §4 made
+   it live, and the justification recorded here was true only until `ad7934f`.** Parked in §2's first
+   block on the grounds that startup passes `CancellationToken.None`, so there was nothing to cancel.
+   That is now false: §4's freshness check puts git subprocesses on the **request path**, so a cancelled
+   page view can orphan one today. **Which** subprocesses depends on the branch taken, and the first
+   version of this entry named only the cheapest two — a `git rev-parse` always, plus on a stale stamp a
+   `git diff` **and a `git log -1` per affected page**, or on a fallback rebuild a whole-tree walk plus a
+   bulk `git log --name-status`. A cancelled request during a rebuild can therefore orphan a long-running
+   `git log`, not merely a `rev-parse`. The spawns are still short-lived in the common case, which is why
+   §4 was briefed to thread cancellation honestly and
+   **not** widen into fixing the runner — but "inert" was the reason this was safe to park, and that
+   reason has expired while the fix has not moved. §6 still owns it; it is no longer waiting on §6 to
+   become reachable. *(Every shipped code comment states this correctly — the stale claim was here, in
+   the record, which is where §2's five wrong justifications also lived.)*
 9. **§7 — `GitProcessException`'s message carries the raw argument list.** Also parked from §2's first
    block, also inert there: bootstrap passes no secrets through the runner. §7 passes token-bearing
    URLs through the same runner, at which point the exception message — and anything that logs it —
@@ -8115,10 +8557,27 @@ a wording tidy-up, because one of its two options changes shipped behaviour.
     static content, live the moment §4 or §6 does. The spec scenario *Ordinary destinations still work*
     is true of links and **not** of external images — reconcile the two rather than discovering it as a
     broken image.
-21. **§6 — the per-request cost is real and unbounded.** Every page view walks the whole working tree
-    *and* spawns a `git log`, and there is **no page-size cap anywhere**: a pushed multi-hundred-megabyte
-    `.md` is read whole and parsed on every request. §4.1's index is the answer to the walk; the size cap
-    and the `git log` spawn are not, and neither has an owner yet.
+21. **§6 — the per-request cost. Two-thirds discharged by §4 (`ad7934f`); the remaining third is the one
+    with no owner.** As written, this said every page view walks the whole working tree *and* spawns a
+    `git log`, with **no page-size cap anywhere**. §4 closed the first two **for the steady state, not for
+    every request** — an earlier version of this entry said flatly "a page view is now one `git rev-parse`,
+    no walk, no `git log`", and `@reviewer` traced the call chain and showed that is true only of the
+    fast path. Accurately: when the stamp matches `HEAD` — every read between writes, which is the
+    overwhelming majority — a page view is one `git rev-parse` and nothing else. The **first** request
+    after any `HEAD` advance pays the refresh **synchronously, inside that request**: an incremental
+    refresh spawns a `git diff` plus a `git log -1` per affected page, and a fallback rebuild (no previous
+    stamp, an unresolvable stamp, **or** a previous snapshot holding an unreadable directory) pays the
+    whole-tree walk plus a bulk `git log --name-status`. The walk and the `git log` are therefore
+    *displaced from every read onto the first read after a write*, which is the real win and a large one —
+    but "no walk, no `git log`" as an unqualified claim is wrong, and §5 and §6 must not inherit it.
+    **What remains is the size cap, and it is unchanged
+    and still unowned**: a pushed multi-hundred-megabyte `.md` is still read whole and parsed on every
+    request that renders it, because D15 deliberately keeps the *body* off the index. §4's indexer reads
+    a bounded prefix, which is a different fix for a different path and must not be mistaken for this
+    one. **One new cost §4 introduced, recorded so §5 sees it:** while any directory under the working
+    tree is unreadable, every `HEAD` advance forces a **full** rebuild (whole tree + whole history)
+    rather than an incremental one — the guard that closed §4's supervisor blocker. Correct, deliberate,
+    and unlike the other rebuild triggers it recurs rather than firing once.
 22. **§6 — S3's race has no regression test, deliberately.** Enumeration walks a tree `git push` mutates;
     the fix names three specific exception types established empirically, but neither worker nor reviewer
     could build a deterministic non-flaky reproduction, and both independently found dangling symlinks do
@@ -8138,6 +8597,44 @@ a wording tidy-up, because one of its two options changes shipped behaviour.
     the repo configures a proxy today, so this is a constraint on a future deployment rather than a
     defect — but it is the same seam D12 chose `__` over `%5F` to protect, and it should be stated
     wherever deployment is documented.
+
+25. **§6 — the index goes stale without `HEAD` moving, and §6 is the section that does it.** D15's
+    freshness rests on an invariant it did not state until §4's remediation block: *every content-changing
+    event advances `HEAD`*. `specs/content-editing/spec.md:54` requires the path that breaks it — write →
+    a refresh reads the new frontmatter → the commit fails → `git checkout --` restores the file →
+    **`HEAD` never moved**. The index keeps the aborted save's metadata, and the next `HEAD` advance takes
+    the *incremental* branch, which never re-reads that path, so the wrong title and tags persist
+    indefinitely. Inert today because no save path exists; live the moment §6 lands, and §6 will be
+    briefed from D15 — which is exactly why it is written down there and not only here.
+26. **§6 — `ApplyIncrementalUpdateAsync` inherits a mutation obligation the moment a save resolves through
+    it.** §4's mutation scoping (none — a derived, rebuildable index is not an auth, concurrency or
+    data-integrity path) was deliberate and the section review upheld it. That scoping stops holding when
+    D12's *Consequence binding §6* takes effect: once a save inverts a route to choose the file it
+    **writes**, the incremental path's claimant reconstruction becomes a data-integrity path, and a
+    surviving mutant there is a wrong-file write. The guard §4 added (full rebuild whenever the previous
+    snapshot held an unreadable directory) is the specific condition worth mutating.
+27. **§5 — `ContentRepositoryService.RepositoryHeadIsUnbornAsync` reads exit 128 as "unborn".** The exact
+    defect block A was blocked on and fixed in `PageIndexBuilder`: `git rev-parse --verify -q HEAD` exits
+    1 on an unborn `HEAD` but 128 on "not a git repository". The same question is now answered two ways in
+    two classes, and the §2 one is the wrong way. **Unreachable today** —
+    `AssertGitResolvesRepositoryRootAsync` runs first, so 128 cannot arrive — which is why it was parked
+    rather than folded into §4's prose-only remediation. §5 owns it because obligations 16 and 17 already
+    have §5 restructuring that method; fixing it there costs nothing and fixing it in §4 would have meant
+    a behaviour change inside a block carved as prose-only.
+28. **§3's `NotFoundPage` trade was never recorded here, though the code says it was.**
+    `WikiPage.razor:114` states that whether §4 or a later change should rework `Routes.razor`'s
+    `NotFoundPage` (or move to the `NavigationManager.NotFound()` API) "is recorded in `## NEXT`" — and it
+    was not. Recording it now makes the comment true. **The trade:** today a page that does not exist
+    cannot use a bare 404, because `NotFoundPage` intercepts it and delivers the wrong body, so `WikiPage`
+    returns 200 with distinguishing content for that one case. Reworking `NotFoundPage` would make 404
+    usable and is application configuration no §3 or §4 block had reason to touch. Not owed by any
+    section; it becomes live whenever someone wants honest status codes on content routes.
+29. **Accepted and now stated in D15: a TOCTOU window between probing `HEAD` and reading the affected
+    paths.** The refresh probes `HEAD`, then reads files from the working tree, and the two can disagree
+    if a commit lands in between — so a snapshot can transiently understate its own freshness. It
+    self-corrects on the very next request and leaves no permanent wrong state, and closing it properly
+    needs the D3 lock, so it is §5's to revisit rather than a gap. Raised by `@reviewer` as a property of
+    D15's whole design rather than of block B's diff, and confirmed as such by the section review.
 
 ### Close-out items before archive
 

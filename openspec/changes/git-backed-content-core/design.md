@@ -210,6 +210,20 @@ push an update in as an optimisation; correctness never depends on their doing s
 depended on being told would be wrong for the third writer no matter how carefully the first two were
 wired.
 
+**This self-healing rests on an invariant it has never stated until now: every content-changing event
+advances `HEAD`.** The stamp only detects staleness when `HEAD` has moved; a write that changes a file on
+disk without ever completing a commit does not move it at all. `specs/content-editing/spec.md`'s *Failed
+commit rolls back the write* scenario (§6) is exactly this: a browser save writes the file, the commit
+fails, and `git checkout -- <file>` restores it under the write lock — `HEAD` never advances, whether the
+rollback succeeds instantly or a refresh lands in the narrow window before it does. If a refresh reads that
+file's frontmatter while the failed write is live, the index is left holding the aborted save's metadata,
+and no future `HEAD` advance repairs it on its own: the next one takes the incremental branch, which only
+re-reads the paths its diff names, and this path was never part of any commit for a diff to name. Inert
+today — no writer in this change can fail a commit yet — and live the moment §6's save path exists. **§6
+must satisfy this invariant directly as part of its own rollback** (e.g. discarding or re-reading the
+affected path's index entry when `git checkout --` runs, not assuming the stamp mechanism already covers
+it); it is not fixed here.
+
 *The check is `git rev-parse HEAD` — one subprocess per page view.* Considered and rejected: reading
 `.git/HEAD` and the ref file directly in C#, which spawns nothing — but a ref may be **packed**
 (`git gc` moves loose refs into `.git/packed-refs`), so that fast path is two code paths, and silently
@@ -218,11 +232,23 @@ the stamp exists to prevent, so it does not get a hand-rolled ref reader. What t
 more expensive: today every page view walks the **entire working tree** *and* spawns a `git log`
 (obligation 21).
 
-**A moved `HEAD` re-indexes what changed, not everything.** `git diff --name-status <stamped>..<current>`
-names the affected paths, and only those are re-read. A full rebuild is the fallback for a stamp git
-cannot resolve — no previous stamp, history rewritten, or a `reset --hard` behind the app's back — where
-it is both cheap and unconditionally correct. This is what gives 4.3 a real caller inside this change
-rather than an update method waiting for §6 to exist.
+**A moved `HEAD` re-indexes what changed, not everything — usually.** `git diff --name-only
+<stamped>..<current>` names the affected paths under `docs/`, and only those are re-read: a deletion
+leaves the index, an addition or modification gets a fresh frontmatter/last-edit read, and each affected
+route's *other* claimants are reconstructed from the previous snapshot rather than a re-walk, so an
+emergent or resolved D12 collision is still caught. A full rebuild — the same whole-tree walk plus
+whole-history walk startup pays, so not a cheap operation, but still unconditionally correct — is the
+fallback in three cases: no previous stamp, a stamped commit git can no longer resolve (history rewritten,
+a `reset --hard` behind the app's back), and a third this decision did not originally name — **the previous
+snapshot has any `UnreadableDirectories`**, because a file under a directory this process could not read at
+the last full build was never recorded anywhere in that snapshot, so the incremental path's claimant
+reconstruction has no complete census to reconstruct from and cannot be trusted. The first two triggers are
+one-off — the very next refresh returns to the incremental path once resolved. **The third is not**: it
+fires on *every* `HEAD` advance for as long as any directory stays unreadable, so a full rebuild becomes the
+request-path steady state for that entire duration, not an occasional fallback — an unfixed permissions
+problem on the volume costs every page view a whole-tree-plus-whole-history rebuild until an operator
+resolves it. This is what gives 4.3 a
+real caller inside this change rather than an update method waiting for §6 to exist.
 
 **Last-edit on a full rebuild is one bulk history walk, not one `git log` per page.** A single
 `git log --name-status` pass takes the most recent commit touching each path. Per-page `git log` makes a
@@ -230,7 +256,10 @@ rebuild scale with the number of pages *times a process spawn*; one walk scales 
 once.
 
 **Indexing reads a bounded prefix of each file, never the whole file.** Frontmatter is at the head of a
-file by definition, so the indexer reads only enough bytes to contain a legal block (D14's cap) rather
+file by definition, so the indexer reads only enough *characters* — via a `StreamReader`, never a raw byte
+slice, which could split a multi-byte UTF-8 codepoint — to contain a legal block (sized from D14's byte cap
+directly: a character is never smaller than a byte, so reading that many characters always consumes at
+least as many bytes as the cap allows, which is conservative rather than exact but never unsound) rather
 than reading a page whole to extract two fields. This deliberately does **not** discharge obligation 21's
 missing page-size cap on the *render* path, which still reads the file whole and still has no owner; §4
 does not widen to fix that, and nothing here should be read as having done so.
