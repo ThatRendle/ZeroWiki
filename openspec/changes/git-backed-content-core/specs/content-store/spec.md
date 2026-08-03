@@ -41,7 +41,40 @@ The system SHALL read Markdown files from the working tree and parse optional YA
 #### Scenario: Malformed frontmatter degrades gracefully
 
 - **WHEN** a Markdown file has a frontmatter block that fails to parse as YAML
-- **THEN** the system still renders the page body and records the metadata as empty rather than failing the page
+- **THEN** the system still renders the page body and records the metadata as empty rather than failing the page, and never records partially-parsed metadata
+
+#### Scenario: Hostile frontmatter cannot take the process down
+
+- **WHEN** a Markdown file's frontmatter block exceeds the permitted size or nesting depth, or expands exponentially through YAML aliases
+- **THEN** the system rejects the block before parsing it, renders the page body with empty metadata, and continues serving every other page
+
+### Requirement: Pages are addressable by a route derived from their path
+
+The system SHALL derive each page's route from its working-tree path relative to `docs/` with the `.md` extension removed, under a `/wiki/` prefix, encoding a space as `_` and a literal `_` as `__`. Where two files would claim the same route, the system SHALL refuse to serve that route rather than choose between them, leaving every other route unaffected.
+
+#### Scenario: Nested page is addressable by its path
+
+- **WHEN** the working tree contains `docs/Project Notes/Kick Off.md`
+- **THEN** the page is served at `/wiki/Project_Notes/Kick_Off`
+
+#### Scenario: Literal underscore round-trips
+
+- **WHEN** the working tree contains a page whose filename contains a literal underscore
+- **THEN** the route encodes it as `__`, and resolving that route back to a path yields the original filename rather than one containing a space
+
+#### Scenario: Ambiguous route is refused, not guessed
+
+- **WHEN** two files in the working tree encode to the same route (for example `a_ b.md` and `a _b.md`, which both encode to `a___b`)
+- **THEN** the system serves neither page at that route, names every file claiming it, and continues to serve every other page normally
+
+### Requirement: Raw HTML in page content is not rendered
+
+The system SHALL render Markdown with raw HTML disabled, so that inline and block HTML in page content appears as text rather than as markup, and SHALL NOT rely on sanitizing HTML instead.
+
+#### Scenario: Embedded script is not executed
+
+- **WHEN** a page's Markdown contains a raw HTML element such as `<script>` or an element carrying an event-handler attribute
+- **THEN** the rendered page displays that markup as visible text and the browser executes none of it
 
 ### Requirement: Derived index rebuildable from the repository
 

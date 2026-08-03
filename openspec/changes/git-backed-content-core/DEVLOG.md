@@ -5371,10 +5371,88 @@ mutate the conditions that survive.
 
 §2 is closed. → `@architect` — open §3.
 
+## 3. Content read & render
+
+**[architect]** Base: `60957e6` — turns the working tree §2 established into a wiki you can actually
+read: page enumeration and the path↔route mapping, optional YAML frontmatter, Markdown rendered in the
+Blazor shell, and per-page authorship read back from git rather than from any hand-maintained field.
+
+**[architect]** Pre-flight (CLAUDE.md §2): tree clean, on `change/git-backed-content-core`,
+`openspec validate --strict` valid, `proposal.md` / `design.md` / `specs/content-store/spec.md` read.
+§2 carries a supervisor `Approve` (round four, `1253ff5`) and §11 closed earlier, so nothing is owed
+backwards. Forward obligation 1 (D9's overclaiming prose) is owed before **§5**, not before §3 or §4 —
+confirmed unchanged.
+
+**[architect]** §3 arrived with two things settled nowhere — not in `design.md`, not in the
+`content-store` spec, not in `tasks.md`: what a file path becomes as a URL (which *is* task 3.1), and
+whether raw HTML in a page renders. Both went to the Product Owner. Their answers, and two decisions
+that fell out of them, are now **D12–D14** in `design.md` with spec scenarios behind them, because §2's
+most expensive lesson was that prose landing in `design.md` binds every later section and is not
+gated by anything unless a scenario gates it.
+
+1. **Route encoding — Product Owner's scheme, not the Architect's.** The Architect proposed
+   percent-encoding (`/wiki/Project%20Notes/Kick%20Off`) on invertibility grounds. The Product Owner
+   rejected `%20` on readability and supplied **space → `_`, literal `_` → `__`**, naming the collision
+   it carries in the same breath (`a_ b.md` vs `a _b.md`). Confirmed by working it: both encode to
+   `a___b`, because the escape character is also the substitute character. Greedy decode is
+   deterministic but **not injective**, and §6 inverts route→path to find the file it saves — so the
+   losing file's route would have written to the winning file.
+2. **The obvious repair is worse than the collision.** Space → `_` with literal `_` → `%5F` is
+   genuinely unambiguous and keeps the common case `%`-free. Rejected: RFC 3986 §6.2.2.2 directs
+   normalizers to decode percent-encoded *unreserved* octets, so a reverse proxy may rewrite
+   `a_%5Fb` → `a__b` and hand the ambiguity back from outside the app. A scheme that depends on a proxy
+   declining to normalize is not a scheme. `__` is two unreserved characters and survives normalization.
+3. **So the ambiguity refuses instead of resolving — at the route, not at startup.** Enumeration
+   already walks the whole tree, so grouping by route is free. Both files stay indexed; the route names
+   every claimant and serves no body; every other route is unaffected. Deliberately *not* §2's
+   startup-refusal posture: §2 guards the volume's structure, seen once by an operator standing there,
+   whereas a filename arrives at runtime by push — a startup refusal would let any pushed filename
+   brick the wiki for everyone until someone reached the server. Shared principle: never silently pick
+   one of two readings. Where it refuses is set by what the fault can reach.
+4. **Raw HTML is escaped, not sanitized** (D13). Content is push-reachable via a git token, so a
+   `<script>` in a page is stored XSS against the administrator, and `MarkupString` sanitizes nothing.
+   Escaping costs no dependency and has no bypass surface; a sanitizer's entire value rests on never
+   having one. Accepted narrowing, stated as such: Obsidian pages with embedded HTML will show their
+   tags. Which further Markdig extensions to enable is explicitly **left open** by the Product Owner.
+5. **SharpYaml behind `IFrontmatterParser`** (D14). Checked before agreeing rather than after: Markdig's
+   frontmatter extension performs **no** parser integration — it hands over `yamlBlock.Lines.ToString()`
+   and evaluates nothing, and Markdig's own docs use YamlDotNet as the worked example. So "same author"
+   buys no shared types and no version coupling; the seam is a `string`. Versions verified on NuGet —
+   Markdig 1.3.2 (2026-06-18), SharpYaml 3.13.0 (2026-07-10), YamlDotNet 18.1.0 (2026-06-26); all three
+   current, SharpYaml the most recently released. Product Owner chose SharpYaml on API familiarity, and
+   asked for the interface precisely because that reason is about familiarity rather than a property
+   only SharpYaml has.
+6. **`❓ @architect` asked and answered — "is YamlDotNet more forgiving of malformed input?"** The
+   Architect had implied it was, and withdrew that: *forgiveness is the wrong property*. 3.2 wants
+   failure **total and catchable**, because partially-parsed metadata is indistinguishable from real
+   metadata and would silently give a page the wrong tags rather than none. What actually decides
+   safety is bounding the input — an alias bomb is well-formed YAML that strictness does not help, and
+   deep nesting can raise `StackOverflowException`, which .NET **cannot catch** and which would let one
+   pushed page kill the container on every read of it, permanently. Hence D14's cap-before-parse, which
+   is what makes "failure is total" implementable rather than aspirational. A spike across both
+   libraries was offered; the Product Owner settled the choice on other grounds, so it was not run —
+   recorded so the absence of that measurement is visible rather than assumed.
+7. **Welcome page — pinned, deliberately.** The Product Owner asked for `/` to become a welcome page
+   fed by a `_welcome-message.md`, then pinned it: revisit once the site runs and a Markdown editor
+   control is chosen. So **no** task 3.5 and **no** spec scenario — the surrounding design questions
+   (absent-file default without writing to the repo at startup, whether `_`-prefixed files form a hidden
+   namespace) are recorded in this thread and nowhere binding. `Home.razor` still holds the Blazor
+   template's "Hello, world!"; it becomes placeholder ZeroWiki content in block 3b as **de-scaffolding**,
+   which is why it takes no task number — leaving template cruft in a shipped section is exactly what a
+   supervisor flags as dead scaffolding.
+
+**[architect]** Block carve — two blocks, neither spanning the section:
+
+- **3a — 3.1–3.2.** Enumeration, the path↔route mapping with collision detection, and frontmatter
+  behind `IFrontmatterParser`. Service layer only, headlessly testable, no UI.
+- **3b — 3.3–3.4.** The Static SSR page that renders a body with raw HTML off, plus git-derived
+  authorship/last-edit on it. One deliverable a human can open in a browser.
+
 ## NEXT
 
-**Resume point: §3 (Content read & render), first block.** §2 is **closed** — supervisor `Approve` on
-round two over `7b50e46..HEAD`. §11 closed earlier over `bb3cb2c..HEAD`.
+**Resume point: §3 (Content read & render), block 3a (3.1–3.2).** §3 is **open** — base `60957e6`
+posted, D12–D14 landed with spec scenarios. §2 is **closed** — supervisor `Approve` on round **four**
+over `7b50e46..HEAD`. §11 closed earlier over `bb3cb2c..HEAD`.
 
 **State: 12/40 tasks ticked** *(counted from `tasks.md`, not carried forward)*. Branch
 `change/git-backed-content-core`. Gates at close-out, run by the Architect rather than relayed:

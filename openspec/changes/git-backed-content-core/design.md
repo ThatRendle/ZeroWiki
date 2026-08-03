@@ -120,6 +120,48 @@ The regex governs **shape only** and its bound is deliberately looser than the l
 
 This amends the **archived** `user-accounts` capability and is carried as a spec delta in this change. It is not retroactive: the pattern runs only at bootstrap and invitation redemption, never at login, so no existing account stops working.
 
+### D12 — Pages live under `/wiki/`, with `_` for space and `__` for a literal underscore
+
+A page's route is its working-tree path relative to `docs/`, with the `.md` extension dropped, under a `/wiki/` prefix: `docs/Project Notes/Kick Off.md` → `/wiki/Project_Notes/Kick_Off`. Directory separators stay separators. The prefix keeps content clear of the shipped root routes (`/login`, `/account`, `/invitations`, `/bootstrap`, `/bootstrap/complete`, `/logout`, `/invite/{Token}`, `/not-found`, `/Error`, `/`), so adding a page can never shadow an application surface.
+
+The encoding is two layers, applied in this order, and the order is what makes them independent:
+
+1. **Space → `_`, literal `_` → `__`.**
+2. **Percent-encode what remains URL-significant** — `%`, `#`, `?` and control characters. This layer is not optional: a file named `a%20b.md` would otherwise emit a route that decodes straight into a collision with `a b.md`. Non-ASCII is left bare; accented filenames are ordinary in an Obsidian vault and survive the round trip.
+
+Layer 2 cannot disturb layer 1 because `_` is RFC 3986 *unreserved*, so no encoder escapes it. Decoding runs in reverse: the framework percent-decodes the path, then `__` → `_` and `_` → space, scanned left to right.
+
+*Why not `%20`:* readability of the common case. Spaces are what an Obsidian vault is actually full of, and `%20` in every wiki URL is the ugly default this deliberately avoids.
+
+*Why not `%5F` for a literal underscore*, which would be unambiguous and keep the common case `%`-free: RFC 3986 §6.2.2.2 tells normalizers to decode percent-encoded **unreserved** octets, so a reverse proxy is entitled to rewrite `a_%5Fb` → `a__b` and hand the ambiguity back from outside the application's control. `__` is two ordinary unreserved characters and survives any normalizer. **A scheme that depends on a proxy declining to normalize is not a scheme.**
+
+**The residual ambiguity is real, and it refuses rather than resolves.** The escape character is also the substitute character, so a run of underscores is ambiguous: `a_ b.md` encodes to `a___b` (`a` + `__` + `_` + `b`) and `a _b.md` encodes to the same `a___b` (`a` + `_` + `__` + `b`). A greedy left-to-right decode is *deterministic* but not *injective* — it always yields `a_ b`, silently making `a _b.md` unreachable, and §6 inverts route→path to find the file it saves, so the losing file's route would write to the winning file. A silent wrong-file write is the failure class §2 refused four separate times.
+
+**Product Owner decision:** detect the collision during enumeration — which already walks the whole tree, so grouping by route is free — and refuse **at that route only**. Both files stay enumerated and indexed; the route reports that it is claimed by more than one file and names every claiming path; neither body renders. The rest of the wiki is unaffected.
+
+Refusing at the route rather than at startup is the point, and it is a deliberate departure from §2's posture rather than an inconsistency with it. §2's refusals guard the *volume's structure*, are seen once by an operator who is standing there, and are fixed before the app serves anything. A route collision is *content*, and content arrives at runtime by push from a laptop: a startup refusal would let any pushed filename brick the whole wiki for everyone until someone reached the server. The shared principle is that the system never silently picks one of two readings — where it refuses is set by what the fault can reach.
+
+**Consequence binding §6:** a save can never target an ambiguous route, because an ambiguous route serves no page to edit. §6 inherits an inverse that is total on every route it can actually be reached from, and MUST NOT reintroduce a greedy "pick the first match" decode as a convenience.
+
+### D13 — Raw HTML in a page is escaped, not rendered and not sanitized
+
+The Markdown pipeline is **Markdig** with raw HTML disabled, so inline and block HTML in a page render as visible text rather than as markup. There is no HTML sanitizer.
+
+*Why:* content reaches the working tree from two writers, and one of them is a `git push` authenticated by a per-user git token. A `<script>` or an `onerror=` attribute in a pushed page is stored XSS against every reader, including the administrator, and Blazor's `MarkupString` — the only way to emit rendered HTML from a component — sanitizes nothing whatsoever. Escaping needs no dependency and has no bypass surface; a sanitizer is a second dependency whose entire security value rests on it never having a bypass, which is a worse bet than not parsing the HTML at all. *Accepted narrowing:* Obsidian users do sometimes embed raw HTML, and those pages will show their tags instead of their effect. That is legible and recoverable, which the alternative failure is not. Which further Markdig extensions to enable is deliberately left open and is not settled by this decision.
+
+### D14 — Frontmatter is parsed behind `IFrontmatterParser`, and failure is total
+
+Markdig's YAML frontmatter extension only *delimits* the block — it hands over `yamlBlock.Lines.ToString()` and evaluates nothing — so the parser is a separate, freely substitutable choice. **SharpYaml** is that choice, reached only through an injectable `IFrontmatterParser` so it can be swapped without touching any calling code.
+
+*Why:* the seam is a `string`, so no parser earns integration credit over any other, and the deciding factors are ordinary ones — SharpYaml is actively maintained (3.13.0, more recently released than Markdig itself) and shares an author and API idiom with Markdig, which the Product Owner already knows well. The interface exists because that reasoning is about familiarity rather than about a property only SharpYaml has.
+
+**Failure must be total, never partial.** On any frontmatter that does not parse, the page renders its body with metadata **empty**. A parser that recovered and returned half a document would be worse than one that threw: partially-parsed metadata is indistinguishable from real metadata, so a page with broken frontmatter would silently acquire the wrong tags rather than none. `IFrontmatterParser` therefore returns empty on failure and never a partial result.
+
+Two hardening requirements bind any implementation, because frontmatter is push-reachable:
+
+- **Deserialize into a constrained shape** — a fixed POCO or `Dictionary<string, object>` — never through a type-resolving deserializer that honours `!!` tags. Both mainstream .NET YAML libraries can instantiate arbitrary types from a document, which turns page content into a deserialization gadget.
+- **Bound the input before parsing it.** Cap the frontmatter block's size and nesting depth at the seam rather than trusting the library's defaults. Ordinary malformed YAML throws catchably and is handled; the two inputs that are *not* ordinary are an alias-expansion bomb (well-formed YAML that expands exponentially — strictness does not help) and nesting deep enough to overflow the stack. A `StackOverflowException` in .NET cannot be caught and kills the process, so it cannot be handled downstream at all: a single pushed page would crash the container on every read of it, permanently. The cap is what makes "failure is total" implementable rather than aspirational.
+
 ## Risks / Trade-offs
 
 - **Dirty tree blocks all pushes** → Transactional save (`git checkout -- <file>` on commit failure, under lock) plus startup reconciliation (commit-as-recovered or discard) guarantee the tree returns to clean.
