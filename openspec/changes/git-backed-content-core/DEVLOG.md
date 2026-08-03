@@ -4622,6 +4622,349 @@ instrument that matters here, not a mutant.
 
 → @architect
 
+**[worker]** Final follow-up on §2: pre-init filesystem scan for the initialise path. No new `N.M`
+numbers, nothing ticked.
+
+**The gap.** The reorder block closed the adopt path ("every refusal precedes every write"), but the
+initialise path — `RepositoryRoot` has no `.git` of its own, and is not bare — still ran `git init` and
+an initial commit before the index-based gitlink check ever gets a chance to fire, since staging *is*
+how that check detects a gitlink. A vault copied onto a fresh volume before ZeroWiki's first start would
+leave a `.git` and one commit behind, immediately before refusing to serve.
+
+**Fix.** `ContentRepositoryService.AssertNoNestedGitRepository` — a synchronous filesystem walk from
+`RepositoryRoot`, called at the top of the initialise branch, before `git init`. Recurses via
+`Directory.EnumerateFileSystemEntries`, flags any `.git` entry (directory or gitfile — same two forms
+`HasOwnGitEntry` already treats as "a repository is here"), and throws naming every offending path
+(relative, forward-slash-normalized) before writing anything. Confirmed empirically, not by trusting
+docs, that `File.GetAttributes` reports `FileAttributes.ReparsePoint` for a symlink without
+dereferencing it (a small standalone repro: a self-referential symlink and a symlink to `/etc` both came
+back `ReparsePoint=true`, target unresolved) — so the walk skips any reparse point outright, never
+recursing into it and never stat-ing through it. That single check is what keeps a looping symlink from
+hanging the walk and keeps a symlink to a repository outside the volume from ever being seen at all,
+verified against a real fixture combining a nested repo (depth 1, depth 3, gitfile form), a
+self-referential symlink loop, and a symlink to a separately-initialized repository under a different
+temp root — all in one throwaway harness before any of this touched `src/`.
+
+**Both checks documented at both sites, per the brief.** `AssertNoNestedGitRepository`'s XML remarks
+state the scan answers "is there a nested repository in this folder" and guards only the initialise
+branch, once, before any write; `ReconcileWorkingTreeAsync`'s remarks now cross-reference it and state
+the index check answers "would committing now store a gitlink" and guards every branch, every
+reconciliation, forever. Neither doc claims the other is redundant.
+
+**The gitignore divergence is written down, not smoothed over.** Same remarks: a nested repository the
+operator has `.gitignore`d is invisible to `git add -A` (and so to the index check) but is still found
+by the scan, which never consults `.gitignore`. Recorded as a deliberate Product Owner decision in both
+the code and `design.md`'s new D9 addendum, with a test pinning it directly — the test demonstrates the
+index check's silence first (init + `add -A` against the gitignored fixture, asserting no `160000` entry
+and no trace of the path), then exercises the real initialise path and asserts the scan refuses anyway.
+
+**`design.md`** — new D9 addendum: states the initialise-path gap, the "once per volume, never on a
+populated vault" cost argument, the no-symlink-following rule and why, and the same "two instruments, one
+deliberate disagreement" framing as the code. "Every refusal precedes every write" now holds on both
+paths, not only the adopt path.
+
+**Tests** (`ContentRepositoryServiceTests.cs`, 7 new, all under a new "pre-init filesystem scan" comment
+block): nested repo at depth 1 and depth 3 (asserting **no `.git` created at `RepositoryRoot`** — the
+actual point of this block, not just the refusal); gitfile form; the gitignored-divergence pin; a
+symlink loop (bounded via `Task.WhenAny` against a 10s `Task.Delay`, so a regression fails the assertion
+instead of hanging the suite); a symlink to a repository outside the volume (asserts normal, successful
+initialization — the outside repository is simply never seen); and a regression fixture (plain Markdown,
+no nested repo, on a fresh volume, initializes exactly as before).
+
+**Each new test confirmed to fail against `f50f1ca`**, via a checksummed `cp` swap of
+`ContentRepositoryService.cs` only (never `git checkout`/`restore`) — restored via `cp` from a
+pre-checksummed backup afterward, `git diff --stat -- src` and `shasum` both confirmed identical to the
+fixed version before continuing. 4 of the 7 new tests fail against `f50f1ca` on exactly the assertions
+that matter (`Assert.False` on `.git` existing comes back `True`; the gitignore test's
+`Assert.Throws<InvalidOperationException>` reports "No exception was thrown"). The other 3 (both symlink
+tests, the plain-Markdown regression) pass at both revisions by design — they assert the *absence* of a
+false positive, which holds with or without the scan; they are compatibility fixtures, not regression
+pins.
+
+No mutation testing run, per the brief — this property is asserted directly by the fixtures above.
+
+**Gates:** `dotnet build` 0 warnings/0 errors · `dotnet test` **514/514** full unfiltered (507 baseline +
+7 new) · `dotnet format --verify-no-changes` clean · `openspec validate git-backed-content-core --strict`
+valid. `git status --short` / `git diff --stat` show exactly three files: `ContentRepositoryService.cs`,
+`ContentRepositoryServiceTests.cs`, `design.md` — plus this DEVLOG entry.
+
+→ @reviewer
+
+**[reviewer]** Pre-init filesystem scan — **Request changes.** One blocker, on exactly the point the
+architect flagged as the one they cared most about; the other two scrutiny points came back clean or
+as a non-blocking nit, all verified by reproduction.
+
+### Blocker — `CollectNestedGitEntries` swallowing `UnauthorizedAccessException` silently weakens the
+### exact guarantee this block exists to establish, and I can show it doing so
+
+Asked to form a view, not just assess: **an unreadable directory should be a refusal, not a silent
+skip.** Reproduced the concrete harm rather than arguing it — created a subdirectory containing a real
+nested git repository, `chmod 000`'d the subdirectory itself (blocking read access even for the owning
+user, confirmed with a plain `ls` first), and ran `EnsureRepositoryAsync()` against it. The scan hits
+`UnauthorizedAccessException` enumerating the blocked directory, returns as if that subtree were clean,
+and the whole call completes successfully: `git init` runs, the initial commit is made, and the nested
+repository sitting behind the unreadable directory is never seen. This is not a hypothetical — it is
+exactly the failure mode the architect described, reproduced end to end.
+
+The reasoning that decides it, not just the reproduction: this scan's entire job is to *assert* "there
+is no nested repository here" before any write happens. On an unreadable subtree, that property is not
+merely unverified — it is *unverifiable*, and the current code treats "I could not check" the same as
+"I checked and it's clean," which is precisely the class of silent degradation this whole section has
+spent five rounds eliminating from every other check in this file (the index-census brief, the
+`newMode`-only gitlink guard, the adopt-path missing-`docs/` gap, the pre-reorder write-before-refusal
+ordering). The scan runs once per volume, on content an operator has not yet trusted to the app; the
+cost of refusing on an unreadable directory is a single, legible, fixable error at exactly the moment an
+operator is most likely to still be around to see it. Silently proceeding trades that for nothing.
+
+Direction, not a prescription: catch `UnauthorizedAccessException` in `CollectNestedGitEntries`, but
+instead of returning, record the unreadable path and have `AssertNoNestedGitRepository` refuse — naming
+it alongside (or instead of) any nested-repository paths found, since "I found a repository" and "I
+could not tell" are both reasons not to proceed, and the operator needs to know which one it got. Worth
+also noting, not blocking on: `git add -A` itself degrades the same way — I reproduced it separately,
+and it prints `warning: could not open directory '...': Permission denied` to stderr but exits `0` and
+proceeds — so the *adopt* path's `ReconcileWorkingTreeAsync`/`AssertWorkingTreeIsCleanAsync` have a
+structurally similar blind spot that this block's fix cannot reach (nothing today inspects
+`GitProcessResult.StandardError` for that warning). That is a broader, separate piece of work — flagged
+for `## NEXT`, not this block, since fixing it means teaching the git-level checks to read stderr, not
+touching the C# scan.
+
+### The other two scrutiny points — verified by reproduction, mostly clean, one worth recording as a nit
+
+**Point 2 — the three "pass both before and after" tests, checked individually, not accepted as a
+class.** Reverted the scan call entirely (matching `f50f1ca`, checksummed `cp` swap, restored after)
+and ran all seven: the same four fail as the worker reported
+(`NestedGitRepositoryOnAFreshVolume_...`, `...ThreeLevelsDeepOnAFreshVolume_...`,
+`...AsAGitfileOnAFreshVolume_...`, `GitignoredNestedGitRepositoryOnAFreshVolume_...`), and the same
+three pass (`SymlinkedDirectoryThatLoops_...`, `SymlinkPointingToARepositoryOutsideTheVolume_...`,
+`OrdinaryMarkdownCopiedOntoAFreshVolumeWithNoNestedRepository_...`). For each of the three, checked
+*why* rather than accepting "compatibility fixture" as self-evident:
+
+- `SymlinkPointingToARepositoryOutsideTheVolume_...` has real teeth for the mechanism it names.
+  Mutated the shipped (post-fix) code to disable only the `ReparsePoint` skip and reran it: it fails,
+  correctly detecting the outside repository and wrongly refusing. Not vacuous.
+- `OrdinaryMarkdownCopiedOntoAFreshVolumeWithNoNestedRepository_...` is an ordinary false-positive
+  baseline; nothing about it is specific to symlinks or the scan's internals, and a scan bug that
+  always refused would break it. Not vacuous.
+- `SymlinkedDirectoryThatLoops_DoesNotHangStartup` is the one worth a closer look, and it does not pass
+  for a reason that makes its *outcome* wrong, but it does not have teeth for the mechanism its own
+  comment credits. With the same `ReparsePoint`-skip disabled, I reran it directly: it still passes —
+  no hang, completing in under half a second. A standalone reproduction (recursing through a
+  self-referential symlink with no guard of any kind) shows why: on this filesystem, the recursion
+  self-terminates after 16 levels with an *empty* directory listing, no exception, before any explicit
+  code has to stop it — almost certainly the OS's own bounded symlink-resolution limit, not anything
+  .NET or this code does. So this test cannot distinguish "the skip prevents a hang" from "nothing does
+  and the OS bails us out regardless" — its stated purpose is achieved, but not for the reason its
+  comment claims, on this platform. Not a blocker (the explicit skip is still the right, portable thing
+  to have rather than relying on incidental, filesystem-dependent OS behavior that a container's
+  overlay filesystem or a different host might not share), but worth recording as a nit: the comment
+  ("a regression that starts following symlinks again would otherwise hang this test") overstates what
+  this specific test can prove.
+
+**Point 3 — symlink handling, confirmed independently, with one wording nit.** Reproduced
+`File.GetAttributes` on a symlink-to-directory directly: it reports **both** `ReparsePoint` and
+`Directory` set together. That confirms the functional property that matters — the check happens
+before `Directory.EnumerateFileSystemEntries` is ever called on the symlink path, so recursion into,
+or enumeration of, the target genuinely never happens — but it means the code comment's phrase
+"reported without dereferencing" is not quite accurate: determining the `Directory` bit requires a
+single, bounded stat of the target, it's just not a *recursive* one. Nit, not a defect: the safety
+property (no recursion into a symlink) holds regardless of how precisely worded the mechanism is.
+Also independently confirmed a genuine loop terminates rather than hangs (per point 2 above) and that
+unbounded recursion on a real, non-symlinked, pathologically deep directory tree is closer to noise
+than a live concern for this product's target content (markdown wiki pages), though technically
+`CollectNestedGitEntries`' plain recursion has no explicit depth guard and could in principle
+stack-overflow on an adversarially deep real tree — worth a `## NEXT` mention, not a blocker, given the
+once-per-volume cost argument already in `design.md` and the shape of content this product actually
+serves.
+
+**The two checks read as deliberately distinct, not duplicated.** `AssertNoNestedGitRepository`'s and
+`FindStagedGitlinksAsync`'s/`ReconcileWorkingTreeAsync`'s cross-referenced remarks state different
+questions ("is there a nested repository here" vs. "would committing now store a gitlink"), different
+scopes (once, initialise-only vs. every reconciliation), and name the gitignore divergence explicitly
+in both places with the same reasoning — a supervisor reading either site gets the full picture without
+having to infer it. Confirmed by reading both, not merely trusting the brief's description.
+
+**Confirmed independently:** `dotnet test --filter
+"FullyQualifiedName~ContentRepositoryServiceTests|FullyQualifiedName~ContentRepositoryStartupTests"`
+31/31; `openspec validate git-backed-content-core --strict` valid; `dotnet format --verify-no-changes`
+clean; `dotnet build` 0/0; `git status --short` / `git diff --stat f50f1ca` show exactly the four files
+(three source/spec + DEVLOG), no residue from any of my scratch reproductions (all removed, checksum-
+verified restored before this post).
+
+No mutation this round, per the ruling — agreed: the property here is asserted directly by the
+fixtures, and the blocker above is a gap in what the swallow *permits*, not in how faithfully a
+condition runs — not something a mutant would have found either way.
+
+→ @architect
+
+**[worker]** Fix round on the pre-init scan — blocker and both nits addressed. No new `N.M` numbers,
+nothing ticked.
+
+**Blocker — unreadable directory now refuses, with its own message.**
+`AssertNoNestedGitRepository`/`CollectNestedGitEntries` now thread a second accumulator
+(`unreadableDirectories`) alongside the nested-repository-path one. `CollectNestedGitEntries` catches
+`UnauthorizedAccessException` (materializing the enumeration inside the `try` so a permission denial hit
+mid-walk is treated identically to one hit at the call itself) and records the relative path instead of
+silently returning. `AssertNoNestedGitRepository` checks the unreadable list **first** — an unreadable
+subtree makes "no nested repository anywhere" unverifiable, not merely unverified, regardless of what
+the readable parts of the tree showed — and throws a message distinct from the nested-repository one:
+names the path, says explicitly this is a permissions problem rather than a repository to remove ("not
+the same problem as a nested repository — no \".git\" needs to be removed here"), and tells the operator
+to fix permissions and restart. Both messages and the reasoning are recorded in
+`AssertNoNestedGitRepository`'s XML remarks, addressed at the exact framing from the finding: "couldn't
+check" is not "checked, clean."
+
+**Test, with the root trap guarded.** `NestedGitRepositoryBehindAnUnreadableDirectory_RefusesRatherThanSilentlySkippingIt`:
+a nested repository behind a `chmod 000` subdirectory. Before asserting anything, the test calls a
+`CanEnumerate` helper against the locked directory and returns early if it can still be listed — the
+`chmod 000`-does-not-block-root case, reasoned through explicitly in a comment: if this process can
+still see through the mode, it's root, the unreadable-directory property the test exists to exercise
+never held, and asserting the refusal would pass for the wrong reason (root would see the nested
+repository directly and the ordinary ls-based check would fire instead, not this one). Confirmed the
+guard's own two branches by reasoning, not just assertion: run as this machine's non-root user (`uid
+501`, confirmed via `id`), `chmod 000` genuinely blocks `Directory.EnumerateFileSystemEntries` — verified
+directly in a standalone repro before writing the test, which is also what shows the exception is thrown
+eagerly at the enumerable-construction call on this platform, not lazily during iteration, which is why
+`CollectNestedGitEntries` materializes with `.ToList()` inside the `try` rather than relying on that. Had
+this been run as root, the early return fires and the test asserts nothing on that run — the correct
+behavior, not a false pass.
+
+**Verified the test fails against the pre-fix (silent-skip) code**, not merely against `f50f1ca`: since
+this vulnerability is in code this same follow-up block introduced, `f50f1ca` predates the scan entirely
+and isn't the right counterfactual. Instead, checksummed-`cp`-swapped `ContentRepositoryService.cs` back
+to the silent-`return`/no-second-accumulator shape the blocker was filed against, ran the new test alone
+— failed exactly as expected (`Assert.Throws() Failure: No exception was thrown`) — then restored the
+fixed file via `cp` from a pre-checksummed backup and confirmed the checksum matched before continuing.
+Never used `git checkout`/`restore` for either swap.
+
+**Nit 1 — symlink-loop test comment corrected, not the test's behavior.** The `[10s Task.WhenAny]` guard
+stays; the comment no longer credits the `ReparsePoint` skip with preventing the hang. It now says
+directly what the reviewer's own reproduction showed: with the skip disabled, the same self-referential
+symlink's recursion self-terminates around 16 levels (an OS-level bound, not this code), well inside the
+timeout, so this test alone doesn't exercise the skip's teeth — it pins "startup terminates," not "the
+skip is why." The skip itself is unchanged and still stated as correct regardless, for portability
+reasons independent of what this one test can prove.
+
+**Nit 2 — "without dereferencing" reworded to state the property, not the mechanism.**
+`AssertNoNestedGitRepository`'s remarks and the inline comment in `CollectNestedGitEntries` no longer
+claim `ReparsePoint` is reported "without dereferencing"; they now say the check happens before
+`Directory.EnumerateFileSystemEntries` is ever called on the symlink path, so recursion into or
+enumeration of the target never happens — the actual safety property, independent of how the OS/runtime
+internally determines the `Directory` bit.
+
+**Left alone, per the ruling — both explicitly `## NEXT`, not this block's:** `git add -A`'s own
+unreadable-directory blind spot (warns on stderr, exits 0 — a different code path, on the adopt side,
+that no C# filesystem scan reaches), and unbounded recursion depth on a pathologically deep
+non-symlinked tree.
+
+No mutation testing, per the brief.
+
+**Gates:** `dotnet build` 0 warnings/0 errors · `dotnet test` **515/515** full unfiltered (514 + 1 net
+new: the unreadable-directory fixture) · `dotnet format --verify-no-changes` clean ·
+`openspec validate git-backed-content-core --strict` valid. `git status --short` / `git diff --stat`
+show exactly the same four files as before this round (`ContentRepositoryService.cs`,
+`ContentRepositoryServiceTests.cs`, `design.md`, DEVLOG) — no residue from either scratch reproduction,
+checksum-verified restored before this post.
+
+→ @reviewer
+
+**[reviewer]** Fix-round re-audit of the pre-init scan — **Approve, with one nit.** Certifying the tree
+as it now stands. All four scrutiny points checked by reproduction, including the branch I couldn't
+exercise on this machine's own account.
+
+**1. The new test fails against the silent-skip code, and I checked both branches of its own root
+guard, not just the one this machine takes.** Checksummed `cp`-swapped `ContentRepositoryService.cs`
+back to the single-accumulator, silent-`return` shape and ran
+`NestedGitRepositoryBehindAnUnreadableDirectory_RefusesRatherThanSilentlySkippingIt` alone: fails
+exactly as reported (`Assert.Throws() Failure: No exception was thrown`). Restored via `cp`, checksum
+confirmed identical before continuing. For the branch this machine can't take as a non-root user
+(confirmed `uid=501`), I didn't take the guard's correctness on faith — I reproduced the root case
+directly in a throwaway Docker container: `chmod 000` on a directory, then both a plain `ls` and, more
+to the point, `Directory.EnumerateFileSystemEntries` from a real .NET 10 SDK container running as
+`uid=0`, both enumerate the directory's contents without error despite the mode. That confirms
+`CanEnumerate`'s early-return branch is reachable and correct — on a machine where this test runs as
+root, it skips rather than asserting a refusal for the wrong reason, which is exactly what a
+permissive-direction bug would have silently gotten away with.
+
+**2. No realistic false-refusal case found, checked adversarially rather than on assumption.** The
+scan only ever walks `RepositoryRoot` (`<DataRoot>/wiki`), never `DataRoot` itself, which rules out the
+two OS-level candidates that actually matter: macOS's `.Spotlight-V100`/`.fseventsd`/`.Trashes` and
+Linux's `lost+found` are volume-*root* artifacts, not something that appears inside an arbitrary
+subdirectory a container bind-mounts — they'd sit at `/data`, never at `/data/wiki`, so they're outside
+the scanned subtree entirely. Also checked a hazard adjacent to the fix rather than the fix itself: does
+an individual unreadable *file* (as opposed to an unreadable directory) crash the scan with an uncaught
+exception, since only the directory-enumeration call is wrapped in `try`/`catch`? Reproduced directly —
+`File.GetAttributes` on a `chmod 000` **file** does not throw at all (`stat`-ing a path only needs
+search/execute permission on its ancestor directories, not read permission on the file itself), so
+there's no uncaught-exception gap hiding behind the one that's handled. Every path I could construct
+that trips the new refusal traces back either to a genuine permission problem worth surfacing, or to a
+location the scan never visits.
+
+**3. The two messages are distinguishable and the unreadable-path one names the path.** Confirmed by
+reading both `BuildUnreadableDirectoryErrorMessage` and `BuildNestedRepositoryScanErrorMessage`
+side by side: distinct opening nouns ("a subdirectory this process cannot read" vs. "a nested git
+repository"), distinct and opposite instructions ("fix the directory's permissions... no \".git\" needs
+to be removed here" vs. "Remove the nested .git"), and the unreadable message includes an explicit
+disclaimer pre-empting the confusion between the two. `{offendingPaths}` is interpolated into both; the
+new test's `Assert.Contains("locked", ...)` / `Assert.DoesNotContain("copied-vault", ...)` pins exactly
+this distinction, not just that *an* exception was thrown.
+
+**4. Both corrected comments verified accurate against the current code, not just re-read.** The
+symlink-loop test's comment now states precisely what my own reproduction showed last round — "this
+test alone does not exercise the skip's teeth," names the ~16-level OS bound, and correctly attributes
+the skip's real protective value to the *other* symlink test — matching what I independently found.
+The "without dereferencing" rewording ("the check happens before `Directory.EnumerateFileSystemEntries`
+is ever called on the symlink path... recursion into or enumeration of the target never happens") is
+verified true by reading `CollectNestedGitEntries` itself: the `ReparsePoint` check runs before the
+recursive call that would eventually enumerate the target, for every code path, not just the common
+one. Neither correction has quietly introduced a sixth mismatch.
+
+**One nit — `design.md` doesn't yet record the unreadable-directory decision.** The D9 addendum this
+block's earlier round added describes the scan's nested-repository refusal in detail, but the fix
+round's fourth file, `design.md`, shows no additional diff beyond the +4 lines already present before
+this fix — the unreadable-directory refusal, a real Product Owner-level call (mine escalated, yours
+settled), isn't recorded there at all. `ContentRepositoryService.cs`'s own XML remarks state the
+reasoning fully and accurately, so nothing is *wrong*, but `design.md` is binding and every other
+decision in this exact addendum chain got its own paragraph — this one didn't. Not blocking: worth a
+short addition (a sentence naming the unreadable-directory refusal and its distinct message) whenever
+`design.md` is next touched, same posture as prior nits closed inline rather than sent back for a round
+of their own.
+
+**Confirmed independently:** `dotnet test --filter
+"FullyQualifiedName~ContentRepositoryServiceTests|FullyQualifiedName~ContentRepositoryStartupTests"`
+32/32; `openspec validate git-backed-content-core --strict` valid; `dotnet format --verify-no-changes`
+clean; `dotnet build` 0/0; `git status --short` / `git diff --stat f50f1ca` show exactly the four files,
+no residue from any scratch reproduction (all removed, checksum-verified restored, including the
+throwaway Docker containers, which touched no repository state).
+
+No mutation this round, per the ruling — agreed, nothing here is a fidelity gap a mutant would find.
+
+**This block is clear to commit.**
+
+→ @architect
+
+**[worker]** `design.md` nit closed — documentation only, no code or test changes.
+
+Added a new D9 addendum paragraph recording the unreadable-directory decision, matching the sibling
+addenda's voice and length: what it decides (an unreadable subdirectory on the initialise path refuses
+in its own right, named separately from the nested-repository refusal, with a permissions-focused
+remediation); why (the scan's job is to *assert* a property before any write — on an unreadable subtree
+that property is unverifiable, not merely unverified, and the `chmod 000` reproduction — a real nested
+repository hidden behind it, invisible to the scan, `git init` and the initial commit proceeding anyway —
+is cited directly); what it costs (once per volume, on content the operator has just copied in and is
+most likely still watching, and no realistic false-refusal case — the walk starts at `RepositoryRoot`,
+never `DataRoot`, ruling out Spotlight/`fseventsd`/`lost+found`, which all live at the volume root); and
+what it does not reach (`git add -A`'s own stderr-warns/exit-0 blind spot one layer further in, explicitly
+owed to §6 at the latest via `## NEXT`, not claimed to be solved here).
+
+**Gates:** `openspec validate git-backed-content-core --strict` valid · `dotnet build` 0 warnings/0
+errors · `dotnet test` **515/515** full unfiltered (unchanged — no test touched) · `dotnet format
+--verify-no-changes` clean. `git diff --stat -- design.md` shows exactly 6 lines added, nothing else in
+`src/`/`tests/` touched this round.
+
+No mutation testing, per the brief.
+
+Not committing — architect verifies and commits.
+
 ## NEXT
 
 **Resume point: §3 (Content read & render), first block.** §2 is **closed** — supervisor `Approve` on
@@ -4719,8 +5062,22 @@ a wording tidy-up, because one of its two options changes shipped behaviour.
     unaffected). And `GitHookInstaller` should record that `git rev-parse --git-path hooks` honours
     `core.hooksPath` — verified by execution, and the fact that makes §5.3's hooks land where git will
     actually run them.
-13. Carried, unchanged: **`GitAuthor.cs:13-15`** still calls reconciliation "later" though it now
-    exists; **`tasks.md:70`** still records 11.1's superseded pattern while `src/` is correct.
+13. ~~Carried: `GitAuthor.cs` "later"; `tasks.md:70`'s superseded 11.1 pattern~~ — **both discharged in
+    `f50f1ca`**, along with the `T`-vs-`M` and `core.hooksPath` remarks from obligation 12.
+14. **`git add -A` has the same unreadable-directory blind spot the scan just closed in C#, and no C#
+    scan can reach it.** Found by `@reviewer` while auditing the pre-init scan. `git add -A` warns on
+    stderr and **exits 0** when it cannot read a directory, so content behind it is silently not staged
+    — which means reconciliation reports success, the tree reports clean, and D9's "never discard"
+    quietly does not hold for that subtree. Distinct from the scan blocker: the scan guards the
+    *initialise* path only, while this touches **every** path, including a push-updated tree in §8. The
+    fix is not a scan — it is deciding whether `ReconcileWorkingTreeAsync` should inspect `add -A`'s
+    **stderr** and refuse rather than trusting its exit code. Likely a Product Owner call, since
+    refusing on a warning is a policy choice; raise it in §6's brief at the latest, and note §10.1 owes
+    a reconciliation test either way.
+15. **Unbounded recursion in `AssertNoNestedGitRepository`** on a pathologically deep, non-symlinked
+    tree. Assessed by `@reviewer` as closer to noise than a live risk for this product's content, and
+    left unguarded deliberately rather than by oversight — recorded so that judgement is visible rather
+    than implicit. Symlink loops are already handled, and are the realistic case.
 
 ### Close-out items before archive
 

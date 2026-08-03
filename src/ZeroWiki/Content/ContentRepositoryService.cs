@@ -96,6 +96,16 @@ public sealed class ContentRepositoryService
             // ancestor's repository as "found" instead of "absent". Both checks above are answered
             // entirely in C#, before any git process runs, so this branch is only ever taken when
             // repositoryRoot truly has no repository of its own.
+            //
+            // Before ever running `git init`: a folder copied onto the volume before ZeroWiki's first
+            // start can already contain a nested git repository (e.g. a copied-in Obsidian vault). The
+            // reconciliation-time gitlink check further down can only see that once something has been
+            // staged, which on this branch means only after `git init` has already created a `.git`
+            // here and an initial commit already exists — this call would then be refusing to serve a
+            // repository it just created around someone else's content. Scanning the filesystem first
+            // means the refusal below runs before `git init`, so nothing is left behind at all.
+            AssertNoNestedGitRepository(repositoryRoot);
+
             _logger.LogInformation("No git repository found at '{RepositoryRoot}'; initializing.", repositoryRoot);
             await _git.RunOrThrowAsync(
                 repositoryRoot,
@@ -167,6 +177,146 @@ public sealed class ContentRepositoryService
         File.Exists(Path.Combine(repositoryRoot, "HEAD")) &&
         Directory.Exists(Path.Combine(repositoryRoot, "objects")) &&
         Directory.Exists(Path.Combine(repositoryRoot, "refs"));
+
+    /// <summary>
+    /// Refuses, before <c>git init</c> ever runs, if <paramref name="repositoryRoot"/>'s directory
+    /// tree already contains a nested git repository — a <c>.git</c> directory or gitfile at any
+    /// depth. This is the <em>initialise</em> path's only guard against gitlinking a copied-in vault:
+    /// <see cref="FindStagedGitlinksAsync"/> answers the same underlying worry from git's index, but
+    /// there is no index yet here — nothing has been staged, because nothing has been written yet.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>This is a second instrument, deliberately, not a duplicate of <see cref="FindStagedGitlinksAsync"/>.</b>
+    /// This scan asks "is there a nested repository in this folder", walking the filesystem directly,
+    /// and guards only the initialise branch, once, before any write. <see cref="FindStagedGitlinksAsync"/>
+    /// asks "would committing right now store a gitlink", from git's index, and guards every branch at
+    /// every reconciliation — including content that arrives long after bootstrap, on a repository this
+    /// scan never runs against again. Neither subsumes the other.
+    /// </para>
+    /// <para>
+    /// The two deliberately disagree in one case (Product Owner decision, recorded in
+    /// <c>design.md</c>'s D9 addendum): a nested repository the operator has <c>.gitignore</c>d is
+    /// skipped entirely by <c>git add -A</c>, so <see cref="FindStagedGitlinksAsync"/> never sees it —
+    /// while this scan does not consult <c>.gitignore</c> at all, so it still finds the <c>.git</c>
+    /// entry and refuses. That divergence is intentional: refusing is recoverable and legible, and a
+    /// gitignored nested repository inside a wiki's content folder is a configuration worth stopping
+    /// on rather than silently accepting.
+    /// </para>
+    /// <para>
+    /// Does not follow symbolic links while walking: a symlinked directory can loop back on an
+    /// ancestor or point outside the volume entirely, and neither is a nested repository in this
+    /// folder. <see cref="File.GetAttributes(string)"/> reports <see cref="FileAttributes.ReparsePoint"/>
+    /// for a symlink alongside <see cref="FileAttributes.Directory"/> when it targets one, without this
+    /// method ever having to open or descend into it — so checking that flag is enough to recognise and
+    /// skip a symlink before recursing into whatever it targets.
+    /// </para>
+    /// <para>
+    /// <b>An unreadable subdirectory is a refusal, not a silent skip.</b> This scan exists to assert a
+    /// property — "no nested repository anywhere in this tree" — before any write, and on a
+    /// subdirectory this process cannot read, that property is <em>unverifiable</em>, not merely
+    /// unverified. Treating "couldn't check" as "checked, clean" would silently reintroduce the exact
+    /// failure mode the rest of this section refuses loudly instead: a repository could be hiding
+    /// behind restrictive permissions and this scan would report the tree clean anyway. The cost of
+    /// refusing here is low — once per volume, on content the operator has just copied in, most likely
+    /// while they are still watching — so an unreadable directory refuses by name, with a message
+    /// distinct from the nested-repository one: fixing permissions and removing a nested repository are
+    /// different actions, and the operator needs to know which one applies.
+    /// </para>
+    /// </remarks>
+    private static void AssertNoNestedGitRepository(string repositoryRoot)
+    {
+        var nestedGitPaths = new List<string>();
+        var unreadableDirectories = new List<string>();
+        CollectNestedGitEntries(repositoryRoot, repositoryRoot, nestedGitPaths, unreadableDirectories);
+
+        // Checked first: an unreadable subtree makes "no nested repository anywhere" unverifiable, not
+        // merely unverified, regardless of what the readable parts of the tree happened to show.
+        if (unreadableDirectories.Count > 0)
+        {
+            throw new InvalidOperationException(BuildUnreadableDirectoryErrorMessage(repositoryRoot, unreadableDirectories));
+        }
+
+        if (nestedGitPaths.Count > 0)
+        {
+            throw new InvalidOperationException(BuildNestedRepositoryScanErrorMessage(repositoryRoot, nestedGitPaths));
+        }
+    }
+
+    private static void CollectNestedGitEntries(
+        string repositoryRoot,
+        string directory,
+        List<string> found,
+        List<string> unreadableDirectories)
+    {
+        List<string> entries;
+        try
+        {
+            // Materialized inside the try: this scan's enumeration must not treat a permission denial
+            // encountered mid-walk any differently from one encountered at the call itself.
+            entries = Directory.EnumerateFileSystemEntries(directory).ToList();
+        }
+        catch (UnauthorizedAccessException)
+        {
+            unreadableDirectories.Add(RelativePath(repositoryRoot, directory));
+            return;
+        }
+
+        foreach (var entry in entries)
+        {
+            var attributes = File.GetAttributes(entry);
+
+            // Never follow a symlink: it may loop back on an ancestor of itself, or point outside the
+            // volume to something that is not nested in this folder at all.
+            if ((attributes & FileAttributes.ReparsePoint) != 0)
+            {
+                continue;
+            }
+
+            if (Path.GetFileName(entry) == ".git")
+            {
+                found.Add(RelativePath(repositoryRoot, entry));
+                continue;
+            }
+
+            if ((attributes & FileAttributes.Directory) != 0)
+            {
+                CollectNestedGitEntries(repositoryRoot, entry, found, unreadableDirectories);
+            }
+        }
+    }
+
+    private static string RelativePath(string repositoryRoot, string path) =>
+        Path.GetRelativePath(repositoryRoot, path).Replace(Path.DirectorySeparatorChar, '/');
+
+    private static string BuildUnreadableDirectoryErrorMessage(string repositoryRoot, IReadOnlyList<string> unreadableDirectories)
+    {
+        var offendingPaths = string.Join(", ", unreadableDirectories.Select(path => $"'{path}'"));
+
+        return
+            $"The content directory at '{repositoryRoot}' contains a subdirectory this process cannot " +
+            $"read at {offendingPaths}, before it has ever been initialized as a git repository. " +
+            "ZeroWiki cannot confirm there is no nested git repository hiding inside an unreadable " +
+            "directory, and refusing to start is safer than assuming it is clean. Fix the directory's " +
+            "permissions so this process can read it (not the same problem as a nested repository — no " +
+            "\".git\" needs to be removed here) and restart the application.";
+    }
+
+    private static string BuildNestedRepositoryScanErrorMessage(string repositoryRoot, IReadOnlyList<string> nestedGitPaths)
+    {
+        var offendingPaths = string.Join(", ", nestedGitPaths.Select(path => $"'{path}'"));
+
+        return
+            $"The content directory at '{repositoryRoot}' already contains a nested git repository at " +
+            $"{offendingPaths} — most likely copied in with its own .git directory (for example an " +
+            "existing Obsidian vault, or a cloned notes folder). ZeroWiki cannot commit a nested " +
+            "repository's file contents into the repository it is about to create here: git would " +
+            "record only a reference to a commit in the nested repository's own history, not the files " +
+            "themselves, and that content would not be recoverable from this wiki if the nested .git is " +
+            "ever removed. Remove the nested .git (or move the folder's contents in without it) and " +
+            "restart the application; refusing to start rather than initialize a repository around a " +
+            "nested one.";
+    }
 
     /// <summary>
     /// Defense-in-depth for every later git invocation this runner makes with
@@ -296,6 +446,13 @@ public sealed class ContentRepositoryService
     /// later restart. Detecting one retroactively is explicitly out of scope (Product Owner decision):
     /// no shipped build has ever created one, and doing so would refuse to start a wiki that already
     /// has one in its history, which is a worse outcome than leaving the pre-existing gap undetected.
+    /// <para>
+    /// This index-based check is not this repository's only nested-repository guard: the initialise
+    /// branch of <see cref="EnsureRepositoryAsync"/> also runs <see cref="AssertNoNestedGitRepository"/>,
+    /// a filesystem scan, before <c>git init</c> — because on that branch nothing has been staged yet
+    /// for this check to see. See <see cref="AssertNoNestedGitRepository"/>'s remarks for why both
+    /// checks stay, and for the one case where they deliberately disagree.
+    /// </para>
     /// </remarks>
     private async Task ReconcileWorkingTreeAsync(string repositoryRoot, CancellationToken cancellationToken)
     {

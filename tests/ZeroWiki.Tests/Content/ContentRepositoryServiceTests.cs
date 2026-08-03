@@ -604,6 +604,289 @@ public sealed class ContentRepositoryServiceTests : IDisposable
         Assert.Equal(operatorMode, File.GetUnixFileMode(postReceivePath));
     }
 
+    // The pre-init filesystem scan: the initialise branch (RepositoryRoot has no .git of its own, and
+    // is not a bare repository). Unlike every gitlink fixture above, these place the nested repository
+    // *before* EnsureRepositoryAsync is ever called at all, standing in for a folder of Markdown (an
+    // existing Obsidian vault, .git and all) copied onto the volume before ZeroWiki's first start. The
+    // index-based gitlink check (FindStagedGitlinksAsync) cannot catch this in time: on this branch it
+    // only ever runs after `git init` has already created a `.git` and an initial commit already
+    // exists, so without the scan a `.git` and one commit would be left behind immediately before
+    // refusing to serve.
+
+    [Fact]
+    public async Task NestedGitRepositoryOnAFreshVolume_RefusesBeforeGitInitEverRuns()
+    {
+        var repositoryRoot = RepositoryRoot;
+        Directory.CreateDirectory(repositoryRoot);
+        var nestedPath = Path.Combine(repositoryRoot, "copied-vault");
+        await CreateNestedGitRepositoryDirectoryAsync(nestedPath);
+
+        var service = CreateService();
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() => service.EnsureRepositoryAsync());
+        Assert.Contains("copied-vault", exception.Message, StringComparison.Ordinal);
+
+        // The whole point of this fixture: no .git was ever created at RepositoryRoot. The refusal
+        // alone already passes without the scan (the index-based check would eventually catch this
+        // too, just after git init and a commit had already run) — this is the assertion that proves
+        // the scan ran before any write.
+        Assert.False(Directory.Exists(Path.Combine(repositoryRoot, ".git")));
+
+        // The offending content itself is untouched — the operator can still fix it.
+        Assert.True(File.Exists(Path.Combine(nestedPath, "note.md")));
+    }
+
+    [Fact]
+    public async Task NestedGitRepositoryThreeLevelsDeepOnAFreshVolume_RefusesBeforeGitInitEverRuns()
+    {
+        var repositoryRoot = RepositoryRoot;
+        Directory.CreateDirectory(repositoryRoot);
+        var nestedPath = Path.Combine(repositoryRoot, "a", "b", "copied-vault");
+        await CreateNestedGitRepositoryDirectoryAsync(nestedPath);
+
+        var service = CreateService();
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() => service.EnsureRepositoryAsync());
+        Assert.Contains("a/b/copied-vault", exception.Message, StringComparison.Ordinal);
+
+        Assert.False(Directory.Exists(Path.Combine(repositoryRoot, ".git")));
+    }
+
+    [Fact]
+    public async Task NestedGitRepositoryAsAGitfileOnAFreshVolume_RefusesBeforeGitInitEverRuns()
+    {
+        var repositoryRoot = RepositoryRoot;
+        Directory.CreateDirectory(repositoryRoot);
+
+        var realGitDirectory = Path.Combine(_dataRoot, "real-vault-gitdir");
+        Directory.CreateDirectory(realGitDirectory);
+        await _git.RunOrThrowAsync(realGitDirectory, ["init", "-b", "main"]);
+        await File.WriteAllTextAsync(Path.Combine(realGitDirectory, "note.md"), "# Note\n");
+        await _git.RunOrThrowAsync(realGitDirectory, ["add", "note.md"]);
+        await _git.RunOrThrowAsync(
+            realGitDirectory,
+            ["commit", "-m", "inner commit"],
+            new Dictionary<string, string>
+            {
+                ["GIT_AUTHOR_NAME"] = "Inner",
+                ["GIT_AUTHOR_EMAIL"] = "inner@example.com",
+                ["GIT_COMMITTER_NAME"] = "Inner",
+                ["GIT_COMMITTER_EMAIL"] = "inner@example.com",
+            });
+
+        var nestedPath = Path.Combine(repositoryRoot, "copied-vault");
+        Directory.CreateDirectory(nestedPath);
+        await File.WriteAllTextAsync(
+            Path.Combine(nestedPath, ".git"),
+            $"gitdir: {Path.Combine(realGitDirectory, ".git")}\n");
+        await File.WriteAllTextAsync(Path.Combine(nestedPath, "note.md"), "# Note\n");
+
+        var service = CreateService();
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() => service.EnsureRepositoryAsync());
+        Assert.Contains("copied-vault", exception.Message, StringComparison.Ordinal);
+
+        Assert.False(Directory.Exists(Path.Combine(repositoryRoot, ".git")));
+    }
+
+    [Fact]
+    public async Task GitignoredNestedGitRepositoryOnAFreshVolume_IsStillRefusedByTheScan()
+    {
+        // The scan and the index-based gitlink check deliberately disagree here (Product Owner
+        // decision, design.md D9 addendum): `git add -A` respects .gitignore, so a gitignored nested
+        // repository is invisible to the index check — demonstrated directly below, standing in for
+        // what that check alone would see. The filesystem scan does not consult .gitignore at all, so
+        // it still finds the .git entry and refuses. This test pins that divergence as deliberate.
+        var repositoryRoot = RepositoryRoot;
+        Directory.CreateDirectory(repositoryRoot);
+        await File.WriteAllTextAsync(Path.Combine(repositoryRoot, ".gitignore"), "copied-vault/\n");
+        var nestedPath = Path.Combine(repositoryRoot, "copied-vault");
+        await CreateNestedGitRepositoryDirectoryAsync(nestedPath);
+
+        // The index check's side of the divergence: were this folder staged as-is (as if the scan
+        // didn't exist), `.gitignore` hides the nested repository from `git add -A` entirely — no
+        // gitlink, no trace of it in the index at all.
+        await _git.RunOrThrowAsync(repositoryRoot, ["init", "-b", "main"]);
+        await _git.RunOrThrowAsync(repositoryRoot, ["add", "-A"]);
+        var lsFilesIgnoringTheScan = await _git.RunOrThrowAsync(repositoryRoot, ["ls-files", "--stage"]);
+        Assert.DoesNotContain("160000", lsFilesIgnoringTheScan.StandardOutput, StringComparison.Ordinal);
+        Assert.DoesNotContain("copied-vault", lsFilesIgnoringTheScan.StandardOutput, StringComparison.Ordinal);
+
+        // Undo that probe so the real initialise path (scan included) is exercised exactly as an
+        // operator would hit it — a fresh, .git-less RepositoryRoot.
+        Directory.Delete(Path.Combine(repositoryRoot, ".git"), recursive: true);
+
+        var service = CreateService();
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() => service.EnsureRepositoryAsync());
+        Assert.Contains("copied-vault", exception.Message, StringComparison.Ordinal);
+        Assert.False(Directory.Exists(Path.Combine(repositoryRoot, ".git")));
+    }
+
+    [Fact]
+    public async Task NestedGitRepositoryBehindAnUnreadableDirectory_RefusesRatherThanSilentlySkippingIt()
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            // chmod-based unreadability is a POSIX permissions concept; the container image (this
+            // scan's actual deployment target) is Linux, matching the existing Windows-skip precedent
+            // for the executable-bit hook tests elsewhere in this file.
+            return;
+        }
+
+        var repositoryRoot = RepositoryRoot;
+        Directory.CreateDirectory(repositoryRoot);
+        var lockedDirectory = Path.Combine(repositoryRoot, "locked");
+        Directory.CreateDirectory(lockedDirectory);
+        var nestedPath = Path.Combine(lockedDirectory, "copied-vault");
+        await CreateNestedGitRepositoryDirectoryAsync(nestedPath);
+
+        File.SetUnixFileMode(lockedDirectory, UnixFileMode.None);
+        try
+        {
+            // chmod 000 does not block root. If this process can still enumerate the directory despite
+            // the mode, it is running as root, the unreadable-directory case this test exists to
+            // exercise never actually held, and asserting the refusal below would pass for the wrong
+            // reason (root would see straight through to the nested repository and the ordinary gitlink
+            // path would fire instead). Skip rather than let that happen silently.
+            if (CanEnumerate(lockedDirectory))
+            {
+                return;
+            }
+
+            // The case this test actually exercises, given the check above did not skip: a genuinely
+            // unreadable directory, confirmed by this process failing to list it.
+            var service = CreateService();
+            var exception = await Assert.ThrowsAsync<InvalidOperationException>(() => service.EnsureRepositoryAsync());
+
+            Assert.Contains("locked", exception.Message, StringComparison.Ordinal);
+
+            // Distinct from the nested-repository message — this refusal is about permissions, not
+            // about a repository to remove; the operator needs to know which action applies.
+            Assert.DoesNotContain("copied-vault", exception.Message, StringComparison.Ordinal);
+
+            // The whole point of this fixture: the unreadable subtree must stop bootstrap before
+            // `git init` ever runs, exactly like a nested repository the scan can actually see.
+            Assert.False(Directory.Exists(Path.Combine(repositoryRoot, ".git")));
+        }
+        finally
+        {
+            // Restore before Dispose() tries to recursively delete _dataRoot.
+            File.SetUnixFileMode(
+                lockedDirectory,
+                UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        }
+    }
+
+    private static bool CanEnumerate(string directory)
+    {
+        try
+        {
+            _ = Directory.EnumerateFileSystemEntries(directory).ToList();
+            return true;
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return false;
+        }
+    }
+
+    [Fact]
+    public async Task SymlinkedDirectoryThatLoops_DoesNotHangStartup()
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            // Symlink creation needs elevation/developer mode on Windows; the container image (this
+            // scan's actual deployment target) is Linux, matching the existing Windows-skip precedent
+            // for the executable-bit hook tests elsewhere in this file.
+            return;
+        }
+
+        var repositoryRoot = RepositoryRoot;
+        Directory.CreateDirectory(repositoryRoot);
+        var loopDirectory = Path.Combine(repositoryRoot, "loop");
+        Directory.CreateDirectory(loopDirectory);
+        File.CreateSymbolicLink(Path.Combine(loopDirectory, "self"), loopDirectory);
+
+        var service = CreateService();
+
+        // Bounded rather than a bare await, so a regression fails this assertion instead of hanging the
+        // whole suite. What this pins is only "startup terminates", not "the ReparsePoint skip is what
+        // stops the loop": with that skip disabled directly, a self-referential symlink's recursion
+        // still self-terminates on its own — an OS-level path-depth bound, observed around 16 levels on
+        // this machine — well before this timeout would ever fire, so this test alone does not exercise
+        // the skip's teeth. The skip stays regardless: it is still the correct, portable way to avoid
+        // depending on that OS bound, and it is what keeps the scan from treating a symlinked
+        // directory's target as nested content of its own (see SymlinkPointingToARepositoryOutsideTheVolume_IsNotReportedAsNested).
+        var bootstrap = service.EnsureRepositoryAsync();
+        var completed = await Task.WhenAny(bootstrap, Task.Delay(TimeSpan.FromSeconds(10)));
+        Assert.Same(bootstrap, completed);
+        await bootstrap;
+
+        Assert.True(Directory.Exists(Path.Combine(repositoryRoot, ".git")));
+    }
+
+    [Fact]
+    public async Task SymlinkPointingToARepositoryOutsideTheVolume_IsNotReportedAsNested()
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            return;
+        }
+
+        var outsideRepository = Path.Combine(Path.GetTempPath(), $"zerowiki-outside-repo-{Guid.NewGuid():n}");
+        Directory.CreateDirectory(outsideRepository);
+        try
+        {
+            await _git.RunOrThrowAsync(outsideRepository, ["init", "-b", "main"]);
+            await File.WriteAllTextAsync(Path.Combine(outsideRepository, "note.md"), "# Note\n");
+            await _git.RunOrThrowAsync(outsideRepository, ["add", "note.md"]);
+            await _git.RunOrThrowAsync(
+                outsideRepository,
+                ["commit", "-m", "outside commit"],
+                new Dictionary<string, string>
+                {
+                    ["GIT_AUTHOR_NAME"] = "Outside",
+                    ["GIT_AUTHOR_EMAIL"] = "outside@example.com",
+                    ["GIT_COMMITTER_NAME"] = "Outside",
+                    ["GIT_COMMITTER_EMAIL"] = "outside@example.com",
+                });
+
+            var repositoryRoot = RepositoryRoot;
+            Directory.CreateDirectory(repositoryRoot);
+            File.CreateSymbolicLink(Path.Combine(repositoryRoot, "linked-elsewhere"), outsideRepository);
+
+            var service = CreateService();
+            await service.EnsureRepositoryAsync();
+
+            Assert.True(Directory.Exists(Path.Combine(repositoryRoot, ".git")));
+            await AssertConfigurationIsAppliedAsync(repositoryRoot);
+            await AssertPorcelainIsEmptyAsync(repositoryRoot);
+        }
+        finally
+        {
+            Directory.Delete(outsideRepository, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task OrdinaryMarkdownCopiedOntoAFreshVolumeWithNoNestedRepository_InitializesNormally()
+    {
+        // Regression: the scan must not false-positive on a plain folder of Markdown with no nested
+        // repository, which is the ordinary way to populate a new ZeroWiki.
+        var repositoryRoot = RepositoryRoot;
+        Directory.CreateDirectory(repositoryRoot);
+        Directory.CreateDirectory(Path.Combine(repositoryRoot, "docs"));
+        await File.WriteAllTextAsync(Path.Combine(repositoryRoot, "docs", "hello.md"), "# Hello\n");
+
+        var service = CreateService();
+        await service.EnsureRepositoryAsync();
+
+        Assert.True(Directory.Exists(Path.Combine(repositoryRoot, ".git")));
+        await AssertIsNonBareAsync(repositoryRoot);
+        await AssertConfigurationIsAppliedAsync(repositoryRoot);
+        await AssertPorcelainIsEmptyAsync(repositoryRoot);
+
+        var lsFiles = await _git.RunOrThrowAsync(repositoryRoot, ["ls-files", "docs/hello.md"]);
+        Assert.Equal("docs/hello.md", lsFiles.StandardOutput.Trim());
+    }
+
     [Fact]
     public async Task ForeignRepositoryWithDenyCurrentBranchRefuseAndANewGitlink_RefusesLeavingTheConfigUnchanged()
     {
