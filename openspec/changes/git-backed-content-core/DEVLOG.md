@@ -8472,8 +8472,8 @@ and owed, when §6 has a save path to fail.
 
 ## NEXT
 
-**Resume point: §5 (Write lock), first block — but one Product Owner decision is owed before it opens**
-(forward obligation 1). §4 is **closed** — supervisor `Approve` on round two over `35dde44..HEAD`. §3
+**Resume point: §5 (Write lock), first block. No design question blocks it** — the entry that claimed
+one (forward obligation 1) was stale and is discharged below. §4 is **closed** — supervisor `Approve` on round two over `35dde44..HEAD`. §3
 closed over `60957e6..HEAD` (round two); §2 closed over `7b50e46..HEAD` (round four); §11 closed over
 `bb3cb2c..HEAD`.
 
@@ -8565,21 +8565,22 @@ a wording tidy-up, because one of its two options changes shipped behaviour.
 
 ### Forward obligations — each is owed by a specific section
 
-1. **Settle before §5 — §2's binding prose overclaims, and one fix changes behaviour.** `design.md`'s
-   D9 addendum claims ZeroWiki "never writes into… a repository whose working tree it did not find
-   intact". False of the shipped code: the bare-repository check refuses **before** any write, but the
-   missing-`docs/` and gitlink checks refuse only **after** repo config is written and
-   `.git/hooks/pre-receive`/`post-receive` are unconditionally overwritten. Two options, and they are
-   not equivalent — **the first changes what ships**:
-   - *Move the `docs/` probe up* beside the bare-repository check. It needs only the `HEAD` probe, so
-     it can run straight after `AssertGitResolvesRepositoryRootAsync`, before config and hooks — making
-     the claim true for two of the three faults.
-   - *Narrow the prose* in `design.md` and `MissingWorkingTreeException` to what the code actually does.
-
-   Either way, the addendum's other half — *"does not commit into a repository's history it did not
-   create"* — is false **regardless of ordering**, because D9 reconciliation puts a `System` commit
-   into adopted history whenever the adopted tree is dirty, by design. That clause needs rewording on
-   both paths. Not blocking §3 or §4; §5 is where the lock starts depending on this ordering.
+1. ~~**Settle before §5 — §2's binding prose overclaims, and one fix changes behaviour.**~~ —
+   **discharged in §2, and this entry was stale for three sections.** Verified against the code at §4's
+   close-out, not against this record: `ContentRepositoryService.EnsureRepositoryAsync` now calls
+   `ApplyRepositoryConfigurationAsync` and `InstallHooksAsync` **last** (`:168-169`), after
+   `EnsureInitialCommitAsync`, `ReconcileWorkingTreeAsync` and `AssertWorkingTreeIsCleanAsync` — so
+   every refusal the method can raise genuinely precedes every write, on both the adopt and the
+   initialise paths. That was `f50f1ca` ("D9 reorder — no write precedes any refusal"), with `2c70e05`
+   and `1253ff5` closing the initialise path behind it; all three are in this file's own block table.
+   The second half was fixed too: `design.md` carries a **"What the posture is not, regardless of
+   ordering"** paragraph stating plainly that ZeroWiki *does* commit into adopted history via D9
+   reconciliation, and giving the accurate posture instead. **Nothing is owed to the Product Owner
+   here.** Recorded rather than deleted because the lesson is the point: this entry survived §3 and §4
+   asserting a Product Owner decision was owed, and the decision had already been taken and shipped —
+   `## NEXT` is append-mostly and its *unticked* entries decay silently while the code moves. **Re-derive
+   a forward obligation from the code before spending a decision on it**; a stale obligation costs more
+   than a missing one, because it is acted upon.
 2. **§5 — the lockfile must not live in the working tree.** A lockfile under `/data/wiki/docs` is an
    untracked file, which makes the tree dirty, which D9 dutifully commits, and `updateInstead` then
    bounces every push against a tree it believes unclean. Put it under `.git/` or beside the
@@ -8867,9 +8868,9 @@ a wording tidy-up, because one of its two options changes shipped behaviour.
 - **Every instrument failure in this change so far has been in the harness, not the code.** Assume the
   measurement is wrong before assuming the finding is real.
 
-Design questions outstanding: **one — forward obligation 1, owed before §5 opens.** `design.md`'s Open
-Questions remain fully resolved and D11 still states the `accepted ⊆ legal` posture whose absence was
-S1; what is open is newer than those. §2's D9 addendum asserts a posture the shipped code does not
-hold, and the two ways to reconcile it are not equivalent — one moves the `docs/` probe ahead of config
-and hooks (changing behaviour), the other narrows the prose (changing only the record). That is a
-Product Owner call. §3 and §4 do not depend on it.
+Design questions outstanding: **none.** `design.md`'s Open Questions remain fully resolved; D11 still
+states the `accepted ⊆ legal` posture whose absence was S1; D15 now records §4's index decisions. The
+one entry that claimed a Product Owner call was owed before §5 — forward obligation 1 — was **stale**,
+and was verified against `EnsureRepositoryAsync`'s actual ordering at §4's close-out rather than
+re-read from this file: §2 had already shipped the fix in `f50f1ca`, and `design.md` already carries the
+corrected posture. §5 opens on the Product Owner's go-ahead, not on a design question.
