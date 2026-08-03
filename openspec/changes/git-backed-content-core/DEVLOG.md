@@ -7214,6 +7214,81 @@ resolvers, not add a third.
 
 → @architect
 
+## 4. Derived index
+
+**[architect]** Base: `35dde44` — D6's derived index: the path/title/tags/last-edit structure built from
+the repository, rebuildable from it alone, and updated for the files a write touches.
+
+**[architect]** Pre-flight (CLAUDE.md §2): tree clean, on `change/git-backed-content-core`,
+`openspec validate --strict` valid, `proposal.md` / `design.md` / `specs/content-store/spec.md` re-read.
+§3 carries a supervisor `Approve` (round two, `7ca5b76`), so nothing is owed backwards. Forward
+obligation 1 (D9's overclaiming prose) is owed before **§5**, not before §4 — confirmed unchanged.
+
+**[architect]** ❓ @product-owner — §4 arrives in the same shape §3 did: **D6 is three sentences, and
+three things it does not settle decide the whole section.** Raising them before briefing any worker,
+because §2's lesson was that prose landing in `design.md` binds every later section and is not gated by
+anything unless a scenario gates it.
+
+D6 settles *what* is in the index (path, title, tags, last-edit), that it is rebuildable from the repo,
+and that browser commits and `post-receive` trigger incremental re-index. It settles none of:
+
+1. **Where the index lives.** Process memory, rebuilt on every start, is the cheapest thing that
+   satisfies "rebuildable from the repository alone" — and D8 would permit a SQLite table beside
+   `identity.db`, since neither is inside the repository. The spec scenario says "the index is *deleted*
+   or absent at startup", which reads as though something on disk was contemplated; nothing in the
+   change requires it.
+2. **Who reads it in this change.** Today nothing would: the only read surface (`WikiPage.razor`) walks
+   the whole working tree *and* spawns a `git log` on every request (`## NEXT` obligation 21). If §4
+   builds a structure no shipped code consults, it is dead scaffolding by the supervisor's own lens —
+   and if it does consume it, §4 quietly becomes the section that changes how every page is served.
+3. **What last-edit costs to build.** One `git log -1` per page is N subprocesses per rebuild; one
+   `git log --name-status` over history is a single subprocess that reads the whole history; lazy
+   per-page with caching pays nothing at startup and everything on first view. This is the section's
+   real cost decision and it is entangled with (2).
+
+A fourth falls out of (1)–(3): **4.3's incremental update has no caller in this change** — §6 and §8 are
+the writers and neither exists yet. Shipping an update method nobody calls is the same scaffolding
+problem as (2) wearing a different hat.
+
+→ @product-owner
+
+**[product-owner]** In-memory index stamped with the `HEAD` sha; `WikiPage` reads it.
+
+**[architect]** Recorded as **D15** in `design.md`, with the freshness obligation and three new
+scenarios behind it in `specs/content-store/spec.md` so §4's section review is gated on behaviour rather
+than on this post. What the Product Owner's answer settles, and what fell out of it:
+
+1. **Nothing is persisted, and that is the stronger form of D6, not a weaker one.** "Rebuildable from the
+   repository alone" stops being a property to maintain and becomes the only way the index can exist. The
+   SQLite-beside-`identity.db` option D8 would have permitted is rejected: the hook cannot write it
+   anyway (obligation 3), so the app would still need a refresh mechanism — and once that exists,
+   persistence adds a second thing that can be stale for no benefit.
+2. **The stamp is what makes §4 correct without §6 and §8**, which is the answer to the fourth question
+   above rather than a detail of the first. D6 says `post-receive` and each browser commit *trigger*
+   re-index; that quietly assumes every writer notifies the app. A stamp compared against the current
+   `HEAD` covers the writer that does not — an `updateInstead` push, or an operator committing on the
+   volume — identically to the two that do. §6 and §8 may later push an update in as an optimisation;
+   correctness will not depend on it.
+3. **The stale check is `git rev-parse HEAD`, one subprocess per view** — chosen over reading `.git/HEAD`
+   and the ref file in C#, which spawns nothing but has to handle **packed** refs (`git gc` moves loose
+   refs into `.git/packed-refs`) and silently serves a stale wiki if that second path is missed. It
+   replaces a whole-tree walk *plus* a `git log` per view (obligation 21), so the request path gets
+   materially cheaper even while gaining a spawn.
+4. **A moved `HEAD` re-indexes only what `git diff --name-status <stamped>..<current>` names**; a full
+   rebuild is the fallback for a stamp git cannot resolve. That gives **4.3 a real caller inside this
+   change** rather than an update method waiting for §6 to exist — the scaffolding worry in questions (2)
+   and (4) is answered by the same mechanism.
+5. **Two things §4 explicitly does not take on.** Obligation 21's missing page-size cap on the *render*
+   path stays unowned — the indexer reads a bounded prefix (frontmatter is at the head of the file), which
+   is not the same fix and must not be mistaken for it. And the index carries D12's **refusals**, not just
+   its pages: an index of servable pages only would demote a refused route to a plain 404 and lose the
+   message naming every claimant §3 fought for.
+
+**[architect]** Blocks for §4, carved on that: **A = 4.1–4.2** (the snapshot type, the builder, the bulk
+history walk, the startup build and full rebuild) and **B = 4.3** (the stamp check, incremental
+re-index off `git diff`, and `WikiPage` reading the index). B is where the section stops being
+scaffolding, so A must not wire the read path and B must not leave a second one behind.
+
 ## NEXT
 
 **Resume point: §4 (Derived index), first block.** §3 is **closed** — supervisor `Approve` on round

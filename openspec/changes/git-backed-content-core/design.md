@@ -186,6 +186,64 @@ Two hardening requirements bind any implementation, because frontmatter is push-
 - **Deserialize into a constrained shape** — a fixed POCO or `Dictionary<string, object>` — never through a type-resolving deserializer that honours `!!` tags. Both mainstream .NET YAML libraries can instantiate arbitrary types from a document, which turns page content into a deserialization gadget.
 - **Bound the input before parsing it.** Cap the frontmatter block's size and nesting depth at the seam rather than trusting the library's defaults. Ordinary malformed YAML throws catchably and is handled; the two inputs that are *not* ordinary are an alias-expansion bomb (well-formed YAML that expands exponentially — strictness does not help) and nesting deep enough to overflow the stack. A `StackOverflowException` in .NET cannot be caught and kills the process, so it cannot be handled downstream at all: a single pushed page would crash the container on every read of it, permanently. The cap is what makes "failure is total" implementable rather than aspirational.
 
+### D15 — The index lives in process memory, stamped with the commit it was built from
+
+D6 said the index is "lightweight", "built from the repo" and "rebuildable from scratch", and left where
+it lives and how it stays true unanswered. **Product Owner decision: an in-memory snapshot stamped with
+the `HEAD` it was built from, and the page-serving path reads it.**
+
+**Nothing is persisted.** D8 would have permitted a SQLite table beside `identity.db` — outside the
+repository, so D6 stays honest — and it is rejected: it buys survival across restarts that a wiki this
+size does not need, and buys a second artifact that can be stale, corrupt, or out of step with `HEAD`.
+The hook could not write it in any case (`## NEXT` obligation 3: the runtime image has no HTTP client,
+and no reason to gain a SQLite one), so a persisted index would *still* need the app to refresh it — the
+freshness mechanism is required either way, at which point persistence adds a second source of truth for
+nothing. "Rebuildable from the repository alone" then stops being a property to maintain and becomes the
+only way the index can exist at all.
+
+**The stamp is what makes the index correct without §6 and §8.** The snapshot records the commit it was
+built from; serving a page verifies that stamp against the repository's current `HEAD` and refreshes when
+they differ. This covers every writer identically — a browser save (§6), an `updateInstead` push (§8), and
+an operator committing by hand on the volume — *including writers that never notify the app*, which is
+the case D6's "`post-receive` … trigger[s] incremental re-index" quietly assumed away. §6 and §8 may later
+push an update in as an optimisation; correctness never depends on their doing so, and an index that
+depended on being told would be wrong for the third writer no matter how carefully the first two were
+wired.
+
+*The check is `git rev-parse HEAD` — one subprocess per page view.* Considered and rejected: reading
+`.git/HEAD` and the ref file directly in C#, which spawns nothing — but a ref may be **packed**
+(`git gc` moves loose refs into `.git/packed-refs`), so that fast path is two code paths, and silently
+serves a stale wiki if the second is missed or subtly wrong. Serving stale content is the exact failure
+the stamp exists to prevent, so it does not get a hand-rolled ref reader. What this replaces is strictly
+more expensive: today every page view walks the **entire working tree** *and* spawns a `git log`
+(obligation 21).
+
+**A moved `HEAD` re-indexes what changed, not everything.** `git diff --name-status <stamped>..<current>`
+names the affected paths, and only those are re-read. A full rebuild is the fallback for a stamp git
+cannot resolve — no previous stamp, history rewritten, or a `reset --hard` behind the app's back — where
+it is both cheap and unconditionally correct. This is what gives 4.3 a real caller inside this change
+rather than an update method waiting for §6 to exist.
+
+**Last-edit on a full rebuild is one bulk history walk, not one `git log` per page.** A single
+`git log --name-status` pass takes the most recent commit touching each path. Per-page `git log` makes a
+rebuild scale with the number of pages *times a process spawn*; one walk scales with history and spawns
+once.
+
+**Indexing reads a bounded prefix of each file, never the whole file.** Frontmatter is at the head of a
+file by definition, so the indexer reads only enough bytes to contain a legal block (D14's cap) rather
+than reading a page whole to extract two fields. This deliberately does **not** discharge obligation 21's
+missing page-size cap on the *render* path, which still reads the file whole and still has no owner; §4
+does not widen to fix that, and nothing here should be read as having done so.
+
+**The index carries D12's refusals, not only its pages.** Ambiguous routes, sole claimants whose route
+does not identify them, and unreadable directories ride in the same snapshot. Serving from the index must
+not weaken what §3 established: an index holding only servable pages would silently demote a *refused*
+route to an ordinary 404, losing the message naming every file implicated.
+
+**The index is metadata only.** A page's body is still read from the working tree on the request that
+renders it, so the index can never serve stale *content* — only stale metadata, which is what the stamp
+governs.
+
 ## Risks / Trade-offs
 
 - **Dirty tree blocks all pushes** → Transactional save (`git checkout -- <file>` on commit failure, under lock) plus startup reconciliation (commit-as-recovered or discard) guarantee the tree returns to clean.

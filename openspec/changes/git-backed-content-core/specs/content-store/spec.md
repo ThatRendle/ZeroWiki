@@ -108,7 +108,7 @@ The system SHALL render Markdown with raw HTML disabled, so that inline and bloc
 
 ### Requirement: Derived index rebuildable from the repository
 
-The system SHALL maintain a lightweight index of pages (paths, titles, tags, and last-edit metadata) that is derived entirely from the repository, and SHALL be able to rebuild that index from the repository alone.
+The system SHALL maintain a lightweight index of pages (paths, titles, tags, and last-edit metadata) that is derived entirely from the repository, and SHALL be able to rebuild that index from the repository alone. The index SHALL record the commit it was built from, and the system SHALL serve page metadata from the index only while that commit is the repository's current commit — refreshing it otherwise, including when the commit was advanced by a writer that never notified the application.
 
 #### Scenario: Index rebuilt from repository
 
@@ -119,6 +119,21 @@ The system SHALL maintain a lightweight index of pages (paths, titles, tags, and
 
 - **WHEN** a file in the working tree is added, modified, or removed by any writer
 - **THEN** the system updates the index entries for the affected files
+
+#### Scenario: Content changed by an unannounced writer is still reflected
+
+- **WHEN** the repository's commit is advanced while the app is running by a writer that does not notify it — an incoming push updating the working tree, or a commit made directly on the volume — and a page is then requested
+- **THEN** the system serves that page's current content and metadata rather than metadata describing the superseded commit, without requiring a restart
+
+#### Scenario: Refused routes survive indexing
+
+- **WHEN** the index is built or refreshed over a working tree containing a route no file identifies uniquely
+- **THEN** that route is still refused, naming every file implicated, rather than being served or reported as a route no page claims
+
+#### Scenario: Index holds no content
+
+- **WHEN** a page's body is rendered
+- **THEN** the body is read from the working tree for that request rather than from the index, so no index entry can cause a superseded body to be served
 
 ### Requirement: Working-tree-clean invariant
 
