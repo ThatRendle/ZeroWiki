@@ -283,6 +283,34 @@ public sealed class ContentRepositoryServiceTests : IDisposable
     }
 
     [Fact]
+    public async Task DocsDeletedBetweenStarts_FailsToStartNamingThePathAndCommitsNothing()
+    {
+        // Not a foreign repository — this is one ZeroWiki itself created, whose docs/ an operator then
+        // deleted entirely (e.g. rm -rf docs) before the next restart. HEAD is born (the initial commit
+        // exists), so this reaches the same "already has history" branch a foreign repository does, and
+        // must refuse the same way. The alternative — falling through to reconciliation — would `git
+        // add -A` the deletion of every page and commit it as a D9 "recovered" change, permanently
+        // ratifying the accidental deletion into history rather than stopping it at the door.
+        var service = CreateService();
+        await service.EnsureRepositoryAsync();
+
+        var repositoryRoot = RepositoryRoot;
+        var commitCountBeforeDeletion = (await _git.RunOrThrowAsync(repositoryRoot, ["rev-list", "--count", "HEAD"])).StandardOutput.Trim();
+
+        Directory.Delete(Path.Combine(repositoryRoot, "docs"), recursive: true);
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() => service.EnsureRepositoryAsync());
+        Assert.Contains(Path.Combine(repositoryRoot, "docs"), exception.Message, StringComparison.Ordinal);
+
+        // The commit count must not have advanced — this is the assertion that actually matters here.
+        // Without it, the test would pass even if the deletion had been silently committed first.
+        Assert.Equal(
+            commitCountBeforeDeletion,
+            (await _git.RunOrThrowAsync(repositoryRoot, ["rev-list", "--count", "HEAD"])).StandardOutput.Trim());
+        Assert.False(Directory.Exists(Path.Combine(repositoryRoot, "docs")));
+    }
+
+    [Fact]
     public async Task NestedGitRepository_FailsToStartNamingThePathAndCommitsNothing()
     {
         var service = CreateService();
@@ -386,14 +414,38 @@ public sealed class ContentRepositoryServiceTests : IDisposable
             ["commit", "-m", "historical gitlink predating the guard"],
             GitAuthor.System.ToEnvironmentVariables());
 
-        var lsFilesBeforeRestart = await _git.RunOrThrowAsync(repositoryRoot, ["ls-files", "--stage"]);
-        Assert.Contains("160000", lsFilesBeforeRestart.StandardOutput, StringComparison.Ordinal);
+        var gitlinkShaBeforeAdvance = ExtractGitlinkSha(
+            (await _git.RunOrThrowAsync(repositoryRoot, ["ls-files", "--stage"])).StandardOutput);
+        Assert.NotNull(gitlinkShaBeforeAdvance);
 
-        // The restart must succeed rather than refuse — the gitlink is already in HEAD, not newly
-        // introduced by this call.
+        // Advance the nested repository's own HEAD before restarting — the normal way a submodule (or
+        // any legitimately adopted gitlink) changes over time. This is the shape the earlier version
+        // of this test never reached: it produces an M record (old mode 160000, new mode 160000, a
+        // changed SHA), not an A record or no record at all — and an M record's new mode is 160000 just
+        // as readily as an A record's, which is exactly what bricked startup before the guard required
+        // old mode to differ too.
+        await File.WriteAllTextAsync(Path.Combine(nestedPath, "another-note.md"), "# Another note\n");
+        await _git.RunOrThrowAsync(nestedPath, ["add", "another-note.md"]);
+        await _git.RunOrThrowAsync(
+            nestedPath,
+            ["commit", "-m", "nested repository advances its own HEAD"],
+            new Dictionary<string, string>
+            {
+                ["GIT_AUTHOR_NAME"] = "Inner",
+                ["GIT_AUTHOR_EMAIL"] = "inner@example.com",
+                ["GIT_COMMITTER_NAME"] = "Inner",
+                ["GIT_COMMITTER_EMAIL"] = "inner@example.com",
+            });
+
+        // The restart must succeed rather than refuse — the gitlink was already in HEAD, and its
+        // nested repository merely advancing is not this reconciliation introducing anything.
         await service.EnsureRepositoryAsync();
 
         await AssertPorcelainIsEmptyAsync(repositoryRoot);
+
+        var gitlinkShaAfterAdvance = ExtractGitlinkSha(
+            (await _git.RunOrThrowAsync(repositoryRoot, ["ls-files", "--stage"])).StandardOutput);
+        Assert.NotEqual(gitlinkShaBeforeAdvance, gitlinkShaAfterAdvance);
     }
 
     [Fact]
@@ -418,6 +470,138 @@ public sealed class ContentRepositoryServiceTests : IDisposable
         Assert.Equal("1", (await _git.RunOrThrowAsync(repositoryRoot, ["rev-list", "--count", "HEAD"])).StandardOutput.Trim());
     }
 
+    // Foreign repositories: ones ZeroWiki did not itself create. Every fixture above builds a
+    // repository ZeroWiki initialized on an earlier call, or a ZeroWiki-shaped one
+    // (RepositoryCreatedWithoutTheConfiguration_...). Adopting a repository built entirely outside
+    // ZeroWiki — someone else's history, someone else's layout — is a distinct code path
+    // (EnsureInitialCommitAsync's "already has history" branch) that none of those fixtures exercise,
+    // and it is where both remediation blockers lived.
+
+    [Fact]
+    public async Task ForeignRepositoryWithHistoryAndDocs_StartsSuccessfullyWithoutAddingACommit()
+    {
+        var repositoryRoot = RepositoryRoot;
+        await CreateForeignRepositoryAsync(repositoryRoot, withDocsDirectory: true);
+        var commitCountBefore = (await _git.RunOrThrowAsync(repositoryRoot, ["rev-list", "--count", "HEAD"])).StandardOutput.Trim();
+
+        var service = CreateService();
+        await service.EnsureRepositoryAsync();
+
+        Assert.Equal(commitCountBefore, (await _git.RunOrThrowAsync(repositoryRoot, ["rev-list", "--count", "HEAD"])).StandardOutput.Trim());
+        await AssertConfigurationIsAppliedAsync(repositoryRoot);
+        await AssertPorcelainIsEmptyAsync(repositoryRoot);
+        Assert.True(Directory.Exists(Path.Combine(repositoryRoot, "docs")));
+
+        var authorEmail = (await _git.RunOrThrowAsync(repositoryRoot, ["log", "-1", "--format=%ae"])).StandardOutput.Trim();
+        Assert.Equal("somebody@example.com", authorEmail);
+    }
+
+    [Fact]
+    public async Task ForeignRepositoryWithHistoryAndNoDocs_FailsToStartNamingWhatIsMissing()
+    {
+        var repositoryRoot = RepositoryRoot;
+        await CreateForeignRepositoryAsync(repositoryRoot, withDocsDirectory: false);
+
+        var service = CreateService();
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() => service.EnsureRepositoryAsync());
+        Assert.Contains(Path.Combine(repositoryRoot, "docs"), exception.Message, StringComparison.Ordinal);
+
+        // Nothing was created and nothing was committed — the repository is exactly as adopted.
+        Assert.False(Directory.Exists(Path.Combine(repositoryRoot, "docs")));
+        Assert.Equal("1", (await _git.RunOrThrowAsync(repositoryRoot, ["rev-list", "--count", "HEAD"])).StandardOutput.Trim());
+        await AssertPorcelainIsEmptyAsync(repositoryRoot);
+    }
+
+    [Fact]
+    public async Task ForeignRepositoryWithAPreExistingGitlink_StartsSuccessfullyAndSurvivesItAdvancing()
+    {
+        var repositoryRoot = RepositoryRoot;
+        await CreateForeignRepositoryAsync(repositoryRoot, withDocsDirectory: true);
+
+        var nestedPath = Path.Combine(repositoryRoot, "docs", "vendored-vault");
+        await CreateNestedGitRepositoryDirectoryAsync(nestedPath);
+        await _git.RunOrThrowAsync(repositoryRoot, ["add", "-A"]);
+        await _git.RunOrThrowAsync(
+            repositoryRoot,
+            ["commit", "-m", "a gitlink somebody else added"],
+            new Dictionary<string, string>
+            {
+                ["GIT_AUTHOR_NAME"] = "Somebody Else",
+                ["GIT_AUTHOR_EMAIL"] = "somebody@example.com",
+                ["GIT_COMMITTER_NAME"] = "Somebody Else",
+                ["GIT_COMMITTER_EMAIL"] = "somebody@example.com",
+            });
+
+        var lsFilesBefore = await _git.RunOrThrowAsync(repositoryRoot, ["ls-files", "--stage"]);
+        Assert.Contains("160000", lsFilesBefore.StandardOutput, StringComparison.Ordinal);
+        var gitlinkShaBeforeAdvance = ExtractGitlinkSha(lsFilesBefore.StandardOutput);
+
+        // First-ever start over a genuinely foreign repository (never touched by this service before)
+        // must succeed — the static case.
+        var service = CreateService();
+        await service.EnsureRepositoryAsync();
+        await AssertPorcelainIsEmptyAsync(repositoryRoot);
+
+        // Advance the nested repository, then restart again — the M-record case, on a repository
+        // ZeroWiki never initialized itself, which is exactly the combination the remediation covers.
+        await File.WriteAllTextAsync(Path.Combine(nestedPath, "another-note.md"), "# Another note\n");
+        await _git.RunOrThrowAsync(nestedPath, ["add", "another-note.md"]);
+        await _git.RunOrThrowAsync(
+            nestedPath,
+            ["commit", "-m", "nested repository advances"],
+            new Dictionary<string, string>
+            {
+                ["GIT_AUTHOR_NAME"] = "Inner",
+                ["GIT_AUTHOR_EMAIL"] = "inner@example.com",
+                ["GIT_COMMITTER_NAME"] = "Inner",
+                ["GIT_COMMITTER_EMAIL"] = "inner@example.com",
+            });
+
+        await service.EnsureRepositoryAsync();
+        await AssertPorcelainIsEmptyAsync(repositoryRoot);
+
+        var gitlinkShaAfterAdvance = ExtractGitlinkSha(
+            (await _git.RunOrThrowAsync(repositoryRoot, ["ls-files", "--stage"])).StandardOutput);
+        Assert.NotEqual(gitlinkShaBeforeAdvance, gitlinkShaAfterAdvance);
+    }
+
+    /// <summary>
+    /// Builds a repository entirely outside <see cref="ContentRepositoryService"/> — its own
+    /// initialization, its own author, its own layout — standing in for one adopted from elsewhere
+    /// rather than one this service created on an earlier call.
+    /// </summary>
+    private async Task CreateForeignRepositoryAsync(string repositoryRoot, bool withDocsDirectory)
+    {
+        Directory.CreateDirectory(repositoryRoot);
+        await _git.RunOrThrowAsync(repositoryRoot, ["init", "-b", "main"]);
+
+        if (withDocsDirectory)
+        {
+            Directory.CreateDirectory(Path.Combine(repositoryRoot, "docs"));
+            await File.WriteAllTextAsync(Path.Combine(repositoryRoot, "docs", "existing-page.md"), "# Existing\n");
+            await _git.RunOrThrowAsync(repositoryRoot, ["add", "docs/existing-page.md"]);
+        }
+        else
+        {
+            // Content lives outside docs/ entirely — a foreign repository has no reason to know
+            // ZeroWiki's layout convention.
+            await File.WriteAllTextAsync(Path.Combine(repositoryRoot, "README.md"), "# Somebody else's repository\n");
+            await _git.RunOrThrowAsync(repositoryRoot, ["add", "README.md"]);
+        }
+
+        await _git.RunOrThrowAsync(
+            repositoryRoot,
+            ["commit", "-m", "a commit ZeroWiki did not make"],
+            new Dictionary<string, string>
+            {
+                ["GIT_AUTHOR_NAME"] = "Somebody Else",
+                ["GIT_AUTHOR_EMAIL"] = "somebody@example.com",
+                ["GIT_COMMITTER_NAME"] = "Somebody Else",
+                ["GIT_COMMITTER_EMAIL"] = "somebody@example.com",
+            });
+    }
+
     private async Task CreateNestedGitRepositoryDirectoryAsync(string nestedPath)
     {
         Directory.CreateDirectory(nestedPath);
@@ -434,6 +618,20 @@ public sealed class ContentRepositoryServiceTests : IDisposable
                 ["GIT_COMMITTER_NAME"] = "Inner",
                 ["GIT_COMMITTER_EMAIL"] = "inner@example.com",
             });
+    }
+
+    /// <summary>Extracts the object SHA of the (single) <c>160000</c> gitlink entry in <c>ls-files --stage</c> output.</summary>
+    private static string? ExtractGitlinkSha(string lsFilesStageOutput)
+    {
+        foreach (var line in lsFilesStageOutput.Split('\n', StringSplitOptions.RemoveEmptyEntries))
+        {
+            if (line.StartsWith("160000 ", StringComparison.Ordinal))
+            {
+                return line.Split(' ')[1];
+            }
+        }
+
+        return null;
     }
 
     private string RepositoryRoot => Path.Combine(_dataRoot, "wiki");

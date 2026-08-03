@@ -14,6 +14,11 @@ The system SHALL treat the mounted content volume as a non-bare git repository w
 - **WHEN** the app starts and the content volume contains no git repository
 - **THEN** the system initializes a new non-bare git repository with a `docs/` directory and an initial commit
 
+#### Scenario: Repository with history but no working tree is refused
+
+- **WHEN** the app starts and the content volume contains a non-bare git repository with commit history (whether adopted from elsewhere or created by a previous start) but no `docs/` directory
+- **THEN** the system refuses to start, naming the missing `docs/` directory, rather than creating one, committing into the repository, or recording the missing directory as a recovered change
+
 #### Scenario: Authorship comes from git
 
 - **WHEN** the system reports who authored or last edited a page

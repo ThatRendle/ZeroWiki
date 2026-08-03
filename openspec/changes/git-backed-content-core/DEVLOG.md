@@ -3872,6 +3872,427 @@ diff before committing.
 
 → @architect
 
+**[supervisor]** Section review of **§2 (Repository bootstrap & invariant)** over `7b50e46..HEAD`
+(`ef2b75b` = 2.1–2.2, `6b82c33` = 2.3–2.5). Working tree clean; `git status --short -- src` empty, so
+no mutation residue, tracked or untracked. Gates taken from the Architect's record, not re-run.
+
+## Verdict: **Request changes** — two blockers
+
+Both live on the same branch of `EnsureRepositoryAsync`: the path that **adopts a repository ZeroWiki
+did not create**. Block 1 built that branch, block 2 hung two guards off it, and neither block's
+review had reason to look at the pair. It is also the only branch in the section with **no test
+fixture of its own** — every "existing repository" test in `ContentRepositoryServiceTests.cs` builds a
+repository that ZeroWiki itself made on a previous start, or a ZeroWiki-shaped one
+(`RepositoryCreatedWithoutTheConfiguration_…:64` inits, creates `docs/`, writes `docs/.gitkeep`,
+commits). There is no fixture for a *foreign* repository — someone else's history, someone else's
+layout. Both blockers are in the gap that leaves.
+
+### Blocker 1 — the gitlink guard bricks startup on a gitlink it did not introduce, which is the exact outcome the Product Owner ruled out of scope
+
+`ContentRepositoryService.cs:377` — `FindStagedGitlinksAsync` matches on `newMode` alone:
+
+```csharp
+if (newMode == "160000")
+{
+    gitlinkPaths.Add(path);
+}
+```
+
+The `<remarks>` at `:321-335`, the fix-round ruling above (§"the question the guard must ask is *would
+committing now introduce a gitlink not already in HEAD*"), and the test comment at
+`ContentRepositoryServiceTests.cs:370-373` all state the intended question as a **delta**. Moving from
+`ls-files --stage` to `diff --cached --raw` fixed the *census* half of that. It did not fix the other
+half: a gitlink already in `HEAD` whose nested repository advances its own `HEAD` produces a `M`
+record, and a `M` record's `newMode` is `160000` too. Nothing is introduced, and the guard fires
+anyway.
+
+**Verified by counterfactual, not by reading.** Built the fixture the section lacks — a repository
+carrying a gitlink in `HEAD`, whose nested repository then commits — and ran the exact sequence
+`ReconcileWorkingTreeAsync` runs (`git add -A` then `git diff --cached --raw -z`):
+
+```
+:160000 160000 7372c60 02388ca M\0docs/vault\0
+```
+
+then fed those bytes through a verbatim transcription of `FindStagedGitlinksAsync:355-381`:
+
+```
+fields   : [":160000 160000 7372c60 02388ca M","docs/vault"]
+gitlinks : ["docs/vault"]
+=> guard fires, EnsureRepositoryAsync throws
+```
+
+`oldMode` is `160000` — the entry was already in `HEAD` — and startup refuses regardless.
+
+**Why this matters rather than being a curiosity.** The reachable case is an adopted repository that
+legitimately contains a **submodule** (or a gitlink from any pre-guard means — the case
+`RepositoryWhoseHeadAlreadyContainsAGitlink_StartsSuccessfully` exists to protect). First start
+succeeds, because the submodule is unchanged. Then the submodule's commit pointer moves — which for a
+live vault or a vendored dependency is the *normal* thing for it to do — and the wiki stops starting,
+permanently, with a message (`BuildGitlinkErrorMessage:390-398`) instructing the operator to *"remove
+the nested `.git`"*. For a legitimate submodule that advice is destructive, and the wiki cannot be
+started until it is followed. This is the bricking the ruling at the top of the second fix round set
+out to prevent, arriving through the one status the fixture never exercised.
+
+The existing test passes only because it never advances the nested repository's `HEAD` before the
+restart (`ContentRepositoryServiceTests.cs:388-394`).
+
+*Slipped block review.* Diff-local review could have caught it in principle; recording that it did
+not, because the fixture and the guard were reviewed together and agreed with each other.
+
+### Blocker 2 — the adopt path never establishes `docs/`, which is what 2.1 claims to deliver
+
+`EnsureInitialCommitAsync:214-223` returns early whenever `HEAD` is born, and
+`Directory.CreateDirectory(_paths.WorkingTree)` at `:225` sits *after* that early return. So for any
+adopted repository with history and no `docs/`, `EnsureRepositoryAsync` runs to completion — classify,
+assert-resolves-root, config, hooks, no initial commit, nothing to reconcile, `status --porcelain`
+empty, assert-clean passes — and `<DataRoot>/wiki/docs` **does not exist**. Reproduced end to end; every
+check in the section reports success.
+
+Block 1's binding decision 8 ("`docs/` must exist in a fresh clone") was wired only to the init path,
+and nothing revisited it. Task 2.1 reads *"detect an existing non-bare git repo on the volume; **serve
+from its `docs/` working tree**"* — the box is ticked and the second clause has no implementation and
+no test behind it. The spec scenario *Repository present on startup* is satisfied only for the
+repository ZeroWiki itself created; the requirement's "without requiring any additional configuration"
+is not met for an adopted one, where the operator must know to create `docs/` by hand.
+
+❓ **@architect** — what *should* the adopt path do? Three shapes, and this is a product call rather
+than a mis-implementation: (a) create `docs/` when absent, leaving it untracked-and-empty (the tree
+stays clean — an empty directory stages nothing — so the invariant is unaffected, and §3 gets the
+precondition it will otherwise have to invent); (b) refuse to start naming the path, matching this
+section's own bare-repo and gitlink precedent; (c) declare it §3's problem and have `3.1` treat an
+absent working tree as zero pages. (c) is defensible, but then 2.1's second clause should stop
+claiming it. Whichever is chosen, §2 owns saying so — leaving §3 to discover an unstated precondition
+is how the next section drifts.
+
+## Suggested remediation shape — one fix block
+
+1. `ContentRepositoryService.cs:377` — narrow the guard to gitlinks actually being **introduced**:
+   also require the record's `oldMode` (`metadataParts[0]`) to be something other than `160000`. Verified
+   this keeps every real detection: a brand-new nested repository comes back `:000000 160000 … A`, and
+   a tracked plain directory that later gains a `.git` produces no diff entry at all (git leaves its
+   files tracked — confirmed by reproduction, so nothing is lost there either).
+2. Extend `RepositoryWhoseHeadAlreadyContainsAGitlink_StartsSuccessfully` (`:368`) to commit once
+   *inside* the nested repository before the restart. That is the assertion the section is missing;
+   today it fails, and it is what pins the scope boundary the Product Owner drew.
+3. Whatever @architect decides for Blocker 2, plus a fixture for it.
+4. Add the missing fixture class generally: **a repository ZeroWiki did not create** — foreign
+   history, no `docs/`, arbitrary layout — and run bootstrap over it. Both blockers, and the
+   `core.hooksPath` question below, all sit in that one blind spot.
+
+No `N.M` numbers, nothing to tick.
+
+## Things checked that came back clean — recorded so they are not re-litigated
+
+- **`EnsureRepositoryAsync`'s ordering is a coherent sequence, not an accreted one.** classify →
+  assert-resolves-root → config → hooks → initial commit → reconcile → assert-clean; each step is
+  where it is for the reason given, including the two moved by fix rounds. The one placement that
+  could have been accidental is hooks landing between config and the initial commit. It is correct,
+  and for a reason stronger than the docstring claims: `git rev-parse --git-path hooks` also honours
+  **`core.hooksPath`** — verified by execution (`git config core.hooksPath /somewhere/else/hooks` →
+  `rev-parse --git-path hooks` returns `/somewhere/else/hooks`) — so the installer writes to wherever
+  git will actually *run* hooks from, not merely to the right place for a gitfile layout. That matters
+  for §5.3: had it hardcoded `.git/hooks`, an adopted repo with `core.hooksPath` set would silently
+  never take the write lock. Worth adding to the `<remarks>` at `GitHookInstaller.cs:12-17`, since
+  §5.3 will rely on it.
+- **No duplicated abstraction.** `GitProcessRunner`/`GitProcessResult`/`GitProcessException`/
+  `GitAuthor`/`GitHookInstaller`/`ContentPaths` are each one thing. `ResolveContentPaths` vs the DI
+  `ContentPaths` singleton is two accessors onto one type for a documented pre-`Build()` reason
+  (`ContentStorageStartupExtensions.cs:46-53`), not a second derivation of the data root. Nothing here
+  anticipates §5/§6/§7 beyond the runner the brief explicitly authorised.
+- **Dead scaffolding: only the no-op hook bodies**, which are a recorded Product Owner decision, are
+  rewritten every start, and say so in their own headers. That is the whole speculative surface.
+- **Render mode / access control / DI**: no routes, pages or components added, so nothing to erode;
+  three singletons, one registration site, no overlap.
+- **2.5 delivers what this section can deliver.** The spec says "at all times"; the shipped startup
+  assertion establishes the invariant at the only moment §2 controls, and after it nothing in this
+  section writes to the tree. "At all times" is genuinely §5.1–5.3 (the lock) and §6.5 (transactional
+  save), with §10.2 as its integrated test. Recording that mapping so §7/§8 do not re-open the
+  no-HTTP-surface decision: the requirement is not under-delivered here, it is delivered in three
+  places and this is the first.
+
+## Mutation scoping — right, and the section's evidence has a shape worth naming
+
+Scoping block 1 out was correct: bootstrap classification is not auth, concurrency or data integrity
+in CLAUDE.md's sense, and the bare-repo refusal is asserted directly by its own test. Scoping block 2
+in for exactly two mutants was also correct — `add -A` → `add -u` is precisely D9's data-integrity
+property, and the depth mutant tests the guard's *coverage* rather than its presence. Stopping at two
+was right; a third would have been the tautological kind.
+
+But note what the section's own history says. Every defect §2 actually produced — the index-census
+brief, `core.quotePath`, and now Blocker 1 — was a gap in **what the condition asks**, and every one
+was invisible to mutation, which measures only how faithfully the shipped condition runs. Mutation
+testing was pointed at the right paths and told the truth about them; it is simply not the instrument
+for this failure mode. The instrument that finds these is **adversarial fixtures** — and both of my
+blockers come from the one fixture class this section never built. That is the transferable lesson for
+§5–§7, which will be far more mutation-heavy: budget fixture diversity alongside mutants, not instead
+of them.
+
+## For `## NEXT` (not the fix block)
+
+- **`GitAuthor.cs:13-15`** still describes startup reconciliation as something that happens "later" —
+  true when block 1 wrote it, superseded by block 2. Comment-only; roll into any later touch.
+- **§5.1's lockfile must not live under `ContentPaths.RepositoryRoot`.** `ReconcileWorkingTreeAsync`
+  runs `git add -A` from the repository root, so anything the app writes inside `/data/wiki` becomes
+  content on the next restart. Same class of hazard as D8's `keys/` reasoning; worth deriving the path
+  so it cannot be configured inside the repo.
+- **Obligations 7 and 8 (subprocess kill on cancel, §6; raw argv in `GitProcessException`, §7)** —
+  parking was the right call. Both are genuinely inert here (`CancellationToken.None`, no secrets in
+  bootstrap's argv), both are owed by a named section, and fixing either here would have been the
+  scope creep this review exists to catch. Confirmed inert, not re-raised.
+- **`tasks.md:70`** still records 11.1's superseded pattern (`[A-Za-z0-9._-]{0,126}`) rather than
+  D11's consecutive-dot form; `CredentialPolicy.UsernamePattern` in `src/` is correct. §11 is closed —
+  this is a durable-record fix for whoever next touches `tasks.md`, not a re-opening.
+- **`## NEXT` below still reads "Resume point: §2 … first block"** — stale; §2's blocks have both
+  landed.
+
+Two rounds available; this is round one. → `@architect`
+
+**[architect]** Ruling on the §2 supervisor review. **Request changes upheld on both blockers.**
+Carving one remediation block — no new `N.M` numbers, nothing ticked, every box in the section is
+already ticked.
+
+**The finding behind the finding, which is the part worth keeping.** Both blockers sit on the same
+branch: the path that **adopts a repository ZeroWiki did not create**. Block 1 built that branch, block
+2 hung two guards off it, and it is the only branch in §2 with no fixture of its own — every "existing
+repository" test builds a repository ZeroWiki itself made, or a ZeroWiki-shaped one. Neither block
+review had any reason to look at the pair, which is precisely the lens the section review exists for.
+This is the third time in this change that the blind spot was the **fixture** rather than the effort
+(§11's service-model differential, §2's `Path.GetTempPath()` roots, now the foreign repository), and
+the first time it has been visible as a *pattern* rather than an incident.
+
+**Blocker 1 — the gitlink guard bricks on a gitlink it did not introduce.** `ContentRepositoryService`
+matches `newMode` alone. Moving from `ls-files --stage` to `diff --cached --raw` fixed the *census*
+half of the question, but an `M` record — an existing gitlink whose nested HEAD merely advanced — also
+carries `newMode == 160000`. An adopted repository with a legitimate submodule starts fine, then never
+starts again once that submodule's pointer moves, telling the operator to delete a `.git` they need.
+That is the same bricking the Product Owner ruled out of scope, arriving through a different door. The
+supervisor verified it by counterfactual: built the missing fixture, ran the real `add -A` +
+`diff --cached --raw -z`, and fed the actual bytes (`:160000 160000 … M\0docs/vault\0`) through a
+transcription of the parser. The shipped test passes only because it never advances the nested HEAD.
+
+**Blocker 2 — the adopt path never establishes `docs/`, and it was a product call.**
+`EnsureInitialCommitAsync` returns early on a born HEAD, and `Directory.CreateDirectory(WorkingTree)`
+sits *after* that return, so an adopted repository with history and no `docs/` completes bootstrap with
+every check green and no working tree. Task 2.1's "serve from its `docs/` working tree" has no
+implementation and no test. Put to the Product Owner rather than patched.
+
+**Product Owner decision: refuse to start, naming what is missing.** ZeroWiki never writes into a
+repository it did not create, and §2 now has one consistent posture across all three foreign-repository
+faults — bare repo, gitlink, missing `docs/` — which is worth more than three separately-reasonable
+behaviours.
+
+**[architect]** Recorded as clean by the supervisor and not to be re-litigated: the seven-step ordering
+of `EnsureRepositoryAsync` is coherent rather than accreted; no duplicated abstraction; the no-op hook
+bodies are the only speculative surface; and `git rev-parse --git-path hooks` honours `core.hooksPath`
+(verified by execution), which makes the hook installer correct in a way **stronger than its docstring
+claims** and matters directly to §5.3's lock. 2.5 delivers what §2 can — "at all times" is genuinely
+owed by §5.1–5.3, §6.5 and §10.2, not shirked here.
+
+**[architect]** On the evidence standard, since three independent agents have now converged on it.
+Mutation scoping was right — block 1 out, block 2 in for exactly two mutants, stop at two. But **every
+defect this section actually produced** (the index census, `core.quotePath`, and now blocker 1) was a
+gap in *what the condition asks*, which mutation structurally cannot see; and both supervisor blockers
+came from the single fixture class the section never built. Mutation measures fidelity of a condition
+to its intent; it is silent on whether the intent is the right question. **For §5–§7, budget fixture
+diversity alongside mutants** — the cheaper instrument here is a fixture nobody thought to build, not a
+third mutant.
+
+**[architect]** → `@worker`: remediation block for §2.
+
+1. **Blocker 1** — require `oldMode != "160000"` so the guard fires only on a gitlink this
+   reconciliation *introduced*, matching what its docstring, my ruling and the test comment all already
+   claim. Confirm the change preserves every existing detection.
+2. **Blocker 1's test has no teeth** — `RepositoryWhoseHeadAlreadyContainsAGitlink_StartsSuccessfully`
+   passes only because it never advances the nested HEAD. Extend it to commit inside the nested
+   repository before restarting.
+3. **Blocker 2** — on the adopt path, refuse to start when `docs/` is absent, naming it and saying what
+   to do. Do not create it, do not commit into a repository ZeroWiki did not create.
+4. **Build the missing fixture class** — foreign repositories, ones ZeroWiki did not create. Both
+   blockers existed because it does not exist. This is the deliverable, not a side effect of the two
+   fixes.
+5. **Gate blocker 2 on spec** — a scenario under *Git repository is the source of truth* in
+   `specs/content-store/spec.md`, plus a line in `design.md` recording the decision and the
+   one-posture-for-three-faults reasoning.
+6. **No mutation testing in this remediation block.** Two mutants have run in §2 and both were sound;
+   neither of these defects was reachable by one, and a third would measure fidelity to an intent that
+   was itself the thing at fault. The fixture in item 4 is the instrument that would have caught both.
+
+**[worker]** Remediation block for §2 — all six items addressed. No new `N.M` numbers, nothing ticked.
+
+1. **Blocker 1 fixed — `FindStagedGitlinksAsync` now requires `oldMode != "160000"` in addition to
+   `newMode == "160000"`.** An `M` record for a gitlink whose nested `HEAD` merely advanced has
+   `oldMode == newMode == "160000"`, so it no longer fires; a genuinely introduced gitlink (`A` record,
+   `oldMode == "000000"`, or a previously tracked path replaced by one) still does. Rewrote the
+   docstring and `<remarks>` to state this as the actual condition rather than "new mode alone,"
+   matching what the ruling, the earlier fix-round text, and the test comment already claimed the
+   guard did. Confirmed every existing detection still fires: all three original gitlink tests (plain
+   nested directory, gitfile form, three-levels-deep) and the café-vault non-ASCII test pass unchanged.
+2. **Blocker 1's test now has teeth.**
+   `RepositoryWhoseHeadAlreadyContainsAGitlink_StartsSuccessfully` extended to commit inside the nested
+   repository *before* the restart — the SHA the gitlink entry points at is captured before and after,
+   and the test now asserts it actually changed, so the restart genuinely exercises the `M`-record path
+   the earlier version of the test never reached (it only ever produced "no diff record at all," since
+   the nested repository was never touched between the two `EnsureRepositoryAsync` calls).
+3. **Blocker 2 fixed — `EnsureInitialCommitAsync`'s "already has history" branch now refuses to start
+   when `ContentPaths.WorkingTree` is absent**, via a new `MissingWorkingTreeException(repositoryRoot)`
+   naming the missing path and saying what to do (create `docs/`, empty is fine, and restart). Does
+   **not** create the directory and does **not** commit — the check runs and throws before
+   `ReconcileWorkingTreeAsync` (and therefore before any `git add -A`) ever touches the adopted
+   repository. Added an XML doc summary to `EnsureInitialCommitAsync` stating both of its jobs (create
+   `docs/` and commit on a fresh repo; refuse rather than create on an adopted one).
+4. **The missing fixture class, built as the deliverable it is** — `CreateForeignRepositoryAsync(repositoryRoot,
+   withDocsDirectory)` constructs a repository entirely outside `ContentRepositoryService` (its own
+   `git init`, its own author `Somebody Else <somebody@example.com>`, its own layout: `docs/` with a
+   real page, or a bare `README.md` with no `docs/` at all), never touched by the service before the
+   test's own `EnsureRepositoryAsync()` call. Three new tests over it:
+   - `ForeignRepositoryWithHistoryAndDocs_StartsSuccessfullyWithoutAddingACommit` — commit count
+     unchanged, configuration applied, porcelain empty, foreign author untouched on the existing commit.
+   - `ForeignRepositoryWithHistoryAndNoDocs_FailsToStartNamingWhatIsMissing` — throws naming the full
+     `docs/` path; asserts `docs/` was never created and no commit was added.
+   - `ForeignRepositoryWithAPreExistingGitlink_StartsSuccessfullyAndSurvivesItAdvancing` — a foreign
+     repository that already carries a gitlink (added by "somebody else", not via this app) starts
+     successfully on its very first-ever `EnsureRepositoryAsync()` call (the static case), then the
+     nested repository's own `HEAD` is advanced and a second call also succeeds (the advancing case) —
+     the SHA change is asserted directly, same as item 2. This is the combination — foreign *and*
+     gitlinked *and* advancing — neither blocker's original fixtures reached at once.
+5. **Spec + design gated.** New scenario *Adopted repository with history but no working tree is
+   refused* under *Git repository is the source of truth* in `specs/content-store/spec.md`. Two D9
+   addenda in `design.md`: corrected the existing gitlink addendum to state the introduced-vs-advancing
+   distinction explicitly (naming the earlier new-mode-only implementation as the defect), and a new
+   addendum recording the `docs/`-missing decision plus the one-posture-for-three-faults reasoning
+   (bare repo, gitlink-would-be-introduced, missing `docs/` — one behaviour: refuse loudly, name what's
+   wrong, never write into a repository ZeroWiki did not create). `openspec validate
+   git-backed-content-core --strict` still passes.
+6. **No mutation testing run**, per the ruling — both defects were gaps in what the condition asked,
+   not in how faithfully it ran, and the fixture class in item 4 is the instrument that actually would
+   have caught them.
+
+**Gates:** `dotnet build` 0 warnings/0 errors · `dotnet test` **504/504** full unfiltered (501 + 3 net
+new — the two extended tests aren't new files, only the three foreign-repository tests are) ·
+`dotnet format --verify-no-changes` clean · `openspec validate git-backed-content-core --strict`
+valid. `git status --short -- src tests` / `git diff --stat -- src tests` reviewed: only
+`ContentRepositoryService.cs` and `ContentRepositoryServiceTests.cs` changed in `src`/`tests` — no new
+files, no touch to `GitHookInstaller.cs`/`ContentStorageStartupExtensions.cs`, matching the
+remediation's actual scope. Not committed, nothing ticked.
+
+→ @reviewer
+
+**[reviewer]** §2 remediation block — **Approve, with one nit.** Both supervisor blockers are
+genuinely fixed, each verified by producing the counterfactual, not by reading the diff.
+
+**Point 3 first, since it's the load-bearing check.** Reverted `FindStagedGitlinksAsync`'s condition
+to the pre-fix `newMode == "160000"` alone (checksummed before/after, restored via the saved copy) and
+ran `RepositoryWhoseHeadAlreadyContainsAGitlink_StartsSuccessfully` and
+`ForeignRepositoryWithAPreExistingGitlink_StartsSuccessfullyAndSurvivesItAdvancing` against it: **both
+fail**, both throwing `BuildGitlinkErrorMessage`'s exact text on the restart call that's supposed to
+succeed. The extended tests have real teeth — they are not passing for an unrelated reason.
+
+**Point 2 — no loss of genuine detection, and I went one step further than the four fixtures.** All 19
+tests in `ContentRepositoryServiceTests` pass together (plain nested directory, gitfile form,
+three-levels-deep, café-vault, plus the three new foreign-repository tests). I also checked the one
+case the fix's own reasoning doesn't fully close on its face: can a genuinely *different* nested
+repository ever present with `oldMode == "160000"` by masquerading as a rename? Reproduced directly —
+renaming an *already-adopted* gitlink to a new path produces a single `R100` record (`oldMode 160000,
+newMode 160000, same SHA`), correctly let through since nothing new is introduced. But deleting that
+gitlink and placing an **unrelated** nested repository (different commit history) at a new path does
+**not** get treated as a rename at all — git reports it as separate `D`/`A` records
+(`:160000 000000 … D` / `:000000 160000 … A`), and the `A` record's `oldMode` is `000000`, still caught.
+There is no way to introduce new, unrecoverable content past this guard by disguising it as a rename.
+
+**Point 4 — the fixture is genuinely foreign.** `CreateForeignRepositoryAsync` never calls
+`CreateService()` or any `ContentRepositoryService` method to build the repository — its own `git
+init`, its own author (`Somebody Else <somebody@example.com>`, distinct from `GitAuthor.System`), its
+own layout choice (a `docs/` with a real page, or a bare `README.md` with no `docs/` at all). It shares
+only `GitProcessRunner` — a generic subprocess wrapper with no ZeroWiki-specific construction logic —
+which is the shared plumbing every fixture in this file uses, not the blind spot being closed.
+
+**Point 1 — the mismatch is real, but it's in the OpenSpec wording, not in the code, and the code's
+own behaviour is the safer answer.** Reproduced the case you flagged directly: built a repository with
+`CreateService()`, let it initialize normally, then deleted its entire `docs/` directory (not a file —
+the directory) and restarted. It refuses, naming the path, exactly as an adopted repository would — no
+existing test covers this, and none of the three new fixtures do either (all build genuinely foreign
+repositories, not a ZeroWiki-created one with `docs/` later removed).
+
+Is this the right behaviour? Yes, and D9 is not actually in tension with it. The alternative — falling
+through to `ReconcileWorkingTreeAsync` when the whole working tree is missing — would run `git add -A`
+over an empty tree, see every previously-tracked page as a deletion, and commit **all of them** as a
+single "recovery" commit per D9's always-commit rule. That is technically reversible (`git revert`,
+consistent with D9's own asymmetry), but it means an operator's `rm -rf docs` — a mistake, not an edit
+— gets silently *ratified into history* on the next restart rather than stopped at the door. A wiped
+working tree is a different, more severe class of anomaly than "some tracked files are dirty inside an
+existing `docs/`," and refusing rather than reconciling is consistent with this section's whole
+posture (bare repo, gitlink) — not a carve-out from it.
+
+So the fix belongs in the wording, not the code, and only in the **OpenSpec artifacts** —
+`ContentRepositoryService.cs`'s own XML doc on `EnsureInitialCommitAsync` already says it correctly
+("a repository that already has history — one this call did not create, **whether a previous start of
+this app or a repository adopted from elsewhere**"). It's `specs/content-store/spec.md`'s scenario
+title (*"Adopted repository with history but no working tree is refused"*) and `design.md`'s addendum
+heading (*"an adopted repository with no `docs/` is refused"*) that narrow the claim to adoption alone
+without saying so applies equally to a ZeroWiki-created repository whose `docs/` is later removed.
+Nit, not a blocker — nothing is unsafe and no test is wrong, but this is the same claim-vs-mechanism
+shape this section has now produced four times, and it's cheap to close: widen the spec scenario's WHEN
+to "a non-bare git repository with commit history but no `docs/` directory" (drop "adopted" from the
+condition, keep it as the motivating example) and add a clause to the design.md addendum naming the
+own-repository-with-docs-later-deleted case explicitly, so a future reader doesn't need to rediscover it
+by reproduction the way this review just did.
+
+**Confirmed independently:** `dotnet test --filter "FullyQualifiedName~ContentRepositoryServiceTests"`
+19/19; `openspec validate git-backed-content-core --strict` valid; `dotnet format --verify-no-changes`
+clean; `dotnet build` 0/0; `git status --short -- src tests` / `git diff --stat -- src tests` show only
+`ContentRepositoryService.cs` and `ContentRepositoryServiceTests.cs`, no residue from any of my scratch
+reproductions (all removed and checksum-verified restored before this post).
+
+No mutation this round, per the ruling — agreed with the reasoning: neither blocker was a fidelity gap
+a mutant could have found, both were gaps in what the guard asked, and the foreign-repository fixture
+class is the instrument that actually closes them.
+
+**§2 remediation is clear to commit.**
+
+→ @architect
+
+**[architect]** Remediation block audited: `@reviewer` **Approve**, verified by counterfactual rather
+than by reading — it reverted `FindStagedGitlinksAsync` to the pre-fix `newMode`-only condition and
+confirmed both extended tests genuinely *fail* against it. It also went past the four fixtures I asked
+for and established that `oldMode != "160000"` opens no hole: renaming an already-adopted gitlink
+yields one `R100` record, correctly let through, while swapping in an *unrelated* nested repository is
+not treated as a rename at all — git splits it into `D`/`A` records and the `A` record's `oldMode` is
+`000000`, still caught.
+
+**[architect]** The reviewer's nit, closed before commit rather than deferred. The `docs/`-missing
+guard is specified for the adopt path but lives in a branch **every** born-`HEAD` repository reaches,
+so a ZeroWiki-created wiki whose `docs/` is deleted (`rm -rf docs`) is refused too. Reviewer reproduced
+it and judged the behaviour right; I agree, and the reason is worth stating because it is not obvious:
+falling through to reconciliation would `git add -A` the deletion of every page and commit it as a D9
+recovery commit, ratifying an operator's mistake into permanent history. A wholly missing working tree
+is a different and more severe class than "some tracked files are dirty", so this is not in tension
+with D9 — it is what D9's posture requires once the thing gone missing is the tree itself. The spec
+scenario and the design addendum were narrowed to "adopted repository" while the code was universal;
+both are now widened, the reasoning is recorded in `design.md`, and
+`DocsDeletedBetweenStarts_FailsToStartNamingThePathAndCommitsNothing` covers the case nobody had a test
+for. Its load-bearing assertion is the **commit count**, not the refusal: without it the test passes
+even if the deletion were silently committed first.
+
+That is the fifth claim-versus-mechanism mismatch in this section (unborn-`HEAD` comment, index-census
+docstring, blocker 1's "delta" wording, `EnsureInitialCommitAsync`'s early return, this one). Every one
+had defensible code and a wrong stated reason. **The standing rule earned here: when a guard's
+justification names a *case*, check the guard's *branch* — the branch is what ships.**
+
+**[architect]** Two process notes, recorded because the tree state was not self-evident.
+
+- **The worker was killed mid-run** by an API error, after the file edits and before its DEVLOG post.
+  An interrupted agent is this project's named hazard, so the tree was verified by hand rather than
+  assumed: all three items landed complete, no untracked files under `src`/`tests`, scope limited to
+  the two source files plus the two OpenSpec artifacts. Its DEVLOG post is missing and this entry
+  stands in for it.
+- **An anomalous gate run took 13m51s** against ~90s for the same suite, which was investigated rather
+  than waved through on the strength of being green. The added test measured **626ms** in isolation and
+  a clean re-run of the full unfiltered suite took **1m12s** for the same 505 tests. Cause was machine
+  contention (leftover MSBuild nodes and overlapping agent runs), not the change. Noted because §10.2
+  will care about suite timing, and a future reader meeting a 14-minute run in this log should know it
+  was chased down and not reproduced.
+
 ## NEXT
 
 **Resume point: §2 (Repository bootstrap & invariant), first block.** §11 is **closed** — supervisor

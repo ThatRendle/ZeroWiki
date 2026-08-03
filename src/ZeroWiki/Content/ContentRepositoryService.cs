@@ -127,6 +127,14 @@ public sealed class ContentRepositoryService
             $"The content repository root '{repositoryRoot}' is a bare git repository. " +
             "ZeroWiki requires a non-bare repository with a working tree; refusing to start.");
 
+    private InvalidOperationException MissingWorkingTreeException(string repositoryRoot) =>
+        new(
+            $"The content repository at '{repositoryRoot}' has commit history but no " +
+            $"'{_paths.WorkingTree}' working tree. ZeroWiki does not create one in a repository it " +
+            "did not itself initialize, and does not commit into a repository's history that it did " +
+            "not create. Create the 'docs' directory at the repository root (it can be empty) and " +
+            "restart the application.");
+
     /// <summary>
     /// Whether <paramref name="repositoryRoot"/> has a <c>.git</c> entry of its own — a directory for
     /// an ordinary repository, or a gitfile for a worktree/submodule layout. Either means "a repository
@@ -209,6 +217,15 @@ public sealed class ContentRepositoryService
             cancellationToken: cancellationToken);
     }
 
+    /// <summary>
+    /// On a freshly initialized repository (no <c>HEAD</c> yet), creates <c>docs/</c> and commits it.
+    /// On a repository that already has history — one this call did not create, whether a previous
+    /// start of this app or a repository adopted from elsewhere — does neither: if
+    /// <see cref="ContentPaths.WorkingTree"/> is absent, refuses to start rather than silently
+    /// establish one (Product Owner decision). ZeroWiki never writes into, or commits into, a
+    /// repository it did not itself create — the same posture as the bare-repository and gitlink
+    /// refusals elsewhere in this class.
+    /// </summary>
     private async Task EnsureInitialCommitAsync(string repositoryRoot, CancellationToken cancellationToken)
     {
         var headProbe = await _git.RunAsync(
@@ -219,6 +236,13 @@ public sealed class ContentRepositoryService
         if (headProbe.Succeeded)
         {
             // Already has history — this call did not create the repository, or a previous start did.
+            // Either way, ZeroWiki does not create docs/ here: doing so on an adopted repository would
+            // be establishing a working tree, and possibly committing, into history it did not create.
+            if (!Directory.Exists(_paths.WorkingTree))
+            {
+                throw MissingWorkingTreeException(repositoryRoot);
+            }
+
             return;
         }
 
@@ -315,24 +339,34 @@ public sealed class ContentRepositoryService
     }
 
     /// <summary>
-    /// Finds every path that committing the current index right now would record as a gitlink (mode
-    /// <c>160000</c>) — the entry git writes for a nested repository instead of its file contents.
+    /// Finds every path that committing the current index right now would record as a <em>newly
+    /// introduced</em> gitlink (mode <c>160000</c>) — the entry git writes for a nested repository
+    /// instead of its file contents. Deliberately narrower than "every gitlink the index carries": an
+    /// adopted repository may legitimately already have one (a submodule, or any pre-guard means), and
+    /// that entry advancing its own nested <c>HEAD</c> is the normal way for it to change, not a fault.
     /// </summary>
     /// <remarks>
     /// Asks <c>git diff --cached --raw</c> — a diff of the index against <c>HEAD</c> — rather than
     /// <c>git ls-files --stage</c>, which lists the *entire* index regardless of whether any of it is
-    /// new. A gitlink that already exists in <c>HEAD</c> (landed before this check existed) produces no
-    /// diff entry and so is correctly ignored on every later restart; only a gitlink this call's
-    /// <c>add -A</c> newly staged, or changed, appears. This call always sees a <em>born</em>
-    /// <c>HEAD</c> — <see cref="EnsureInitialCommitAsync"/> runs unconditionally before reconciliation
-    /// in <see cref="EnsureRepositoryAsync"/> and always creates the initial commit — so the genuinely
-    /// unborn-<c>HEAD</c> case (a fresh repository with no commits at all) never actually reaches this
-    /// method or the <c>git reset</c> below it, and the "nested repository copied in before the very
-    /// first commit" tests are covered by that ordering, not by this method tolerating an unborn
-    /// <c>HEAD</c>. (As a property of git, <c>diff --cached --raw</c> *would* diff against the empty
-    /// tree if it ever did face an unborn <c>HEAD</c> — but that is not why this code is safe today,
-    /// and would only become load-bearing if a future change reordered <c>EnsureRepositoryAsync</c> to
-    /// run reconciliation before the initial commit.)
+    /// new. A gitlink that already exists in <c>HEAD</c> produces either no diff entry at all (unchanged)
+    /// or an <c>M</c> record whose <em>old</em> mode is already <c>160000</c> (its nested repository
+    /// merely advanced) — both must be ignored, or an adopted repository containing a legitimate
+    /// submodule would start fine once and then refuse forever the moment that submodule's pointer
+    /// moves, which is exactly the bricking this check exists to prevent, arriving through the one
+    /// status (<c>M</c>, not <c>A</c>) an earlier version of this method did not distinguish. A gitlink
+    /// genuinely being introduced now is an <c>A</c> record (<c>old mode 000000</c>) or, in principle,
+    /// an <c>M</c> record whose *old* mode was something else (a previously tracked path replaced by a
+    /// nested repository) — both have <c>old mode != 160000</c>, which is the actual condition below.
+    /// <para>
+    /// This call always sees a <em>born</em> <c>HEAD</c> — <see cref="EnsureInitialCommitAsync"/> runs
+    /// unconditionally before reconciliation in <see cref="EnsureRepositoryAsync"/> and either creates
+    /// the initial commit or refuses to start when history exists with no working tree — so the
+    /// genuinely unborn-<c>HEAD</c> case (a fresh repository with no commits at all) never actually
+    /// reaches this method or the <c>git reset</c> below it. (As a property of git, <c>diff --cached
+    /// --raw</c> *would* diff against the empty tree if it ever did face an unborn <c>HEAD</c> — but
+    /// that is not why this code is safe today, and would only become load-bearing if a future change
+    /// reordered <c>EnsureRepositoryAsync</c> to run reconciliation before the initial commit.)
+    /// </para>
     /// <para>
     /// Uses <c>-z</c>: without it, <c>core.quotePath</c> (on by default) renders any non-ASCII path as
     /// a quoted C-style octal escape (e.g. <c>café-vault</c> becomes <c>"caf\303\251-vault"</c>), which
@@ -361,6 +395,7 @@ public sealed class ContentRepositoryService
             var metadataParts = fields[index].TrimStart(':').Split(' ');
             index++;
 
+            var oldMode = metadataParts[0];
             var newMode = metadataParts[1];
             var status = metadataParts[4];
 
@@ -374,7 +409,12 @@ public sealed class ContentRepositoryService
                 path = fields[index];
             }
 
-            if (newMode == "160000")
+            // newMode alone is not enough: an M record for a gitlink whose nested HEAD merely advanced
+            // also has newMode 160000, and that is not this reconciliation introducing anything — it is
+            // an already-adopted gitlink changing the way gitlinks normally do. Requiring oldMode to
+            // differ excludes exactly that case while still catching a genuinely new gitlink (an A
+            // record, oldMode 000000) or a previously tracked path replaced by one.
+            if (newMode == "160000" && oldMode != "160000")
             {
                 gitlinkPaths.Add(path);
             }
