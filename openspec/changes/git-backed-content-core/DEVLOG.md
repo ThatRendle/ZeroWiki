@@ -8373,15 +8373,148 @@ re-run is unblocked once this is committed.
 
 → @architect
 
+**[supervisor]** §4 section review, round two, over `35dde44..HEAD` (`8dc1646`) — the same range now
+carrying the remediation.
+
+## Verdict: **Approve** — §4 closes
+
+### First, my own error, because it is the finding of this round
+
+**B1 called the `UnreadableDirectories` guard "a fourth" full-rebuild trigger. It is the third, and the
+Architect and @reviewer are right.** I verified it against the code rather than against either summary:
+`RefreshAsync` contains exactly three `BuildAsync()` call sites — `PageIndexBuilder.cs:141` (no previous
+stamp / `HEAD` unborn again), `:158` (the `UnreadableDirectories` guard), `:184` (the diff could not be
+computed). The only other `BuildAsync()` in `src/` is `ContentStorageStartupExtensions.cs:73`, the
+startup build, which is not a refresh trigger at all. Three branches, three triggers.
+
+I got it wrong by counting against D15's *old prose*, which listed three items flatly, rather than
+against the branches — and the rewrite is correct to regroup "history rewritten" and "`reset --hard`"
+as one condition, because they are one `if`. That is this change's own standing rule — *"when a guard's
+justification names a **case**, check the guard's **branch** — the branch is what ships"* — and I applied
+it to block B's guard while not applying it to my own arithmetic. The wrong count then propagated
+through the brief into the worker's text before @reviewer caught it by reading `RefreshAsync`. The
+section review is not exempt from the defect it exists to catch; recorded here so the next one isn't
+trusted more than it earns.
+
+### The three blockers
+
+- **B1 — closed.** D15 now names the third trigger, and — the part that mattered — distinguishes it from
+  the other two by *recurrence*: the first two are one-off, the third fires on every `HEAD` advance for
+  as long as any directory stays unreadable. `--name-only` matches `PageIndexBuilder.cs:164`;
+  characters-not-bytes matches `:377`; "unconditionally correct" is retained without "cheap". Keeping
+  the load-bearing half while dropping the wrong half was the right correction, not the easy one.
+- **B2 — closed, and better than I asked for.** D15 states the invariant, cites the case that breaks it
+  by name, and assigns the fix to §6 without attempting it. I verified the citation resolves rather than
+  assuming: *Failed commit rolls back the write* exists verbatim at
+  `specs/content-editing/spec.md:56`, under *Requirement: Transactional save*. The added instruction to
+  §6 — discard or re-read the affected entry when `git checkout --` runs, rather than assuming the stamp
+  covers it — is the actionable form; my finding only named the hole.
+- **B3 — closed.** `PageIndexSnapshot.cs:14–24` now describes the shipped mechanism and points at
+  `GetCurrentAsync`/`RefreshAsync`. Its remaining forward reference is to §6's *future* obligation, which
+  is a live cross-reference, not pending work in this section. No pending-work forward reference
+  survives anywhere in `src/`.
+
+### Behaviour genuinely did not move — verified, not relayed
+
+`git diff ad7934f..HEAD -- src` touches one file and **zero non-comment lines** (13 changed lines, all
+`///`). `git status --short` clean. Everything I checked structurally in round one — the read path, the
+census exhaustiveness, DI, Static SSR, the five scenarios, the absence of a second read path — is over
+byte-identical code and stands. `dotnet test` unchanged at 710/710 is consistent with that rather than
+merely asserted alongside it.
+
+### One item for `## NEXT`, not worth a third round
+
+**D15's new cost sentence contradicts its own first clause.** It reads: *"it fires on every `HEAD`
+advance … — an unfixed permissions problem on the volume costs **every page view** a
+whole-tree-plus-whole-history rebuild until an operator resolves it."* A `HEAD` advance is not a page
+view: a read arriving on a matching stamp still takes the fast path and pays one `rev-parse`, unreadable
+directory or not. The first clause is right and the trailing restatement overstates it — the same shape
+@reviewer caught in obligation 21's first rewrite, corrected there (`## NEXT` 21 now says *displaced
+from every read onto the first read after a write*, which is exactly right) and not here. So the same
+commit states this accurately in the working record and inaccurately in the artefact that binds §5, §6
+and §8. Suggested replacement for the trailing clause:
+
+> — an unfixed permissions problem on the volume costs the **first page view after every `HEAD` advance**
+> a whole-tree-plus-whole-history rebuild until an operator resolves it; reads arriving on a matching
+> stamp still take the fast path.
+
+Two smaller precision points for the same pass, both in D15's B2 paragraph: *"no writer in this change
+can fail a commit yet"* is loose — §2's reconciliation commit can fail; what actually makes this inert
+is that **no writer that can fail a commit runs while the index is live** (a failed startup commit
+throws before `BuildPageIndexAsync`). And *"no future `HEAD` advance repairs it on its own"* is true
+of the incremental branch but not of a later commit that happens to touch that exact path, or of any
+full rebuild — "on its own" is carrying more weight than it can.
+
+This is a docs correction the §5 opening commit can carry; it does not need a block, and it is not worth
+spending the round CLAUDE.md caps at two. I am naming it rather than waving it because D15's cost
+claims are what §5 and §6 will plan against.
+
+### The `## NEXT` corrections — all four landed, and one improved on the ask
+
+Obligation 8's "inert" justification is retired and now enumerates *which* subprocesses the request path
+can orphan per branch, which my finding did not. Obligation 21's corrected form is the accurate one and
+supersedes the wording I proposed — I had said "no walk, no `git log`", @reviewer traced the call chain
+and showed that holds only on the fast path. Obligations 25–29 cover B2's forward half, §6's inherited
+mutation obligation, `RepositoryHeadIsUnbornAsync` (correctly parked to §5 rather than folded into a
+prose-only block — I agree; fixing it here would have put a behaviour change inside a block carved
+without tests), §3's `NotFoundPage` trade (which makes `WikiPage.razor:114` true again), and the
+accepted TOCTOU window.
+
+### What this Approve cannot see
+
+It certifies prose against mechanism. It does not re-establish that the mechanism is right — that rests
+on round one's structural pass plus block B's review, over code this commit did not touch. And the one
+gap round one named is unchanged and unclosable here: **no test moves working-tree content while holding
+`HEAD` still**, which is B2's window and why it survived every block review. That test becomes possible,
+and owed, when §6 has a save path to fail.
+
+§4 closes. → @architect
+
 ## NEXT
 
-**Resume point: §4 (Derived index), first block.** §3 is **closed** — supervisor `Approve` on round
-two over `60957e6..HEAD`. §2 closed over `7b50e46..HEAD` (round four); §11 closed over `bb3cb2c..HEAD`.
+**Resume point: §5 (Write lock), first block — but one Product Owner decision is owed before it opens**
+(forward obligation 1). §4 is **closed** — supervisor `Approve` on round two over `35dde44..HEAD`. §3
+closed over `60957e6..HEAD` (round two); §2 closed over `7b50e46..HEAD` (round four); §11 closed over
+`bb3cb2c..HEAD`.
 
-**State: 16/40 tasks ticked** *(counted from `tasks.md`, not carried forward)*. Branch
+**State: 19/40 tasks ticked** *(counted from `tasks.md`, not carried forward)*. Branch
 `change/git-backed-content-core`. Gates at close-out, run by the Architect rather than relayed:
-`dotnet build` 0/0, `dotnet test` **681/681** full unfiltered, `dotnet format --verify-no-changes`
+`dotnet build` 0/0, `dotnet test` **710/710** full unfiltered, `dotnet format --verify-no-changes`
 exit 0, `openspec validate --strict` valid.
+
+**§4 took two supervisor rounds and four commits, and every blocker in both rounds was prose.** The
+mechanism was right from the first pass; what was wrong was what the record *said* about it. Round one's
+three blockers were all D15 having drifted from the code it binds — D15 landed in `c59ce13`, **before**
+block B changed the mechanism, and `design.md` was in no block's diff afterwards, so no block review
+could structurally have seen it. That is the section's transferable lesson: **a design decision written
+mid-section is not covered by the block reviews that follow it**, because the artefact that changed and
+the artefact that binds are in different diffs.
+
+**The sharper one is where the wrong count came from.** Round one's B1 called the unreadable-directory
+guard "a fourth" full-rebuild trigger. There are three. The supervisor had counted against D15's old
+*flat* list rather than against `RefreshAsync`'s branches; the remediation correctly regrouped two
+conditions into one and inherited the stale ordinal; the Architect propagated "fourth" into the worker's
+brief straight from the supervisor's post; the worker wrote it. It was caught only when `@reviewer`
+checked the count against the code's three `BuildAsync()` call sites instead of against the prose's own
+internal consistency — and the supervisor then recorded, in its own approving post, that it had broken
+this change's own standing rule (*when a guard's justification names a case, check the guard's branch*)
+on its own arithmetic. **The section review is not exempt from the defect class it exists to catch**, and
+a finding inherited from an audit is not evidence until it is re-derived from the code.
+
+**Two claims about §4's win were overstated before they were right.** The Architect's first rewrite of
+obligation 21 said a page view is now "one `git rev-parse`, no walk, no `git log`". True only on the
+fast-path stamp match: an incremental refresh spawns a `git log -1` per affected page, and any of the
+three fallback rebuilds pays the whole-tree walk plus the bulk `git log`, **synchronously inside the
+triggering request**. The accurate form — carried in obligation 21 now — is that the walk and the
+`git log` are *displaced from every read onto the first read after a write*. Caught by `@reviewer`
+tracing `WikiPage.razor`'s awaited call chain; it also caught the same overstatement surviving in D15's
+own cost sentence, which is carried as a close-out item below rather than spending a third round.
+
+**A harness note worth carrying: three agents in §4 stalled waiting on backgrounded `dotnet test` runs**
+— two reviewers and a worker, none of which posted a figure. Resolved by the Architect running the suite
+in the foreground as the record and instructing agents to report "not obtained" rather than wait. Consistent
+with this change's oldest standing rule: every instrument failure so far has been in the harness, not the
+code.
 
 **§2 took four supervisor rounds and seven commits.** Worth stating plainly, because the shape repeated:
 every one of the four findings was a gap in **what a condition asks**, not in how faithfully it runs —
@@ -8419,8 +8552,12 @@ fix stopped it.
 | §3 | 3.1–3.2 enumeration + frontmatter | `8332c79` | Request changes ×2 → **Approve** w/ nit | ↑ |
 | §3 | 3.3–3.4 rendering + git authorship | `e9bfea0` | Request changes ×2 → **Approve** w/ nit | ↑ |
 | §3 | remediation (3 supervisor blockers) | `7ca5b76` | **Approve** w/ 2 nits | → **Approve** (round 2) |
+| §4 design | D15 + spec delta | `c59ce13` | — | Request changes (B1–B3) → **Approve** |
+| §4 | 4.1–4.2 index + full rebuild | `fe3496f` | Request changes → **Approve** | ↑ |
+| §4 | 4.3 freshness + index-backed read path | `ad7934f` | Request changes ×2 → **Approve** | ↑ |
+| §4 | remediation (3 supervisor blockers, prose only) | `8dc1646` | Request changes → **Approve** | → **Approve** (round 2) |
 
-**Execution order from here: §4 → §5 → … → §10.** §11, §2 and §3 are done; the remaining sections run
+**Execution order from here: §5 → §6 → … → §10.** §11, §2, §3 and §4 are done; the remaining sections run
 in `tasks.md` order.
 
 **One decision is owed before §5 opens** — forward obligation 1 below. It is a Product Owner call, not
@@ -8635,6 +8772,18 @@ a wording tidy-up, because one of its two options changes shipped behaviour.
     self-corrects on the very next request and leaves no permanent wrong state, and closing it properly
     needs the D3 lock, so it is §5's to revisit rather than a gap. Raised by `@reviewer` as a property of
     D15's whole design rather than of block B's diff, and confirmed as such by the section review.
+
+30. **§5's opening commit carries a D15 docs correction — the same overstatement, in the one place it
+    binds.** D15's new cost sentence says the third rebuild trigger "fires on every `HEAD` advance …
+    costs **every page view** a whole-tree-plus-whole-history rebuild". A `HEAD` advance is not a page
+    view: a read on a matching stamp still takes the fast path. This is exactly the overstatement
+    `@reviewer` caught in obligation 21's first rewrite and fixed *there*, so the same commit is accurate
+    in `## NEXT` and inaccurate in `design.md` — the artefact that actually briefs §5, §6 and §8. The
+    supervisor's post carries exact replacement wording, plus two smaller precision points in D15's B2
+    paragraph (notably: "no writer in this change can fail a commit yet" is wrong — §2's reconciliation
+    commit can; what makes the staleness inert today is that no such writer runs *while the index is
+    live*). Deliberately **not** a third supervisor round — CLAUDE.md caps at two, and a docs correction
+    does not justify spending one.
 
 ### Close-out items before archive
 
