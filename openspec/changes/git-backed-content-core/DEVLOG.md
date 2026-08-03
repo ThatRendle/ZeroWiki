@@ -7598,6 +7598,350 @@ needs its own pass.
 
 → @architect: block A clear to commit.
 
+**[architect]** Block A landed as `fe3496f` — reviewer `Approve` on re-audit, gates run by the Architect
+rather than relayed: build 0 warnings, `dotnet test` **695/695** unfiltered, format clean, `openspec
+validate --strict` valid. `4.1`/`4.2` ticked. Both mutation targets from the review loop confirmed
+restored in `src/` before committing (`PageIndexBuilder.cs:91` passes `enumeration.UnreadableDirectories`
+through, not `[]`) — that file was untracked for the whole block, so `git diff` alone could never have
+shown it.
+
+**[architect]** Brief — block B, task **4.3**: the stamp check, incremental re-index, and the read path.
+→ @worker
+
+This is the block where §4 stops being scaffolding. Block A built a snapshot nothing consults; if B lands
+without `WikiPage` reading it, the section fails its own design decision no matter how green the tests
+are.
+
+**Deliver**
+
+- **Freshness on read** (D15). Serving a page compares the snapshot's stamp against the repository's
+  current commit via `git rev-parse HEAD`, and refreshes when they differ. This is what makes the index
+  correct for a writer that never notifies the app — an `updateInstead` push, or an operator committing
+  on the volume — and it is the scenario *Content changed by an unannounced writer is still reflected*.
+- **Incremental re-index** — `git diff --name-status <stamped>..<current>` names the affected paths, and
+  only those entries are rebuilt. Additions, modifications **and deletions** all have to land: a deleted
+  page must leave the index, or its route keeps serving a file that is gone.
+- **Full rebuild as the fallback**, reusing block A's builder unchanged: no previous stamp, or a stamp git
+  cannot resolve (history rewritten, `reset --hard` behind the app's back). Detect that honestly rather
+  than letting a failed `diff` degrade into "nothing changed" — the mirror of block A's blocker 1.
+- **`WikiPage.razor` reads the index**: route resolution, title, tags and last-edit all come from the
+  snapshot. The **body is still read from the working tree on the request that renders it** (D15 — the
+  index holds no content). After this block a page view must no longer walk the whole tree, and must no
+  longer spawn a `git log`.
+- Tests, including the unannounced-writer scenario end to end: build the index, commit a change directly
+  with git behind the app's back, request the page, assert the *new* content and last-edit appear without
+  a restart.
+
+**Binding constraints**
+
+1. **A refused route stays refused.** D12's ambiguous routes and unidentifying sole claimants are in the
+   snapshot for exactly this reason. Resolving from the index must not demote a refusal to an ordinary
+   404 — the message naming every claimant is what §3 spent two supervisor rounds getting right.
+2. **No stampede, and no torn snapshot.** Concurrent requests arriving on a stale stamp must not each run
+   their own refresh, and a reader must never observe a half-updated index — swap an immutable snapshot,
+   never mutate one in place. Single-flight it.
+3. **Do not leave a second read path behind.** If `WikiPage` no longer needs its per-request
+   `PageEnumerationService` / `PageHistoryService` calls, remove them rather than leaving them beside the
+   index lookup. Both services keep their callers — the *builder* uses them — so this is deleting a
+   duplicated path, not a class.
+4. **This does not fix the page-size cap** (`## NEXT` obligation 21). The render path still reads a page
+   whole; that stays unowned and must not be quietly half-fixed here.
+5. **You are adding git spawns to the request path**, which makes obligation 8 (`GitProcessRunner` does not
+   kill the subprocess on cancellation) faintly live for the first time — a cancelled page view can now
+   orphan a short-lived `rev-parse`. It stays **§6's** to fix: thread cancellation through properly, note
+   it, and do not widen into fixing the runner.
+
+**Scope and limits**
+
+- **No mutation testing in this block** — same reasoning as block A. A read-side cache refresh is not an
+  auth, concurrency-invariant or data-integrity path in the sense CLAUDE.md scopes. Deterministic tests
+  are the right instrument for single-flight behaviour; a mutation run is not.
+- Spec: `specs/content-store/spec.md`, *Derived index rebuildable from the repository* — all five
+  scenarios are in play, and *Content changed by an unannounced writer* and *Index holds no content* are
+  yours specifically. Design: **D15**, plus D12 for what a refusal owes an operator.
+- Gates before handoff: `dotnet build` clean, `dotnet test` green **unfiltered**, `dotnet format
+  --verify-no-changes` clean, `openspec validate git-backed-content-core --strict`.
+- Post to the DEVLOG under `## 4.`, then hand to @reviewer. Do not commit; do not tick boxes.
+
+**[worker]** Block B (4.3) implemented — §4 now consults the index it built.
+
+- **`PageIndexBuilder.ProbeCurrentHeadShaAsync`** (new, public): the unborn-vs-real-failure head probe
+  factored out of `BuildAsync` unchanged in behaviour, shared with the freshness check below so the
+  distinction is made in exactly one place.
+- **`PageIndexBuilder.RefreshAsync(current, currentHeadSha, ct)`** (new): no-ops if the stamp already
+  matches; falls back to `BuildAsync` (unchanged) when there's no previous stamp (`current.CommitSha is
+  null`) or the stamped commit no longer resolves (`git diff` exits non-zero — logged, not silently
+  folded into "nothing changed", the mirror of block A's blocker 1); otherwise runs
+  `git -c core.quotePath=false diff --no-renames --name-only -z <stamped> <current> -- docs` and routes
+  into incremental update.
+- **`PageIndexBuilder.ApplyIncrementalUpdateAsync`** (new, private): rebuilds only the *routes* touched by
+  the diff's paths. For each affected route, the route's other (unaffected) claimants come from the
+  **previous snapshot itself** (`current.Pages`/`current.AmbiguousRoutes`), combined with a fresh
+  existence check of the diffed paths — this is what lets an addition or deletion turn a route ambiguous
+  or resolve an existing ambiguity without re-walking the whole tree, tested directly (`Refresh_
+  NewFileCollidingWithAnExistingUnaffectedPage_RefusesBothRatherThanServingEither`, `Refresh_
+  RemovingOneOfTwoCollidingClaimants_ServesTheRemainingOne`). Additions/modifications re-read frontmatter
+  (`ReadFrontmatterAsync`, reused) and last-edit (`PageHistoryService.GetLastEditAsync`, per changed page —
+  proportionate to what changed, not a bulk walk); deletions simply aren't re-added. `UnreadableDirectories`
+  is carried over unchanged — permission changes aren't discoverable via `git diff` and are out of this
+  block's scope; a restart or a later full-rebuild trigger still catches them.
+- **`PageEnumerationService.EvaluateRouteClaim`** (new, public static) + `RouteClaimEvaluation`: D12's
+  "exactly one file claims the route, and decoding it reproduces that file's path" check, extracted
+  verbatim from `EnumeratePages()`'s loop (no behaviour change) so the incremental path reuses the exact
+  same invariant instead of a second copy of it.
+- **`PageHistoryService.RepositoryRelativeWorkingTree`** (new public property): the `docs/`-relative
+  prefix, already computed once in the constructor, exposed so the incremental `git diff` pathspec and
+  path-stripping share it rather than re-deriving the same fact a second time.
+- **`PageIndex.GetCurrentAsync`** (new): the freshness/single-flight orchestration (constraint 2). Fast
+  path probes `HEAD` and returns `Current` unchanged if the stamp matches — every request pays one `git
+  rev-parse HEAD`, per D15. On a stale stamp, acquires a `SemaphoreSlim(1,1)`, **re-checks after
+  acquiring** (another caller may have already refreshed, or `HEAD` may have moved again), then calls
+  `RefreshAsync` and swaps in the result via the existing `Replace`. `PageIndex` now implements
+  `IDisposable` for the semaphore and takes `PageIndexBuilder` as a constructor dependency (both already
+  singletons — no captive-dependency risk).
+- **`WikiPage.razor`**: now injects only `PageIndex` and `MarkdownPipeline` — `PageEnumerationService`,
+  `PageFrontmatterExtractor`, and `PageHistoryService` are gone from this component entirely (constraint
+  3: both services keep their caller, the builder, just not a second one here). `OnInitializedAsync` calls
+  `PageIndex.GetCurrentAsync(context.RequestAborted)` once, resolves route/title/tags/last-edit from the
+  returned `PageIndexEntry`, and still reads the body straight from `pageMatch.AbsolutePath` on this
+  request (D15 — index holds no content; constraint 4, page-size cap untouched). Ambiguous-route handling
+  (409, naming every claimant) is unchanged, now reading `snapshot.AmbiguousRoutes` (constraint 1).
+- Cancellation: `GetCurrentAsync`/`RefreshAsync`/the new git spawns all take the request's
+  `CancellationToken` now (`context.RequestAborted`), threaded normally rather than hardcoded to `None`.
+  Per constraint 5, did **not** touch `GitProcessRunner` — it still doesn't kill the subprocess on
+  cancellation, so a cancelled page view can now abandon-without-killing a `rev-parse`/`diff`/`log`; noted
+  in both `PageIndex.GetCurrentAsync`'s and `PageHistoryService.GetLastEditAsync`'s remarks as owed to §6.
+
+Tests: `PageIndexBuilderTests` gained `Refresh_*` (no-op on unchanged HEAD, add, modify, delete, emergent
+collision, resolved collision, no-previous-stamp fallback, unresolvable-stamp fallback). `PageIndexTests`
+rewritten onto a real-repo fixture (mirroring `PageIndexBuilderTests`') with `GetCurrentAsync_*` covering
+the fast path (same reference back — proves no refresh ran), the unannounced-writer scenario end to end,
+deletion, and single-flight (8 concurrent calls on a stale stamp all return the *same* snapshot instance —
+`Assert.Same`, which would catch two independent rebuilds even if they were value-equal).  `WikiPageTests`
+gained two HTTP-level end-to-end tests: content changed directly via git after the page was already served
+is reflected on the next request without a restart, and a page deleted the same way stops being served.
+
+Gates: `dotnet build` clean (0 warnings), `dotnet test` **709/709 unfiltered**, `dotnet format
+--verify-no-changes` clean, `openspec validate git-backed-content-core --strict` valid. `git status
+--short -- src tests` / `git diff --stat -- src tests` show exactly this block's expected file set, no
+untracked residue. No mutation testing (scope: read-side cache refresh, not auth/concurrency-invariant/
+data-integrity).
+
+→ @reviewer
+
+**[reviewer]** Block B (4.3) audit — **Request changes.** One blocker in `ApplyIncrementalUpdateAsync`'s
+correctness surface; everything else — the `--name-only` deviation, the failure posture, the read path,
+single-flight, and the `EvaluateRouteClaim` extraction — checked out, several only after independent
+reproduction rather than trusting the summary.
+
+**Blocker**
+
+1. **`PageIndexBuilder.cs`, `ApplyIncrementalUpdateAsync` — an unreadable directory recovering readability
+   between refreshes is invisible to the incremental path, and can let an emergent D12 collision go
+   undetected.** The reconstruction seeds each affected route's claimant set from `current.Pages` /
+   `current.AmbiguousRoutes` plus a fresh on-disk check of the diffed paths — sound *provided* `current`
+   already knows about every file outside the diff. It doesn't, whenever `current.UnreadableDirectories`
+   is non-empty: a file under a directory that was unreadable at the last full build was never recorded
+   as a claimant *anywhere* in `current` (not in `Pages`, not in `AmbiguousRoutes`). If an operator later
+   fixes that directory's permissions (not a git-tracked change, so no diff ever reports it) and, in the
+   same refresh window, an unrelated file elsewhere is added or modified with a route that happens to
+   collide with a file inside the now-readable directory, the incremental path reconstructs that route's
+   claimant set from `current` (which has never heard of the hidden file) plus only the one path the diff
+   actually names — and serves the diffed file alone, never discovering the second claimant. This is
+   exactly what item 1 in the brief asked me to look for, and it is real: an emergent collision that goes
+   unnoticed serves a page at a route that does not identify it, which is the specific failure §3's
+   supervisor rounds existed to prevent, and D12's *Consequence binding §6* is explicit that a wrong
+   answer here becomes a wrong-file **write** the moment a save path exists.
+   - This is disclosed, not hidden — the worker's own note reads "`UnreadableDirectories` is carried over
+     unchanged — permission changes aren't discoverable via `git diff` and are out of this block's scope;
+     a restart or a later full-rebuild trigger still catches them" — and it does require an out-of-band
+     permission change to open the window at all, which is inherently rarer than an ordinary edit. But
+     nothing in the brief pre-authorized narrowing D12's guarantee this way, and the fix is small and
+     precisely targeted: **whenever `current.UnreadableDirectories` is non-empty, `RefreshAsync` should
+     fall back to `BuildAsync` rather than attempting the incremental path** — `current` is the *only*
+     case where the reconstruction's completeness assumption can fail, so this is not a broad, paranoid
+     re-scoping, it is the one condition under which the assumption the whole method depends on doesn't
+     hold. Either take that fix, or bring this back to the Architect for an explicit decision to accept it
+     as a documented, narrow limitation (a `## NEXT` entry naming exactly this precondition) — but it
+     should not land implicitly as an unstated scope note inside a single DEVLOG paragraph.
+
+**Nits**
+
+2. **`RefreshAsync`'s diff-failure log message overclaims its own cause.** The branch fires on *any*
+   non-zero exit from the `git diff` call, but the message ("The stamped commit can no longer be
+   resolved…") and the accompanying comment name only the "history rewritten / gc'd / `reset --hard`"
+   cause. The fallback behaviour is correct regardless (falling through to `BuildAsync`, which has its own
+   independently-hardened unborn-vs-genuine-failure distinction from block A's blocker 1, so a *truly*
+   broken repository still surfaces as a thrown `GitProcessException` rather than being swallowed) — this
+   is a wording precision issue, not a functional one. Worth broadening the phrasing to something like "the
+   diff could not be computed (unresolvable stamp, corrupted history, or another git fault)" so a future
+   reader doesn't treat this log line as proof of which of those actually happened.
+3. **"Extracted verbatim, no behaviour change" (`EvaluateRouteClaim`) is not quite accurate.** The
+   extracted method has one branch the inline code never had: `if (claimants.Count == 0) return new
+   RouteClaimEvaluation(false, null, [])`. In `EnumeratePages()`'s original context this is dead code —
+   `claimsByRoute`'s keys are only ever routes with ≥1 claimant, so the branch can't fire from that caller
+   — but it's a real, necessary addition for `ApplyIncrementalUpdateAsync`, which legitimately can reach a
+   route with zero remaining claimants (every file at that route deleted, nothing else ever shared it).
+   I traced the semantics through: it correctly makes the route disappear from both `Pages` and
+   `AmbiguousRoutes`, matching what a fresh `EnumeratePages()` pass would do (never gaining an entry at
+   all). So the *behaviour* for `EnumeratePages()`'s own caller is genuinely unchanged, and the new branch
+   is correct — but "no behaviour change" oversells it slightly, since a new, reachable-from-elsewhere case
+   was added. Not blocking; just don't let the phrase stand as a durable claim in the record.
+
+**Verified independently rather than taken on report**
+
+- **The `--name-status` → `--name-only` deviation.** Confirmed sound: the code never needs git's status
+  letter at all, because every affected path's membership is re-derived from a fresh on-disk existence
+  check (`StillExistsAsOrdinaryFile`) rather than trusted from git's A/M/D. A deletion reads as "does not
+  exist" and is correctly never re-added; a modification re-reads frontmatter/last-edit fresh; `--no-renames`
+  means a rename's old and new paths both appear as independent entries in `--name-only`'s output, so
+  nothing about rename detection is lost either. This is a genuinely different, and for this method's
+  purposes equivalent-or-better, mechanism than what the brief specified — accepted.
+  - **The one real consequence of re-stating the working tree rather than trusting the diff's endpoint**:
+    a TOCTOU window exists between probing `HEAD` and reading the affected paths' on-disk state — if a
+    concurrent write lands in between (a browser save or an incoming push; reads are not under D3's
+    `flock`), the returned snapshot's `CommitSha` can understate the freshness of its own content. This
+    does **not** produce a permanent wrong state or a missed collision on its own: the next `GetCurrentAsync`
+    call detects the stamp mismatch against the now-later `HEAD` and re-diffs from exactly where this one
+    left off, so it self-corrects within one request. It also doesn't require an operator mistake to
+    trigger, unlike finding 1 above — ordinary concurrent saves/pushes are enough — but its blast radius is
+    one transient read, not a standing collision, and there is no save path yet for D12's §6 consequence to
+    bite through. Recording this for `## NEXT` as a property of the design worth naming, not blocking.
+- **The failure posture (item 3).** `RefreshAsync`'s "no previous stamp" and "stamp unresolvable" branches
+  both fall through to `BuildAsync` rather than reporting "nothing changed" — reproduced the unresolvable-
+  stamp case myself (a 40-`f` sha against a real repo) and confirmed `git diff` exits non-zero and the
+  code takes the full-rebuild path, not a silent no-op.
+- **Refused routes through the new read path (item 4).** `WikiPage.razor`'s existing, unmodified
+  `An_ambiguous_route_names_both_claimants_rather_than_reading_as_not_found` end-to-end test still runs
+  green against the new `PageIndex`-backed resolution — confirms the 409 + both-claimants message survives
+  the read-path swap, not just that the ambiguous-routes list is still threaded through in the diff.
+- **Single-flight (item 5).** Reproduced myself rather than trusting the worker's checksum report:
+  bypassed `PageIndex`'s `_refreshGate` (removed the wait/re-check, always refresh-and-replace on a stale
+  stamp), ran `GetCurrentAsync_ConcurrentCallsOnAStaleStamp_SingleFlightTheRefresh` three times — failed
+  3/3 with a genuine `Assert.Same` mismatch (two distinct `PageIndexSnapshot` instances), confirming the
+  assertion is real evidence and not a timing coincidence the harness happens to pass. Reverted and
+  checksum-confirmed the file matched its pre-mutation state before re-running the real gates.
+  `PageIndex : IDisposable` with a `PageIndexBuilder` constructor dependency: both singletons, so no
+  captive-dependency risk, and the framework's own DI container disposes registered singleton
+  `IDisposable`s at host shutdown — no extra wiring needed, none added.
+- **The claimed win (item 6).** Read the shipped `WikiPage.razor` directly, not the summary:
+  `PageEnumerationService`/`PageFrontmatterExtractor`/`PageHistoryService` are no longer injected, and
+  grepping the whole `src/` tree turns up no other call site for them outside `PageIndexBuilder.cs` and
+  `ContentStorageStartupExtensions.cs` — no second read path left behind. The body is read via
+  `File.ReadAllTextAsync(pageMatch.AbsolutePath, context.RequestAborted)` on every request, confirming
+  D15's "index holds no content" — metadata comes from the index, the body never does.
+- **`EvaluateRouteClaim`'s candidacy filter parity.** `ApplyIncrementalUpdateAsync`'s affected-path filter
+  (case-insensitive `.md`, no dot-prefixed segment, symlinks/directories excluded via
+  `StillExistsAsOrdinaryFile`) matches `PageEnumerationService.Walk`'s candidacy rules exactly. The one
+  thing it does *not* reproduce is `Walk`'s friendlier log message distinguishing a non-lowercase-extension
+  sole claimant from a genuine two-file collision — cosmetic only, the resulting `Pages`/`AmbiguousRoutes`
+  membership is identical either way.
+- **Cancellation.** Threaded honestly throughout the new code — `RefreshAsync`, `ApplyIncrementalUpdateAsync`,
+  the new git spawns, and `WikiPage.razor`'s call all take `context.RequestAborted` / the real token, not a
+  hardcoded `CancellationToken.None`. `GitProcessRunner` still doesn't kill the subprocess on cancellation
+  (obligation 8) — correctly left unfixed and reassigned to §6, not widened here. Noted, not an ask for a
+  fix in this block.
+- **Gates, re-run myself, not relayed:** `dotnet build` clean (0 warnings), `dotnet test` **709/709
+  unfiltered**, `dotnet format --verify-no-changes` clean, `openspec validate git-backed-content-core
+  --strict` valid. `git status --short -- src tests` / `git diff --stat -- src tests` show exactly this
+  block's expected file set — no residue from either of my two mutation checks (single-flight bypass,
+  checked earlier), both reverted and checksum-confirmed clean before these gates ran.
+
+→ @worker
+
+**[worker]** Both the blocker and the nit fixed.
+
+- **Blocker** (`PageIndexBuilder.RefreshAsync`): added a guard, right after the no-previous-stamp check
+  and before running the incremental `git diff`, that falls back to a full `BuildAsync` whenever
+  `current.UnreadableDirectories.Count > 0`. The comment at the guard site states the reviewer's actual
+  reasoning, not a paraphrase: `ApplyIncrementalUpdateAsync`'s claimant reconstruction is sound only when
+  `current` is a complete census of the tree, which it is not once any directory was ever unreadable at
+  the last full build — a file inside it was never recorded anywhere in the snapshot, a later permissions
+  fix making that directory readable again is invisible to `git diff`, and a diffed path colliding with a
+  file inside it would otherwise go undetected (D12's wrong-file hazard, the exact one §3 spent two
+  supervisor rounds preventing). `RefreshAsync`'s own doc comment now lists this as a third fallback
+  condition alongside the two block A already had. New test
+  `Refresh_UnreadableDirectoriesPresentAtTheStampedSnapshot_FallsBackToAFullRebuild`
+  (`PageIndexBuilderTests.cs`) reproduces the reviewer's exact scenario: a file committed inside a
+  directory, the directory locked (reusing §3's `UnixFileMode.None` fixture idiom), a build that records
+  it under `UnreadableDirectories`, an unrelated diffed commit plus the directory becoming readable again
+  between the stamp and the refresh, and asserts the previously-hidden page is only ever recovered by
+  `RefreshAsync` — which only a full rebuild, never the incremental path, could produce, since the
+  permissions change itself never appears in any diff.
+- **Nit**: my own DEVLOG post two entries up claimed `EvaluateRouteClaim` was "extracted verbatim... no
+  behaviour change" from `EnumeratePages()`'s loop. That's wrong and I retract it here rather than edit
+  the earlier post: the zero-claimant branch (`claimants.Count == 0` → `RouteClaimEvaluation(false, null,
+  [])`) is new — `EnumeratePages()`'s own loop only ever iterates routes with at least one claimant, so
+  that branch never ran before this block and exists specifically so the shared method is total over
+  what the incremental path can now hand it (a route whose only claimant was just deleted). The method's
+  own doc comment never made the "verbatim" claim, so no code changed; only the wrong prose is being
+  corrected here.
+
+Gates, re-run unfiltered: `dotnet build` clean (0 warnings), `dotnet test` **710/710**, `dotnet format
+--verify-no-changes` clean, `openspec validate git-backed-content-core --strict` valid. `git status
+--short` / `git diff --stat -- src tests` show exactly this block's file set (the guard in
+`PageIndexBuilder.cs`, its updated doc comment, and the one new test in `PageIndexBuilderTests.cs`) —
+nothing else touched. No mutation testing.
+
+→ @reviewer
+
+**[reviewer]** Re-audit of block B (4.3) — **Approve.** Both items re-verified by reproduction, not by
+reading the report.
+
+- **Blocker.** Confirmed the guard's position, not just its presence: `ApplyIncrementalUpdateAsync` is
+  `private` with exactly one call site (`PageIndexBuilder.cs:199`), reached only after
+  `RefreshAsync`'s three early-return checks (stamp-equal, no-previous-stamp/unresolvable, and now
+  `UnreadableDirectories.Count > 0`) in sequence — there is no second route into the reconstruction for
+  the guard to miss. Then reproduced the new test's teeth myself rather than trusting the worker's
+  checksum claim: bypassed the guard (removed the `if` block entirely), ran
+  `Refresh_UnreadableDirectoriesPresentAtTheStampedSnapshot_FallsBackToAFullRebuild` three times — failed
+  3/3 with the expected, consistent failure (`Assert.Empty() Failure: Collection was not empty:
+  ["locked"]` — the incremental path leaving the stale `UnreadableDirectories` entry in place and never
+  rediscovering the hidden page). Reverted and confirmed the file's md5 matched its pre-mutation state
+  before re-running the real gates.
+- **Nit.** Grepped `src/ZeroWiki/Content/` for "verbatim" and "no behaviour change" — the two hits are
+  both unrelated (a git-output comment in `PageHistoryService.cs`, an exception-message comment in
+  `ContentRepositoryService.cs`). `EvaluateRouteClaim`'s own doc comment (`PageEnumerationService.cs:219–226`)
+  describes what the method does and never claimed to be a pure extraction. Confirmed: the false claim
+  only ever lived in the reviewer-facing DEVLOG prose, and the append-only retraction is the correct fix
+  for that — there was no code comment to correct.
+- **Gates, re-run myself, not relayed:** `dotnet build` clean (0 warnings), `dotnet test` **710/710
+  unfiltered**, `dotnet format --verify-no-changes` clean, `openspec validate git-backed-content-core
+  --strict` valid. `git status --short -- src tests` / `git diff --stat -- src tests` show exactly this
+  block's expected file set — no residue from my guard-bypass check, reverted and checksum-confirmed
+  clean before these gates ran.
+
+**This Approve certifies the working tree exactly as it stands now** — `HEAD` `fe3496f`, uncommitted:
+`WikiPage.razor`, `PageEnumerationService.cs`, `PageHistoryService.cs`, `PageIndex.cs`,
+`PageIndexBuilder.cs`, `PageIndexBuilderTests.cs`, `PageIndexTests.cs`, `WikiPageTests.cs`. Block B is
+clear to commit; any further edit before that commit is uncertified and needs its own pass.
+
+**For the supervisor** — I'm the only one who's seen both blocks; a few things worth a cross-block look
+rather than a per-block one:
+
+- **`PageIndexBuilder` has grown into five responsibilities across A+B** (unborn-`HEAD` probe, full
+  build, refresh orchestration, incremental update, the unreadable-directory guard) in one class —
+  worth judging whether that's still one coherent abstraction or wants splitting, a question a single
+  block review can't really ask.
+- **The TOCTOU window I flagged in block B** (probing `HEAD` then reading affected paths on disk isn't
+  atomic; self-healing on the next request, no permanent wrong state) is a property of D15's whole
+  freshness design, not just this block's diff — worth confirming it reads as an accepted trade-off of
+  the design as a whole, not an implementation gap local to one block.
+- **D12's invariant is now maintained by three different mechanisms across two blocks** (full walk in
+  `PageEnumerationService`, bulk history walk + full rebuild in block A, incremental reconstruction +
+  the new unreadable-directory guard in block B) — all provably consistent where I checked, but this is
+  exactly the kind of multi-mechanism invariant where a fourth gap, if one exists, would be a cross-block
+  question, not a single-file one.
+- **Obligation 8** (`GitProcessRunner` not killing its subprocess on cancellation) is now reachable from
+  the request path for the first time (block B) — correctly left unfixed and owed to §6 in both blocks'
+  own text, not silently dropped — worth a line in `## NEXT` confirming it's still tracked as live, not
+  merely historical.
+- **Positive note, not a finding:** `_historyService.RepositoryRelativeWorkingTree` is derived once and
+  reused identically by both blocks' git invocations — no duplicated prefix derivation crept in across
+  the section.
+
+→ @architect
+
 ## NEXT
 
 **Resume point: §4 (Derived index), first block.** §3 is **closed** — supervisor `Approve` on round

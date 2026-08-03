@@ -50,18 +50,29 @@ public sealed class PageHistoryService
     }
 
     /// <summary>
+    /// The working tree's path relative to the repository root (e.g. <c>docs</c>), computed once here
+    /// (see the private field's own remarks for why) and exposed so <see cref="PageIndexBuilder"/>'s
+    /// incremental re-index (4.3) can scope its own <c>git diff</c> pathspec to the same prefix without a
+    /// second, independently-maintained derivation of the same fact.
+    /// </summary>
+    public string RepositoryRelativeWorkingTree => _repositoryRelativeWorkingTree;
+
+    /// <summary>
     /// Returns the author and date of the most recent commit that touched
     /// <paramref name="workingTreeRelativePath"/>, or <see langword="null"/> if git has no history for it
     /// (an untracked file on disk, or the git subprocess itself failed) — a page still renders with no
     /// last-edit line rather than failing the whole request over metadata that isn't essential to it.
     /// </summary>
     /// <remarks>
-    /// Always called with <see cref="CancellationToken.None"/> by its caller (3b), not the request's own
-    /// token: <see cref="GitProcessRunner"/> does not yet kill the git subprocess on cancellation — that
-    /// fix is owed to §6 — so passing a token here would imply a cancellation guarantee this does not
-    /// have. Author date (<c>%aI</c>), not committer date: D5 ties "who edited this" to authorship, and a
-    /// browser save stamps both identically (<see cref="GitAuthor.ToEnvironmentVariables"/>), so the two
-    /// only ever diverge for a pushed commit, where author is the field D5 actually means.
+    /// Called by <see cref="PageIndexBuilder"/>'s incremental re-index (4.3) with the request's own
+    /// cancellation token, one call per changed page rather than <see cref="GetAllLastEditsAsync"/>'s bulk
+    /// walk — proportionate to what actually changed. <see cref="GitProcessRunner"/> still does not kill
+    /// the git subprocess on cancellation (obligation 8, owed to §6): a cancelled request abandons the
+    /// wait without killing the spawned <c>git log</c>, which is an existing, narrow gap this call makes
+    /// reachable from the request path for the first time rather than one it introduces. Author date
+    /// (<c>%aI</c>), not committer date: D5 ties "who edited this" to authorship, and a browser save
+    /// stamps both identically (<see cref="GitAuthor.ToEnvironmentVariables"/>), so the two only ever
+    /// diverge for a pushed commit, where author is the field D5 actually means.
     /// </remarks>
     public async Task<PageLastEdit?> GetLastEditAsync(string workingTreeRelativePath, CancellationToken cancellationToken)
     {

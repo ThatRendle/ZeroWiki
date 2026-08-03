@@ -71,26 +71,17 @@ public sealed class PageEnumerationService
 
         foreach (var (route, relativePaths) in claimsByRoute.OrderBy(entry => entry.Key, StringComparer.Ordinal))
         {
-            // D12's invariant is one property, not two alternatives: "the route identifies exactly this
-            // file" — exactly one file claims the route, AND decoding the route reproduces that file's
-            // own path. Checking claimant count alone misses the case that has no second file at all:
-            // "Chapter  1.md" (two spaces) is the tree's only claimant of "Chapter__1", yet that route
-            // decodes to "Chapter_1.md" — a file that does not exist. Serving it would let a later save
-            // resolve the route to a different file than the one being read.
-            var identifiesExactlyOneFile =
-                relativePaths.Count == 1 &&
-                PageRouteCodec.TryDecode(route, out var roundTrippedPath) &&
-                string.Equals(roundTrippedPath, relativePaths[0], StringComparison.Ordinal);
+            var evaluation = EvaluateRouteClaim(route, relativePaths);
 
-            if (identifiesExactlyOneFile)
+            if (evaluation.IsServable)
             {
-                var relativePath = relativePaths[0];
+                var relativePath = evaluation.RelativePath!;
                 var absolutePath = Path.Combine(_paths.WorkingTree, ToPlatformPath(relativePath));
                 pages.Add(new EnumeratedPage(route, relativePath, absolutePath));
             }
             else
             {
-                var claimants = relativePaths.OrderBy(path => path, StringComparer.Ordinal).ToArray();
+                var claimants = evaluation.Claimants;
                 ambiguousRoutes.Add(new AmbiguousPageRoute(route, claimants));
 
                 // A sole claimant whose only discrepancy from its own round trip is the case of its
@@ -101,7 +92,7 @@ public sealed class PageEnumerationService
                 // this file can never round-trip regardless of what any other file in the tree does.
                 // Naming that explicitly saves an operator from hunting for a second claimant that does
                 // not exist.
-                if (claimants.Length == 1 && HasNonLowercaseMarkdownExtension(claimants[0]))
+                if (claimants.Count == 1 && HasNonLowercaseMarkdownExtension(claimants[0]))
                 {
                     _logger.LogWarning(
                         "'{RelativePath}' has a Markdown extension that is not exactly lowercase '.md' " +
@@ -116,7 +107,7 @@ public sealed class PageEnumerationService
                         "Route '{Route}' does not identify exactly one file ({Count} claimant(s): {Claimants}); " +
                         "refusing to serve it (D12).",
                         route,
-                        claimants.Length,
+                        claimants.Count,
                         string.Join(", ", claimants));
                 }
             }
@@ -223,4 +214,41 @@ public sealed class PageEnumerationService
     private static bool HasNonLowercaseMarkdownExtension(string relativePath) =>
         relativePath.EndsWith(".md", StringComparison.OrdinalIgnoreCase)
         && !relativePath.EndsWith(".md", StringComparison.Ordinal);
+
+    /// <summary>
+    /// D12's per-route invariant, applied to whatever set of files currently claims <paramref name="route"/>
+    /// — "the route identifies exactly this file", one property, not two independent checks: exactly one
+    /// file claims it, <i>and</i> <see cref="PageRouteCodec.TryDecode"/> applied to the route reproduces
+    /// that file's own path. Shared by <see cref="EnumeratePages"/>'s full walk and
+    /// <see cref="PageIndexBuilder"/>'s incremental re-index (4.3, D15) so this invariant is checked in
+    /// exactly one place regardless of whether the claimant set came from a fresh walk or an updated
+    /// in-memory tally.
+    /// </summary>
+    public static RouteClaimEvaluation EvaluateRouteClaim(string route, IReadOnlyList<string> claimants)
+    {
+        var identifiesExactlyOneFile =
+            claimants.Count == 1 &&
+            PageRouteCodec.TryDecode(route, out var roundTrippedPath) &&
+            string.Equals(roundTrippedPath, claimants[0], StringComparison.Ordinal);
+
+        if (identifiesExactlyOneFile)
+        {
+            return new RouteClaimEvaluation(true, claimants[0], []);
+        }
+
+        if (claimants.Count == 0)
+        {
+            return new RouteClaimEvaluation(false, null, []);
+        }
+
+        var ordered = claimants.OrderBy(path => path, StringComparer.Ordinal).ToArray();
+        return new RouteClaimEvaluation(false, null, ordered);
+    }
 }
+
+/// <summary>
+/// The outcome of <see cref="PageEnumerationService.EvaluateRouteClaim"/>: either the one file
+/// <see cref="RelativePath"/> that the route identifies, or the sorted <see cref="Claimants"/> naming
+/// every file implicated in the refusal (empty when the route currently has no claimant at all).
+/// </summary>
+public readonly record struct RouteClaimEvaluation(bool IsServable, string? RelativePath, IReadOnlyList<string> Claimants);

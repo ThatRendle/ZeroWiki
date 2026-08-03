@@ -165,6 +165,57 @@ public sealed class WikiPageTests : IDisposable
     }
 
     [Fact]
+    public async Task Content_changed_directly_with_git_after_the_page_was_already_served_is_reflected_without_a_restart()
+    {
+        // D15's freshness scenario end to end: a writer that never notifies the app -- an `updateInstead`
+        // push or an operator committing on the volume, simulated here by committing straight through
+        // git rather than through the app's own save path -- must still be reflected on the very next
+        // request, with no restart in between.
+        await SeedAccountAsync("alice");
+        await WritePageAsync("page.md", "Original body.", authorName: "First Author");
+        var client = await SignInAsync("alice");
+
+        var firstResponse = await client.GetAsync("/wiki/page");
+        var firstBody = await firstResponse.Content.ReadAsStringAsync();
+        Assert.Contains("Original body.", firstBody, StringComparison.Ordinal);
+        Assert.Contains("First Author", firstBody, StringComparison.Ordinal);
+
+        await WritePageAsync("page.md", "Updated body.", authorName: "Second Author");
+
+        var secondResponse = await client.GetAsync("/wiki/page");
+        var secondBody = await secondResponse.Content.ReadAsStringAsync();
+        Assert.Equal(HttpStatusCode.OK, secondResponse.StatusCode);
+        Assert.Contains("Updated body.", secondBody, StringComparison.Ordinal);
+        Assert.Contains("Second Author", secondBody, StringComparison.Ordinal);
+        Assert.DoesNotContain("Original body.", secondBody, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task A_page_deleted_directly_with_git_stops_being_served_without_a_restart()
+    {
+        await SeedAccountAsync("alice");
+        await WritePageAsync("page.md", "Should disappear.");
+        var client = await SignInAsync("alice");
+
+        var beforeResponse = await client.GetAsync("/wiki/page");
+        Assert.Contains("Should disappear.", await beforeResponse.Content.ReadAsStringAsync(), StringComparison.Ordinal);
+
+        var repositoryRoot = Path.Combine(_app.DataRoot, "wiki");
+        await _git.RunOrThrowAsync(repositoryRoot, ["rm", "docs/page.md"]);
+        await _git.RunOrThrowAsync(
+            repositoryRoot,
+            ["commit", "-m", "remove page.md"],
+            new GitAuthor("Test Author", "author@zerowiki.example").ToEnvironmentVariables());
+
+        var afterResponse = await client.GetAsync("/wiki/page");
+        var afterBody = await afterResponse.Content.ReadAsStringAsync();
+
+        Assert.Equal(HttpStatusCode.OK, afterResponse.StatusCode);
+        Assert.Contains("There is no page at this address.", afterBody, StringComparison.Ordinal);
+        Assert.DoesNotContain("Should disappear.", afterBody, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task Authorship_is_read_from_git_history()
     {
         await SeedAccountAsync("alice");

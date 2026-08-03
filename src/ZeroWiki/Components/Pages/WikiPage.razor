@@ -8,9 +8,7 @@
 @using Markdig
 @using Microsoft.AspNetCore.Diagnostics
 
-@inject PageEnumerationService PageEnumerationService
-@inject PageFrontmatterExtractor PageFrontmatterExtractor
-@inject PageHistoryService PageHistoryService
+@inject PageIndex PageIndex
 @inject MarkdownPipeline MarkdownPipeline
 
 <PageTitle>@PageDisplayTitle</PageTitle>
@@ -19,7 +17,7 @@
 {
     <h1>@PageDisplayTitle</h1>
 
-    @if (_lastEdit is { } lastEdit)
+    @if (_page?.LastEdit is { } lastEdit)
     {
         <p class="page-last-edit">
             Last edited by <strong>@lastEdit.AuthorName</strong> on
@@ -27,10 +25,10 @@
         </p>
     }
 
-    @if (_frontmatter is { Tags.Count: > 0 } frontmatter)
+    @if (_page is { Tags.Count: > 0 } page)
     {
         <ul class="page-tags">
-            @foreach (var tag in frontmatter.Tags)
+            @foreach (var tag in page.Tags)
             {
                 <li>@tag</li>
             }
@@ -69,20 +67,21 @@ else
     [CascadingParameter]
     private HttpContext? HttpContext { get; set; }
 
-    private EnumeratedPage? _page;
+    private PageIndexEntry? _page;
     private AmbiguousPageRoute? _ambiguousRoute;
     private MarkupString? _renderedBody;
-    private PageFrontmatter? _frontmatter;
-    private PageLastEdit? _lastEdit;
 
     private string PageDisplayTitle =>
-        _frontmatter?.Title is { Length: > 0 } title ? title : _page?.RelativePath ?? "ZeroWiki";
+        _page?.Title is { Length: > 0 } title ? title : _page?.RelativePath ?? "ZeroWiki";
 
     /// <summary>
-    /// Resolves <see cref="Route"/> against a fresh enumeration (no caching — §4.1 owns the index that
-    /// makes this cheap) and either renders the page, surfaces 3a's refusal for it, or reports it as not
-    /// found. None of these three outcomes collapse into another: an ambiguous or sole-claimant-refused
-    /// route names every file implicated (D12) rather than reading as an ordinary 404.
+    /// Resolves <see cref="Route"/> against <see cref="PageIndex"/>'s current snapshot — refreshed first
+    /// if it is stale (D15, 4.3) — and either renders the page, surfaces D12's refusal for it, or reports
+    /// it as not found. None of these three outcomes collapse into another: an ambiguous or
+    /// sole-claimant-refused route names every file implicated (D12) rather than reading as an ordinary
+    /// 404. Title, tags, and last-edit all come from the resolved <see cref="PageIndexEntry"/> — only the
+    /// body is read from the working tree on this request, never from the index (D15: "index holds no
+    /// content"), so metadata can be a refresh behind but the rendered body never can.
     /// </summary>
     /// <remarks>
     /// <para>
@@ -147,9 +146,15 @@ else
             return;
         }
 
-        var enumeration = PageEnumerationService.EnumeratePages();
+        // D15/4.3: refreshes the snapshot first when its stamp no longer matches the repository's
+        // current HEAD — the mechanism that keeps this correct for a writer that never notifies the app
+        // (an `updateInstead` push, or an operator committing on the volume), identically to a browser
+        // save. GitProcessRunner still does not kill its subprocess on cancellation (obligation 8, owed
+        // to §6): a cancelled request abandons the wait rather than the underlying `git` invocation, an
+        // existing, narrow gap this call makes reachable from the request path, not one it introduces.
+        var snapshot = await PageIndex.GetCurrentAsync(context.RequestAborted);
 
-        var ambiguousMatch = enumeration.AmbiguousRoutes
+        var ambiguousMatch = snapshot.AmbiguousRoutes
             .FirstOrDefault(candidate => string.Equals(candidate.Route, canonicalRoute, StringComparison.Ordinal));
         if (ambiguousMatch is not null)
         {
@@ -158,7 +163,7 @@ else
             return;
         }
 
-        var pageMatch = enumeration.Pages
+        var pageMatch = snapshot.Pages
             .FirstOrDefault(candidate => string.Equals(candidate.Route, canonicalRoute, StringComparison.Ordinal));
         if (pageMatch is null)
         {
@@ -172,24 +177,20 @@ else
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
-            // The file existed when EnumeratePages() walked the tree a moment ago and is gone, mid-write,
-            // or newly unreadable now — a concurrent save racing this read without D3's lock (a gap 3a's
-            // review already parked for §6). UnauthorizedAccessException does not derive from IOException
-            // (S3, block 3 remediation) and was previously uncaught here, producing a 500 instead of the
-            // clean not-found this comment already promised. Report not found rather than a 500; the next
-            // request re-enumerates.
+            // The file existed in the index a moment ago and is gone, mid-write, or newly unreadable now
+            // — a concurrent save racing this read without D3's lock (a gap 3a's review already parked
+            // for §6). UnauthorizedAccessException does not derive from IOException (S3, block 3
+            // remediation) and was previously uncaught here, producing a 500 instead of the clean
+            // not-found this comment already promised. Report not found rather than a 500; the next
+            // request re-resolves against a fresh (or freshly refreshed) index.
             return;
         }
 
+        // D15: the index holds no content — the body is always read from the working tree on the
+        // request that renders it, above, never from the snapshot, so an out-of-date CommitSha can make
+        // metadata stale for the instant before a refresh, but never the rendered body.
         _page = pageMatch;
-        _frontmatter = PageFrontmatterExtractor.Extract(markdown);
         _renderedBody = new MarkupString(Markdown.ToHtml(markdown, MarkdownPipeline));
-
-        // D5: authorship is read from git, never a hand-maintained field. CancellationToken.None, not
-        // context.RequestAborted: GitProcessRunner does not yet kill its subprocess on cancellation
-        // (forward obligation 8, owed to §6) — passing the request token here would imply a cancellation
-        // guarantee that does not exist yet.
-        _lastEdit = await PageHistoryService.GetLastEditAsync(pageMatch.RelativePath, CancellationToken.None);
     }
 
     /// <summary>

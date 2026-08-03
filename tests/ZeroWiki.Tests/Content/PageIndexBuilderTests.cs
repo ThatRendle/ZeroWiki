@@ -243,4 +243,246 @@ public sealed class PageIndexBuilderTests : IDisposable
         Assert.Empty(snapshot.Pages);
         Assert.NotNull(snapshot.CommitSha);
     }
+
+    [Fact]
+    public async Task Refresh_WhenHeadUnchanged_ReturnsTheSameSnapshotInstance()
+    {
+        await InitializeRepositoryAsync();
+        await CommitPageAsync("page.md", new GitAuthor("Alice", "alice@zerowiki.example"), DateTimeOffset.UnixEpoch, "content");
+        var builder = CreateBuilder();
+        var current = await builder.BuildAsync(CancellationToken.None);
+
+        var refreshed = await builder.RefreshAsync(current, current.CommitSha, CancellationToken.None);
+
+        Assert.Same(current, refreshed);
+    }
+
+    [Fact]
+    public async Task Refresh_AddedPage_IsAddedWithoutDisturbingUnaffectedPages()
+    {
+        await InitializeRepositoryAsync();
+        await CommitPageAsync("first.md", new GitAuthor("Alice", "alice@zerowiki.example"), DateTimeOffset.UnixEpoch, "content");
+        var builder = CreateBuilder();
+        var current = await builder.BuildAsync(CancellationToken.None);
+
+        var editedAt = new DateTimeOffset(2026, 2, 2, 0, 0, 0, TimeSpan.Zero);
+        var newSha = await CommitPageAsync("second.md", new GitAuthor("Bob", "bob@zerowiki.example"), editedAt, "new content");
+
+        var refreshed = await builder.RefreshAsync(current, newSha, CancellationToken.None);
+
+        Assert.Equal(newSha, refreshed.CommitSha);
+        Assert.Equal(2, refreshed.Pages.Count);
+        var added = Assert.Single(refreshed.Pages, p => p.RelativePath == "second.md");
+        Assert.NotNull(added.LastEdit);
+        Assert.Equal("Bob", added.LastEdit.AuthorName);
+        Assert.Contains(refreshed.Pages, p => p.RelativePath == "first.md");
+    }
+
+    [Fact]
+    public async Task Refresh_ModifiedPage_PicksUpNewFrontmatterAndLastEdit()
+    {
+        await InitializeRepositoryAsync();
+        await CommitPageAsync(
+            "page.md",
+            new GitAuthor("Alice", "alice@zerowiki.example"),
+            DateTimeOffset.UnixEpoch,
+            "---\ntitle: Original\n---\nBody.");
+        var builder = CreateBuilder();
+        var current = await builder.BuildAsync(CancellationToken.None);
+
+        var editedAt = new DateTimeOffset(2026, 3, 3, 0, 0, 0, TimeSpan.Zero);
+        var newSha = await CommitPageAsync(
+            "page.md",
+            new GitAuthor("Carol", "carol@zerowiki.example"),
+            editedAt,
+            "---\ntitle: Updated\n---\nBody.");
+
+        var refreshed = await builder.RefreshAsync(current, newSha, CancellationToken.None);
+
+        var page = Assert.Single(refreshed.Pages);
+        Assert.Equal("Updated", page.Title);
+        Assert.NotNull(page.LastEdit);
+        Assert.Equal("Carol", page.LastEdit.AuthorName);
+        Assert.Equal(editedAt, page.LastEdit.EditedAt);
+    }
+
+    [Fact]
+    public async Task Refresh_DeletedPage_LeavesTheIndexRatherThanServingAGoneFile()
+    {
+        await InitializeRepositoryAsync();
+        await CommitPageAsync("keep.md", new GitAuthor("Alice", "alice@zerowiki.example"), DateTimeOffset.UnixEpoch, "content");
+        await CommitPageAsync("remove.md", new GitAuthor("Alice", "alice@zerowiki.example"), DateTimeOffset.UnixEpoch, "content");
+        var builder = CreateBuilder();
+        var current = await builder.BuildAsync(CancellationToken.None);
+        Assert.Equal(2, current.Pages.Count);
+
+        var repositoryRoot = Paths.RepositoryRoot;
+        await _git.RunOrThrowAsync(repositoryRoot, ["rm", "docs/remove.md"]);
+        var env = new GitAuthor("Alice", "alice@zerowiki.example").ToEnvironmentVariables();
+        await _git.RunOrThrowAsync(repositoryRoot, ["commit", "-m", "remove"], env);
+        var newSha = (await _git.RunOrThrowAsync(repositoryRoot, ["rev-parse", "HEAD"])).StandardOutput.Trim();
+
+        var refreshed = await builder.RefreshAsync(current, newSha, CancellationToken.None);
+
+        var remaining = Assert.Single(refreshed.Pages);
+        Assert.Equal("keep.md", remaining.RelativePath);
+    }
+
+    [Fact]
+    public async Task Refresh_NewFileCollidingWithAnExistingUnaffectedPage_RefusesBothRatherThanServingEither()
+    {
+        // The route a fresh EnumeratePages() would compute for "a_ b.md" and "a _b.md" collide (D12).
+        // Only the second file is part of the diff here -- the first is entirely unaffected -- proving
+        // the incremental path detects an emergent collision against a claimant the diff never mentions.
+        await InitializeRepositoryAsync();
+        await CommitPageAsync("a_ b.md", new GitAuthor("Alice", "alice@zerowiki.example"), DateTimeOffset.UnixEpoch, "first");
+        var builder = CreateBuilder();
+        var current = await builder.BuildAsync(CancellationToken.None);
+        Assert.Single(current.Pages);
+        Assert.Empty(current.AmbiguousRoutes);
+
+        var newSha = await CommitPageAsync("a _b.md", new GitAuthor("Bob", "bob@zerowiki.example"), DateTimeOffset.UnixEpoch, "second");
+
+        var refreshed = await builder.RefreshAsync(current, newSha, CancellationToken.None);
+
+        Assert.Empty(refreshed.Pages);
+        var ambiguous = Assert.Single(refreshed.AmbiguousRoutes);
+        Assert.Equal("a___b", ambiguous.Route);
+        Assert.Equal(["a _b.md", "a_ b.md"], ambiguous.RelativePaths);
+    }
+
+    [Fact]
+    public async Task Refresh_RemovingOneOfTwoCollidingClaimants_ServesTheRemainingOne()
+    {
+        await InitializeRepositoryAsync();
+        await CommitPageAsync("a_ b.md", new GitAuthor("Alice", "alice@zerowiki.example"), DateTimeOffset.UnixEpoch, "first");
+        await CommitPageAsync("a _b.md", new GitAuthor("Bob", "bob@zerowiki.example"), DateTimeOffset.UnixEpoch, "second");
+        var builder = CreateBuilder();
+        var current = await builder.BuildAsync(CancellationToken.None);
+        Assert.Empty(current.Pages);
+        Assert.Single(current.AmbiguousRoutes);
+
+        var repositoryRoot = Paths.RepositoryRoot;
+        await _git.RunOrThrowAsync(repositoryRoot, ["rm", "docs/a _b.md"]);
+        var env = new GitAuthor("Alice", "alice@zerowiki.example").ToEnvironmentVariables();
+        await _git.RunOrThrowAsync(repositoryRoot, ["commit", "-m", "resolve collision"], env);
+        var newSha = (await _git.RunOrThrowAsync(repositoryRoot, ["rev-parse", "HEAD"])).StandardOutput.Trim();
+
+        var refreshed = await builder.RefreshAsync(current, newSha, CancellationToken.None);
+
+        Assert.Empty(refreshed.AmbiguousRoutes);
+        var page = Assert.Single(refreshed.Pages);
+        Assert.Equal("a_ b.md", page.RelativePath);
+    }
+
+    [Fact]
+    public async Task Refresh_NoPreviousStamp_FallsBackToAFullRebuild()
+    {
+        await InitializeRepositoryAsync();
+        var newSha = await CommitPageAsync("page.md", new GitAuthor("Alice", "alice@zerowiki.example"), DateTimeOffset.UnixEpoch, "content");
+        var builder = CreateBuilder();
+
+        var refreshed = await builder.RefreshAsync(PageIndexSnapshot.Empty, newSha, CancellationToken.None);
+
+        Assert.Equal(newSha, refreshed.CommitSha);
+        Assert.Single(refreshed.Pages);
+    }
+
+    [Fact]
+    public async Task Refresh_StampedCommitNoLongerResolvable_FallsBackToAFullRebuildRatherThanReportingNoChange()
+    {
+        await InitializeRepositoryAsync();
+        await CommitPageAsync("page.md", new GitAuthor("Alice", "alice@zerowiki.example"), DateTimeOffset.UnixEpoch, "content");
+        var builder = CreateBuilder();
+        var current = await builder.BuildAsync(CancellationToken.None);
+
+        var editedAt = new DateTimeOffset(2026, 4, 4, 0, 0, 0, TimeSpan.Zero);
+        var newSha = await CommitPageAsync("second.md", new GitAuthor("Bob", "bob@zerowiki.example"), editedAt, "content");
+
+        // A stamp git can no longer resolve -- history rewritten, gc'd, or a reset --hard behind the
+        // app's back -- must not silently degrade into "nothing changed": detected honestly and rebuilt.
+        var unresolvableStamp = new string('f', 40);
+
+        var refreshed = await builder.RefreshAsync(current with { CommitSha = unresolvableStamp }, newSha, CancellationToken.None);
+
+        Assert.Equal(newSha, refreshed.CommitSha);
+        Assert.Equal(2, refreshed.Pages.Count);
+    }
+
+    [Fact]
+    public async Task Refresh_UnreadableDirectoriesPresentAtTheStampedSnapshot_FallsBackToAFullRebuild()
+    {
+        // Reviewer finding (block B round 1): ApplyIncrementalUpdateAsync reconstructs a route's other
+        // claimants from `current` alone, which is sound only when `current` is a complete census of the
+        // tree. It is not when UnreadableDirectories is non-empty -- a file under a directory this
+        // process could not read at the last full build was never recorded anywhere in the snapshot. If
+        // that directory later becomes readable (a permissions change, not a git-tracked one -- no `git
+        // diff` will ever name it) this is the only way that file is ever rediscovered, proven here by
+        // making the directory readable again between the stamped snapshot and the refresh and asserting
+        // the previously-hidden page appears -- something only a full rebuild, never the incremental path,
+        // could ever produce.
+        if (!OperatingSystem.IsLinux() && !OperatingSystem.IsMacOS())
+        {
+            return;
+        }
+
+        await InitializeRepositoryAsync();
+        await CommitPageAsync("unaffected.md", new GitAuthor("Alice", "alice@zerowiki.example"), DateTimeOffset.UnixEpoch, "content");
+        await CommitPageAsync(
+            Path.Combine("locked", "hidden.md"),
+            new GitAuthor("Alice", "alice@zerowiki.example"),
+            DateTimeOffset.UnixEpoch,
+            "content");
+
+        var lockedDir = Path.Combine(Paths.WorkingTree, "locked");
+        File.SetUnixFileMode(lockedDir, UnixFileMode.None);
+
+        try
+        {
+            bool stillReadable;
+            try
+            {
+                Directory.EnumerateFileSystemEntries(lockedDir).ToList();
+                stillReadable = true;
+            }
+            catch (UnauthorizedAccessException)
+            {
+                stillReadable = false;
+            }
+
+            if (stillReadable)
+            {
+                // Running as a user that ignores permission bits (e.g. root in CI) -- this test's
+                // premise cannot be exercised in this environment; nothing to assert.
+                return;
+            }
+
+            var builder = CreateBuilder();
+            var current = await builder.BuildAsync(CancellationToken.None);
+            Assert.Contains("locked", current.UnreadableDirectories);
+            Assert.DoesNotContain(current.Pages, p => p.RelativePath.Contains("hidden", StringComparison.Ordinal));
+
+            // A diffed change entirely unrelated to "locked" -- plus the directory becoming readable
+            // again (an operator's permissions fix, invisible to `git diff`) between the stamp and now.
+            var newSha = await CommitPageAsync(
+                "second.md",
+                new GitAuthor("Bob", "bob@zerowiki.example"),
+                DateTimeOffset.UnixEpoch,
+                "content");
+            File.SetUnixFileMode(lockedDir, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+
+            var refreshed = await builder.RefreshAsync(current, newSha, CancellationToken.None);
+
+            Assert.Empty(refreshed.UnreadableDirectories);
+            Assert.Contains(refreshed.Pages, p => p.RelativePath.Contains("hidden", StringComparison.Ordinal));
+            Assert.Contains(refreshed.Pages, p => p.RelativePath == "second.md");
+        }
+        finally
+        {
+            if (Directory.Exists(lockedDir))
+            {
+                File.SetUnixFileMode(lockedDir, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+            }
+        }
+    }
 }
