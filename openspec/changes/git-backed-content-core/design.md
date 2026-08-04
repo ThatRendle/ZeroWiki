@@ -36,9 +36,11 @@ Expose `info/refs`, `git-upload-pack`, `git-receive-pack` by mapping those route
 
 ### D3 — Single cross-process write lock (`flock`)
 
-All repository writes are serialized through one `flock` on a lockfile, taken by **both** the app's commit path **and** git's `pre-receive`/`post-receive` hooks.
+All repository writes are serialized through one `flock` on a lockfile. It is taken by the app's own commit path directly, and — for pushes — by the app itself wrapping the whole `git http-backend` invocation (§7.5), not by the `pre-receive`/`post-receive` hooks that invocation runs as children of.
 
-*Why:* browser commits run in the app process; pushes run in the `git http-backend` subprocess. An in-process `lock` cannot protect against the subprocess, so the shared primitive must be filesystem-level. Without it, a push can land between a save's `write` and `commit` and leave the tree dirty from two sources. At this scale, serialized writes are not a bottleneck.
+*Why filesystem-level, not in-process:* both acquisition points — the app's own commit path (§5.2) and its wrapper around `git http-backend` for pushes (§7.5) — run inside the same .NET process, so it is fair to ask why an in-process primitive (a C# `lock`, `SemaphoreSlim`) would not suffice. It would not, because the racer this lock exists to exclude is not two code paths inside one process — it is a **second, wholly separate OS process**: `## NEXT` obligation 16 names the concrete case, two ZeroWiki instances running concurrently against the same mounted volume during a rolling deploy's brief overlap. Each instance has its own CLR and its own in-process lock state, sharing nothing with the other's; an in-process lock can only ever exclude within the process that holds it, so it is structurally incapable of seeing, let alone blocking, a second instance's write. The shared primitive therefore has to live outside any one process's memory — on the filesystem, where any process that opens it (this instance, a concurrently-running sibling, or an operator's own `flock` invocation) is subject to the same exclusion. Without it, a push and a save — or two instances' own writes — can interleave and leave the tree dirty from two sources. At this scale, serialized writes are not a bottleneck.
+
+*Why the hooks cannot be the lock point (§5 finding, Product Owner decision):* `receive.denyCurrentBranch=updateInstead`'s receive sequence is objects written → `pre-receive` runs and **exits** → refs update and the working tree is updated by git itself → `post-receive` runs and exits. A `flock` acquired and released inside `pre-receive` is gone before git touches the working tree — no hook process is alive during the write the lock exists to cover, so a hook-held lock cannot deliver this decision's guarantee regardless of which hook holds it. Locking around the whole `http-backend` invocation instead covers git's own ref/working-tree update because that update happens strictly inside the wrapped subprocess's lifetime. See D16 for the consequence this has for the hooks themselves: they must not attempt to take this lock at all, on pain of deadlock.
 
 ### D4 — Optimistic concurrency via base-revision CAS
 
@@ -275,9 +277,10 @@ governs.
 
 ### D16 — The write lock: primitive, location, and acquisition policy
 
-D3 says one `flock`, taken by both the app's commit path and git's `pre-receive`/`post-receive` hooks,
-in three sentences. This settles the four things that decide whether that claim actually holds: which
-primitive, where the lockfile lives, how each side acquires it, and what §5.1's lock does to the
+D3 says one `flock`, taken by the app directly for its own commit path and by the app again — wrapping
+the whole `git http-backend` invocation, not the `pre-receive`/`post-receive` hooks it runs — for
+pushes. This settles the four things that decide whether that claim actually holds: which primitive,
+where the lockfile lives, how each side acquires it, and what §5.1's lock does to the
 snapshot-trusting read at `## NEXT` obligation 16.
 
 **Primitive — a `flock(2)` advisory lock taken on a raw POSIX file descriptor via `P/Invoke`, not
@@ -325,8 +328,26 @@ calls — mutual exclusion holds by construction, not by two independent impleme
 agree. It gives a true kernel-level blocking wait (no poll loop, immediate wake on release) and a true
 non-blocking `LOCK_NB` trylock, and closing the fd (including on process exit/crash) releases the lock
 automatically — no stale-lock cleanup path is needed on either side. The cost is `unsafe`/`P/Invoke` and
-a few lines of interop rather than a `using var fs = new FileStream(...)`; that cost buys exactness on the
-one claim this whole section rests on.
+a few lines of interop rather than a `using var fs = new FileStream(...)`.
+
+**What this claim's status actually is, now that §5.3 is struck.** When this was written, the shell's
+`flock(1)` was the *only* other lock-holder in the design — the `pre-receive`/`post-receive` hooks — so
+demonstrating `.NET flock(2) ↔ shell flock(1)` interop *was* the one claim the whole section rested on:
+without it, nothing established that our primitive and the hooks' primitive excluded each other at all.
+That is no longer the section's foundation. Both acquisition points are now the same C# `RepositoryWriteLock`
+type — the app's own commit path (§5.2) and its wrapper around `git http-backend` (§7.5) — and the
+property the section actually rests on is instance-vs-instance exclusion: two **separate OS processes**
+each running our own `flock(2)` code excluding each other, which is precisely what a rolling deploy's
+overlapping instances (`## NEXT` obligation 16) need and precisely what §5's "ours-vs-ours" tests prove
+directly, by running a second real process against the production lock type. The `.NET-vs-flock(1)`
+interop spike above still demonstrates something true and still worth having recorded — `flock(2)` is
+the same kernel primitive regardless of which userspace code calls it, so this was never at risk of
+being wrong — but it is no longer load-bearing for the guarantee this section makes. It is **insurance**,
+not foundation: kept because an operator debugging a stuck lock will reach for `flock` on the command
+line, and a future hook or maintenance script might too, so it is cheap confirmation that doing so
+behaves as expected against our lockfile — not because anything in §5.1–§5.2/§7.5's own correctness
+depends on it. The `flock(2)`-vs-`flock(1)` interop regression test (`RepositoryWriteLockTests.cs`,
+Linux-only) is kept for that reason, reframed the same way in its own comments.
 
 **A bounded wait has no syscall for it.** `flock(2)` is binary — block forever (`LOCK_EX`) or fail
 instantly (`LOCK_EX|LOCK_NB`) — there is no third "block up to N seconds" mode, and a blocked `flock(2)`
@@ -334,8 +355,11 @@ call cannot be cancelled from .NET without leaking the native thread it runs on.
 acquisition is therefore a **poll loop**: `LOCK_EX|LOCK_NB` on a fixed interval (starting at ~50ms,
 matching what the spike's `FileStream` fallback already used) against a wall-clock deadline, driven by a
 `CancellationToken` so it composes with the rest of the request pipeline rather than blocking a thread
-pool thread for the whole wait. The hook side has no such constraint — `/bin/sh` calling `flock -x
-<path> -c '…'` is a genuine kernel-level unbounded block, exactly D3's original three sentences.
+pool thread for the whole wait. The push side has no such constraint: the app's own wrapper around the
+whole `git http-backend` invocation (§7.5) acquires the same lock with a plain blocking `LOCK_EX` —
+a genuine kernel-level unbounded block, taken directly by the app rather than by a hook (see D3's
+"why the hooks cannot be the lock point" and the acquisition-policy note below for why no hook may
+attempt this acquisition itself).
 
 **Location — `ContentPaths.LockFilePath`, a sibling of `RepositoryRoot`, not a file under it.** The
 brief's framing ("outside `ContentPaths.WorkingTree`") understates the constraint: within
@@ -359,11 +383,12 @@ actually consults. **Nothing in git dictates where a lockfile of our own inventi
 protocol requirement pulling it toward `.git/`, so the reason the hooks path must be resolved dynamically
 does not transfer to it. A fixed, `DataRoot`-relative constant is simpler, needs no `git` subprocess call
 just to find the file to lock, and matches `KeysDirectory`'s already-established shape for "outside the
-repository, on the volume, derived once." The generated `pre-receive` hook body (§5.3, out of scope here)
-bakes this literal path into its `#!/bin/sh` text at install time, since the script has no way to ask
-`ContentPaths` anything at runtime.
+repository, on the volume, derived once." Because acquisition on both sides — the app's own commit path
+(§5.2) and the push wrapper around `git http-backend` (§7.5) — happens in C# rather than in a generated
+shell script, `ContentPaths.LockFilePath` never has to be baked as a literal path into hook text at
+install time; neither hook needs to know it exists at all.
 
-**Acquisition policy — bounded for the app, unbounded for hooks (Product Owner decision).**
+**Acquisition policy — bounded for saves, unbounded for pushes (Product Owner decision).**
 
 - **Ceiling:** a configurable `ContentStorage:WriteLockTimeout`, defaulting to **10 seconds**, bound the
   same way as `ContentStorageOptions.DataRoot` (an `IOptions<ContentStorageOptions>` section, overridable
@@ -383,18 +408,33 @@ bakes this literal path into its `#!/bin/sh` text at install time, since the scr
   HTTP response; an indefinite hang is a hung tab with no recovery path but closing it, for a failure mode
   that costs nothing to recover from (nothing was written yet — the user just retries). A push is a
   background sync — `obsidian-git` runs it off an interval or an explicit user action with no one watching
-  a terminal in real time — and more importantly, timing a `pre-receive` hook out mid-push has a *worse*
-  failure shape than waiting: git's push protocol has no clean "busy, retry" signal for a hook to send, so
-  a bounded hook wait would surface as a rejected or malformed push the client has to interpret, where an
-  unbounded wait instead just... finishes, correctly, the moment the (normally brief, bounded) save that
-  is holding the lock releases it.
-- **What an unbounded hook wait costs when the app is what is stuck:** honestly, more than it looks. If
-  the app's own accept-and-write phase holds the lock and hangs — a bug, not ordinary contention, since
-  the app's *own* acquisition is bounded and a crash releases the OS-level `flock` automatically on
-  process exit — every subsequent push blocks forever with no timeout to break it and no diagnostic beyond
-  "the push never returns." The operator's only lever is restarting the app process, which releases the
-  lock as a side effect of the process exiting. This is a real, named cost of the asymmetry, not a case
-  the policy pretends away.
+  a terminal in real time — and more importantly, timing the push side's wait out mid-push has a *worse*
+  failure shape than waiting: git's push protocol has no clean "busy, retry" signal to send back through
+  `git http-backend`, so a bounded wait there would surface as a rejected or malformed push the client has
+  to interpret, where an unbounded wait instead just... finishes, correctly, the moment the (normally
+  brief, bounded) save that is holding the lock releases it. This reasoning does not depend on which
+  process performs the acquisition — it held when a hook was the candidate lock-holder, and it holds
+  now that the app's own `http-backend` wrapper (§7.5) is.
+- **What an unbounded wait costs when the app itself is what is stuck — sharper now than when a hook
+  would have been the one waiting.** If the app's own accept-and-write phase (§5.2) or a browser save's
+  commit path holds the lock and hangs — a bug, not ordinary contention, since bounded acquisition and a
+  crash both release the OS-level `flock` automatically — every subsequent push's wait now also runs
+  *inside the app process itself* (the §7.5 wrapper around `git http-backend`, not a separate hook
+  process), blocking forever with no timeout to break it and no diagnostic beyond "the push never
+  returns." The operator's only lever is restarting the app process, which releases the lock as a side
+  effect of the process exiting — the same lever as before, but now the thing an operator restarts to
+  break the deadlock is the very process that is also refusing to serve the hung request, not a
+  short-lived child of it. This is a real, named cost of the asymmetry, not a case the policy pretends
+  away, and moving the mechanism from a hook to the app's own wrapper (§5's Product Owner decision) does
+  not reduce it.
+- **Why no hook may attempt this acquisition itself, even as a defensive no-op.** Once the app holds the
+  lock around the whole `http-backend` invocation, that lock is held by the *parent* of every hook the
+  receive runs — `pre-receive` and `post-receive` are children of the wrapped subprocess, which is itself
+  a child of the app. A hook that calls `flock` on the same lockfile blocks on its own parent, which
+  cannot release the lock while it is itself waiting on the hook to exit: `flock(2)` is per-open-file-
+  description, so a separate process gets no re-entrancy, and this acquisition policy makes the wait
+  unbounded on both sides of that deadlock. The result is not a slow push but one that never returns.
+  `GitHookInstaller`'s generated hook bodies carry this warning explicitly, for whoever next edits them.
 
 **Obligation 16 — the write lock is what makes `repositoryHasNoCommitsYet` a snapshot safe to trust, and
 only once it wraps classification too.** `EnsureInitialCommitAsync` trusts a boolean

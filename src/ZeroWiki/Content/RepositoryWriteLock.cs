@@ -12,10 +12,12 @@ namespace ZeroWiki.Content;
 /// every open regardless of the requested <see cref="FileShare"/> value — so they throw
 /// <see cref="IOException"/> the instant another process already holds the lock, before this type's own
 /// <c>flock()</c> call would ever run (verified by execution; recorded in design.md D16). Serializes the
-/// app's write path (§5.2) against a concurrent git push, which locks the same file with a plain
-/// <c>flock(1)</c> shell invocation from the generated <c>pre-receive</c>/<c>post-receive</c> hooks
-/// (§5.3) — real <c>flock(2)</c>, called directly, is byte-for-byte what <c>flock(1)</c> also calls, so
-/// mutual exclusion holds by construction.
+/// app's own commit path (§5.2) against a concurrent git push — locked, for the duration of the whole
+/// push, by the app itself wrapping the <c>git http-backend</c> invocation (§7.5), not by a hook: a
+/// <c>flock</c> held inside <c>pre-receive</c> or <c>post-receive</c> would be released when that hook
+/// exits, before git updates the working tree, so no hook can be the one holding this lock (design.md
+/// D3, D16). The generated hooks must never call <c>flock</c> on this file themselves — see
+/// <see cref="GitHookInstaller"/>'s remarks for why doing so would deadlock against their own parent.
 /// </summary>
 /// <remarks>
 /// <para>
@@ -25,8 +27,9 @@ namespace ZeroWiki.Content;
 /// <see cref="AcquireAsync"/> therefore polls <c>LOCK_EX|LOCK_NB</c> on a fixed interval against a
 /// wall-clock deadline, composing with the caller's own <see cref="CancellationToken"/> via
 /// <see cref="Task.Delay(TimeSpan, CancellationToken)"/> rather than blocking a thread-pool thread for
-/// the whole wait. The hook side has no such constraint — a genuine kernel-level unbounded
-/// <c>flock(1)</c> block, out of scope here (§5.3).
+/// the whole wait. The push side has no such constraint — the app's own wrapper around
+/// <c>git http-backend</c> (§7.5) acquires this same lock with a plain blocking <c>LOCK_EX</c>, a
+/// genuine kernel-level unbounded block, taken directly by the app rather than by a hook (design.md D16).
 /// </para>
 /// <para>
 /// <b>Releasing is closing the file descriptor, not a separate unlock call.</b> The kernel drops an

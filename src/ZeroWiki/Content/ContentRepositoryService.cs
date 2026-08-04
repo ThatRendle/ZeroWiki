@@ -240,10 +240,10 @@ public sealed class ContentRepositoryService
                 $"{ex.Timeout}. This most likely means another ZeroWiki instance's own startup is still " +
                 "holding it against the same data volume (e.g. a rolling deploy's brief overlap), which " +
                 "resolves itself once that instance finishes — restarting is not needed in that case. " +
-                "It can also mean a git push's pre-receive/post-receive hook, or the git http-backend " +
-                "subprocess handling it, is stuck holding the lock indefinitely (by design, a hook's own " +
-                "wait for this lock has no bound). Refusing to start rather than proceed without " +
-                "exclusive access to the repository.",
+                "It can also mean the app's own wrapper around a git push's git http-backend invocation " +
+                "is stuck holding the lock indefinitely (by design, its wait for this lock has no bound " +
+                "— never a receive hook, which must not acquire this lock itself). Refusing to start " +
+                "rather than proceed without exclusive access to the repository.",
                 ex);
         }
     }

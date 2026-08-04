@@ -122,11 +122,16 @@ public sealed class RepositoryWriteLockTests : IDisposable
     [Fact]
     public async Task HeldByFlock1_NonBlockingShellProbeFailsWhileHeldAndSucceedsAfterRelease()
     {
-        // Ours-vs-flock(1): the interop block D depends on. Linux-only, per the block brief — macOS has
-        // no flock(1) binary at all (confirmed: D16's own spike). Skipping on "is the binary missing"
-        // rather than an explicit platform check would report green on a Linux box that happens to be
-        // missing util-linux while the one property this whole section rests on goes unverified — so
-        // this fails outright on Linux if flock(1) is absent, and only skips on a positive macOS check.
+        // Ours-vs-flock(1): insurance, not foundation (design.md D16) — with hooks forbidden from ever
+        // taking this lock (§5, Product Owner decision), what the section's guarantee actually rests on
+        // is instance-vs-instance flock(2) exclusion between two processes running our own code, proven
+        // directly by the "ours-vs-ours" test above. This test instead pins that an operator's or a
+        // future script's plain `flock` shell invocation still behaves as expected against our lockfile.
+        // Linux-only, per the block brief — macOS has no flock(1) binary at all (confirmed: D16's own
+        // spike). Skipping on "is the binary missing" rather than an explicit platform check would report
+        // green on a Linux box that happens to be missing util-linux while this insurance property goes
+        // unverified — so this fails outright on Linux if flock(1) is absent, and only skips on a
+        // positive macOS check.
         if (!OperatingSystem.IsLinux())
         {
             return;
@@ -203,8 +208,9 @@ public sealed class RepositoryWriteLockTests : IDisposable
 
         throw new InvalidOperationException(
             "flock(1) not found on this Linux host. The block brief requires failing here rather than " +
-            "skipping: a skip conditioned on 'is the binary there' would report green while the " +
-            "app/hook interop property this section rests on goes unverified. Install util-linux.");
+            "skipping: a skip conditioned on 'is the binary there' would report green while this " +
+            "insurance property (design.md D16 — flock(2)-vs-flock(1) interop) goes unverified. " +
+            "Install util-linux.");
     }
 
     private static async Task<(int ExitCode, string StandardOutput, string StandardError)> RunFlockAsync(

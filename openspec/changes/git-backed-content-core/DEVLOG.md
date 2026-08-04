@@ -9726,6 +9726,463 @@ comment states the comparison carefully and cites the full-suite pair. The defec
 file, which is where §2's five wrong justifications also lived — the record drifts more readily than
 the code, because nothing executes the record.
 
+**[architect]** Block C **landed as `e6ef77a`**, ticking **5.1 and 5.2** — the first boxes §5 has moved.
+Gates run by me: `dotnet build` 0/0, `dotnet test` **716/716** unfiltered foreground (1m49s),
+`dotnet format --verify-no-changes` exit 0, `openspec validate --strict` valid, and
+`grep -rn "MUTANT" src/ tests/` empty — the residue check, run because §5 is the first section in this
+change to mutate a file git had no baseline for.
+
+**[architect]** ❓ @product-owner — **5.3 as written cannot deliver the requirement it exists for, and
+this is a spec/tasks defect rather than an implementation problem.** Raised before briefing block D
+rather than after a worker met it mid-block.
+
+Git's receive sequence with `receive.denyCurrentBranch=updateInstead` (confirmed set,
+`ContentRepositoryService.cs:505`) is: receive-pack writes the objects → **`pre-receive` runs and
+exits** → refs update and the working tree is updated → **`post-receive` runs and exits**. A `flock`
+held by `pre-receive` is released when `pre-receive` exits, which is *before* the tree is touched.
+**No hook is alive during the write the lock is supposed to cover**, so
+`specs/content-editing/spec.md:42-45` — "the push waits until the save releases the lock before
+updating the working tree" — is not satisfied by hooks that acquire and release it. The failure mode is
+not corruption (`updateInstead` refuses a dirty tree) but a **spurious push rejection** during a save,
+which is a confusing thing to hand an Obsidian user and is not what the spec describes.
+
+Three candidate lock points, none free: `push-to-checkout` (the only hook running at the right moment,
+but installing it means git stops doing its own checkout and ours must reimplement it — a fidelity gap
+becomes a data-integrity bug on the push path); the app wrapping the whole `git http-backend`
+invocation (simplest and safest, but holds the lock across the client's pack upload, so a large push
+blocks saves for its duration); or hooks locking only their own work and accepting the tree update is
+unprotected (honest, cheap, leaves the requirement partly unmet).
+
+**[product-owner]** The http-backend wrapper. Move it to §7.
+
+**[architect]** Recorded, and `tasks.md` updated: **5.3 struck from §5 with its reason inline, and
+7.5 added** — "Hold the repository write lock around the whole `git http-backend` invocation". §5's
+remaining work is therefore an amendment block that ticks nothing; §5 is complete at 5.1–5.2.
+
+**⚠️ The decision creates a deadlock hazard, and §8 is where it will bite.** Once the app holds the
+lock around `git http-backend`, that lock is held by the **parent** of every hook the receive runs. A
+hook that tries to `flock` the same file therefore blocks against its own parent — `flock(2)` is
+per-open-file-description, so a different process gets no re-entrancy — and by D16's own rule the hook
+side waits **unbounded**. The result is not a slow push or an error: it is a push that never returns,
+and an operator whose only lever is restarting the app. **`GitHookInstaller`'s two hook bodies
+currently promise exactly this**, in the generated files an implementer will read:
+`"Filled in by section 5.3: acquire the repository's single write lock before any ref is updated"`.
+§8.1–8.2 fill in `post-receive` for re-indexing and broadcast, and that is precisely the moment someone
+follows the comment. The comment must become a warning before §8 exists, not after.
+
+**[architect]** Brief — **block D: amend the record to match the decision, and disarm the hazard.
+Ticks nothing — 5.3 is struck, not completed. Closes §5.**
+
+1. **`GitHookInstaller` — the load-bearing part.** Both hook bodies (`PreReceiveHookBody`,
+   `PostReceiveHookBody`) currently tell a future implementer to take the write lock here. Replace
+   those lines with an explicit **warning not to**, stating the mechanism (the app holds the lock
+   around the whole `http-backend` invocation, so the hook's parent already holds it; `flock(2)` gives
+   no re-entrancy across processes; the hook side is unbounded by design, so the push hangs forever
+   rather than failing). Write it for the person who arrives in §8 with a `post-receive` to fill in and
+   no memory of this decision. Also update the class `<summary>`/`<remarks>` and the two
+   `PreReceiveHookName`/`PostReceiveHookName` doc comments, which reference §5.3's lock acquisition.
+2. **`design.md` D3** — its mechanism sentence ("taken by **both** the app's commit path **and** git's
+   `pre-receive`/`post-receive` hooks") is now false. Correct it to the decided mechanism, and keep the
+   *reasoning* that made D3 right — the lock must be filesystem-level because pushes run in a
+   subprocess — since that is unchanged and is what still rules out an in-process lock. Record why the
+   hooks cannot be the lock point (the sequence above), so this is not rediscovered.
+3. **`design.md` D16** — check every reference to §5.3 and to the hooks' unbounded wait. D16's
+   asymmetry justification still holds (the app bounded, the push side unbounded) but the *mechanism*
+   moves from a hook's `flock(1)` to the app's own wrapper. **Do not weaken the asymmetry, and do not
+   delete D16's honest statement of its cost** — that cost is now sharper, because the unbounded waiter
+   is the app's own subprocess wrapper. `RepositoryWriteLock`'s `<summary>` also names the hooks as the
+   other locker; fix it there too.
+4. **Check for anything else that names §5.3 or hook-held locking** — `ContentPaths.LockFilePath`'s
+   remarks, `ContentStorageOptions.WriteLockTimeout`, tests, the spec. **This is block B's lesson
+   applied prospectively**: ask what this decision made false *elsewhere*, not only what is in front of
+   you. Report what you searched for, not just what you found.
+
+**No spec delta.** `specs/content-editing/spec.md`'s requirement and its four scenarios all remain
+true and still describe the guarantee — only which component delivers it changes, and a spec should not
+name the component. If you conclude otherwise, say so rather than editing the spec.
+
+**Out of scope**: implementing 7.5. No `http-backend` route, no wrapper, no new lock call site.
+
+**Gates**: `dotnet build`, `dotnet test` unfiltered (report the real figure or "not obtained"),
+`dotnet format --verify-no-changes`, `openspec validate git-backed-content-core --strict`. Existing
+tests should be untouched; if one asserts on a hook body's text, that is a legitimate edit — say so
+explicitly rather than folding it in silently.
+
+**Mutation testing: no.** Comments and prose only.
+
+→ @worker
+
+**[worker]** Block D done. Ticks nothing — 5.3 is struck, not completed, per the brief. Prose/comments
+only; `git diff --stat -- src tests` shows only doc-comment and string-literal lines (confirmed by
+re-reading each diff, not just the stat) across five `src/` files plus one test string, no logic
+changed.
+
+**1. `GitHookInstaller.cs` — both hook bodies rewritten as a warning, not an instruction.**
+`PreReceiveHookBody`/`PostReceiveHookBody` no longer say "filled in by section 5.3: acquire the lock" —
+they now explicitly say **do not** acquire the write lock here, name the mechanism (the app already
+holds it around the whole `git http-backend` invocation, §7.5), and state the consequence in the hook's
+own words for whoever reads it with no memory of this thread: `flock(2)` gives no re-entrancy across
+processes, so locking here blocks this hook against its own parent, the wait is unbounded by design, and
+the result is a push that never returns rather than a slow one. `PostReceiveHookBody` keeps its §8.1-8.2
+re-index/broadcast instruction and adds a line that that work needs none of this — it can assume the
+push already finished landing under the app's lock by the time the hook runs, which is exactly the
+"someone arrives here with a `post-receive` to fill in" case the brief named as the actual hazard.
+Class `<remarks>` now has a second `<para>` stating the deadlock mechanism plainly; both
+`PreReceiveHookName`/`PostReceiveHookName` doc comments dropped their §5.3 lock claims and instead warn
+against it, cross-referencing each other and the hook bodies.
+
+**2. `design.md` D3** — mechanism sentence corrected: the lock is taken by the app's own commit path
+directly, and by the app again wrapping the whole `http-backend` invocation for pushes — not by the
+hooks. Added a **new "why the hooks cannot be the lock point" paragraph** stating the receive sequence
+that makes this true (`pre-receive` runs and exits, *then* refs/working-tree update, *then*
+`post-receive` runs) so a hook-held `flock` is provably gone before the write it's meant to cover. The
+original "why filesystem-level, not in-process" reasoning (pushes run in a subprocess, so an in-process
+lock can't reach them) is untouched — still correct, still the reason `flock` and not an in-process
+primitive.
+
+**3. `design.md` D16`** — four spots fixed, none of the asymmetry weakened:
+- Opening paragraph's restatement of D3 updated to match.
+- "A bounded wait has no syscall for it" — "the hook side" → the app's own `http-backend` wrapper
+  acquires the same lock with a blocking `LOCK_EX`; still an unbounded kernel-level block, now
+  attributed to the right process.
+- Location section — dropped the now-false claim that the generated `pre-receive` body bakes the
+  lockfile path into its shell text; replaced with the actual (simpler) consequence: since both
+  acquisition sites are C#, the path never needs to be baked into hook text at all, and neither hook
+  needs to know it exists.
+- Acquisition-policy heading retitled "bounded for saves, unbounded for pushes" (was "...unbounded for
+  hooks"). The asymmetry's justification paragraph is otherwise untouched — still the person-waiting-on-
+  a-response vs. background-sync argument, still the "no clean busy/retry signal" point, just no longer
+  naming a hook as the thing doing the waiting. **The cost paragraph is sharpened, not diluted**: it now
+  says explicitly that the unbounded wait runs *inside the app process itself* now, not a short-lived
+  child of it, so restarting to break the deadlock means restarting the very process refusing to serve
+  the hung request — a real difference in operational character from the original hook-based framing,
+  named rather than smoothed over, per the brief's "do not weaken the asymmetry, do not delete the
+  honest cost statement" instruction. Added a new bullet explaining *why* no hook may attempt this
+  acquisition even defensively (parent/child `flock` deadlock), so the reasoning that justifies
+  `GitHookInstaller`'s warning lives in the design doc too, not only in the generated comment.
+- Obligation 16's own text never named hooks or §5.3 — checked, left untouched.
+
+**4. Search for other stale references — what I checked, not just what I found.** Grepped the whole
+repo (`src`, `tests`, `openspec/changes/git-backed-content-core`) for `5\.3`, `§5\.3`, and `hook.*lock`/
+`lock.*hook` case-insensitive, then read every hit in context rather than pattern-matching blind:
+
+- `ContentPaths.cs` `LockFilePath`'s `<remarks>` — fixed (was: pre-receive bakes the literal path; now:
+  both lock sites are C#, so no hook ever needs the path).
+- `ContentStorageOptions.cs` `WriteLockTimeout`'s doc — fixed (was: "the hooks' own `flock(1)` call,
+  §5.3, is deliberately unbounded"; now: "the app's own wrapper around `http-backend` (§7.5), not a
+  hook").
+- `RepositoryWriteLock.cs` — class `<summary>` fixed (named the hooks as the other locker via §5.3; now
+  states the receive-sequence reason a hook can't hold this lock, and points at `GitHookInstaller` for
+  why attempting to would deadlock). The `<remarks>` "hook side has no such constraint" sentence fixed
+  the same way as D16's twin sentence.
+- `ContentRepositoryService.cs:64-71` (`EnsureRepositoryAsync`'s phase-split remarks) — read, no false
+  claim: describes only which of `AcceptRepositoryAsync`/`ConfigureRepositoryAsync` holds the lock, never
+  names a hook. Left as-is.
+- `ContentRepositoryService.cs:238-247` (`AcquireStartupWriteLockAsync`'s exception message) — **not
+  named in the brief's example list, found by the grep, and operator-visible, so fixed.** The refusal
+  message an operator actually reads on startup lock-timeout said "a git push's pre-receive/post-receive
+  hook, or the git http-backend subprocess handling it, is stuck holding the lock indefinitely (by
+  design, a hook's own wait for this lock has no bound)" — false in exactly the way D16 was: hooks never
+  hold this lock now. Reworded to name the app's own `http-backend` wrapper and state explicitly that a
+  hook must not acquire this lock itself. Checked `tests/` for any assertion on this message's text —
+  none — so no test needed changing for this fix.
+- `RepositoryWriteLockTests.cs:207` — the `flock(1)`-not-found exception message said "the app/hook
+  interop property this section rests on" — not a stale *claim* (the `flock(2)`-vs-`flock(1)` interop
+  property this test proves is still real and still worth proving), but "hook" was the wrong noun for
+  what's being interop-tested now. Reworded to "the `flock(2)`-vs-`flock(1)` interop property". Not a
+  test-assertion change — the test still exercises exactly the same behaviour, only the message string
+  moved.
+- `ContentStorageStartupExtensions.cs` — grepped for `hook`/`WriteLockTimeout`; only the `.Validate` call
+  site, no prose to go stale.
+- `proposal.md:11` — **found, not fixed, flagging explicitly rather than silently leaving it.** "Single
+  per-repo write lock (cross-process `flock`) shared by the app's commit path and git's receive hooks"
+  restates the same now-false mechanism as old D3. I did not edit it: `proposal.md` has been touched
+  exactly once since this change's initial commit (`bd2eeea`, resolving D8-D11) despite several later
+  Product Owner decisions that changed mechanism at least as significantly as this one (D9's four
+  addenda, D16 itself) and none of them updated it — this repo's established practice appears to be that
+  `proposal.md` records the change's original why/what and design.md carries the binding, evolving
+  detail, not that every mechanism refinement gets back-ported into it. Given that precedent and that
+  it's outside the brief's explicit deliverable list, I left it and I'm surfacing it here rather than
+  either silently fixing or silently ignoring it — @architect's call whether it's worth a one-line touch.
+- `openspec/specs/` (committed capability specs) — no `git-backed-content-core` capability archived yet,
+  nothing there to check.
+- `README`/other `*.md` outside this change — grepped for `pre-receive`/`post-receive`; only hits are
+  inside this change's own `proposal.md`/`design.md`/`tasks.md` (already covered above) and `DEVLOG.md`
+  (append-only, not editable).
+
+**No spec delta, and I agree with the brief's own read.** `specs/content-editing/spec.md`'s "Single
+per-repo write lock" requirement and its four scenarios (checked directly, `:38-60`) never name a
+hook, `http-backend`, or any component — "a browser save"/"a git push" throughout. All four remain true
+under the new mechanism; nothing needed there.
+
+**Gates.** `dotnet build` clean (0 warnings, 0 errors). `dotnet format --verify-no-changes` exit 0.
+`openspec validate git-backed-content-core --strict` valid. `dotnet test` unfiltered, foreground:
+**716 passed, 0 failed, 0 skipped, 716 total, 1m 52s** — same 716 as block C landed with; no test
+added or removed, one test's exception-message string edited (flagged above, not an assertion change).
+
+No mutation testing run, per the brief (comments/prose only).
+
+→ @reviewer
+
+**[reviewer]** Block D audit — the section-closing block. Independently reconfirmed gates first:
+`dotnet build` 0/0, `dotnet format --verify-no-changes` clean, `openspec validate --strict` valid,
+`dotnet test` unfiltered foreground — **716/716**, same count as block C, matching the report.
+
+**1. The warning — correct, sufficient, and not overstated.** Cross-checked the foundational premise
+independently rather than trusting the DEVLOG's prior claim: git's documented `pre-receive` →
+ref/working-tree update → `post-receive` ordering, and `receive.denyCurrentBranch=updateInstead`'s
+documented implementation (the working-tree update happens as part of the ref-update step, strictly
+after `pre-receive` has already exited), both confirm a `flock` acquired and released inside
+`pre-receive` cannot still be held during the later write — this holds on the OS fact alone (a process
+that has exited holds no locks) without needing anything git-specific beyond the ordering. The premise
+is sound.
+
+Read both generated hook bodies as instructed — as the §8 implementer, cold. The actionable instruction
+("do NOT acquire the repository write lock here") comes before the technical justification, so a skim
+still gets the directive; the justification itself (parent holds it, `flock(2)` gives no cross-process
+re-entrancy, the wait is unbounded by design, recourse is restarting the app) is accurate and specific
+enough to be convincing rather than merely assertive. Checked the brief's own hypothesis directly: is a
+non-blocking `flock -n` probe a narrower true statement the warning overstates by omission? Concluded
+no, and deliberately — a probe can't provide any actual synchronization guarantee (the state can change
+between the probe and whatever the hook does next), and in the reverse-race window right as the app's
+wrapper releases, a probing hook could spuriously *succeed* and briefly hold the lock for no protective
+purpose. Naming that exception would only invite exactly the "let me just check first" mistake the
+warning exists to prevent, so the blanket phrasing is the right call, not an overstatement. One
+non-blocking observation: "blocks on its own parent" describes a hook as the app's direct child, when
+the real chain is app → `http-backend` → `receive-pack` → hook (a descendant, not necessarily a direct
+child). Doesn't affect correctness — `flock(2)` exclusion is global and process-tree-agnostic, so the
+deadlock reasoning holds regardless of exactly how many hops separate them — but "child" is doing more
+precise-sounding work than it technically is. Not blocking.
+
+**2. D3 and D16 — the asymmetry is preserved and honestly sharpened, confirmed by direct reading. But
+two justifications this block left untouched are now under-supporting the claims they carry, and I
+think both need a small addition, not a rewrite.**
+
+**2a. D3's "why filesystem-level, not in-process" reasoning no longer covers the strongest form of the
+question a reader will now ask.** As written: "browser commits run in the app process; pushes run in
+the `git http-backend` subprocess. An in-process lock cannot protect against the subprocess." That's
+still true, but it answers the *old* shape of the question — it doesn't address the case this decision
+just created: with the push-side lock now acquired by the app's own C# wrapper (§7.5), not a hook, both
+acquisition *points* are code running in the same .NET process. A careful reader now has grounds to ask
+"if both sides are in-process C#, why not an in-process `SemaphoreSlim`?" The answer exists and is
+correct — obligation 16's rolling-deploy scenario: a *second app instance* is a genuinely separate OS
+process racing the first over the same volume, and an in-process lock can't reach across that boundary
+either, independent of hooks entirely — but D3 doesn't say this. It's not wrong, it's incomplete for the
+mechanism it now describes, and the brief predicted exactly this shape of gap ("the argument may need to
+be different rather than merely re-pointed"). Needs a sentence naming the second-instance case as an
+independent reason filesystem-level locking remains necessary even now.
+
+**2b. D16's "Primitive" section — entirely untouched by this block — still calls flock(1) interop "the
+one claim this whole section rests on," and that claim's load-bearing status has changed.** This section
+wasn't in the brief's explicit list and isn't caught by any literal "5.3"/"hook" grep, which is exactly
+why I want to flag it plainly: `*Why this one:* real flock(2), called directly, is byte-for-byte what
+/bin/sh's flock(1) also calls — mutual exclusion holds by construction, not by two independent
+implementations happening to agree... that cost buys exactness on **the one claim this whole section
+rests on**.` That claim was central because hooks (shell scripts calling `flock(1)`) were expected to be
+the other party to this lock. Now they are explicitly forbidden from ever touching it — block D's whole
+purpose — and *both* remaining acquisition points are the same C# `RepositoryWriteLock` type. There is
+no longer a second, independent implementation this needs to interoperate with in the live mechanism;
+"two independent implementations happening to agree" no longer describes what's actually happening. The
+underlying fact (flock(2) does interoperate with flock(1)) is still true, and the two `HeldByFlock1_*`
+tests still assert something real, not something false — but D16's own self-description of *why this
+mattered* is now stale in the same way 2a is: a premise quietly changed under a claim that still reads
+confidently. This is squarely the "block B proved a diff-local reading cannot catch" class named in the
+brief — not a literal false statement, a justification whose relevance evaporated without the prose
+noticing. Worth a short addendum acknowledging the interop property is no longer required for hook
+correctness (nothing calls `flock(1)` on this file in the live mechanism anymore) but remains valid
+regardless — the kernel-level blocking wait, the `LOCK_NB` trylock, and the automatic release-on-close
+properties in the same paragraph are independent of flock(1) entirely and justify the primitive on their
+own — and, if worth keeping, that the interop tests now serve as regression protection for the
+primitive's own correctness rather than for a live cross-mechanism requirement.
+
+Everything else in D16 checked clean: the acquisition-policy asymmetry justification (person-waiting vs.
+background-sync, no clean busy/retry signal) is explicitly stated to be process-agnostic and I confirm
+it reads that way; the cost paragraph is sharpened honestly, not diluted — the new "same process now
+plays both the stuck-holder and the unbounded-waiter" framing is a genuine, correctly-reasoned
+structural difference, not padding. Obligation 16 confirmed to never have named hooks or §5.3 — correctly
+left untouched.
+
+**3. Independent stale-reference sweep — reproduced, not trusted.** Grepped the whole repo for `5\.3`,
+`hook.*lock`/`lock.*hook` (case-insensitive), and separately every file matching
+`flock|write.?lock|LockFilePath|WriteLockTimeout` under `src/ZeroWiki`, read every hit. Confirmed the
+worker's fix list is complete for literal references — I found no additional stale "5.3" or "hook holds
+this lock" claim anywhere in `src/`/`tests/`. `Identity/BootstrapService.cs` and `InvitationService.cs`
+"write lock" hits are the identity store's unrelated SQLite transaction lock — correctly out of scope,
+confirmed by reading. All `§5.3` hits in `DEVLOG.md` are inside already-committed, append-only prior
+posts describing past state — correctly untouched. The only gap my sweep found is 2b above, which by its
+nature (a justification's relevance quietly changing, not a false statement) wouldn't show up in any
+grep — which is itself the point being illustrated.
+
+**4. `proposal.md:11` — the edit is accurate.** Compared old and new text directly: the new sentence
+("taken by the app — around its own commit path, and around the whole `git http-backend` invocation
+that serves a push") matches D3's corrected mechanism exactly, no overstatement or new claim introduced.
+
+**On the worker's restraint vs. the Architect's edit — asked for a real opinion, so: the worker's
+*process* was exactly right; I side with the Architect on the *substance*.** Verified the precedent
+claim empirically rather than taking it on faith: `git log -- proposal.md` shows exactly two touches in
+this change's whole history (initial commit, and the D8-D11 resolution) — confirmed accurate, D9's four
+addenda and D16 itself really did land without a proposal.md update. But "this omission recurred
+unnoticed before" is a description of drift, not a decision anyone made on purpose — I found no
+statement anywhere in `CLAUDE.md` or this change's own record establishing "`proposal.md` is frozen
+after initial commit" as a deliberate convention; it reads as accumulated gaps nobody caught, not a rule.
+`proposal.md` is a reader-facing summary, not an internal note — a demonstrably false bullet sitting
+beside otherwise-accurate ones does more damage to a reader's trust in the whole document than either
+fixing it or leaving an explicit "not maintained past initial commit" caveat would. Flagging explicitly
+rather than silently fixing *or* silently leaving it — which is what the worker did — was the correct
+call regardless of which way the substantive judgment landed; that's the process this project's workflow
+asks for, and I wouldn't want a future worker to read this thread and conclude flagging is a weaker move
+than guessing. On the substance, though, I'd have fixed it too.
+
+**5. No spec delta — confirmed correct.** Re-read `specs/content-editing/spec.md:38-60` directly
+(untouched by this diff, confirmed via `git diff --stat`): the requirement and all four scenarios say
+only "a browser save" / "a git push" throughout, never a hook, `http-backend`, or any component name.
+All four remain true under the corrected mechanism. Nothing needed.
+
+**Verdict: Request changes — 2a and 2b only.** Everything else (the warning's correctness and
+sufficiency, the asymmetry's preservation, the stale-reference sweep, the `proposal.md` edit, the
+no-spec-delta call) confirmed clean. Both findings are small, surgical prose additions to binding design
+text (not a redesign, not a scope change, no code touched) — D3 needs the second-instance reason named
+alongside the subprocess reason, and D16's Primitive section needs its flock(1)-interop claim's changed
+relevance acknowledged rather than left reading as confidently load-bearing as it did when hooks were
+still a candidate locker. → @architect
+
+**[worker]** Findings 2a and 2b addressed. `design.md` only, per scope, plus two stale test comments
+2b's reframing left behind (flagged, not silently folded in) — no code behaviour, no test removed.
+
+**2a — D3's "why filesystem-level, not in-process" paragraph rewritten, not re-pointed.** The old
+sentence ("browser commits run in the app process; pushes run in the subprocess") no longer answers the
+question a reader hits now that both acquisition points are C#. The paragraph now states the real reason
+directly: the racer is a **second, wholly separate OS process** — `## NEXT` obligation 16's two ZeroWiki
+instances over one volume during a rolling deploy's overlap — and an in-process primitive (`lock`,
+`SemaphoreSlim`) is structurally incapable of excluding a second process's own CLR and lock state,
+regardless of how many acquisition call sites in *this* process use it. The shared primitive therefore
+has to live on the filesystem, visible to any process that opens it. Kept the original closing sentence
+("without it, a push can land between write and commit...") but widened it to also cover two instances'
+own writes, since that's now the argument's actual subject.
+
+**2b — D16's Primitive section reframed: interop demoted from foundation to insurance, and I agree it's
+worth keeping.** Added a paragraph directly after "why this one" stating plainly that the
+`.NET-flock(2)-vs-shell-flock(1)` spike *was* the one claim the section rested on when hooks were the
+only other locker, and is not anymore: both acquisition points are now the same `RepositoryWriteLock`
+type, so what the section's guarantee actually rests on is **instance-vs-instance exclusion between two
+processes running our own code** — exactly what §5's "ours-vs-ours" test already proves directly (a
+second real process running the production lock type), and exactly the same obligation-16 racer 2a
+names.
+
+**My call on the interop test: keep it, agreeing with your view and for the same reason.** `flock(2)` is
+one kernel primitive regardless of which userspace code calls it, so the interop fact was never at real
+risk of being wrong — but "never at risk" is exactly the profile of a cheap regression test worth having
+as insurance, not a reason to cut it: an operator debugging a stuck lock reaches for `flock` on the
+command line, and a future hook or maintenance script might too (nothing in this section forbids a
+*read-only* shell probe, only forbids a *hook* from taking the write lock itself). The test's cost is
+already paid — Linux-only, sub-second, no new infrastructure — so there's no case for removing it now
+that its status changed; only its framing needed to change, which I did.
+
+**Comments elsewhere that went stale from the same reframing — found and fixed, `tests/` only.**
+`RepositoryWriteLockTests.cs` had two more spots using the same now-inaccurate "rests on"/"depends on"
+language the finding named in `design.md`, both in the Linux-only interop test's own comments:
+`:125` ("the interop block D depends on") was doubly stale — block D turned out to be prose-only, so
+nothing in it ever depended on this test, and the framing was the same foundation-not-insurance error
+2b names; `:128` ("the one property this whole section rests on") is 2b's exact sentence, verbatim, in a
+test comment. Reworded both to match D16's new language (insurance, not foundation; the "ours-vs-ours"
+test above is what the section's guarantee actually rests on) and updated `FindFlock1OrThrow`'s
+exception message (`:210-213`, the string I touched in the prior round) the same way, since "this
+section rests on" was the same claim in a different location. All three are comments/string literals
+only — confirmed via `git diff -- tests` filtered to non-`//`/string lines: empty.
+
+**Gates.** `dotnet build` clean (0 warnings, 0 errors). `dotnet format --verify-no-changes` exit 0.
+`openspec validate git-backed-content-core --strict` valid. `dotnet test` unfiltered, foreground:
+**716 passed, 0 failed, 0 skipped, 716 total, 1m 51s** — same 716, no test added/removed/behaviour-changed.
+`git status --short --untracked-files=all -- src tests` clean, no stray files.
+
+→ @reviewer
+
+**[reviewer]** Re-audit of 2a/2b. Independently reconfirmed gates first: `dotnet build` 0/0, `dotnet
+format --verify-no-changes` clean, `openspec validate --strict` valid, `dotnet test` unfiltered
+foreground — **716/716**, same count as before. `git status --short --untracked-files=all -- src
+tests` clean, only the six already-tracked files modified, nothing untracked.
+
+**2a — confirmed genuinely the argument that is now true, not the old one with new nouns.** Checked
+this by asking whether the OLD reasoning would even apply to the NEW scenario, not just whether the new
+text reads differently. The old argument's racer was `git http-backend` — a raw OS process running no
+.NET at all, so an in-process C# lock obviously can't reach it. The new argument's racer is a *second
+instance of the same managed application* — a process that **does** run identical C# code, so "an
+in-process lock can't reach unmanaged code" isn't even a coherent objection to it; the actual reason is
+different in kind: two OS processes never share CLR memory, so two `SemaphoreSlim` instances, however
+many call sites reference the *same* one within a single process, are simply two unrelated objects
+across a process boundary. The new paragraph states exactly this ("its own CLR and its own in-process
+lock state, sharing nothing with the other's... structurally incapable of seeing, let alone blocking, a
+second instance's write") — that's the right failure mode for the right racer, not a substitution.
+Checked for overclaiming too: "two ZeroWiki instances running concurrently... during a rolling deploy's
+brief overlap" and "a concurrently-running sibling" both frame this as a transient, survived overlap,
+not a supported multi-instance deployment topology — consistent with obligation 16's original framing,
+which I already verified in block A. No overclaim.
+
+**2b — confirmed accurate and appropriately scoped: interop demoted to insurance, instance-vs-instance
+exclusion named as the actual foundation, proven by the tests that already exist.** Matches what I
+asked for exactly.
+
+**On keeping the interop test — I agree with the call, and I think there's a stronger argument for it
+than either of us has stated yet, which directly answers your "earns nothing" worry.** The kernel fact
+(`flock(2)` and `flock(1)` share one lock table) was indeed never at risk — but "the kernel fact can't be
+wrong" is not the same claim as "our use of it can't regress," and there's a specific regression class
+only this test can catch. I checked mechanically whether the flock(1) tests would even catch block C's
+own `LOCK_EX`→`LOCK_SH` mutant: they wouldn't — both flock(1) probe tests have the shell make an
+*exclusive* request against whatever we hold, and an incoming exclusive request conflicts with **any**
+existing lock, shared or exclusive, so neither test direction can distinguish which mode our side used.
+"Ours-vs-ours" is what actually caught that mutant (per block C's own report), and remains the stronger
+test for our primitive's own correctness. What the interop test uniquely catches is a different, real
+defect class: if our implementation ever silently drifted to a *different, self-consistent* locking
+mechanism — `fcntl()` record locks instead of `flock(2)`, say, which do not interoperate with `flock(1)`
+at all — two of our own instances would still correctly exclude each other (they'd agree with themselves
+under the new, wrong primitive), and "ours-vs-ours" would keep passing. Only a check against an
+*independent* implementation of the real primitive (the shell's own `flock(1)`, via a completely
+different code path) can catch that. That's not a hypothetical concern for this project specifically —
+it's the same "two measurements agreeing when they share an instrument" pattern this change has already
+been bitten by once (§3, the escaping-bypass audits). The test is worth more than "cheap and already
+paid for" — it's the one thing standing between "our two instances agree" and "our two instances agree
+about the *right* thing." Worth folding into the design doc's own justification if there's a natural
+moment to, but I'm not gating this round on it — the current text isn't wrong, just not as strong as it
+could be.
+
+**Propagation sweep — reproduced independently, not accepted on the report.** Grepped `rests on`/
+`depends on`/`byte-for-byte`/`holds by construction`/`the foundation`/`interop` across all of `src/` and
+`tests/`. Every other hit is unrelated to §5 (bootstrap concurrency, page-index snapshot invariants, a
+password hasher's PHC format, etc.) — confirmed by reading each, not just counting matches. The two
+`RepositoryWriteLockTests.cs` fixes (`:125`, exception message) are the only propagated copies that
+existed, and both are now fixed and read accurately. Also swept for 2a's language specifically
+(`in-process`, `SemaphoreSlim`, `second instance`, `rolling deploy`) in case that reasoning had *also*
+been copy-pasted anywhere — it hadn't; every hit is either this design.md text itself or an unrelated,
+already-verified-accurate mention (`ContentRepositoryService.cs`'s startup-lock remarks/exception
+message, both already checked in earlier rounds).
+
+**For the supervisor, said now rather than left to be found:**
+
+1. **The propagation itself is the transferable lesson for §6 onward, and it's a new pattern in this
+   change's history, distinct from §2–4's.** §2 was gaps in what a condition asked; §3 was a gap in what
+   the audit could see; §4 was a design decision written mid-section that no block review structurally
+   covered. This one is different again: **binding prose copied verbatim into a code comment creates a
+   second site that goes stale in lockstep with the first, silently, because nothing structural connects
+   them** — a grep for the mechanism's name won't find it, only a grep for the *sentence*. It happened
+   twice in one section (`design.md` → `RepositoryWriteLockTests.cs`, twice). Worth stating plainly
+   rather than rediscovering: **any design.md sentence a worker is tempted to paste into a comment
+   verbatim is a candidate for going stale twice**, and future blocks that touch a binding decision
+   should grep for their own prior sentences, not just for component names.
+2. **§7.5 has no test coverage yet, by design — that's fine, but it's a named gap, not an absent one.**
+   Everything in `RepositoryWriteLockTests.cs`/`LockTestHarness` exercises `RepositoryWriteLock` directly;
+   nothing yet proves the eventual `http-backend` wrapper actually acquires/releases it correctly around
+   a real push, because that code doesn't exist yet. This is the same shape as block C's honestly-recorded
+   surviving mutant (two-instance-race-at-startup) — not a defect in §5, but worth the supervisor (or
+   whoever briefs §7.5) knowing it's an open evidence obligation, not silently assumed covered by today's
+   tests.
+3. Nothing else — the D3/D16 reasoning, the hook warning, the stale-reference sweep, and the
+   `proposal.md` edit were all confirmed clean in the first round and nothing since has touched them.
+
+**Verdict: Approve.** 2a and 2b both confirmed genuine, accurate, and appropriately scoped; the interop
+test's retention is right, now on firmer ground than either of us had stated; the propagation sweep is
+clean and complete. Clears to commit — §5 is done at 5.1–5.2, closes here, and goes to the supervisor
+over `c966651..HEAD`. → @architect
+
 ## NEXT
 
 **Resume point: §5 (Write lock), first block. No design question blocks it** — the entry that claimed

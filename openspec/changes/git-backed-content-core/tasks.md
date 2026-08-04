@@ -30,7 +30,11 @@
 
 - [x] 5.1 Implement a single cross-process `flock` on a repo lockfile
 - [x] 5.2 Make the app commit path acquire/release the lock around write+commit
-- [ ] 5.3 Make the `pre-receive`/`post-receive` hooks acquire/release the same lock
+- ~~5.3 Make the `pre-receive`/`post-receive` hooks acquire/release the same lock~~ — **moved to 7.5**
+  (Product Owner decision). A `flock` taken in `pre-receive` is released when `pre-receive` exits,
+  which is *before* git updates the refs and the `updateInstead` working tree, so no hook is alive
+  during the write the spec requires the lock to cover. The push side is locked by the app wrapping
+  the `git http-backend` subprocess instead — the process that actually owns the whole receive.
 
 ## 6. Commit-on-save
 
@@ -46,6 +50,7 @@
 - [ ] 7.2 Protect the git routes with wiki authentication (Basic over TLS or per-user token); refuse unauthenticated access
 - [ ] 7.3 Verify authenticated clone/fetch/push against the running app
 - [ ] 7.4 Confirm `updateInstead` fast-forward push updates the working tree; confirm non-fast-forward push is rejected
+- [ ] 7.5 Hold the repository write lock around the whole `git http-backend` invocation, so push receipt is serialized against browser saves (moved from 5.3; see §5's DEVLOG for why no hook can do this)
 
 ## 8. Push reactions & identity
 

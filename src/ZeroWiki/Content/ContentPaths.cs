@@ -52,9 +52,11 @@ public sealed class ContentPaths
     /// <c>docs/</c>) would be staged, committed, and pushed to every Obsidian vault, and would keep the
     /// tree dirty between acquisitions. Nothing in git dictates where a lockfile of our own invention
     /// lives, unlike the hooks directory (see <see cref="GitHookInstaller"/>'s remarks), so — unlike
-    /// that path — this one does not need to be resolved dynamically via a git subprocess call. The
-    /// generated <c>pre-receive</c> hook body (§5.3) bakes this literal path into its <c>#!/bin/sh</c>
-    /// text at install time, since the script has no way to ask this type anything at runtime.
+    /// that path — this one does not need to be resolved dynamically via a git subprocess call. Both
+    /// sides that acquire this lock — the app's own commit path (§5.2) and the wrapper around
+    /// <c>git http-backend</c> for pushes (§7.5) — do so in C#, so this path is never baked into a
+    /// generated hook's <c>#!/bin/sh</c> text; the generated hooks must never acquire this lock at all
+    /// (see <see cref="GitHookInstaller"/>'s remarks for why).
     /// </summary>
     public string LockFilePath { get; }
 }
