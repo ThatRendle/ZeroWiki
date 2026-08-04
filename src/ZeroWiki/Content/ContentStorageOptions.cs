@@ -13,4 +13,15 @@ public sealed class ContentStorageOptions
 
     /// <summary>The data volume root. Defaults to <c>/data</c>, the container mount point.</summary>
     public string DataRoot { get; set; } = "/data";
+
+    /// <summary>
+    /// How long the app-side write path waits to acquire D16's single cross-process write lock before
+    /// giving up. Defaults to 10 seconds — comfortably covers an ordinary commit-on-save plus
+    /// contention from a concurrent push of realistic size, while still failing well inside typical
+    /// browser/reverse-proxy request timeouts. Bound the same way as <see cref="DataRoot"/>. Applies
+    /// only to the app's own acquisition; a git push's wait for the same lock (the
+    /// <c>pre-receive</c>/<c>post-receive</c> hooks' own <c>flock(1)</c> call, §5.3) is deliberately
+    /// unbounded and is not configured here (design.md D16, Product Owner decision).
+    /// </summary>
+    public TimeSpan WriteLockTimeout { get; set; } = TimeSpan.FromSeconds(10);
 }

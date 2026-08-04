@@ -4,5 +4,6 @@
   </Folder>
   <Folder Name="/tests/">
     <Project Path="tests/ZeroWiki.Tests/ZeroWiki.Tests.csproj" />
+    <Project Path="tests/ZeroWiki.LockTestHarness/ZeroWiki.LockTestHarness.csproj" />
   </Folder>
 </Solution>

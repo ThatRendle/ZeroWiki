@@ -18,6 +18,9 @@ public static class ContentStorageStartupExtensions
             .Validate(
                 options => !string.IsNullOrWhiteSpace(options.DataRoot),
                 "ContentStorage:DataRoot must not be empty.")
+            .Validate(
+                options => options.WriteLockTimeout > TimeSpan.Zero,
+                "ContentStorage:WriteLockTimeout must be greater than zero.")
             .ValidateOnStart();
 
         services.AddSingleton(sp =>

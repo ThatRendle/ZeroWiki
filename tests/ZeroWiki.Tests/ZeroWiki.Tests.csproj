@@ -22,6 +22,10 @@
 
   <ItemGroup>
     <ProjectReference Include="..\..\src\ZeroWiki\ZeroWiki.csproj" />
+    <!-- Not used as a library — referenced so it builds alongside this project. RepositoryWriteLockTests
+         spawns it as a subprocess (a genuine second OS process running RepositoryWriteLock's real
+         production code) rather than exercising the lock only in-process. -->
+    <ProjectReference Include="..\ZeroWiki.LockTestHarness\ZeroWiki.LockTestHarness.csproj" />
   </ItemGroup>
 
 </Project>

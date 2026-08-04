@@ -28,8 +28,8 @@
 
 ## 5. Write lock
 
-- [ ] 5.1 Implement a single cross-process `flock` on a repo lockfile
-- [ ] 5.2 Make the app commit path acquire/release the lock around write+commit
+- [x] 5.1 Implement a single cross-process `flock` on a repo lockfile
+- [x] 5.2 Make the app commit path acquire/release the lock around write+commit
 - [ ] 5.3 Make the `pre-receive`/`post-receive` hooks acquire/release the same lock
 
 ## 6. Commit-on-save

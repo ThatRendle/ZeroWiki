@@ -9237,6 +9237,495 @@ equivalent evidence to a synchronously-returned foreground run, not a discount.
 verified category, not a convenient dodge; the widened search is confirmed independently and turns up
 nothing further; gates independently reconfirmed clean. Block B is done. → @architect
 
+**[architect]** Block B **landed as `87ff1cc`**. Gates run by me: `dotnet build` 0/0, `dotnet test`
+**710/710** unfiltered foreground (1m23s), `dotnet format --verify-no-changes` exit 0,
+`openspec validate --strict` valid, only `ContentRepositoryService.cs` touched.
+
+**Block B's finding is the one worth carrying forward, and it is not about this refactor.** The five
+stale references were **outside the diff**, created by it. No reading of the diff could have found them
+— they were found by asking *what did this diff make false elsewhere*, which is a different question
+from *is this diff correct*. A per-block review is diff-local by definition, so this class is normally
+the supervisor's to catch; it was caught here only because the reviewer was asked the second question
+explicitly. **§6 and beyond: when a block moves a method boundary, renames, or re-homes a
+responsibility, brief the reviewer on the second question by name.** The first one will not find it.
+
+**[architect]** Brief — **block C: 5.1 and 5.2. The lock stops being prose.**
+
+D16 is committed (`172c622`) and block B (`87ff1cc`) has put the accept phase behind its own method for
+exactly this. Read both before starting; D16 is binding, not background.
+
+**Deliverables.**
+
+1. **`ContentPaths.LockFilePath`** — `Path.Combine(DataRoot, "wiki.lock")`, following `KeysDirectory`'s
+   shape and its `<remarks>` reasoning. Outside `RepositoryRoot` **entirely**, per D16: `git add -A`
+   (in `ReconcileWorkingTreeAsync`) and `git status --porcelain` (in `AssertWorkingTreeIsCleanAsync`)
+   both run unscoped at `repositoryRoot`, so anything beneath it would be staged, committed by D9, and
+   pushed to every vault.
+2. **`ContentStorageOptions.WriteLockTimeout`** — 10s default, bound the same way `DataRoot` already is.
+   Note `## NEXT` obligation 6: `ResolveContentPaths` reads configuration before `Build()` and works
+   only because `ZeroWikiAppFactory` uses `UseSetting`. If your option touches that pre-`Build()` path,
+   read that obligation in full first.
+3. **The lock type itself (5.1)** — raw `open()` + `flock(2)` via `P/Invoke`, per D16. Not
+   `FileStream`, not `File.OpenHandle` (D16 records exactly why: .NET's open-time emulation throws
+   before your own `flock()` can run). App-side acquisition is a `LOCK_EX|LOCK_NB` poll loop against a
+   wall-clock deadline, driven by a `CancellationToken`. Release on dispose; the fd closing on process
+   exit is what makes stale locks a non-problem, so make that property hard to break accidentally.
+4. **`AcceptRepositoryAsync` takes the lock (5.2)** — around the **whole** phase including
+   classification, with `repositoryHasNoCommitsYet` **re-derived under the lock** (D16, obligation 16).
+   `ConfigureRepositoryAsync` stays outside it, deliberately.
+
+**On 5.2's wording — an Architect call, recorded because it is one.** 5.2 says "the app commit path".
+The app's save path does not exist yet; it is §6. The only place the app commits today is the
+reconciliation commit inside `AcceptRepositoryAsync`, so that is what 5.2 binds to now, and §6's save
+path adopts the same lock when it lands. **Do not build a save path here.**
+
+**A gap in D16 you must not paper over.** D16 settles what a *bounded save* does when its wait expires
+— a per-request "repository busy" failure, explicitly "not one of D9's fatal startup refusals". It does
+**not** settle what happens when the **startup** accept phase cannot get the lock within the bound;
+there is no request to fail there. My reading, which you should implement: **refusing to start, with a
+message naming the lockfile and what likely holds it**, is consistent with D9's posture that a
+repository ZeroWiki cannot safely accept is a refusal, not a degraded mode — and a rolling deploy's
+overlap is far inside 10s, so a timeout there means something is genuinely wrong. **Implement that,
+and post it to the DEVLOG as an explicit question to the Product Owner** rather than burying it; it is
+operator-visible behaviour D16 does not cover, and the PO gets the call at review time.
+
+**Evidence — this is the part that matters, and a passing suite is not it.** A lock that silently
+no-ops passes every test that never contends. Therefore:
+
+- **Prove the test red first.** Before the real implementation, write the contention test against a
+  deliberately no-op lock and **watch it fail**. Post the failing output. A contention test never
+  observed failing is not evidence it can fail. This is §3's standard — the bypass was proven to fire
+  on a real click *before* the fix was checked.
+- **Ours-vs-ours**, in the gate on every platform: a second **process** running the production lock
+  code, with the first blocking until it releases. macOS has `flock(2)` even without the `flock(1)`
+  binary, so this runs everywhere. Proves our primitive excludes across processes.
+- **Ours-vs-`flock(1)`**, the interop block D depends on: Linux-only. **Skip on an explicit macOS
+  platform check, and *fail* on Linux if `flock(1)` is absent.** A skip conditioned on "is the binary
+  there" reports green on a Linux box missing `util-linux` while the one property the section rests on
+  goes unverified. Block A's spike demonstrated this interop but a scratchpad spike is not a regression
+  test — nothing stops this block from changing the open flags and breaking it silently.
+- **The timeout** needs its own test, and it must distinguish "waited and gave up" from "never waited".
+
+**Mutation testing — in scope here, unlike blocks A and B.** The write lock is concurrency and data
+integrity, the two categories CLAUDE.md names. Exactly three mutants, **cap 3 confirmation runs each,
+full unfiltered suite every run** — never a filtered one, `BootstrapConcurrencyTests` read 3/3 filtered
+and 7/13 under the real parallel suite:
+
+1. **`LOCK_EX` → `LOCK_SH`.** The one that matters most: a shared lock succeeds for every single writer,
+   so it passes every test that does not contend. If this dies, your contention tests are real.
+2. **Drop `LOCK_NB`** from the poll loop — converts the bounded app wait into an unbounded one. The
+   timeout test should die.
+3. **Revert `repositoryHasNoCommitsYet` to the snapshot** instead of re-deriving under the lock. **I
+   expect this to survive** — catching it needs two instances genuinely racing at startup. If it does,
+   record it deliberately with its reason as a real finding about §5's evidence; do **not** edit code
+   to make it die, and do not go hunting further without asking.
+
+**⚠️ The lockfile hazard, in bold because it has bitten this repo.** Your lock class is a **new file**,
+untracked for most of this block. **`git diff -- src` is blind to untracked files** — it does not report
+them as unchanged, it does not report them *at all*. §7b's mandated diff came back clean over a file it
+had never looked at, for exactly this reason. So: **checksum the target before *and* after every
+mutation**, revert via `trap`/`finally` and never a final step an interruption can skip, and run
+`git status --short --untracked-files=all -- src` alongside any diff. A `??` entry means "read it or
+checksum it", not "it's fine".
+
+**Gates:** `dotnet build` clean, `dotnet test` unfiltered (report the real figure or "not obtained"),
+`dotnet format --verify-no-changes`, `openspec validate git-backed-content-core --strict`.
+
+→ @worker
+
+**[worker]** Block C done — 5.1, 5.2. `ContentPaths.LockFilePath` (`<DataRoot>/wiki.lock`),
+`ContentStorageOptions.WriteLockTimeout` (10s default, `.Validate`d alongside `DataRoot`),
+`RepositoryWriteLock` (new), `RepositoryLockTimeoutException` (new), and `AcceptRepositoryAsync` now
+acquires the lock around the whole phase — directory creation through
+`AssertWorkingTreeIsCleanAsync` — with `repositoryHasNoCommitsYet` computed only after the lock is
+held. `ConfigureRepositoryAsync` untouched, outside the lock, per D16.
+
+**The lock itself: raw `open()`/`creat()`/`flock()`/`close()` via `LibraryImport("libc")`**, never
+`FileStream`/`File.OpenHandle` (D16's reasoning). Acquisition is a `LOCK_EX|LOCK_NB` poll loop (50ms
+interval) against a wall-clock deadline driven by the caller's `CancellationToken`; release is closing
+the fd, nothing else — no separate unlock path to forget, and a crash releases it for free. Required
+`<AllowUnsafeBlocks>true</AllowUnsafeBlocks>` on `ZeroWiki.csproj` (`LibraryImport` needs it to
+generate marshalling stubs).
+
+**A real, previously-undiscovered platform bug, found before it could ship, not reasoned around.**
+POSIX `open(2)` is variadic (`int open(const char*, int flags, ...)`) — the `mode` argument is only
+read when `O_CREAT` is set. A fixed 3-parameter P/Invoke (`open(path, flags, mode)`) — the shape both
+D16's own spike and a naive implementation would use — works on Linux (x86-64 and aarch64 both pass
+the first several integer args in registers regardless of variadic-ness) but is **silently wrong on
+Apple Silicon macOS**: Apple's ABI requires every variadic argument to be passed on the stack, .NET's
+P/Invoke marshalling has no notion of "this call is variadic," and the callee reads garbage off the
+stack in `mode`'s place. Confirmed by execution on this dev machine (arm64 Mac) before writing any
+production code: a lockfile created via the naive 3-arg form came back `r-xr-xr-x` instead of the
+requested `0644`. Fixed by sidestepping the ABI question rather than depending on it: `creat(2)` —
+genuinely non-variadic, POSIX-standard on both platforms — creates the file (called unconditionally;
+truncating an existing zero-byte lockfile is harmless and, also confirmed by execution, does not
+disturb a lock another process already holds on it), then the file is opened for locking with the
+2-argument `open(path, flags)` overload, which needs no mode. Verified correct on both platforms via
+direct dotnet runs (mode `644`, correct `flock` contention in both directions) — macOS host and, via
+Docker, `mcr.microsoft.com/dotnet/sdk:10.0` (Ubuntu 24.04, `aarch64` — Docker Desktop on this arm64
+Mac).
+
+**Red first.** Wrote the contention tests, then patched `TryAcquire` to `=> true` (no-op — never calls
+`flock` at all) and ran the full unfiltered suite: 3 failed exactly as expected —
+`HeldByAnotherProcess_NonBlockingAttemptFailsWhileHeld` and
+`...BoundedWaitGivesUpAfterTheTimeoutElapses...` ("No exception was thrown"), and
+`...WaitsThenAcquiresOnceTheHolderReleases` ("only waited 00:00:00.0000899" instead of ~500ms).
+Reverted via `cp` from a pre-saved original + checksum, confirmed identical (`2528bd08…`), rebuilt,
+reran — green.
+
+**Ours-vs-ours** (`RepositoryWriteLockTests` + new `ZeroWiki.LockTestHarness` console project,
+referenced by `ZeroWiki.Tests.csproj` so it builds alongside): a genuine second **process** running
+`RepositoryWriteLock`'s real production code, synchronized on its own "ACQUIRED" stdout line rather
+than a guessed sleep. Three tests: non-blocking attempt fails immediately while held; a bounded wait
+(400ms timeout against a 3s hold) gives up — elapsed asserted `>= 300ms` and `< 2s`, distinguishing
+"waited and gave up" from both "never waited" and "waited forever"; a generous wait (5s timeout
+against a 500ms hold) succeeds only after `>= ~350ms`, proving it actually blocked rather than
+returning a stale/broken "success." All pass against the real implementation; all fail red-first
+above.
+
+**Ours-vs-`flock(1)`** (two more facts in the same file, `OperatingSystem.IsLinux()`-gated): shell
+`flock -n` probes the lockfile in both directions (busy while held, succeeds after release), and our
+lock waits for and then acquires a lock a `flock -x … -c 'sleep 1'` shell process holds. On macOS these
+early-return (no `flock(1)` binary exists, matching D16). Verified this isn't vacuous three ways: (1)
+ran the whole file inside the Ubuntu SDK container — all 6 pass, including these 2, for real; (2)
+inside that same container, moved `/usr/bin/flock` aside and reran — both fail with the "flock(1) not
+found... refusing to skip" message, proving the fail-not-skip path actually fires rather than the test
+silently no-opping; (3) the non-blocking-probe test's own assertions require the shell probe's exit
+code to flip between held/released, which a vacuous test couldn't satisfy by accident.
+
+**The startup-timeout gap D16 leaves open.** Implemented as: refuse to start. `AcceptRepositoryAsync`
+wraps `RepositoryWriteLock.AcquireAsync` in `AcquireStartupWriteLockAsync`, which catches
+`RepositoryLockTimeoutException` and rethrows `InvalidOperationException` naming the lockfile path and
+the two likely holders — another instance's own overlapping startup (self-resolving, no restart
+needed) or a stuck hook/`http-backend` subprocess (D16 already names this as unbounded-by-design and
+uncapped) — matching this class's existing refusal posture (D9) rather than a new failure shape.
+
+❓ @product-owner — recorded per the brief as an explicit question, since D16 doesn't cover it and
+it's operator-visible: **is "refuse to start, name the lockfile, say who's likely holding it" the
+right call for startup hitting the write-lock timeout**, or would you rather startup retry
+indefinitely (mirroring the hook's own unbounded wait) on the theory that a rolling-deploy overlap is
+the overwhelmingly common case and a transient refusal-to-start is worse than just waiting? My
+implementation is the "refuse" reading from the brief; flagging before it's load-bearing.
+
+**Mutation testing — all 3 confirmed, full unfiltered suite every run, checksummed before/after,
+reverted via `trap`/`finally`, `git status --short --untracked-files=all -- src` checked alongside
+(the two new files are untracked, so this — not `git diff`, which is blind to them — is what actually
+confirms a clean revert):**
+
+1. **`LOCK_EX`(2) → `LOCK_SH`(1)** — dies, 1/1: 3 failed / 716 total, same three contention tests as
+   red-first, same failure shapes. Confirmed non-flaky in one run (deterministic instrument, no timing
+   borderline).
+2. **Drop `LOCK_NB`** (`Flock(fd, LockExclusive | LockNonBlocking)` → `Flock(fd, LockExclusive)`) —
+   dies, 1/1: 2 failed / 716 (the non-blocking-attempt and bounded-wait tests; the "waits then
+   acquires" test still passes since a longer block now happens to resolve inside its own 5s timeout
+   too — expected, since that mutation converts every attempt into a blocking one, not a broken one).
+3. **Revert `repositoryHasNoCommitsYet` to a pre-lock snapshot** (moved the
+   `AcquireStartupWriteLockAsync` call from before classification to just after it, in
+   `ContentRepositoryService.cs`) — **survives, 1/1: 716/716 green.** Exactly the finding the brief
+   predicted: catching this needs two instances genuinely racing classification against each other at
+   startup, which nothing in this block's test suite constructs (the "ours-vs-ours" tests exercise
+   `RepositoryWriteLock` directly, not two `ContentRepositoryService.EnsureRepositoryAsync` calls
+   racing over one data root). Recorded as a real gap in §5's evidence, not fixed — a genuine
+   two-instance-at-startup integration test is out of this block's scope per the brief, and I did not
+   go hunting further.
+
+**Gates:** `dotnet build` clean (0 warnings, 0 errors, after adding
+`<AllowUnsafeBlocks>true</AllowUnsafeBlocks>` to `ZeroWiki.csproj`). `dotnet format
+--verify-no-changes` exit 0. `openspec validate git-backed-content-core --strict` valid. `dotnet test`
+unfiltered, foreground: **716 passed, 0 failed, 0 skipped, 716 total, 1m 55s** (710 existing + 6 new in
+`RepositoryWriteLockTests`) — no existing test edited.
+
+New files: `src/ZeroWiki/Content/RepositoryWriteLock.cs`, `RepositoryLockTimeoutException.cs`,
+`tests/ZeroWiki.LockTestHarness/*` (new project, added to `ZeroWiki.slnx`),
+`tests/ZeroWiki.Tests/Content/RepositoryWriteLockTests.cs`, `LockHarnessProcess.cs`. Modified:
+`ContentPaths.cs`, `ContentStorageOptions.cs`, `ContentStorageStartupExtensions.cs` (added
+`.Validate` for `WriteLockTimeout`), `ContentRepositoryService.cs` (constructor now also takes
+`IOptions<ContentStorageOptions>`), `ZeroWiki.csproj`, `ContentRepositoryServiceTests.cs`
+(`CreateService` now takes an optional `writeLockTimeout`), `ZeroWiki.Tests.csproj`,
+`ZeroWiki.slnx`.
+
+→ @reviewer
+
+**[reviewer]** Block C audit — 5.1, 5.2, the largest block in the section. Independently reconfirmed
+gates first: `dotnet build` (0/0, including `ZeroWiki.LockTestHarness`), `dotnet format
+--verify-no-changes` (clean), `openspec validate --strict` (valid), `dotnet test` unfiltered foreground
+— **716 passed, 0 failed, 0 skipped, 716 total, 1m 52s** — matching the worker's figure exactly.
+`git status --short --untracked-files=all -- src` re-checked: clean, `LockExclusive | LockNonBlocking`
+intact in `RepositoryWriteLock.cs` — a second look at what the coordinator already confirmed, as asked,
+turned up nothing different.
+
+**1. The deadline is not wall-clock, and this is real — not scale-proofed away.** Confirmed by reading
+`RepositoryWriteLock.cs:101-121` directly: `waited` accumulates the *requested* `delay` passed to each
+`Task.Delay` call, not measured elapsed time —
+
+```
+var delay = PollInterval <= remaining ? PollInterval : remaining;
+await Task.Delay(delay, cancellationToken).ConfigureAwait(false);
+waited += delay;
+```
+
+`Task.Delay`'s own contract is a minimum, not a guarantee — it will not return before `delay` has
+elapsed but may return arbitrarily later under scheduler/thread-pool pressure. That pressure correlates
+directly with what makes this lock contended in the first place (a busy save, a concurrent push, GC from
+either), so the deviation is largest exactly when the timeout is doing its real job. The existing tests
+don't catch it because they don't need to: `HeldByAnotherProcess_BoundedWaitGivesUpAfterTheTimeoutElapsesRatherThanNeverWaitingOrWaitingForever`
+tolerates 300ms–2000ms against a 400ms nominal bound — a band wide enough that only gross drift would
+ever fail it, and ordinary `Task.Delay` overshoot on an unloaded test runner is a few ms, not seconds.
+
+Checked whether this is scale that can't matter: no — under real load this compounds over up to ~200
+polls for the 10s default, and both `D16` (design.md) and this type's own `<remarks>` (`:24-25`,
+"against a wall-clock deadline") assert a guarantee the code does not deliver. This is not a case where
+the prose overclaims something true by construction; the actual behavioral requirement — fail well
+inside a browser/reverse-proxy timeout, stated as the entire justification for the 10s default — needs
+*real* elapsed time bounded, not a sum of requested sleep durations. **The fix belongs in the code, not
+the prose**: track actual elapsed time (`Stopwatch.StartNew()`, compare `stopwatch.Elapsed` each
+iteration) rather than accumulating intended delays. Small, mechanical, low-risk — this is not asking
+for a redesign.
+
+**2. `AllowUnsafeBlocks` — confirmed genuinely required, cannot be scoped per-file.** Verified by
+experiment, not by taking the comment's word for it: removed the flag from `ZeroWiki.csproj`, rebuilt —
+`SYSLIB1062` plus four `CS0227`s from the `LibraryImportGenerator`'s own generated marshalling stubs,
+confirming the requirement is real and (since a single C# compilation has one `/unsafe` switch for every
+file in it) genuinely project-wide, not something a per-file directive can narrow. Restored, rebuilt
+clean. Weighed the wider question: the developer's own source has no manual `unsafe` block or pointer
+arithmetic — the unsafety is entirely the source generator's marshalling-stub strategy for a P/Invoke
+declaration — so this doesn't hand the rest of the assembly any new *capability* beyond "the compiler no
+longer stops a future `unsafe` block here," a guardrail loss rather than a live hole. A separate small
+assembly would scope it exactly, at the cost of a new project and a cross-assembly reference for one
+lock type. Given this project's own proportionality framing (a wiki for a small trusted group, not a
+system warranting unbounded verification) I don't think that trade is worth mandating — the comment is
+adequate. Recording the option for the Architect to weigh rather than deciding it myself. Not blocking.
+
+**3. `ZeroWiki.LockTestHarness` cannot reach production — confirmed against the Dockerfile, not
+assumed.** The Dockerfile's own header comment states it explicitly ("Only the app project is needed to
+run the container — restore/copy it in isolation, skipping the test project and solution file") and the
+build stage runs `dotnet publish src/ZeroWiki/ZeroWiki.csproj` directly — never `ZeroWiki.slnx`.
+Confirmed the dependency direction too: `ZeroWiki.LockTestHarness.csproj` references `ZeroWiki.csproj`
+(harness → app), never the reverse, and `ZeroWiki.csproj` carries no `ProjectReference` at all. Adding
+the harness to the `.slnx` is invisible to a project-scoped `dotnet publish`. No other Dockerfile or CI
+config exists in the repo to check. No finding.
+
+**4. `Directory.CreateDirectory(_paths.DataRoot)` ordering — confirmed correct, and confirmed
+necessary, not merely tidy.** It has to precede the lock acquisition: `RepositoryWriteLock`'s
+`creat(2)` is a shallow syscall that does not create parent directories the way `Directory.CreateDirectory`
+does, so without this line, acquiring the lock against a `DataRoot` that doesn't yet exist would fail
+with `ENOENT` before `Directory.CreateDirectory(repositoryRoot)` — which used to be what implicitly
+created `DataRoot` as a side effect — ever got a chance to run post-split. Confirmed this isn't
+hypothetical: `ContentRepositoryServiceTests`'s fixture never pre-creates `_dataRoot` (`:14`, just a
+computed path) — its very first test calls `EnsureRepositoryAsync` against a directory that does not
+exist yet, so this ordering is exercised by the block's own gate, not just reasoned about. No collision
+with `identity.db`/`keys/`: `Directory.CreateDirectory` is idempotent and never touches existing
+contents of a directory that's already there. No finding.
+
+**5. The surviving mutant — confirmed recorded honestly, not fixed, and I agree with leaving it.**
+`git diff`/current source confirm `repositoryHasNoCommitsYet` is computed after
+`AcquireStartupWriteLockAsync`, not before — the mutation described (moving the acquire call past
+classification) is not present in the landed code. Independently checked the "nothing constructs this"
+claim against both test files rather than accepting it: `RepositoryWriteLockTests.cs`'s six tests all
+exercise `RepositoryWriteLock` directly (confirmed by reading every test); `ContentRepositoryServiceTests.cs`'s
+diff is the `CreateService` signature change only, no new race test. The claim holds.
+
+**My own read, since asked directly: correctly left to later, not worth closing in §5.** The lock
+*primitive's* cross-process exclusion is proven for real (the "ours-vs-ours" tests). What's unproven is
+narrower — whether `ContentRepositoryService`'s own sequencing uses that primitive correctly under a
+genuine two-instance race — and closing that gap needs two real `EnsureRepositoryAsync` calls racing
+over one data root, which is integration-test infrastructure a different order of complexity than
+anything else in this block. Given this project's own proportionality standard and that the mechanism
+protecting against the race (lock wraps classification, D16 obligation 16) was already verified
+structurally correct in block B's review, I'd park this rather than gate §5 on it — worth a `## NEXT`
+note for whoever eventually builds genuine multi-instance testing, not a blocker now.
+
+**6. The `creat(2)` claim — reproduced independently on both platforms, not accepted on the worker's
+say-so.** Built my own spike mirroring the *exact* production sequence (`creat` unconditional →
+`open` → `flock(LOCK_EX[|LOCK_NB])`), not a bare `flock` check, since the claim is specifically about
+`creat`'s truncation while another process holds the lock via a separate fd. On macOS (host) and Linux
+(Docker, `mcr.microsoft.com/dotnet/sdk:10.0`, matching the runtime image's base): held the lock in one
+process; a second process ran the full contend sequence while held — failed correctly (`EAGAIN`/errno
+11 or 35 depending on platform), and a `FileInfo` size check confirmed the file *was* truncated to 0
+bytes by that contend attempt's `creat` call, proving this isn't a no-op that merely looks safe. A
+second contend attempt, still held, failed identically — proving the first truncation didn't disturb
+the original lock. After release, a contend attempt succeeded cleanly. Both platforms, both directions,
+with truncation verified to actually happen. This claim is confirmed, not merely plausible.
+
+**7. Confirmed nothing else writes without the lock.** Grepped every `_git.Run*` call site under
+`src/ZeroWiki`: `PageHistoryService.cs` (`git log`, read), `GitHookInstaller.cs` (`rev-parse
+--git-path hooks`, read), `PageIndexBuilder.cs` (`rev-parse`, `diff`, both read) — no other file
+invokes git at all. `ContentRepositoryService.cs` is the only writer, and it's the one holding the lock.
+No finding.
+
+**Verdict: Request changes — finding 1 only.** Items 2–7 confirmed clean or correctly deferred;
+nothing needed there. Finding 1 is real, in the section's most concurrency-sensitive file, and is
+exactly the class of claim CLAUDE.md's evidence standard singles out — true today by the small scale of
+a passing test run, not by construction, and would drift silently under the load this lock exists to
+handle. Fix is small (swap the delay accumulator for a `Stopwatch`-based actual-elapsed check) — should
+be a fast turnaround, not a redesign. → @architect
+
+**[worker]** Fixed the finding. `AcquireAsync` now starts a `Stopwatch` once, before the loop, and
+compares `stopwatch.Elapsed` (real elapsed time) against `timeout` on every iteration — replacing the
+old accumulator that summed *requested* `Task.Delay` durations. This also makes the loop
+self-correcting: an overrun on one `Task.Delay` shortens the next iteration's computed `remaining`,
+instead of compounding across iterations the way the accumulator did. "Always attempt at least once,
+even at `TimeSpan.Zero`" is unchanged — `TryAcquire` still runs before the first elapsed check, and the
+existing test pinning that still passes untouched.
+
+**Red first, against the actual shipped bug, not a simulation.** Tightened
+`HeldByAnotherProcess_BoundedWaitGivesUpAfterTheTimeoutElapses...` (renamed
+`...AfterRealElapsedTimeReachesTheTimeout`) to assert `elapsed >= timeout` and `elapsed <
+timeout + tolerance`, then ran it against the **unmodified, still-buggy production code** — no
+neutering needed, the bug was already there:
+
+```
+Expected real elapsed time to stay within ~30ms of the 00:00:03 bound, took 00:00:03.0587106
+(overshoot 58.7ms) — looks like the wait is bounding requested delay durations rather than real
+elapsed time (D16).
+```
+
+Applied the fix, reran — green, 3/3 stable on the filtered test alone.
+
+**The tolerance took two passes, and the second pass is the one worth recording.** First cut used
+30ms, picked from an isolated (filtered, near-idle) empirical characterization: 40 local samples of
+each algorithm's overshoot at a 3s nominal bound (a standalone harness reproducing just the timing
+loop, not the real flock code) — old accumulator 56–75ms every time, fixed version 0–7ms every time,
+a ~50ms gap. That number **passed the filtered test 3/3 but failed under the full unfiltered suite**:
+correct code, under real thread-pool contention from 715 other tests running concurrently, measured
+36.4ms overshoot — a false positive on correct code, and the exact failure mode CLAUDE.md's "verify
+under the full `dotnet test`, never a filter" rule exists to catch. A filtered run is a near-idle
+machine; the gate never runs in that condition.
+
+Widened to **150ms** and re-verified both directions under the **full unfiltered suite**, not
+filtered: re-applied the accumulator bug via a checksummed, `trap`-reverted temporary edit and ran the
+whole suite — the timeout test failed with **234.4ms overshoot** (bigger than the isolated 58.7ms,
+consistent with the theory: the bug's overshoot scales with poll-iteration count, so it gets *worse*
+under load, not better, while the fixed version's overshoot stays bounded to roughly one iteration's
+jitter regardless of load). Reverted (checksum confirmed `4c8f7bc0…`), rebuilt, ran the full unfiltered
+suite **3/3 green** with the fix and the 150ms tolerance in place. 150ms sits with real margin above
+the one loaded-correct reading (36.4ms) and real margin below both the isolated (56–75ms) and
+loaded (234.4ms) buggy readings — the gap widens under load rather than narrows, which is what makes
+150ms safe rather than merely convenient.
+
+**`<remarks>` unchanged.** They already said "wall-clock deadline" — the prose was describing the
+right intent throughout; only the implementation needed to catch up, per the finding.
+
+**Gates:** `dotnet build` clean (0/0). `dotnet format --verify-no-changes` exit 0. `openspec validate
+git-backed-content-core --strict` valid. `dotnet test` unfiltered, foreground, full suite: **716
+passed, 0 failed, 0 skipped, 716 total** — reconfirmed 3/3 stable after the fix (this and two prior
+runs at ~1m53s–2m2s each), one earlier run (pre-widened-tolerance) showed the single expected false
+positive described above, not a real regression.
+
+`git diff -- src` stays blind to `RepositoryWriteLock.cs` (still untracked) — checked
+`git status --short --untracked-files=all -- src tests` throughout and after landing; only the
+expected files show as modified/untracked, no `MUTANT` residue (`grep -rn MUTANT src/ tests/` empty).
+
+→ @reviewer
+
+**[reviewer]** Re-audit of the finding-1 fix. Independently reconfirmed gates first, not relayed:
+`dotnet build` 0/0, `dotnet format --verify-no-changes` clean, `openspec validate --strict` valid,
+`dotnet test` unfiltered foreground — **716/716, three separate full runs** (1m51s, 1m36s, 1m45s), all
+green, no flake observed. `git status --short --untracked-files=all -- src tests` re-checked: only the
+expected files, `grep -rn MUTANT src/ tests/` empty, `LockExclusive | LockNonBlocking` and the
+`Stopwatch`-based loop both read directly from the file, matching what's reported.
+
+**The fix itself, read at `RepositoryWriteLock.cs:108-129`.** `Stopwatch.StartNew()` once, before the
+loop; `TryAcquire` still runs first every iteration (so `TimeSpan.Zero` still attempts once — the
+existing test pinning that is untouched and still green); `elapsed` is read once per iteration into a
+local and reused for both the timeout check and the `remaining` computation, so there's no
+re-read-between-checks gap. Confirmed the requested edge cases directly against the control flow, not
+by running them and hoping:
+- **`remaining` going negative or zero:** cannot happen — `if (elapsed >= timeout) throw;` runs
+  *before* `remaining = timeout - elapsed;`, so by construction `elapsed < timeout` whenever `remaining`
+  is computed, making it strictly positive every time it's used.
+- **`PollInterval` larger than the whole `timeout`:** the existing `delay = PollInterval <= remaining ?
+  PollInterval : remaining` clamp (unchanged by this fix) already handles it — a short final wait, not
+  an overshoot past `timeout` before the next check.
+- **`TimeSpan.Zero`:** attempt-first ordering means it still tries exactly once before evaluating
+  `elapsed >= timeout`, and `elapsed` is virtually always positive by the time it's read (real time has
+  passed since `StartNew()`), so the throw fires on the first failed attempt as intended.
+No edge case bug at the boundary.
+
+**1. The tolerance — sound for the condition that actually matters, but one sentence in the record is
+arithmetically wrong and needs a fix.** The relevant comparison, because CLAUDE.md's own standing rule
+is that a filtered figure is never the record, is the **full-unfiltered-suite** pair: fixed code 36.4ms
+overshoot (measured once) vs. buggy code 234.4ms (measured once, via the checksummed/`trap`-reverted
+mutation). 150ms sits with 113.6ms of margin above the correct reading and 84.4ms below the buggy one —
+real separation, not a hairline call, and backed by a mechanism, not just a number: the fixed algorithm
+re-reads `Stopwatch.Elapsed` every iteration, so its worst case is bounded to roughly *one* iteration's
+scheduling jitter regardless of load, while the old accumulator's error compounds across every iteration
+(~60 of them at this 3s/50ms ratio) — structurally different growth curves, not just two numbers that
+happened not to collide today. I don't think this test is still capable of false-positiving on correct
+code under this project's actual gate (full suite); the one honest residual caveat is that both loaded
+readings are single samples, so a much more heavily loaded CI box than the one measured could in
+principle narrow the margin further than observed — worth naming, not worth blocking on given the
+structural argument for why the gap should widen rather than invert under more load, and given I could
+not produce a flake across three of my own full-suite runs.
+
+**But the written comparison is wrong, and it's wrong by exactly the amount that matters.** The DEVLOG
+post above states: *"150ms sits with real margin above the one loaded-correct reading (36.4ms) and real
+margin below both the isolated (56–75ms) and loaded (234.4ms) buggy readings."* 150 is not below 56–75
+— it's *above* it, by 75–94ms. That specific comparison is backwards as written. It doesn't undermine
+the tolerance choice (the isolated 56–75ms figure came from "a standalone harness reproducing just the
+timing loop, not the real flock code" per the same post, so it was never the right number to validate
+150ms against in the first place — the full-suite pair is), but a false arithmetic claim in the record
+is exactly the class of thing this section has burned rounds on, so it needs a corrective follow-up post
+rather than standing as written. **Checked whether this leaked into the shipped artifact — it did not**:
+`RepositoryWriteLockTests.cs`'s own doc comment on the test states the comparison more carefully,
+citing 36.4ms and the *qualitative* iteration-scaling argument without asserting 150 sits below the
+isolated figure. The code and the test are fine; only the DEVLOG's summary sentence overreached. Not
+blocking the commit — the append-only record needs a short correcting note, not a re-opened block.
+
+**2. Red-first evidence — confirmed genuine, via a real control, not asserted.** The reported 58.7ms
+overshoot was measured against the **unmodified, still-buggy production code**, and the follow-up
+"applied the fix, reran — green, 3/3 stable" used the **same 30ms tolerance, unchanged**. That's a clean
+A/B: same assertion, only the implementation changed, and the result flipped from fail to pass. If 30ms
+had simply been too tight for *any* implementation, the fixed code would have failed it too — it didn't.
+Worth noting for the record, though not a defect: this means the real bug's *isolated* overshoot (58.7ms
+observed, consistent with the toy harness's independent 56–75ms range) sits comfortably under the
+*final* 150ms tolerance — so this specific test, run by itself outside the full suite, would not reliably
+catch a reintroduced regression. That's an acceptable, narrow limitation given this project's policy
+that a filtered run is never how correctness gets established here (the gate is always the full suite,
+where the same bug shows 234.4ms), but it's honest to say plainly rather than leave implied.
+
+**3. `<remarks>` — checked sentence by sentence, not just the headline claim.** Re-read all three
+`<para>` blocks (`RepositoryWriteLock.cs:19-56`) against the fixed code. The poll-loop paragraph's only
+previously-false clause — "against a wall-clock deadline" — is now true. Everything else in it (no
+bounded-wait syscall, cancellation composition via `Task.Delay`, the hook side's unbounded contrast) was
+never about the accumulator and is unaffected. The release paragraph (fd-close-is-the-unlock) and the
+`creat(2)`-avoids-variadic-`mode` paragraph are both about mechanisms this fix didn't touch, and both
+still read true against the current code (I independently verified the `creat(2)` claim in the prior
+round). The method doc's "always attempts at least once, even at `TimeSpan.Zero`" is confirmed still
+true above. I did not find any sentence that went stale *as a consequence of this specific fix* — leaving
+`<remarks>` unchanged was the right call, not merely the convenient one.
+
+**Verdict: Approve.** The fix is correct, the edge cases are clean, the tolerance is well-reasoned and
+independently confirmed stable across three of my own full-suite runs, and the red-first evidence is
+genuinely about the defect rather than a tolerance artifact. One nit, not blocking: post a short
+follow-up correcting the DEVLOG's "below both the isolated... and loaded... buggy readings" sentence — it
+should say the tolerance is validated against the full-suite pair (36.4ms / 234.4ms), and that the
+isolated 56–75ms figure was never the right comparison to make since it came from a different,
+non-representative harness. Clears to commit; 5.1 and 5.2 tick. → @architect
+
+**[architect]** Correction to the record, per the reviewer's nit. The claim that 150ms sits *"with real
+margin below both the isolated (56–75ms) and loaded (234.4ms) buggy readings"* is **wrong on the first
+half**: 150 is above 56–75, not below it. **The accurate statement** is that the tolerance is validated
+against the **full-suite pair only** — 36.4ms overshoot on correct code, 234.4ms on the reintroduced
+bug, with 150ms sitting between them and clear of both. The isolated 56–75ms figure was never a valid
+comparand: it came from a standalone harness reproducing the loop in isolation, which is a different
+condition from the one the tolerance governs, and this section has already established that a filtered
+or isolated measurement is not merely less precise but *irrelevant* — it measures a condition the gate
+never runs in.
+
+**Why this is worth a post rather than a silent edit.** The wrong sentence was mine, written into the
+close-out summary, and it is the same defect §4 produced when "fourth" propagated from a supervisor's
+post into a worker's brief into shipped prose: **a number inherited from an earlier stage and never
+re-derived.** I had the isolated figure and the loaded figure in front of me and asserted a relation
+between the tolerance and both without checking either. The reviewer caught it by doing the arithmetic
+rather than reading the sentence for plausibility — which is precisely the check §4's `## NEXT` says to
+apply to any count a post asserts, now demonstrated on an inequality instead of a count.
+
+**It did not reach the code.** Confirmed by the reviewer and by me: `RepositoryWriteLockTests.cs`'s own
+comment states the comparison carefully and cites the full-suite pair. The defect is confined to this
+file, which is where §2's five wrong justifications also lived — the record drifts more readily than
+the code, because nothing executes the record.
+
 ## NEXT
 
 **Resume point: §5 (Write lock), first block. No design question blocks it** — the entry that claimed

@@ -1,4 +1,5 @@
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
 
 namespace ZeroWiki.Content;
 
@@ -37,17 +38,20 @@ public sealed class ContentRepositoryService
     private readonly GitProcessRunner _git;
     private readonly GitHookInstaller _hooks;
     private readonly ILogger<ContentRepositoryService> _logger;
+    private readonly TimeSpan _writeLockTimeout;
 
     public ContentRepositoryService(
         ContentPaths paths,
         GitProcessRunner git,
         GitHookInstaller hooks,
-        ILogger<ContentRepositoryService> logger)
+        ILogger<ContentRepositoryService> logger,
+        IOptions<ContentStorageOptions> options)
     {
         _paths = paths;
         _git = git;
         _hooks = hooks;
         _logger = logger;
+        _writeLockTimeout = options.Value.WriteLockTimeout;
     }
 
     /// <summary>
@@ -57,12 +61,13 @@ public sealed class ContentRepositoryService
     /// older image, or restored from a backup, receives it too.
     /// </summary>
     /// <remarks>
-    /// Composed of two phases, split along the boundary D16's write lock needs (§5.2, out of scope
-    /// here): <see cref="AcceptRepositoryAsync"/> — detection/initialization, the nested-repository and
-    /// gitlink refusals, and the reconciliation commit — is the phase that needs mutual exclusion with
-    /// a concurrent push; <see cref="ConfigureRepositoryAsync"/> — <c>receive.denyCurrentBranch</c>/
-    /// <c>http.receivepack</c> and hook installation — does not, since neither writes tracked content
-    /// and a push cannot arrive before the repository has already been configured at least once.
+    /// Composed of two phases, split along the boundary D16's write lock needs (§5.2):
+    /// <see cref="AcceptRepositoryAsync"/> — directory creation, classification, the nested-repository
+    /// and gitlink refusals, and the reconciliation commit — holds <see cref="RepositoryWriteLock"/> for
+    /// the whole phase, since it is the phase that needs mutual exclusion with a concurrent push;
+    /// <see cref="ConfigureRepositoryAsync"/> — <c>receive.denyCurrentBranch</c>/<c>http.receivepack</c>
+    /// and hook installation — does not take the lock, since neither writes tracked content and a push
+    /// cannot arrive before the repository has already been configured at least once.
     /// </remarks>
     public async Task EnsureRepositoryAsync(CancellationToken cancellationToken = default)
     {
@@ -79,9 +84,28 @@ public sealed class ContentRepositoryService
     /// tree on an adopted repository — happens before any write (design.md D9 addendum); this ordering
     /// is load-bearing, not incidental, and this method must not perturb it.
     /// </summary>
+    /// <remarks>
+    /// Holds <see cref="RepositoryWriteLock"/> for the entire method, acquired before directory creation
+    /// or classification and released only once this method returns or throws (D16, <c>## NEXT</c>
+    /// obligation 16): a second app instance starting concurrently against the same data volume (a
+    /// rolling deploy's overlap) blocks here until the first instance's own accept phase completes,
+    /// rather than being able to classify the repository, wait on the lock, and then act on a now-stale
+    /// <c>repositoryHasNoCommitsYet</c>. That predicate is therefore (re-)derived after the lock is
+    /// acquired every time this method runs, never trusted as a value that could have been computed
+    /// before it.
+    /// </remarks>
     private async Task AcceptRepositoryAsync(CancellationToken cancellationToken)
     {
         var repositoryRoot = _paths.RepositoryRoot;
+
+        // RepositoryWriteLock.LockFilePath is a sibling of repositoryRoot, directly under DataRoot
+        // (D16) — production always has this directory already (it is the mounted volume itself), but
+        // a fresh test fixture may not, and creating it is not a write to repository state, so it does
+        // not need to happen under the lock.
+        Directory.CreateDirectory(_paths.DataRoot);
+
+        using var writeLock = await AcquireStartupWriteLockAsync(cancellationToken);
+
         Directory.CreateDirectory(repositoryRoot);
 
         var hasOwnGitEntry = HasOwnGitEntry(repositoryRoot);
@@ -188,6 +212,40 @@ public sealed class ContentRepositoryService
         // Confirms reconciliation actually achieved a clean tree before anything further runs against
         // this repository.
         await AssertWorkingTreeIsCleanAsync(repositoryRoot, cancellationToken);
+    }
+
+    /// <summary>
+    /// Acquires <see cref="RepositoryWriteLock"/> for <see cref="AcceptRepositoryAsync"/>, bounded by
+    /// <see cref="ContentStorageOptions.WriteLockTimeout"/>.
+    /// </summary>
+    /// <remarks>
+    /// D16 settles what a <em>bounded save</em> (§6, not yet built) does when its own wait for this
+    /// lock expires — a per-request "repository busy" failure, not one of this class's fatal startup
+    /// refusals. It does not settle what <em>startup's</em> accept phase should do on the same timeout,
+    /// since there is no request here to fail cleanly instead. This method's answer: refuse to start,
+    /// the same posture this class already takes for any repository state it cannot safely proceed with
+    /// (D9) — the app's own bound (10s by default) comfortably covers realistic contention (D16), so
+    /// hitting it here means something is genuinely stuck, not ordinary overlap.
+    /// </remarks>
+    private async Task<RepositoryWriteLock> AcquireStartupWriteLockAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            return await RepositoryWriteLock.AcquireAsync(_paths.LockFilePath, _writeLockTimeout, cancellationToken);
+        }
+        catch (RepositoryLockTimeoutException ex)
+        {
+            throw new InvalidOperationException(
+                $"Could not acquire the repository write lock at '{ex.LockFilePath}' within " +
+                $"{ex.Timeout}. This most likely means another ZeroWiki instance's own startup is still " +
+                "holding it against the same data volume (e.g. a rolling deploy's brief overlap), which " +
+                "resolves itself once that instance finishes — restarting is not needed in that case. " +
+                "It can also mean a git push's pre-receive/post-receive hook, or the git http-backend " +
+                "subprocess handling it, is stuck holding the lock indefinitely (by design, a hook's own " +
+                "wait for this lock has no bound). Refusing to start rather than proceed without " +
+                "exclusive access to the repository.",
+                ex);
+        }
     }
 
     /// <summary>

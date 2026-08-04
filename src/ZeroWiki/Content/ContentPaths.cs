@@ -22,6 +22,7 @@ public sealed class ContentPaths
         RepositoryRoot = Path.Combine(DataRoot, "wiki");
         WorkingTree = Path.Combine(RepositoryRoot, "docs");
         KeysDirectory = Path.Combine(DataRoot, "keys");
+        LockFilePath = Path.Combine(DataRoot, "wiki.lock");
     }
 
     /// <summary>The mounted data volume root, e.g. <c>/data</c>.</summary>
@@ -40,4 +41,20 @@ public sealed class ContentPaths
     /// vault that clones the remote.
     /// </summary>
     public string KeysDirectory { get; }
+
+    /// <summary>
+    /// D16's single cross-process write-lock file — <c>&lt;DataRoot&gt;/wiki.lock</c>, following
+    /// <see cref="KeysDirectory"/>'s exact precedent: a fixed, <see cref="DataRoot"/>-relative sibling
+    /// of <see cref="RepositoryRoot"/>, computed once, not derived from git. Deliberately outside
+    /// <see cref="RepositoryRoot"/> entirely, not merely outside <see cref="WorkingTree"/> — reconciling
+    /// the working tree runs <c>git add -A</c>/<c>git status --porcelain</c> unscoped at
+    /// <see cref="RepositoryRoot"/>, so anything beneath it (including a file placed directly alongside
+    /// <c>docs/</c>) would be staged, committed, and pushed to every Obsidian vault, and would keep the
+    /// tree dirty between acquisitions. Nothing in git dictates where a lockfile of our own invention
+    /// lives, unlike the hooks directory (see <see cref="GitHookInstaller"/>'s remarks), so — unlike
+    /// that path — this one does not need to be resolved dynamically via a git subprocess call. The
+    /// generated <c>pre-receive</c> hook body (§5.3) bakes this literal path into its <c>#!/bin/sh</c>
+    /// text at install time, since the script has no way to ask this type anything at runtime.
+    /// </summary>
+    public string LockFilePath { get; }
 }

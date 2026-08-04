@@ -1,4 +1,5 @@
 using Microsoft.Extensions.Logging.Abstractions;
+using Microsoft.Extensions.Options;
 using ZeroWiki.Content;
 
 namespace ZeroWiki.Tests.Content;
@@ -1101,8 +1102,17 @@ public sealed class ContentRepositoryServiceTests : IDisposable
 
     private string RepositoryRoot => Path.Combine(_dataRoot, "wiki");
 
-    private ContentRepositoryService CreateService() =>
-        new(new ContentPaths(_dataRoot), _git, new GitHookInstaller(_git), NullLogger<ContentRepositoryService>.Instance);
+    private ContentRepositoryService CreateService(TimeSpan? writeLockTimeout = null) =>
+        new(
+            new ContentPaths(_dataRoot),
+            _git,
+            new GitHookInstaller(_git),
+            NullLogger<ContentRepositoryService>.Instance,
+            Options.Create(new ContentStorageOptions
+            {
+                DataRoot = _dataRoot,
+                WriteLockTimeout = writeLockTimeout ?? TimeSpan.FromSeconds(10),
+            }));
 
     private async Task AssertIsNonBareAsync(string repositoryRoot)
     {

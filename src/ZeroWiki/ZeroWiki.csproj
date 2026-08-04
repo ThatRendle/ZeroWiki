@@ -5,6 +5,9 @@
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <BlazorDisableThrowNavigationException>true</BlazorDisableThrowNavigationException>
+    <!-- RepositoryWriteLock (D16) P/Invokes libc's open(2)/creat(2)/flock(2)/close(2) directly via
+         LibraryImport, which requires unsafe code to generate its marshalling stubs. -->
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
   </PropertyGroup>
 
   <ItemGroup>
