@@ -8470,6 +8470,443 @@ and owed, when §6 has a save path to fail.
 
 §4 closes. → @architect
 
+## 5. Write lock
+
+**[architect]** Base: `c966651` — D3's single cross-process `flock`: one lock taken by **both** the app's
+write path and git's receive hooks, so a browser save and an incoming push can never interleave on the
+repository and neither can leave the tree dirty.
+
+**[architect]** Pre-flight (CLAUDE.md §2): tree clean, on `change/git-backed-content-core`,
+`openspec validate --strict` valid, `proposal.md` / `design.md` / `specs/content-editing/spec.md`
+re-read. §4 carries a supervisor `Approve` (round two, `8dc1646`), so nothing is owed backwards.
+Forward obligation 1 — the entry that spent three sections asserting a Product Owner decision was owed
+*before §5* — was re-derived from the code at §4's close-out and **discharged**. §5 opens with nothing
+owed on it.
+
+**[architect]** ❓ @product-owner — two calls before briefing anyone, both raised because §5 is where
+two parked obligations come due at once and one of them changes shipped behaviour.
+
+1. **Obligation 17 — the `AcceptRepositoryAsync`/`ConfigureRepositoryAsync` split.** A cross-process
+   `flock` wants to wrap exactly the accept-and-write phase and **not** the configure phase, which is
+   the shape the split already has. Since `1253ff5`, `git init` sits in its own `if` outside the block
+   that computed its boolean, so the classify block no longer owns its own action. Does the refactor
+   land inside §5?
+2. **Contention has no ceiling in the spec.** Both scenarios say a writer *waits*. Nothing says what
+   happens if the holder never releases — a crashed hook or an orphaned `http-backend` subprocess hangs
+   every subsequent save and push with no diagnostic.
+
+**[product-owner]** (1) Split first, then lock — as its own block, reviewed on its own. (2) Bounded for
+the app, unbounded for hooks.
+
+**[architect]** Recorded. What the second answer costs, stated plainly so the design block does not
+discover it late: **a bounded app wait is not "the save waits until the push releases the lock"** —
+`specs/content-editing/spec.md:47-50` describes an unbounded one. So this is a **spec delta**, not a
+design note, and §5's section review is gated on the new scenario rather than on this post. That is
+§2's lesson applied without being re-taught: prose landing in `design.md` binds every later section and
+is gated by nothing unless a scenario gates it. The asymmetry also has to earn its own justification in
+the record — a browser save has a person waiting on a request, a push is a background sync — rather
+than being asserted.
+
+**[architect]** §5 breakdown — four blocks. It is a three-task section and this is more blocks than
+tasks; the reason is that two of the four carry no `N.M` at all. Block A is prose that binds the other
+three, and block B is the Product Owner's refactor, which ticks nothing because obligation 17 is not a
+task. Neither is padding: the lock's shape is the section's whole risk surface, and §4's lesson was
+that **a design decision written mid-section is covered by no block review that follows it**, because
+the artefact that changed and the artefact that binds sit in different diffs. Writing D16 first is what
+keeps it inside a diff a reviewer sees.
+
+| Block | Scope | Ticks |
+|---|---|---|
+| A | D16 + spec delta — the lock's mechanism, location and acquisition policy | — |
+| B | `AcceptRepositoryAsync`/`ConfigureRepositoryAsync` split (obligation 17), behaviour-preserving | — |
+| C | 5.1–5.2 — the lock primitive, and the app's write path taking it | 5.1, 5.2 |
+| D | 5.3 — `pre-receive`/`post-receive` take the same lock | 5.3 |
+
+**[architect]** Brief — **block A (design only: D16 + spec delta). No production code, no `src/` change.**
+
+**What you are settling.** D3 is three sentences — "all repository writes are serialized through one
+`flock` on a lockfile, taken by both the app's commit path and git's `pre-receive`/`post-receive`" —
+and every question that decides whether §5 is correct is downstream of it. Settle these, in
+`design.md` as **D16** and in `specs/content-editing/spec.md` as scenarios where behaviour is visible:
+
+1. **Which primitive, and does it actually interoperate — verified by execution, not by reasoning.**
+   The hooks are `/bin/sh` and will use `flock(1)`. The app is .NET. Whether a lock held by one
+   excludes the other is the single assumption the entire section rests on, and it is exactly the kind
+   of claim this change has repeatedly got wrong in prose while the code was fine. Candidates to
+   measure: `FileStream` with `FileShare.None`, a `P/Invoke` to `flock(2)`, and shelling out to
+   `flock(1)`. **Build a two-process spike and demonstrate mutual exclusion in both directions**
+   (.NET holds → shell blocks; shell holds → .NET blocks), then record in D16 *what you ran* and *what
+   you observed*, not what the documentation says. A mechanism that cannot be shown to exclude is not
+   a candidate. Run the spike under the scratchpad, not in `src/`.
+2. **Where the lockfile lives — obligation 2 is live and it bites hard.** A lockfile under
+   `docs/` is an untracked file → the tree is dirty → D9 dutifully commits it → `updateInstead` then
+   bounces every push against a tree it believes unclean. It must be outside `ContentPaths.WorkingTree`,
+   and per obligation 2 the path belongs on **`ContentPaths`** rather than in a parallel notion of where
+   things live (`KeysDirectory` is the precedent, and its `<remarks>` explains exactly this reasoning
+   for a different file). Note the tension to resolve: putting it under `.git/` means resolving `.git`,
+   and `GitHookInstaller` deliberately does **not** assume `<root>/.git` — it asks
+   `git rev-parse --git-path`, because a gitfile layout puts it elsewhere. A `ContentPaths` that
+   hardcodes `.git` would contradict that. Whatever you choose, the **hook script has to name the path
+   literally**, since `/bin/sh` cannot ask `ContentPaths` — `GitHookInstaller` generates the body, so it
+   can bake an absolute path in.
+3. **The acquisition policy the Product Owner set: bounded for the app, unbounded for hooks.** Settle
+   the ceiling's value and where it is configured, what the app does when it expires (this is the part
+   that is user-visible and needs a scenario), and what the operator sees. Justify the asymmetry on its
+   own terms. Also state what an unbounded hook wait means when the app is the thing that is stuck.
+4. **Obligation 16 — `repositoryHasNoCommitsYet` is a snapshot, and §5.1 is what invalidates it.**
+   Since `1253ff5`, `EnsureInitialCommitAsync` no longer verifies `HEAD` immediately before committing;
+   it trusts a value computed earlier in `EnsureRepositoryAsync`. That is correct **today only because
+   startup is single-threaded and unlocked**. D16 must say whether startup's accept phase takes the
+   lock and, if it does, whether the predicate has to be re-derived under it. The realistic racer is
+   two app instances over one volume during a container swap, not a push — the hooks cannot fire until
+   an app is already serving. Say which of those you are protecting against; "both" is a fine answer,
+   "unstated" is not.
+
+**Spec delta.** Add to the `Single per-repo write lock` requirement in
+`specs/content-editing/spec.md` whatever scenarios make the above *behaviour* rather than prose — at
+minimum the app's bounded wait expiring, since the two existing scenarios describe an unbounded wait
+for both writers and are now only half true. Keep the existing two; do not weaken them into vagueness
+that both policies satisfy.
+
+**Out of scope for this block.** No `src/` change of any kind — not the `ContentPaths` property, not
+the lock class, not the hook bodies. Blocks C and D implement what you write here. If the spike
+produces throwaway code, it lives in the scratchpad and does not get committed.
+
+**Gates:** `openspec validate git-backed-content-core --strict`, plus `dotnet build` / `dotnet test` /
+`dotnet format --verify-no-changes` still clean (they should be untouched — if a design-only block
+moves any of them, something landed in `src/` that should not have).
+
+**Mutation testing: not applicable to this block** (CLAUDE.md's cap and scope still bind if you think
+otherwise — ask before starting one).
+
+**Report the full unfiltered `dotnet test` figure, or report "not obtained".** Do not background the
+suite and wait on it: three agents in §4 stalled that way and none posted a number.
+
+→ @worker
+
+**[worker]** Block A done — D16 added to `design.md`, spec delta added to
+`specs/content-editing/spec.md`'s `Single per-repo write lock` requirement. No `src/`/`tests/` touched
+(`git diff --stat -- src tests` empty).
+
+**Spike (scratchpad, discarded after — not committed).** macOS has no `flock(1)` binary at all, so the
+spike ran inside `mcr.microsoft.com/dotnet/sdk:10.0` / `mcr.microsoft.com/dotnet/aspnet:10.0` — the exact
+images this repo's `Dockerfile` builds/ships — confirmed Ubuntu 24.04 with `flock` from `util-linux`
+present by default. A small console app P/Invoked `open()`+`flock()` on a raw fd, run head-to-head with
+the shell's own `flock(1)`:
+
+- `.NET holds → shell blocks`: .NET `flock(fd, LOCK_EX)` held 3s; concurrently `flock -n -x <path>` exited
+  1 (busy) while held, and a blocking `flock -x <path>` returned only after ~2.5s (`took 2511ms`).
+- `shell holds → .NET blocks`: shell `flock -x <path> -c 'sleep 3'` held first; .NET's
+  `flock(fd, LOCK_EX|LOCK_NB)` returned `EAGAIN` (errno=11) immediately, and its blocking
+  `flock(fd, LOCK_EX)` returned only after release (`acquired after 2447ms`).
+
+Both directions hold. **Rejected candidate, caught by surprise:** `File.OpenHandle`/`FileStream` go
+through .NET's own Unix open-time locking emulation regardless of the `FileShare` value requested —
+`File.OpenHandle(path, ..., FileShare.ReadWrite)` still threw `IOException` the instant the shell held an
+exclusive `flock(1)`. `FileStream`+`FileShare.None` *does* end up mutually exclusive with `flock(1)` (via
+that same undocumented internal mechanism, and only as a manual poll/retry against `IOException`, never a
+true blocking wait), but it's riding a code path this design doesn't want to depend on for the lock. A raw
+fd has to come from `open()` P/Invoke, not `File.OpenHandle`, or the app's own `flock()` call never gets
+a chance to run.
+
+**D16 settles:** primitive (`flock(2)` via raw-fd P/Invoke; app-side bound is a `LOCK_NB` poll loop since
+`flock(2)` has no timeout mode); location (`ContentPaths.LockFilePath` = `<DataRoot>/wiki.lock`, sibling
+of `RepositoryRoot` — not merely outside `WorkingTree` as the brief said, but outside `RepositoryRoot`
+entirely: `EnsureRepositoryAsync` runs `add -A`/`status --porcelain` unscoped at `repositoryRoot`, so
+everything under it except `.git` is tracked; resolves the `GitHookInstaller` tension by naming why a
+lockfile of our own invention doesn't need git's dynamic hooks-path resolution — nothing in git dictates
+where it lives); acquisition policy (10s default `ContentStorage:WriteLockTimeout` for the app, a distinct
+"repository busy" failure on expiry with nothing written, unbounded `flock -x` in the hook, asymmetry
+justified on live-human-waiting vs. background-sync plus the hook protocol having no clean "busy, retry"
+signal; named the real cost — an app-side bug that hangs while holding the lock stalls every push forever
+with no timeout to break it); and obligation 16 (the lock has to wrap the whole accept phase including
+classification, not just the writes — `repositoryHasNoCommitsYet` must be (re-)derived after acquiring the
+lock, protecting against two app instances over one volume during a container swap, not a push, since a
+hook can't fire before some app is already serving).
+
+**Spec delta:** kept the two existing scenarios verbatim, added `Save's bounded wait for the lock expires`
+and `Push's wait for the lock has no ceiling`, and added two SHALL sentences to the requirement prose
+making the bounded/unbounded asymmetry itself normative rather than only a design note.
+
+**Gates:** `openspec validate git-backed-content-core --strict` valid. `dotnet build` clean (0 warnings, 0
+errors). `dotnet format --verify-no-changes` clean. `dotnet test` unfiltered, foreground: **710 passed, 0
+failed, 0 skipped, 710 total, 1m 27s**.
+
+→ @reviewer
+
+**[reviewer]** Block A audit. Scope confirmed diff-local to `design.md` (D16) and
+`specs/content-editing/spec.md`; `git diff --stat -- src tests` against `HEAD` is empty, so no
+scope check is spent on that axis. I re-derived every load-bearing claim from the code and from an
+independent execution, rather than accepting the worker's transcript, per the brief.
+
+**Independent re-derivation of the interop claim (brief item 1).** Built my own two-process spike —
+same P/Invoke shape (`open()`+`flock(2)` on a raw fd) — in `mcr.microsoft.com/dotnet/sdk:10.0` /
+`aspnet:10.0` (confirmed Ubuntu 24.04.4, `flock` from `util-linux 2.39.3` present by default,
+matching D16's claim about this repo's `Dockerfile`). I deliberately added negative controls the
+worker's transcript doesn't report, aimed at exactly the trap CLAUDE.md names — corroboration that
+shares an instrument isn't corroboration:
+- Non-blocking probes against a **locked** path fail/EAGAIN in ~2-40ms; the **same probes against an
+  unlocked control path** succeed in ~1-20ms — rules out a probe that always reports "busy" regardless
+  of lock state.
+- Blocking waits against the **locked** path return after ~2.44-2.52s (consistent with a 3s hold
+  started 0.5s earlier) in both directions; blocking waits against a **fresh unlocked path** at the
+  same instant return in single-digit ms — rules out both "these processes never actually overlapped"
+  (which would show ~0ms on the locked-path wait, not ~2.5s) and generic subprocess-spawn latency
+  being mistaken for contention.
+Both directions of exclusion reproduce cleanly against this instrument. **D16's foundational claim
+holds**, and holds under a stricter check than what's recorded.
+
+**FileStream/File.OpenHandle rejection (item 2).** Re-ran the specific claim: `File.Open`/`FileStream`
+with `FileShare.None`, `.Read`, and `.ReadWrite` all threw `IOException` immediately (3-5ms) against a
+path externally held by `flock -x`, while the identical calls against an unlocked control path
+succeeded immediately. This confirms D16's claim that .NET's Unix open-time emulation fires
+"independently of the `FileShare` value requested" — and, since `fcntl()`/`lockf()`-style locks do
+*not* interoperate with `flock(1)` on Linux (different lock domains), the fact that it interoperates
+at all is itself proof the emulation *is* `flock()`-based, exactly as D16 says. Checked the trap named
+in my brief directly: D16 does **not** claim the emulation is something other than `flock(2)` in order
+to justify rejecting it — it explicitly says "flock()-based emulation" and rejects on separate,
+independent grounds (uncontrollable via the parameter meant to control it, no true blocking wait, an
+internal/undocumented code path this design doesn't want load-bearing for a security property). The
+reason given is correct on its own terms, not merely a correct conclusion resting on a shaky premise.
+
+**Lockfile location (item 3).** Verified against the actual call sites rather than the design's
+paraphrase: `git add -A` (`ContentRepositoryService.cs:526`, in `ReconcileWorkingTreeAsync`) and
+`git status --porcelain` (`ContentRepositoryService.cs:682-685`, in `AssertWorkingTreeIsCleanAsync`)
+both run with `repositoryRoot` as their working directory and no pathspec — confirmed. `ContentPaths`
+has no `LockFilePath` yet (correctly out of scope for a design-only block) and `KeysDirectory`
+(`ContentPaths.cs:36-42`, `<DataRoot>/keys`) carries exactly the `<remarks>` reasoning D16 cites by
+analogy. `GitHookInstaller.ResolveHooksDirectoryAsync` (`GitHookInstaller.cs:74-83`) does call
+`git rev-parse --git-path hooks` rather than hardcoding `.git/hooks`, confirming the tension D16
+resolves is real. `identity.db` and `keys/` both already sit directly under `DataRoot`
+(`appsettings.json:10`, `Program.cs:92`) — a `<DataRoot>/wiki.lock` joins them with no name collision.
+All confirmed.
+
+**Obligation 16 (item 5).** `EnsureInitialCommitAsync` (`ContentRepositoryService.cs:453-493`) does
+trust a `repositoryHasNoCommitsYet` boolean computed earlier and passed in, not a re-checked `HEAD` —
+confirmed, and its own XML doc says as much. The classification order D16 says the lock must wrap
+(`HasOwnGitEntry` → `RepositoryHeadIsUnbornAsync`/`LooksLikeBareGitDirectory` → ... →
+`EnsureInitialCommitAsync` → `ReconcileWorkingTreeAsync` → `AssertWorkingTreeIsCleanAsync`) matches
+the method's actual structure exactly. I went one step further than the brief on the threat-model
+claim ("a push really cannot race startup"): `Program.cs:97` (`await app.EnsureContentRepositoryAsync()`)
+runs and is awaited **before** `app.Run()` at `Program.cs:180` — Kestrel is not yet accepting
+connections while a single instance's own accept phase runs, so that instance cannot self-race a push
+against its own startup; only a second instance on the same volume can. This is a stronger and more
+precise confirmation than D16's own prose gives — worth folding the `Program.cs:97/180` ordering into
+D16 itself as the actual proof rather than an inference, since "the hook cannot fire before some app is
+serving" is asserted there without pointing at what guarantees it. Nit, not a blocker.
+
+**Config surface (item 6).** `ContentStorage:WriteLockTimeout` is a direct, implementable extension of
+the already-bound `ContentStorageOptions`/`IOptions` pattern (`ContentStorageOptions.cs`, `DataRoot`'s
+existing precedent) — real surface, not invented.
+
+**Spec delta (item 4).** Both original scenarios kept verbatim (diff is pure insertion after them).
+New scenarios are testable behaviour (concrete WHEN/THEN with observable postconditions — a distinct
+error result, "nothing written," "continues waiting"), not restated prose. The two added SHALL
+sentences make the bound/no-bound asymmetry itself normative rather than blurring it into wording both
+policies would satisfy. `openspec validate git-backed-content-core --strict` passes.
+
+**Nits (non-blocking):**
+1. `design.md`, D16's location section — "`EnsureRepositoryAsync` runs `git add -A` and `git status
+   --porcelain`" is one call-frame removed from the truth: those two commands run inside
+   `ReconcileWorkingTreeAsync`/`AssertWorkingTreeIsCleanAsync`, both called from within
+   `EnsureRepositoryAsync`. Not misleading for this document's purpose, but a document whose job is
+   precision about call sites should name the actual frames.
+2. `specs/content-editing/spec.md`, "Push's wait for the lock has no ceiling" — the precondition
+   "a browser save holds the write lock for longer than the app's own write-lock wait bound" borrows a
+   number (the *acquisition*-wait timeout) to describe something it doesn't actually bound (how long a
+   save may *hold* the lock once acquired). Reads fine, but "for any length of time" would say the same
+   thing without implying the timeout constrains hold duration.
+
+**Architectural note (not blocking, for blocks C/D):** D16 names, honestly, that an app-side bug that
+hangs while holding the lock stalls every push forever with the operator's only lever being a process
+restart. Worth blocks C/D considering whether the *hook's* unbounded wait can at least emit one
+diagnostic line if it's been waiting past some large sanity threshold (e.g. minutes) — not a bound on
+the wait itself, just a breadcrumb for the operator's "the push never returns" case D16 already
+foresees. Not required by this block; D16 states the tradeoff rather than hiding it.
+
+**Verdict: Approve with nits.** Every load-bearing claim in D16 was established, not inherited — the
+interop claim reproduces independently under an instrument built specifically to rule out the
+sequential-execution and silent-failure traps, the FileStream rejection reason is sound on its own
+terms and doesn't misattribute the underlying primitive, the lockfile-location and obligation-16
+reasoning both match the code exactly (including a stronger proof than D16 itself states for "a push
+cannot race a first start"), and the spec delta is genuinely normative and testable. The two nits are
+optional; no fix is required before this block lands. → @architect
+
+**[architect]** All three of the reviewer's items applied **by me, after its `Approve with nits`** —
+so this block's committed state is *not* the state the reviewer certified, and that gap is exactly the
+one that opened twice earlier in this change. Handing straight back for re-certification rather than
+committing on the strength of a verdict that predates the edits. They are taken as nits-worth-fixing
+rather than optional because all three are precision-of-record defects in the two documents whose only
+job is to bind blocks B–D, and **§4's three supervisor blockers were every one of them prose** — the
+cheap moment to close that class is before the section review, not after it.
+
+1. **Call frames (nit 1)** — D16's location section now names `ReconcileWorkingTreeAsync` (`git add -A`)
+   and `AssertWorkingTreeIsCleanAsync` (`git status --porcelain`) as the frames the commands actually
+   run in, rather than attributing both to `EnsureRepositoryAsync` one frame up.
+2. **Spec precondition (nit 2)** — "for longer than the app's own write-lock wait bound" → "for any
+   length of time". The reviewer is right that the old form borrowed the *acquisition* timeout to
+   describe *hold* duration, which the timeout does not bound. The scenario is about the push side
+   having no ceiling; tying it to a number on the save side was the wrong axis.
+3. **The `Program.cs` ordering (the reviewer's stronger proof)** — folded into D16's obligation-16
+   paragraph as the guarantee rather than left as the reviewer's finding. `Program.cs:97` awaits
+   `EnsureContentRepositoryAsync()`; `app.Run()` is not reached until `:180`. D16 previously asserted
+   "a hook cannot fire until some app is serving" without pointing at what makes it true. Recorded with
+   the consequence attached: moving the bootstrap call after `app.Run()` would silently reintroduce the
+   race the lock exists to close — which turns an incidental ordering into a stated invariant someone
+   can violate knowingly rather than by accident.
+
+The **architectural note** (a breadcrumb log line when a hook's unbounded wait passes a sanity
+threshold) is not applied here — it is block C/D work, and it goes into their brief rather than into
+D16, since D16's job was to state the tradeoff and it does.
+
+→ @reviewer for re-certification of these three edits only.
+
+**[reviewer]** Re-certification of the three edits only, per scope — not a re-audit of D16.
+
+**1. Call frames — confirmed correct.** `design.md`'s location section now attributes `git add -A` to
+`ReconcileWorkingTreeAsync` and `git status --porcelain` to `AssertWorkingTreeIsCleanAsync`, both
+described as running within `EnsureRepositoryAsync`'s call — matches `ContentRepositoryService.cs:526`
+and `:682-685` exactly. The surrounding argument is intact: the conclusion is still "outside
+`RepositoryRoot` entirely," not weakened to "outside `WorkingTree`." No issue.
+
+**2. Spec precondition — this is a real finding, not a clean fix.** `specs/content-editing/spec.md:59`
+now reads "a browser save holds the write lock for **any length of time** and a git push arrives." Compare
+`:44`, unchanged: "a browser save holds the write lock and a git push arrives." These are now the same
+precondition — "any length of time" adds no constraint an unqualified WHEN didn't already imply, so
+**"Push's wait for the lock has no ceiling" and "Push waits for an in-progress save" describe the same
+test.** Nothing in the new scenario is any longer verifiable as a *distinct* fact: a test written to
+satisfy it (hold the lock, push arrives, push waits, push eventually succeeds) is byte-for-byte the same
+test that already satisfies the first scenario. The THEN clause's "rather than being rejected" reads as
+if it's asserting the no-ceiling property, but with no durational anchor in the WHEN, there is nothing
+past which rejection was ever on the table for this scenario to rule out.
+
+My nit 2 was about phrasing, not substance — "borrows a number... to describe something it doesn't
+bound" was a complaint about the *justification* being indirect, not a request to remove the threshold.
+The number was what made the scenario a distinct, checkable fact: it's the one point in the spec that
+directly contrasts with "Save's bounded wait for the lock expires" (`:54`, unchanged) — same shape of
+precondition, opposite outcome, because one side of D16's Product Owner decision has a ceiling and the
+other doesn't. Stripping the anchor removed the contrast along with the awkward phrasing.
+
+**Suggested fix** (worker's call on exact wording, but the WHEN needs a concrete threshold back):
+mirror `:54`'s own phrasing rather than reinventing it — `"a browser save holds the write lock for
+longer than the configured write-lock wait bound and a git push arrives"`. Reusing the same named bound
+on both sides of the asymmetry is the point: it's what makes "Save's bounded wait... expires" and
+"Push's wait... has no ceiling" read as a matched pair rather than two unrelated scenarios, one of which
+now happens to duplicate a third.
+
+**3. `Program.cs` ordering — confirmed accurate, both the citation and the structural claim.**
+`Program.cs:97` (`await app.EnsureContentRepositoryAsync()`) and `:180` (`app.Run()`) are exactly right —
+read the file directly. Checked the stronger claim itself, not just the line numbers: grepped the whole
+of `src/` for `AddHostedService`/`BackgroundService`/`IHostedService` — none exist anywhere in this
+codebase. Kestrel does not bind or accept until the host starts inside `app.Run()`, and nothing between
+`builder.Build()` (`:94`) and `:180` opens a listener or starts a background worker early. So "cannot
+self-race as a matter of program structure" is precisely true today, not merely likely — there is no
+code path, hosted service or otherwise, that could serve a request (a push included) before line 97's
+await completes. Confirmed, not overstated.
+
+One nit on the consequence sentence, not blocking: "moving the bootstrap call after `app.Run()`" is
+imprecise taken literally — `app.Run()` blocks until shutdown, so code textually placed after it in
+`Program.cs` wouldn't run at all, not race anything. The intended meaning (detaching the bootstrap from
+the awaited chain so it runs concurrently with request-serving, e.g. as a fire-and-forget or a hosted
+service) is clear from context and correct; the literal phrasing just wouldn't compile-and-mean what it
+says if someone followed it as an instruction.
+
+**Verdict: Request changes — item 2 only.** Items 1 and 3 are certified as landed correctly; nothing
+further needed there. Item 2 needs a durational anchor restored to `specs/content-editing/spec.md:59`'s
+WHEN clause so the scenario is a distinct, checkable fact again rather than a restatement of
+`:42-45`. `openspec validate --strict` passing doesn't catch this, as flagged — it's a semantic
+duplication, not a structural one.
+
+Agree the breadcrumb-log architectural note can wait for block C/D's brief — it was framed as
+non-blocking there and nothing about these three edits changes that. → @architect
+
+**[architect]** Accepted — the finding is right, and the shape of my error is worth naming rather than
+just fixing. Removing the durational anchor left `:59`'s WHEN substantively identical to `:44`, so a
+test satisfying one would satisfy the other. **I corrected the axis by deleting the quantity, when the
+defect was that the quantity sat on the wrong axis** — the same over-correction §4 produced when a
+regrouped guard inherited a stale ordinal: a fix aimed at the sentence rather than at what the sentence
+was for.
+
+**Not applying the suggested wording verbatim, and why.** The suggestion — `"a browser save holds the
+write lock for longer than the configured write-lock wait bound"` — restores distinctness but reinstates
+precisely what nit 2 objected to: the *acquisition* bound used to describe how long a save may *hold*
+the lock, which that bound does not govern. Both reviewer posts are right about the defect each names;
+the suggested fix satisfies the second by undoing the first.
+
+The axis this scenario is about is **the push's own wait**, not the save's hold. `:59` now reads:
+
+> **WHEN** a git push has waited for the write lock held by a browser save for longer than the
+> configured write-lock wait bound
+
+The bound stays as a **yardstick for a duration it genuinely measures** (a wait), the scenario is
+plainly distinct from `:44` (which contains no duration at all), and it states the property under test
+directly: the ceiling that would have expired a save's wait does not exist for a push.
+
+❓ @reviewer — one thing I deliberately did **not** touch, having over-corrected once already here.
+`:54` has the mirror-image shape: it anchors *the save's wait expiring* on how long the **push holds**
+the lock. That is causally sound — a save's wait can only exceed the bound if the push holds it that
+long — so it may be fine as-is, and you certified it. But if `:59` belongs on the wait axis, symmetry
+says `:54` may too. Your call: leave it or make the pair symmetric. Say which, rather than me widening
+this edit a third time.
+
+→ @reviewer for re-certification of item 2's replacement, and an answer on `:54`.
+
+**[reviewer]** Re-certification of item 2's replacement, plus the `:54` question.
+
+**1. `:59` holds as a distinct, checkable fact — and your objection is sound, not hairsplitting. My
+suggested wording was the weaker fix, not just a different one.** Take the correction.
+
+Here's why, worked through rather than asserted: the two clocks in play — "how long the push has
+held the lock" and "how long the push has waited for it" — are only the same number if the push
+arrives at the exact instant the save acquires. In general they diverge: if the save has held the lock
+for `H` and the push arrived `A` time units into that hold, the push's own elapsed wait is `H - A`, not
+`H`. My suggested wording ("a browser save holds the write lock for longer than the configured
+write-lock wait bound and a git push arrives") pins `H`, not `H - A` — it doesn't actually guarantee the
+push itself has waited past the bound, only that the save's total hold has. A test built strictly to
+that letter could submit the push just before the save releases and satisfy the WHEN while the push's
+own wait stays near zero — which wouldn't touch the property the scenario exists to assert at all.
+
+`:59`'s property is a claim about the push's own experience never being capped — an absence-of-a-limit
+claim, which is only possible to state rigorously in terms of the actor whose limit is being denied.
+Anchoring on the holder's duration was reaching for the wrong clock, not just an indirect way of
+reaching for the right one. Confirmed distinct from `:44` (`:44` has no duration at all and is satisfied
+by any successful ordinary wait; `:59` specifically requires observing the push still waiting, unrejected,
+past a threshold `:44` never mentions) and confirmed distinct from `:54` (opposite outcome — continues
+vs. fails). `openspec validate --strict` passes; re-read `:52-60` directly against `:38-45` to check the
+redundancy question by eye, not by trusting the validator, since it was already flagged that structural
+validation can't see this class of duplication.
+
+**2. `:54` — leave it. Definitive answer, not a hedge.**
+
+The symmetry argument is real but doesn't transfer, because the two scenarios assert different *kinds*
+of property. `:59` asserts an absence — "there is no point at which this gets capped" — and an absence
+claim is only checkable by naming the clock whose non-capping is being claimed, which is what forced the
+rewrite. `:54` asserts a threshold-triggered event — "once a specific clock crosses a line, this fires"
+— and for that shape, a sufficient-condition setup in the WHEN plus the precise trigger named in the
+THEN (`:55`: "the system stops waiting **once the bound is reached**") is a complete, standard way to
+write it. The THEN already carries the exact causal claim; the WHEN's job is only to guarantee the
+scenario gets there.
+
+Full honesty on the record rather than a clean "no defect": under the same adversarial reading I used
+above, `:54` has the mirror-image looseness — "push holds for longer than the bound and a save is
+submitted" doesn't pin *when* during that hold the save arrives, so a save submitted late enough in the
+push's hold could still succeed before its own wait reaches the bound, technically satisfying the WHEN
+without the THEN necessarily following. That's the same gap in kind as the one that broke the original
+`:59`. But it doesn't have the same *consequence*: it doesn't collapse `:54` into any other scenario —
+`:54`'s THEN (fails the save, distinct "repository busy" result, nothing written) is unique in this
+requirement regardless of which clock anchors the WHEN, so nothing here is untestable or indistinguishable
+the way the old `:59` was. It's a soft precision gap, not a redundancy defect, and under the ordinary
+(non-adversarial) reading anyone would build a test under — submit the save when contention starts, which
+is the natural way to construct this scenario — it holds fine.
+
+Weighed against that: this thread has already gone from "phrasing nit" to "restore the anchor" to "put
+the anchor on the right clock" in one block. `:54` was part of the original spec delta, fully certified in
+round one, and reopening it now would be a fourth edit chasing a symmetry aesthetic rather than a
+demonstrated defect — exactly the shape of over-correction you're already watching for. Recorded here so
+it's not silently dropped, but not actioned. **Leave `:54` as written.**
+
+**Verdict: item 2 certified. `:54` unchanged, by design, not by oversight.** → @architect
+
 ## NEXT
 
 **Resume point: §5 (Write lock), first block. No design question blocks it** — the entry that claimed

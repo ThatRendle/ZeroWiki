@@ -37,7 +37,7 @@ The system SHALL require each save to declare the base revision it started from 
 
 ### Requirement: Single per-repo write lock
 
-The system SHALL serialize all repository writes — browser commits and git push receipt — through a single cross-process lock so that no two writers mutate the repository concurrently and the working tree is never left dirty by an interleaving.
+The system SHALL serialize all repository writes — browser commits and git push receipt — through a single cross-process lock so that no two writers mutate the repository concurrently and the working tree is never left dirty by an interleaving. The system SHALL bound how long a browser save waits to acquire this lock, and SHALL fail the save cleanly — without writing anything — if that bound is exceeded. The system SHALL NOT apply any such bound to a git push's wait for the same lock.
 
 #### Scenario: Push waits for an in-progress save
 
@@ -48,6 +48,16 @@ The system SHALL serialize all repository writes — browser commits and git pus
 
 - **WHEN** a git push holds the write lock and a browser save is submitted
 - **THEN** the save waits until the push releases the lock before writing and committing
+
+#### Scenario: Save's bounded wait for the lock expires
+
+- **WHEN** a git push holds the write lock for longer than the configured write-lock wait bound and a browser save is submitted
+- **THEN** the system stops waiting once the bound is reached, fails the save with a distinct "repository busy" result rather than the stale-revision conflict result, and does not write or commit anything
+
+#### Scenario: Push's wait for the lock has no ceiling
+
+- **WHEN** a git push has waited for the write lock held by a browser save for longer than the configured write-lock wait bound
+- **THEN** the push continues waiting rather than being rejected, and updates the working tree once the save eventually releases the lock
 
 ### Requirement: Transactional save
 

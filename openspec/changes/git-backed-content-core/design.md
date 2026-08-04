@@ -273,6 +273,162 @@ route to an ordinary 404, losing the message naming every file implicated.
 renders it, so the index can never serve stale *content* — only stale metadata, which is what the stamp
 governs.
 
+### D16 — The write lock: primitive, location, and acquisition policy
+
+D3 says one `flock`, taken by both the app's commit path and git's `pre-receive`/`post-receive` hooks,
+in three sentences. This settles the four things that decide whether that claim actually holds: which
+primitive, where the lockfile lives, how each side acquires it, and what §5.1's lock does to the
+snapshot-trusting read at `## NEXT` obligation 16.
+
+**Primitive — a `flock(2)` advisory lock taken on a raw POSIX file descriptor via `P/Invoke`, not
+`FileStream`/`FileShare` and not shelling out to `flock(1)` from the app.** Verified with a two-process
+spike (scratchpad, not `src/`): a small console app P/Invoking `libc`'s `open()` and `flock()` directly,
+run against the shell's own `flock(1)` inside `mcr.microsoft.com/dotnet/sdk:10.0` /
+`mcr.microsoft.com/dotnet/aspnet:10.0` — the exact images this repository's `Dockerfile` builds and
+ships, Ubuntu 24.04 with `flock` from `util-linux` present by default (an `Essential: yes` Debian/Ubuntu
+package, needing no extra install). Development is macOS, which has **no `flock(1)` binary at all** — the
+spike could not have been run meaningfully on the host and was run inside the container instead, which is
+also the only environment whose result this decision can trust; nothing here rests on a macOS observation.
+
+Both directions of mutual exclusion were demonstrated, not assumed:
+
+- **.NET holds → shell blocks.** The spike opened a raw fd with `open(O_CREAT|O_RDWR)` and called
+  `flock(fd, LOCK_EX)`, held it 3s, then released. Concurrently: `flock -n -x <path> -c '...'` (shell,
+  non-blocking) exited `1` ("busy") while the lock was held, and a plain blocking `flock -x <path> -c
+  '...'` returned only after ~2.5s (matching the remaining hold time from a 0.5s-delayed start) —
+  `SHELL_GOT_LOCK_AFTER_WAIT`, `took 2511ms`.
+- **Shell holds → .NET blocks.** `flock -x <path> -c 'sleep 3'` (shell) ran first; concurrently, the
+  .NET side's non-blocking `flock(fd, LOCK_EX|LOCK_NB)` returned `EAGAIN` (`errno=11`) immediately, and
+  its blocking `flock(fd, LOCK_EX)` returned only after the shell released — `acquired after 2447ms`.
+
+Both other candidates were run and rejected on what was actually observed, not on their reputations:
+
+- **`FileStream` with `FileShare.None`** *does* demonstrate mutual exclusion with `flock(1)` in both
+  directions — but only because .NET's Unix I/O layer applies its own `flock()`-based emulation of
+  Windows file-sharing semantics at *every* file open, independently of the `FileShare` value requested.
+  This was caught by surprise: `File.OpenHandle(path, ..., FileShare.ReadWrite)` — requesting the least
+  restrictive sharing, not `None` — still threw `IOException: …being used by another process` the moment
+  the shell held an exclusive `flock(1)` on the same path. That is an internal, undocumented interaction
+  between two lock layers the app does not control the second of, not a primitive chosen on its own
+  terms; a `FileShare.None` blocking wait against `flock(1)` also only works as a manual poll-and-retry
+  loop (`FileStream` open throws `IOException`, not a blocking wait), never a true kernel-level block.
+  Rejected: the interoperability is real but incidental, riding on a code path (`SafeFileHandle`'s
+  open-time locking) this design does not want to depend on for a security/integrity property.
+- **A raw fd via `File.OpenHandle`, then P/Invoke `flock(2)` on it** — the natural middle ground — fails
+  outright for the same reason: `File.OpenHandle` goes through the same open-time emulation as
+  `FileStream`, so it throws before the app's own `flock()` call ever runs, whenever another process
+  already holds the lock. The raw fd has to come from a **raw `open()`** P/Invoke, bypassing .NET's own
+  file-open path entirely — which is what the chosen primitive does.
+
+*Why this one:* real `flock(2)`, called directly, is byte-for-byte what `/bin/sh`'s `flock(1)` also
+calls — mutual exclusion holds by construction, not by two independent implementations happening to
+agree. It gives a true kernel-level blocking wait (no poll loop, immediate wake on release) and a true
+non-blocking `LOCK_NB` trylock, and closing the fd (including on process exit/crash) releases the lock
+automatically — no stale-lock cleanup path is needed on either side. The cost is `unsafe`/`P/Invoke` and
+a few lines of interop rather than a `using var fs = new FileStream(...)`; that cost buys exactness on the
+one claim this whole section rests on.
+
+**A bounded wait has no syscall for it.** `flock(2)` is binary — block forever (`LOCK_EX`) or fail
+instantly (`LOCK_EX|LOCK_NB`) — there is no third "block up to N seconds" mode, and a blocked `flock(2)`
+call cannot be cancelled from .NET without leaking the native thread it runs on. §5.2's app-side lock
+acquisition is therefore a **poll loop**: `LOCK_EX|LOCK_NB` on a fixed interval (starting at ~50ms,
+matching what the spike's `FileStream` fallback already used) against a wall-clock deadline, driven by a
+`CancellationToken` so it composes with the rest of the request pipeline rather than blocking a thread
+pool thread for the whole wait. The hook side has no such constraint — `/bin/sh` calling `flock -x
+<path> -c '…'` is a genuine kernel-level unbounded block, exactly D3's original three sentences.
+
+**Location — `ContentPaths.LockFilePath`, a sibling of `RepositoryRoot`, not a file under it.** The
+brief's framing ("outside `ContentPaths.WorkingTree`") understates the constraint: within
+`EnsureRepositoryAsync`'s call, `ReconcileWorkingTreeAsync` runs `git add -A` and
+`AssertWorkingTreeIsCleanAsync` runs `git status --porcelain`, both with `repositoryRoot` (not `docs/`)
+as the working directory and neither with a pathspec restricting it to `docs/` — the entire non-bare
+repository, everything under
+`RepositoryRoot` except `.git` itself, is git's tracked working tree and is what the clean-tree invariant
+governs. A lockfile placed anywhere under `RepositoryRoot` — including directly inside it, alongside
+`docs/` — would therefore be staged by reconciliation, committed by D9, and pushed to every Obsidian
+vault on the next clone; `updateInstead` would then bounce the next push against a tree the lockfile
+itself keeps dirty between acquisitions. It has to live outside `RepositoryRoot` entirely.
+
+Per `## NEXT` obligation 2, the path is a property on `ContentPaths` — `LockFilePath`, computed as
+`Path.Combine(DataRoot, "wiki.lock")` — following `KeysDirectory`'s exact precedent (a config-independent
+sibling of `RepositoryRoot`, `<DataRoot>/keys`) rather than a parallel notion of where things live.
+This resolves the tension the brief names: `GitHookInstaller` resolves the *hooks* directory dynamically
+(`git rev-parse --git-path hooks`) because git itself decides where it will look for a hook — `core
+.hooksPath`, a gitfile layout, or the default — and a hardcoded guess can silently miss the one git
+actually consults. **Nothing in git dictates where a lockfile of our own invention lives**; there is no
+protocol requirement pulling it toward `.git/`, so the reason the hooks path must be resolved dynamically
+does not transfer to it. A fixed, `DataRoot`-relative constant is simpler, needs no `git` subprocess call
+just to find the file to lock, and matches `KeysDirectory`'s already-established shape for "outside the
+repository, on the volume, derived once." The generated `pre-receive` hook body (§5.3, out of scope here)
+bakes this literal path into its `#!/bin/sh` text at install time, since the script has no way to ask
+`ContentPaths` anything at runtime.
+
+**Acquisition policy — bounded for the app, unbounded for hooks (Product Owner decision).**
+
+- **Ceiling:** a configurable `ContentStorage:WriteLockTimeout`, defaulting to **10 seconds**, bound the
+  same way as `ContentStorageOptions.DataRoot` (an `IOptions<ContentStorageOptions>` section, overridable
+  by `appsettings.*.json` or an environment variable in the container). Ten seconds comfortably covers an
+  ordinary commit-on-save (sub-second for a small text file) plus contention from a concurrent push of
+  realistic size, while still failing well inside typical browser/reverse-proxy request timeouts (tens of
+  seconds), so a stuck save surfaces as a clear error rather than a silently hanging tab.
+- **What the app does when it expires:** the save request fails outright — no file is ever written, since
+  the lock is acquired *before* the write+commit begins — with a distinct error response (not D4's 409;
+  this is lock contention, not a stale base revision) telling the caller the repository is busy and to
+  retry. This is a per-request, recoverable failure, not one of D9's fatal startup refusals — the process
+  keeps running and serving other reads.
+- **What the operator sees:** a structured warning-level log entry recording how long the request waited
+  before giving up, on the same request-handling path as other write failures — not a crash, not a
+  silently swallowed error.
+- **The asymmetry, justified on its own terms:** a browser save has a person synchronously waiting on an
+  HTTP response; an indefinite hang is a hung tab with no recovery path but closing it, for a failure mode
+  that costs nothing to recover from (nothing was written yet — the user just retries). A push is a
+  background sync — `obsidian-git` runs it off an interval or an explicit user action with no one watching
+  a terminal in real time — and more importantly, timing a `pre-receive` hook out mid-push has a *worse*
+  failure shape than waiting: git's push protocol has no clean "busy, retry" signal for a hook to send, so
+  a bounded hook wait would surface as a rejected or malformed push the client has to interpret, where an
+  unbounded wait instead just... finishes, correctly, the moment the (normally brief, bounded) save that
+  is holding the lock releases it.
+- **What an unbounded hook wait costs when the app is what is stuck:** honestly, more than it looks. If
+  the app's own accept-and-write phase holds the lock and hangs — a bug, not ordinary contention, since
+  the app's *own* acquisition is bounded and a crash releases the OS-level `flock` automatically on
+  process exit — every subsequent push blocks forever with no timeout to break it and no diagnostic beyond
+  "the push never returns." The operator's only lever is restarting the app process, which releases the
+  lock as a side effect of the process exiting. This is a real, named cost of the asymmetry, not a case
+  the policy pretends away.
+
+**Obligation 16 — the write lock is what makes `repositoryHasNoCommitsYet` a snapshot safe to trust, and
+only once it wraps classification too.** `EnsureInitialCommitAsync` trusts a boolean
+`EnsureRepositoryAsync` computed earlier in the same call, rather than re-verifying `HEAD` immediately
+before committing — correct today only because startup is single-threaded and unlocked, so nothing else
+can move `HEAD` between the two. **The racer this protects against is two app instances over one shared
+volume during a container swap — not a push:** a `pre-receive`/`post-receive` hook cannot fire until some
+app is already accepting connections and serving `git http-backend`, so no push can race a *first* start;
+a second app instance starting concurrently against the same `/data` volume (a rolling deploy overlapping
+the outgoing and incoming containers) can.
+
+What *guarantees* that first half is the composition-root ordering, not an inference about how quickly a
+push could arrive: `Program.cs:97` awaits `app.EnsureContentRepositoryAsync()` and `app.Run()` is not
+reached until `Program.cs:180`, so Kestrel is not yet accepting connections anywhere in the accept
+phase. A single instance therefore cannot self-race a push against its own startup as a matter of
+program structure — which is also why this ordering is load-bearing rather than incidental, and why
+moving the bootstrap call after `app.Run()` would silently reintroduce exactly the race the lock is
+being added to close.
+
+Once §5.1–5.2 land, the lock has to wrap the **entire accept phase** — from directory creation and
+classification (`HasOwnGitEntry`, `LooksLikeBareGitDirectory`, `RepositoryHeadIsUnbornAsync`) through
+`AssertWorkingTreeIsCleanAsync` — not only the writes downstream of it. Wrapping only the writes and
+computing `repositoryHasNoCommitsYet` outside the lock would still leave a second instance able to compute
+the predicate, block on the lock while the first instance's accept phase runs to completion (creating the
+initial commit the second instance never saw), then enter its own write phase trusting a now-stale `true`.
+**The predicate must therefore be (re-)derived after the lock is acquired, not merely trusted as a value
+computed earlier in the call** — concretely, block B's `AcceptRepositoryAsync` acquires the write lock
+first and performs classification inside it, so no other instance's write can land between "read the
+repository's state" and "act on it." This does not extend to `ConfigureRepositoryAsync` (D3's own
+"configure phase" — `receive.denyCurrentBranch`/`http.receivepack` and hook installation): neither writes
+tracked content, hook installation touches only `.git/hooks` rather than the working tree the clean-tree
+invariant governs, and pushes cannot arrive before configuration has already run once — so nothing in that
+phase needs the mutual exclusion the lock exists to provide.
+
 ## Risks / Trade-offs
 
 - **Dirty tree blocks all pushes** → Transactional save (`git checkout -- <file>` on commit failure, under lock) plus startup reconciliation (commit-as-recovered or discard) guarantee the tree returns to clean.
