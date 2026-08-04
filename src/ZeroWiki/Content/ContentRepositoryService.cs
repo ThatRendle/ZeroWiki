@@ -56,7 +56,30 @@ public sealed class ContentRepositoryService
     /// only when this call is the one that initializes the repository — so a repository made by an
     /// older image, or restored from a backup, receives it too.
     /// </summary>
+    /// <remarks>
+    /// Composed of two phases, split along the boundary D16's write lock needs (§5.2, out of scope
+    /// here): <see cref="AcceptRepositoryAsync"/> — detection/initialization, the nested-repository and
+    /// gitlink refusals, and the reconciliation commit — is the phase that needs mutual exclusion with
+    /// a concurrent push; <see cref="ConfigureRepositoryAsync"/> — <c>receive.denyCurrentBranch</c>/
+    /// <c>http.receivepack</c> and hook installation — does not, since neither writes tracked content
+    /// and a push cannot arrive before the repository has already been configured at least once.
+    /// </remarks>
     public async Task EnsureRepositoryAsync(CancellationToken cancellationToken = default)
+    {
+        await AcceptRepositoryAsync(cancellationToken);
+        await ConfigureRepositoryAsync(cancellationToken);
+    }
+
+    /// <summary>
+    /// The accept-and-write phase (D16): detects or initializes the repository at
+    /// <see cref="ContentPaths.RepositoryRoot"/>, reconciles any dirty working tree left from a crash
+    /// or manually copied-in content (D9), and asserts the working-tree-clean invariant. Every refusal
+    /// this method can raise — bare repository, a nested repository (scanned before any commit exists
+    /// to diff against, and again via the staged-gitlink check once one does), and a missing working
+    /// tree on an adopted repository — happens before any write (design.md D9 addendum); this ordering
+    /// is load-bearing, not incidental, and this method must not perturb it.
+    /// </summary>
+    private async Task AcceptRepositoryAsync(CancellationToken cancellationToken)
     {
         var repositoryRoot = _paths.RepositoryRoot;
         Directory.CreateDirectory(repositoryRoot);
@@ -123,35 +146,39 @@ public sealed class ContentRepositoryService
         // already contain a nested git repository (e.g. a copied-in Obsidian vault); the
         // reconciliation-time gitlink check further down can only see that once something has been
         // staged, which requires a commit to diff against, so this scan is what catches it before then.
+        //
+        // git init lives inside this same block, immediately after the scan, rather than behind a
+        // second top-level `if (!hasOwnGitEntry)` further down: the predicate that decides whether to
+        // initialize (`!hasOwnGitEntry`, true only when this branch's own classification chose it) and
+        // the write it governs belong together, and a reader should not have to hold two `if`s apart in
+        // the method body to see why a repository was initialized here.
         if (repositoryHasNoCommitsYet)
         {
             AssertNoNestedGitRepository(repositoryRoot);
-        }
 
-        if (!hasOwnGitEntry)
-        {
-            // Scanning above happens before this call: leaving nothing behind if it refuses is the
-            // entire point of running the scan first on this branch.
-            await _git.RunOrThrowAsync(
-                repositoryRoot,
-                ["init", "-b", DefaultBranch],
-                cancellationToken: cancellationToken);
+            if (!hasOwnGitEntry)
+            {
+                // Scanning above happens before this call: leaving nothing behind if it refuses is the
+                // entire point of running the scan first on this branch.
+                await _git.RunOrThrowAsync(
+                    repositoryRoot,
+                    ["init", "-b", DefaultBranch],
+                    cancellationToken: cancellationToken);
+            }
         }
 
         // Every branch above that did not throw leaves .git present at repositoryRoot — found as-is,
         // or just created by init — so the assertion has what it needs here. Run it before any write:
-        // if classification ever regresses, this is what stops the configuration/hooks writes below
-        // from landing in a repository git merely discovered (e.g. an ancestor's), rather than
+        // if classification ever regresses, this is what stops the initial-commit/reconciliation writes
+        // below from landing in a repository git merely discovered (e.g. an ancestor's), rather than
         // reporting that damage after it already happened.
         await AssertGitResolvesRepositoryRootAsync(repositoryRoot, cancellationToken);
 
-        // Every refusal this method can raise — bare repository (above), a nested repository (above),
-        // missing docs/, and a staged gitlink — happens before any write below. This ordering is
-        // load-bearing, not incidental (design.md D9 addendum): the docs/ probe below needs only the
-        // already-computed repositoryHasNoCommitsYet value, and the gitlink probe is intrinsically a
-        // staging-and-diff operation, so both can and must run before configuration or hooks touch the
-        // repository at all. A repository this method is about to refuse never has anything written to
-        // it first.
+        // The docs/ probe below needs only the already-computed repositoryHasNoCommitsYet value, and
+        // the gitlink probe (inside ReconcileWorkingTreeAsync) is intrinsically a staging-and-diff
+        // operation — both can and must run before this repository is ever configured or has hooks
+        // installed. A repository this method is about to refuse never has anything written to it
+        // first.
         await EnsureInitialCommitAsync(repositoryRoot, repositoryHasNoCommitsYet, cancellationToken);
 
         // D9: a dirty tree at startup (e.g. Markdown copied onto the volume before first start, or an
@@ -161,10 +188,21 @@ public sealed class ContentRepositoryService
         // Confirms reconciliation actually achieved a clean tree before anything further runs against
         // this repository.
         await AssertWorkingTreeIsCleanAsync(repositoryRoot, cancellationToken);
+    }
 
-        // Runs last, now that every refusal above has had its chance to fire first: neither writes
-        // anything a refusal above needs to be true of, and receive.denyCurrentBranch/http.receivepack
-        // govern pushes while the hooks fire on push — neither can matter before the app is serving.
+    /// <summary>
+    /// The configure phase (D16): applies the Smart HTTP remote's git configuration and installs the
+    /// push hooks. Runs only once <see cref="AcceptRepositoryAsync"/> has completed without refusing —
+    /// neither write here needs to be true of a repository <see cref="AcceptRepositoryAsync"/> would
+    /// have refused, and <c>receive.denyCurrentBranch</c>/<c>http.receivepack</c> govern pushes while
+    /// the hooks fire on push, neither of which can matter before the app is serving. Needs no mutual
+    /// exclusion with a concurrent push: neither write touches tracked content, so it sits outside
+    /// D16's write lock.
+    /// </summary>
+    private async Task ConfigureRepositoryAsync(CancellationToken cancellationToken)
+    {
+        var repositoryRoot = _paths.RepositoryRoot;
+
         await ApplyRepositoryConfigurationAsync(repositoryRoot, cancellationToken);
         await _hooks.InstallHooksAsync(repositoryRoot, cancellationToken);
     }
@@ -208,7 +246,7 @@ public sealed class ContentRepositoryService
     /// Refuses if <paramref name="repositoryRoot"/>'s directory tree contains a nested git repository —
     /// a <c>.git</c> directory or gitfile at any depth <em>below</em> <paramref name="repositoryRoot"/>
     /// itself (its own top-level <c>.git</c>, if it already has one, is never itself "nested" — see
-    /// <see cref="CollectNestedGitEntries"/>). Called by <see cref="EnsureRepositoryAsync"/> whenever
+    /// <see cref="CollectNestedGitEntries"/>). Called by <see cref="AcceptRepositoryAsync"/> whenever
     /// the repository has no commits yet — before it creates the initial commit, whether that is
     /// because <c>.git</c> does not exist yet (before <c>git init</c> runs) or because it does but
     /// <c>HEAD</c> is unborn (e.g. a process that died between <c>git init</c> and the initial commit
@@ -220,7 +258,7 @@ public sealed class ContentRepositoryService
     /// <para>
     /// <b>This is a second instrument, deliberately, not a duplicate of <see cref="FindStagedGitlinksAsync"/>.</b>
     /// This scan asks "is there a nested repository in this folder", walking the filesystem directly,
-    /// and guards <see cref="EnsureRepositoryAsync"/> only when it is about to create the initial
+    /// and guards <see cref="AcceptRepositoryAsync"/> only when it is about to create the initial
     /// commit, before any write. <see cref="FindStagedGitlinksAsync"/> asks "would committing right now
     /// store a gitlink", from git's index, and guards every reconciliation once a commit already exists
     /// — including content that arrives long after bootstrap, on a repository this scan never runs
@@ -446,7 +484,7 @@ public sealed class ContentRepositoryService
     /// before-any-write posture as the bare-repository and gitlink refusals elsewhere in this class.
     /// </summary>
     /// <param name="repositoryHasNoCommitsYet">
-    /// Computed once by <see cref="EnsureRepositoryAsync"/> and passed in rather than re-derived here,
+    /// Computed once by <see cref="AcceptRepositoryAsync"/> and passed in rather than re-derived here,
     /// so it is the same value that also gates <see cref="AssertNoNestedGitRepository"/> — the two
     /// decisions share one predicate and cannot drift apart.
     /// </param>
@@ -509,7 +547,7 @@ public sealed class ContentRepositoryService
     /// has one in its history, which is a worse outcome than leaving the pre-existing gap undetected.
     /// <para>
     /// This index-based check is not this repository's only nested-repository guard:
-    /// <see cref="EnsureRepositoryAsync"/> also runs <see cref="AssertNoNestedGitRepository"/>, a
+    /// <see cref="AcceptRepositoryAsync"/> also runs <see cref="AssertNoNestedGitRepository"/>, a
     /// filesystem scan, whenever the repository has no commits yet — before it creates the initial
     /// commit — because there is no index yet at that point for this check to see. See
     /// <see cref="AssertNoNestedGitRepository"/>'s remarks for exactly which cases that covers, why both
@@ -590,13 +628,13 @@ public sealed class ContentRepositoryService
     /// status letters, so this correction does not change behaviour).
     /// <para>
     /// This call always sees a <em>born</em> <c>HEAD</c> — <see cref="EnsureInitialCommitAsync"/> runs
-    /// unconditionally before reconciliation in <see cref="EnsureRepositoryAsync"/> and either creates
+    /// unconditionally before reconciliation in <see cref="AcceptRepositoryAsync"/> and either creates
     /// the initial commit or refuses to start when history exists with no working tree — so the
     /// genuinely unborn-<c>HEAD</c> case (a fresh repository with no commits at all) never actually
     /// reaches this method or the <c>git reset</c> below it. (As a property of git, <c>diff --cached
     /// --raw</c> *would* diff against the empty tree if it ever did face an unborn <c>HEAD</c> — but
     /// that is not why this code is safe today, and would only become load-bearing if a future change
-    /// reordered <c>EnsureRepositoryAsync</c> to run reconciliation before the initial commit.)
+    /// reordered <c>AcceptRepositoryAsync</c> to run reconciliation before the initial commit.)
     /// </para>
     /// <para>
     /// Uses <c>-z</c>: without it, <c>core.quotePath</c> (on by default) renders any non-ASCII path as

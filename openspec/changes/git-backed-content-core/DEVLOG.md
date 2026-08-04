@@ -8907,6 +8907,336 @@ it's not silently dropped, but not actioned. **Leave `:54` as written.**
 
 **Verdict: item 2 certified. `:54` unchanged, by design, not by oversight.** → @architect
 
+**[architect]** Block A **landed as `172c622`**. Gates run by me rather than relayed: `dotnet build`
+0/0, `dotnet test` **710/710** full unfiltered foreground (1m45s), `dotnet format --verify-no-changes`
+exit 0, `openspec validate --strict` valid. `git diff -- src tests` empty **and**
+`git status --short --untracked-files=all -- src tests` empty — both checks, because the second is the
+one §7b learned about the hard way, and a design block that ran a container spike is exactly where a
+stray file would hide.
+
+**What the three review rounds cost and bought, recorded before it is forgotten.** Two of the three
+were caused by me, not the worker: I applied the reviewer's nits *after* its `Approve`, and my fix to
+nit 2 over-corrected. The transferable part is not "don't over-correct" — it is that **the reviewer's
+second finding was invisible to `openspec validate --strict`**, which passed happily on a scenario that
+had become a semantic duplicate of one fifteen lines above it. A structural validator cannot see two
+scenarios saying the same thing. That is §2's defect shape (a gap in what a condition *asks*, not in
+how faithfully it runs) arriving in a new medium, and §6 should know that a green validator says
+nothing about whether a delta's scenarios are distinct.
+
+**[architect]** Brief — **block B: the `AcceptRepositoryAsync`/`ConfigureRepositoryAsync` split
+(`## NEXT` obligation 17). Behaviour-preserving refactor. Ticks no task — obligation 17 is not one.**
+
+**Why this is a block and not a tidy-up.** D16 (committed in `172c622` — read it first) says the write
+lock has to wrap the **entire accept phase including classification**, and must not wrap the configure
+phase. `EnsureRepositoryAsync` today interleaves both, and since `1253ff5` `git init` sits in its own
+`if` **outside** the block that computed the boolean governing it — so the classify step no longer owns
+its own action. Threading a lock through that shape is what obligation 17 says gets expensive. The
+Product Owner's call was: split first, reviewed on its own, then lock.
+
+**The split.** `EnsureRepositoryAsync` becomes the composition of two methods:
+
+- **`AcceptRepositoryAsync`** — everything from `Directory.CreateDirectory(repositoryRoot)` and
+  classification (`HasOwnGitEntry`, `LooksLikeBareGitDirectory`, `RepositoryHeadIsUnbornAsync`) through
+  the nested-repository scan, `git init`, `AssertGitResolvesRepositoryRootAsync`,
+  `EnsureInitialCommitAsync`, `ReconcileWorkingTreeAsync` and `AssertWorkingTreeIsCleanAsync`. This is
+  exactly what block C wraps in the lock — the boundary is not a matter of taste, it is D16's.
+- **`ConfigureRepositoryAsync`** — `ApplyRepositoryConfigurationAsync` and `InstallHooksAsync`, which
+  D16 explains need no mutual exclusion: neither writes tracked content, hook installation touches only
+  the hooks directory, and pushes cannot arrive before configuration has run at least once.
+
+**The classify step must own its action.** Moving code without fixing that leaves obligation 17
+undischarged. `git init` and the predicate that governs it belong together; a reader should not have to
+hold two `if`s in their head to see why a repository was initialised. How you express that is yours —
+but if your split leaves `git init` still detached from its own predicate, **say so** rather than
+declaring the obligation closed.
+
+**What must not change — the hard constraint.** `f50f1ca` established that **no write precedes any
+refusal**, on both the adopt and the initialise paths, with `2c70e05` and `1253ff5` closing the
+initialise path behind it. That ordering is load-bearing (D9 addendum), it took §2 four supervisor
+rounds and seven commits to get right, and this block must not perturb it by one step: same order, same
+refusals, same exception messages. **The existing suite is your instrument — 710/710 must pass with no
+test edited.** If a test needs changing to accommodate the split, the split is wrong; stop and say so
+rather than adjusting the test to fit.
+
+**Explicitly out of scope.** No lock. No `ContentPaths.LockFilePath`. No `WriteLockTimeout` option. No
+`P/Invoke`. All of that is block C. Place `repositoryHasNoCommitsYet` so that block C's change —
+re-deriving it under the lock — is a *local* edit inside `AcceptRepositoryAsync`, but **do not** pre-empt
+that change here: today's single-threaded startup makes the snapshot correct as it stands, and changing
+it without the lock present would be a behaviour change dressed as a refactor.
+
+**Gates:** `dotnet build` clean, `dotnet test` **710/710 unfiltered in the foreground** (report the real
+figure, or report "not obtained" — do not background it and wait), `dotnet format --verify-no-changes`,
+`openspec validate git-backed-content-core --strict`.
+
+**Mutation testing: no.** This block changes no condition and adds no behaviour, so there is nothing
+whose absence a mutant would reveal that the existing 710 do not already pin. If you believe otherwise,
+ask first — CLAUDE.md's limits (3 confirmation runs, security/correctness paths only, checksum before
+*and* after, revert via `trap`/`finally`) bind if it ever starts.
+
+→ @worker
+
+**[worker]** Block B done. `EnsureRepositoryAsync` is now a two-line composition of
+`AcceptRepositoryAsync` (everything from `Directory.CreateDirectory` through classification, the
+nested-repository scan, `git init`, `AssertGitResolvesRepositoryRootAsync`,
+`EnsureInitialCommitAsync`, `ReconcileWorkingTreeAsync`, `AssertWorkingTreeIsCleanAsync`) and
+`ConfigureRepositoryAsync` (`ApplyRepositoryConfigurationAsync`, `InstallHooksAsync`) — the exact D16
+boundary. Both are `private`; `EnsureRepositoryAsync` stays the sole public entry point, unchanged in
+signature, so no caller or test needed to change.
+
+**Obligation 17 — discharged, not just moved.** `git init` no longer sits in a separate top-level
+`if (!hasOwnGitEntry)` after the scan. It's now nested directly inside the
+`if (repositoryHasNoCommitsYet) { AssertNoNestedGitRepository(...); ... }` block, guarded by
+`if (!hasOwnGitEntry)` immediately below the scan it depends on. I deliberately did **not** move
+`git init` into the classify `else` branch itself and did **not** duplicate the
+`AssertNoNestedGitRepository` call into two branches — the method's own doc comments explain at
+length why that call is gated on the single shared `repositoryHasNoCommitsYet` predicate rather than
+per-branch, specifically to keep it from drifting apart from `EnsureInitialCommitAsync`'s gate again;
+duplicating it to let `git init` live in the `else` branch would have undone that. The predicate
+governing `git init` (`!hasOwnGitEntry`) and the write it governs are now one nested `if`, right after
+the scan that must precede it, in the same block — a reader confirms "scan already ran, init is safe"
+without leaving that block. Order is unchanged: scan → init, both still inside the same conditional
+structure that decides whether either runs at all.
+
+**Refusal-before-write ordering — unperturbed, verified by inspection, not just by the green suite.**
+Traced both paths against `f50f1ca`'s invariant: adopt path (`hasOwnGitEntry: true`) — bare-repo probe
+throw, then (if HEAD unborn) nested-repo scan throw, both before `AssertGitResolvesRepositoryRootAsync`
+or any write; initialise path (`hasOwnGitEntry: false`, not bare) — nested-repo scan throw, *then*
+`git init` (the first write), unchanged relative order. `AssertGitResolvesRepositoryRootAsync`,
+`EnsureInitialCommitAsync`'s missing-working-tree refusal, and `ReconcileWorkingTreeAsync`'s gitlink
+refusal (which unstages before throwing) all still run in the same sequence, still all before
+`ConfigureRepositoryAsync`. Same exception messages — none touched.
+
+`repositoryHasNoCommitsYet` stays a local variable computed once inside `AcceptRepositoryAsync` and
+passed into `EnsureInitialCommitAsync`, exactly where block C's later "re-derive it under the lock"
+change would be a local edit — not pre-empted here; today's single-threaded, unlocked startup is still
+what makes the snapshot correct as committed.
+
+**Gates:** `dotnet build` clean (0 warnings, 0 errors). `dotnet test` unfiltered, foreground: **710
+passed, 0 failed, 0 skipped, 710 total, 1m 18s** — no test edited (`git diff --stat -- tests` empty).
+`dotnet format --verify-no-changes` exit 0. `openspec validate git-backed-content-core --strict` valid.
+`git diff --stat -- src tests` / `git status --short --untracked-files=all -- src tests` both show only
+`src/ZeroWiki/Content/ContentRepositoryService.cs` modified — no stray files.
+
+No mutation testing run, per the brief.
+
+→ @reviewer
+
+**[reviewer]** Block B audit. Scope confirmed diff-local to `ContentRepositoryService.cs` +
+`DEVLOG.md` against `172c622`; nothing else touched, tracked or untracked. Re-derived every claim
+against the code rather than the worker's inspection notes, per the brief. Independently confirmed
+gates: `dotnet build` clean (0/0), `openspec validate --strict` valid, `dotnet format
+--verify-no-changes` clean — treated as necessary, not sufficient, since a behaviour-preserving
+refactor passing 710/710 is exactly what it should do even when subtly wrong.
+
+**1. The nesting is exactly equivalent — proved exhaustively, not spot-checked.** The three-way
+classification (`hasOwnGitEntry` / `LooksLikeBareGitDirectory` / else) has exactly one live
+(non-throwing) path on which `!hasOwnGitEntry` is true: the `else` branch at
+`ContentRepositoryService.cs:122-136`, which unconditionally sets `repositoryHasNoCommitsYet = true`
+in the same branch, before either variable is used again. The bare-directory branch throws
+(`:114-121`) and never reaches the nested block at all. The `hasOwnGitEntry: true` branch (`:90-113`)
+can produce `repositoryHasNoCommitsYet` either value, but `!hasOwnGitEntry` is false throughout it, so
+the inner `if (!hasOwnGitEntry)` never fires there regardless of the outer guard. There is therefore no
+live path to `!hasOwnGitEntry == true` with `repositoryHasNoCommitsYet == false` — the outer guard is
+always satisfied exactly when the inner one needs to be reached, and the nesting changes nothing
+observable relative to the old two-top-level-`if`s shape. Confirmed for all three branches, not just
+the one the brief's own reading focused on.
+
+**2. Forward reasoning for block C is right, with one nuance worth recording rather than one to fix.**
+The nesting is genuine defense-in-depth against exactly the staleness the brief describes: a
+`repositoryHasNoCommitsYet` re-derived to `false` under the lock now skips `git init` unconditionally
+(the outer guard), regardless of whatever `hasOwnGitEntry` says — where the old flat structure's
+`git init` was gated on `!hasOwnGitEntry` alone and would have re-run over a repository instance 1 just
+created if that value were stale. Worth being precise about when this actually bites, though: D16's own
+text says block C's plan is "`AcceptRepositoryAsync` acquires the write lock **first** and performs
+classification inside it" — lock-then-classify-fresh, not classify-then-wait-then-partially-re-derive.
+Under that literal plan, `hasOwnGitEntry` is recomputed fresh under the lock too, so the specific
+staleness scenario never arises in the first place. The nesting's value is real but is defense-in-depth
+against a *partial* re-derivation block C isn't actually planning to do — not a fix for a race the
+planned implementation would otherwise have. Locality confirmed separately: `ConfigureRepositoryAsync`
+re-derives `repositoryRoot` independently and depends on nothing `AcceptRepositoryAsync` computes, so
+wrapping only `AcceptRepositoryAsync` in a lock in block C requires touching no other method — the split
+does leave block C local, as required.
+
+**3. Refusal-before-write ordering — confirmed unperturbed by direct reading, not by trusting the
+worker's trace.** Walked both paths against `f50f1ca`'s invariant myself: adopt path
+(`hasOwnGitEntry: true`) — bare-repo throw (`:102`) before anything else; initialise path — nested-repo
+scan throw (`:157`) strictly before `git init` (`:163-166`), same relative order as before the split.
+`AssertGitResolvesRepositoryRootAsync` (`:175`), `EnsureInitialCommitAsync`'s missing-working-tree
+refusal (`:501-504`), and `ReconcileWorkingTreeAsync`'s gitlink refusal (`:574-583`, unstages before
+throwing) all still run in the same sequence, all still before `ConfigureRepositoryAsync` — which is
+guaranteed by plain C# `await` semantics (a throw from `AcceptRepositoryAsync` never reaches the
+`ConfigureRepositoryAsync` await on the next line of `EnsureRepositoryAsync`). None of the exception
+message builders (`BareRepositoryException`, `MissingWorkingTreeException`,
+`BuildUnreadableDirectoryErrorMessage`, `BuildNestedRepositoryScanErrorMessage`, the gitlink message,
+`AssertGitResolvesRepositoryRootAsync`'s own) appear in the diff — confirmed unchanged. No issue.
+
+**4. Comment rewrites — the ones the diff touched are accurate; the ones it didn't touch are now
+false, and that's a real finding, not scope creep.** Every comment actually reworded inside the moved
+block is true of its new location: the `AssertGitResolvesRepositoryRootAsync` comment now correctly
+says "stops the initial-commit/reconciliation writes below" (both now genuinely below it, inside
+`AcceptRepositoryAsync`, since configuration/hooks moved to a separate method); the "ordering is
+load-bearing" claim was relocated to `AcceptRepositoryAsync`'s own XML summary rather than dropped;
+the `git init` placement comment (`:150-154`) accurately describes the branch structure I verified in
+item 1. No issue there.
+
+But grepping the whole file for `EnsureRepositoryAsync` turns up five more references the diff left
+untouched, and the split's own consequence makes them wrong now — this is exactly the "prose that
+drifts from the code it sits next to" pattern the brief named, just in the surrounding methods rather
+than the moved block:
+
+- `:249` — "Called by `EnsureRepositoryAsync` whenever the repository has no commits yet." False:
+  `AssertNoNestedGitRepository` is now called by `AcceptRepositoryAsync`; `EnsureRepositoryAsync` no
+  longer calls it, directly or otherwise.
+- `:261` — "guards `EnsureRepositoryAsync` only when it is about to create the initial commit." Same
+  issue — should name `AcceptRepositoryAsync`.
+- `:487` — "Computed once by `EnsureRepositoryAsync` and passed in rather than re-derived here." False
+  — `repositoryHasNoCommitsYet` is computed by `AcceptRepositoryAsync`, which is also what passes it to
+  `EnsureInitialCommitAsync`. `EnsureRepositoryAsync` itself is now a two-line composition that computes
+  nothing.
+- `:550` — "`EnsureRepositoryAsync` also runs `AssertNoNestedGitRepository`." False for the same
+  reason as `:249`.
+- `:630-631` — "`EnsureInitialCommitAsync` runs unconditionally before reconciliation in
+  `EnsureRepositoryAsync`." False — both run inside `AcceptRepositoryAsync`. The parenthetical at
+  `:637` ("would only become load-bearing if a future change reordered `EnsureRepositoryAsync` to run
+  reconciliation before the initial commit") should match for consistency, though as a hypothetical
+  about a future change it's the least urgent of the five.
+
+One at `:483-484` ("before `EnsureRepositoryAsync` has written any configuration or hooks") I'm not
+flagging as false — read end-to-end, `EnsureRepositoryAsync` as a whole genuinely hasn't written
+configuration by that point, so the claim still holds; it's just no longer the most precise available
+statement now that `AcceptRepositoryAsync` is the actual frame doing the refusing. Not blocking.
+
+These are load-bearing doc comments, not incidental prose — `:487`'s whole point is telling a future
+reader which method owns a value so it "cannot drift apart," and it now names the wrong owner. Worth
+fixing before this lands: rename the five `EnsureRepositoryAsync` references above to
+`AcceptRepositoryAsync` (verbatim swap, no other wording implied to need to change) — mechanical, low
+risk, no behaviour touched.
+
+**5. Obligation 17 — genuinely discharged, and the worker's judgment not to duplicate
+`AssertNoNestedGitRepository` is correct.** `git init`'s governing predicate (`!hasOwnGitEntry`) and the
+write it governs are now one nested `if`, inside the same block as the scan that must precede it —
+matches the obligation's complaint (classify step didn't own its own action) and fixes it structurally,
+not just by relocating the code. Duplicating the scan into two branches instead (to let `git init` live
+directly in the `else` branch) would have reintroduced the exact two-predicate-drift bug the
+surrounding comments (`:138-148`) already document as history — correctly avoided.
+
+**6. `ConfigureRepositoryAsync`'s independent `repositoryRoot` — confirmed trivial, as flagged.**
+`ContentPaths.RepositoryRoot` (`ContentPaths.cs:22,31`) is a get-only property set once in the
+constructor from `DataRoot`; `ContentPaths` is a singleton, so both phases observe the identical value.
+Nothing else was threaded through the old single local — the pre-split configuration/hooks calls used
+only `repositoryRoot`, confirmed from the diff itself. No issue.
+
+**Verdict: Request changes — item 4's five stale references only.** Items 1, 2, 3, 5, and 6 are
+confirmed clean; nothing needed there. The fix is mechanical (rename `EnsureRepositoryAsync` →
+`AcceptRepositoryAsync` at `:249`, `:261`, `:487`, `:550`, `:630-631`, and the `:637` parenthetical for
+consistency) and touches no behaviour, so this should be a fast turnaround. → @architect
+
+**[worker]** Fixed all six. Read each in context before changing rather than pattern-replacing.
+
+- `:249` (`AssertNoNestedGitRepository` summary) — "Called by `EnsureRepositoryAsync`" → "Called by
+  `AcceptRepositoryAsync`".
+- `:261` (same method's remarks) — "guards `EnsureRepositoryAsync` only when it is about to create the
+  initial commit" → "guards `AcceptRepositoryAsync`...".
+- `:487` (`EnsureInitialCommitAsync`'s `repositoryHasNoCommitsYet` param doc) — the one the reviewer
+  called sharpest. "Computed once by `EnsureRepositoryAsync` and passed in... so it is the same value
+  that also gates `AssertNoNestedGitRepository`" → `AcceptRepositoryAsync`. Read it closely as asked:
+  the sentence's whole job is naming the one method that owns the shared predicate so
+  `EnsureInitialCommitAsync` and `AssertNoNestedGitRepository` can't drift apart from it — that owner is
+  now `AcceptRepositoryAsync` (the predicate is a local computed and consumed entirely inside it), not
+  the composed `EnsureRepositoryAsync`, which never touches the boolean itself.
+- `:550` (`ReconcileWorkingTreeAsync` remarks, "not this repository's only nested-repository guard") —
+  "`EnsureRepositoryAsync` also runs `AssertNoNestedGitRepository`" → `AcceptRepositoryAsync`.
+- `:630-631` (`FindStagedGitlinksAsync` remarks, the born-`HEAD` argument) — "`EnsureInitialCommitAsync`
+  runs unconditionally before reconciliation in `EnsureRepositoryAsync`" → `AcceptRepositoryAsync`. Both
+  calls this sentence is about (`EnsureInitialCommitAsync`, `ReconcileWorkingTreeAsync`) are exclusively
+  `AcceptRepositoryAsync`'s; `EnsureRepositoryAsync` never orders them relative to each other, it only
+  calls `AcceptRepositoryAsync` as one opaque step.
+- `:637` parenthetical ("would only become load-bearing if a future change reordered
+  `EnsureRepositoryAsync`...") — same reasoning, → `AcceptRepositoryAsync`: reordering
+  `EnsureRepositoryAsync` (swapping the Accept/Configure calls) couldn't reorder reconciliation before
+  the initial commit at all, since both live inside `AcceptRepositoryAsync`; only reordering statements
+  inside that method could.
+
+**Checked one I deliberately did not touch.** `:483` (`EnsureInitialCommitAsync`'s summary — "does so
+before `EnsureRepositoryAsync` has written any configuration or hooks") also names `EnsureRepositoryAsync`
+but stays true after the split: at the moment this refusal fires, the composed `EnsureRepositoryAsync`
+call the caller made genuinely hasn't reached configuration/hooks yet (that's `ConfigureRepositoryAsync`,
+which only runs after `AcceptRepositoryAsync` returns without throwing) — a correct claim about the
+outer call, not a stale reference to a now-nonexistent single method. Left as-is.
+
+**Beyond the six.** Grepped for `this method`, `above`, `below`, `further down`, `elsewhere in this
+class` across the whole file. Every hit is self-contained within the method it appears in — none crosses
+the new `AcceptRepositoryAsync`/`ConfigureRepositoryAsync` boundary. No further stale references found.
+
+**Gates.** `dotnet build` clean (0 warnings, 0 errors). `dotnet test` unfiltered, foreground (backgrounded
+automatically past the 2-minute default timeout, waited for the completion notification rather than
+polling — no filter, no early read): **710 passed, 0 failed, 0 skipped, 710 total, 2m 3s.** No test
+edited. `dotnet format --verify-no-changes` exit 0. `openspec validate git-backed-content-core --strict`
+valid. `git diff --stat -- src tests` shows only `ContentRepositoryService.cs`, and re-reading the diff
+confirms comment/cref lines only — no code line changed.
+
+→ @reviewer
+
+**[reviewer]** Re-audit of the six-site fix, plus `:483` and the widened search. Confirmed
+mechanically first: `git diff -U0 172c622` filtered to non-`//`/`///` lines shows only the split's own
+structure (two signatures, the two-line composition, the `git init` nesting, `ConfigureRepositoryAsync`'s
+local) — no behaviour changed since block B's original landing, consistent with the worker's own claim.
+Independently re-ran `dotnet build` (0/0), `dotnet format --verify-no-changes` (clean), `openspec
+validate --strict` (valid) against the current tree, not relayed.
+
+**All six sites checked in place, not by diffing prose against itself.** `:249`, `:261`, `:550` now
+correctly name `AcceptRepositoryAsync`, read in their full surrounding paragraphs — none of the
+rewrites orphaned an antecedent or changed a claim's meaning beyond the method name. `:487` — the one I
+called sharpest — now reads "Computed once by `AcceptRepositoryAsync` and passed in... so it is the
+same value that also gates `AssertNoNestedGitRepository`", which is exactly right: the predicate is a
+local computed and consumed entirely inside `AcceptRepositoryAsync`, and `EnsureRepositoryAsync` never
+touches it. `:630-631` and `:637` now name `AcceptRepositoryAsync` for both the containment claim and
+the future-reordering hypothetical. All six confirmed true of the code as it now reads.
+
+**1. `:483` — left untouched, and the worker's reasoning is right, not merely convenient.** I checked
+it against actual control flow rather than against the sentence's own internal logic. The claim is "does
+so before `EnsureRepositoryAsync` has written any configuration or hooks" — grammatically a claim about
+the *composed call's* cumulative state (what has `EnsureRepositoryAsync`, the thing `Program.cs` calls,
+written by the time this throws), not a direct-agency or containment claim like the six that needed
+fixing (*"called by X"*, *"computed by X"*, *"X also runs Y"*, *"Y runs ... in X"*). Confirmed against
+the code: the `MissingWorkingTreeException` throw inside `EnsureInitialCommitAsync` propagates straight
+up through the `await AcceptRepositoryAsync(cancellationToken);` line in `EnsureRepositoryAsync`
+(`:69`) — plain C# `await` semantics mean the next line, `await ConfigureRepositoryAsync(...)`, is
+never reached, so `ConfigureRepositoryAsync`'s writes genuinely have not happened at that point,
+regardless of which private method did the classifying. The category the worker names — "survives the
+split by being about the composition, not the phase" — is real, and this is a correct instance of it,
+not an excuse to skip an edit. Compare `ConfigureRepositoryAsync`'s own new XML doc (`:195`, "Runs only
+once `AcceptRepositoryAsync` has completed without refusing") — same category, already phrased that
+way deliberately. No further change needed.
+
+**2. The widened search — reproduced independently, not accepted on the report.** Re-ran the worker's
+five terms myself and read every hit in context, then went further and grepped `here`, `prior`,
+`preceding`, `subsequent`, `earlier`, `later`, `same method`, `this class`, `this section`, `this call`
+across the whole file to catch anything the five named patterns might have missed. Every "above"/"below"/
+"further down" inside what is now `AcceptRepositoryAsync` (`:109, 129, 139, 144, 147, 151, 161, 170, 173,
+177`) points to a call or check that is *also* inside `AcceptRepositoryAsync` — none of them point
+forward into `ConfigureRepositoryAsync`, and `ConfigureRepositoryAsync` itself uses only named `<see
+cref>` references, no positional prose, so there is nothing on that side to cross back the other way
+either. Every self-referential "this method" (`:77, 80, 140, 180, 538, 624, 634`) is inside the method
+it describes and auto-follows the code by construction — that class of reference cannot go stale from a
+method split the way a named symbol can, which is exactly why they're the ones the worker didn't need to
+touch. The broader sweep turned up nothing new. Confirmed: no stray hit crosses the boundary.
+
+**On the backgrounded test run.** The worker's own framing — auto-backgrounded past the CLI's 2-minute
+default, awaited via the completion notification rather than polled or filtered — is the harness's
+sanctioned pattern for a long-running foreground command (this environment's own tool guidance:
+`run_in_background` plus waiting for notification, no `sleep` polling), not the failure mode §4's three
+stalled agents hit. Those three backgrounded a run and then either polled or never came back with a
+number; this one reports a specific, complete, unfiltered figure — 710 passed, 0 failed, 0 skipped, 710
+total, 2m 3s — obtained by waiting for the real result rather than working around not having it. It also
+matches, exactly, the coordinator's own independently-run figure at the same duration, which is two
+separately-invoked instruments agreeing rather than one instrument corroborating itself. I treat this as
+equivalent evidence to a synchronously-returned foreground run, not a discount.
+
+**Verdict: Approve.** All six original fixes confirmed correct in place; `:483`'s exception is a real,
+verified category, not a convenient dodge; the widened search is confirmed independently and turns up
+nothing further; gates independently reconfirmed clean. Block B is done. → @architect
+
 ## NEXT
 
 **Resume point: §5 (Write lock), first block. No design question blocks it** — the entry that claimed
