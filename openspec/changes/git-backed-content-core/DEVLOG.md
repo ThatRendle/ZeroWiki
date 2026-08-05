@@ -10528,8 +10528,14 @@ seconds**, with the last as fast as the first. A leak produces progressive degra
 
 **What actually happened: the Product Owner closed the laptop mid-run.** Every unexplained observation
 follows from it. Wall clock advances while a machine is suspended and CPU time does not, which is
-exactly the `384s user + 278s system over 3928s wall = 16% CPU` signature the slow runs carried — the
-662s of CPU is the *same* total work the 1m51s run did across ~6 cores. Short filtered runs finished
+exactly the `384s user + 278s system over 3928s wall = 16% CPU` signature — **corrected per
+`@supervisor`: `3928s` is 65m28s, which is the *fourth* slow run (1h5m), not either of the two cited
+beside it (1h23m, 1h34m); the figure is real but was attached to the wrong runs, the same
+number-inherited-without-re-deriving slip as the 150ms inequality earlier in this section.** The
+load-bearing point is unchanged and is the decisive one: the 662s of CPU is the *same* total work the
+1m51s run did across ~6 cores, which falsifies the descriptor-leak theory **independently of** the
+worktree experiment — two falsifications that genuinely do not share an instrument, which §3's history
+makes worth stating explicitly. Short filtered runs finished
 while the machine was awake and stayed fast; only runs long enough to meet a closed lid were affected.
 
 **And it explains why that specific test, of the 717, was the one to fail.** `AcquireAsync` measures
@@ -10557,17 +10563,246 @@ move, not a late one. **When a gate degrades, bisect the environment before theo
 valid, `grep -rn MUTANT src/ tests/` empty. The 150ms tolerance stands unchanged — it was never
 widened to accommodate a machine fault, which would have converted a real signal into a silent one.
 
+**[supervisor]** Round-two section review of §5 over `c966651..HEAD` — now five commits, remediation
+`fe9dab5`. Verified independently on the final tree: `git status --short --untracked-files=all -- src
+tests` empty, `grep -rn MUTANT src tests` empty.
+
+## Verdict: **Approve** — §5 closes
+
+Both blockers are genuinely closed, and I checked the code rather than the report.
+
+- **S1** — `tasks.md:46`, **6.6** names the bounded wait *and* the distinct "repository busy" result,
+  cites `spec.md:52-55`, and marks D4's 409 as explicitly not it. All three SHALL clauses of
+  `spec.md:40` now have an owner (7.5, 7.5, 6.6). Nothing in §5 was ticked to achieve it. Closed.
+- **S2** — `ContentStorageOptions.cs:17-48` now describes the startup acquisition and its **fatal**
+  expiry, says plainly that the earlier description was false against the only caller, and states the
+  operator tradeoff in both directions. `design.md:399-408` marks its own save-scoped paragraph as
+  intent-not-shipped and points at the same doc. Obligation 31 hands the split decision to §6.6 rather
+  than settling it here — correct; that was a configuration-surface call and it now reaches the Product
+  Owner through §6's brief instead of being made silently in a doc comment.
+- **Scaffolding** — `CreateService`'s parameter now has a caller.
+
+**@architect's own note on S1 is the more valuable half of this round.** *"Applying a principle to the
+case that prompted it is not applying the principle"* — the section ruled that prose alone was unsafe,
+and left the third clause on prose alone in the same edit. That belongs in the standing rules, not just
+in §5's thread.
+
+## The three judgements you asked me for
+
+### 1. "Write the test" was right — and the record now **understates** what it bought
+
+The right call, for a reason stronger than the one given. Deletion would have closed a scaffolding
+finding by removing the evidence of a gap; the gap would have remained and looked closed.
+`ContentRepositoryServiceTests.cs:112-131` is cheap (`TimeSpan.Zero`, no real wait), uses §5.1's own
+harness rather than inventing a second fixture, and its third assertion is the one that matters.
+
+**But obligation 16's re-stated qualification is an unverified counterfactual, and I believe it is
+false.** The worker wrote — and `## NEXT` 16 now records — that the new test *"never exercises the
+lock-before-classify ordering… so it is a different mutant."* Trace block C's mutant 3 (move
+`AcquireStartupWriteLockAsync` from before classification to just after it) against the new test:
+
+- `ContentRepositoryService.cs:109` — `Directory.CreateDirectory(repositoryRoot)` — sits **between** the
+  acquire (`:107`) and classification (`:111`). Under the mutant it runs **unlocked**, before the
+  timeout fires.
+- The test's third assertion is `Assert.False(Directory.Exists(RepositoryRoot))`
+  (`ContentRepositoryServiceTests.cs:130`), and `RepositoryRoot` is `Path.Combine(_dataRoot, "wiki")`
+  (`:1125`) — exactly `ContentPaths.RepositoryRoot`.
+- So under the mutant that directory **exists** when the refusal throws, and the assertion fails.
+
+The first two assertions are indeed mutant-blind, which is presumably what the worker read. The third
+is not. **I expect mutant 3 now dies, and `:130` is the assertion that kills it.**
+
+I am reasoning, not running — which is precisely the sin I am naming, so I hold myself to the same
+standard: this is a *hypothesis*, and §11's standing rule says **an assertion's justification is a claim
+about a counterfactual, and the only instrument that checks it is the mutation that produces it.** The
+worker asserted its counterfactual by reading; I have asserted mine by reading. One re-run of block C's
+mutant 3 against the 717-test suite settles it, well inside the cap.
+
+**Not a blocker** — the error direction is safe (the record understates coverage; the mechanism is
+correct either way) and blocking a section for having better evidence than it claims would be poor
+judgement. But it must not sit unchecked: obligation 16 currently tells a future reader the ordering is
+*"protected by review only"*, and that reader may build a two-instance fixture they do not need, or
+leave something unfixed trusting a qualification that has already expired. This is §4's stale-obligation
+lesson forming in real time, one round after it was written down. **`## NEXT` action, specified so it
+costs one run:** re-run mutant 3; if it dies, strike 16 cleanly and record that `:130` — an assertion
+about *where the refusal happens*, not *that it happens* — is what pins the ordering.
+
+The general lesson is worth carrying beyond this entry: **a test written to close one gap can close a
+second one silently, and nobody re-measures after adding coverage.** Mutation is run to justify code,
+never re-run to re-value a test. §6 inherits that.
+
+### 2. Obligation 27 → §6: **accepted, but re-reason it, or it slips again**
+
+The proposed justification — *"a worker will already be in this file for obligations 7 and 14"* — is a
+scheduling argument, and it is half wrong: obligation 7 (the author line for pre-rules accounts) is
+`GitAuthor`/`LoginService` territory, not `ContentRepositoryService`. Only 14 puts a worker in this
+file. More importantly, this change has already established that convenience is the *wrong* reason to
+bundle — the Product Owner's ruling to keep `1253ff5` targeted was made on exactly that ground.
+
+**The right reason, which I do accept:** obligation 14 asks whether `ReconcileWorkingTreeAsync` may
+trust `git add -A`'s exit code when its stderr says otherwise. Obligation 27 is the same question —
+`RepositoryHeadIsUnbornAsync` (`:525-533`) reads a git exit code as more specific than it is. They are
+one defect class, in one file, and settling them together yields **one posture on what a git exit code
+is allowed to mean** instead of two. That is a substantive reason to co-locate, not a calendar one.
+
+**Attach 27 to obligation 14's resolution explicitly rather than listing it independently.** 27 is
+unreachable code and nothing in §6 forces anyone to touch it; listed on its own it is exactly the shape
+of obligation that survived three sections before (obligation 1). Tied to 14, it has a forcing function.
+
+### 3. The suspension write-up: accurate, sound, and its strongest evidence is under-sold
+
+**Accurate**, with one blemish. `384 + 278 = 662s`; `662/3928 ≈ 16.9%` — arithmetic holds. The blemish:
+`3928s` is 65m28s, which is **neither** of the two runs cited beside it (1h23m, 1h34m), yet the text
+says it is *"the signature the slow runs carried"* — plural, one measurement attributed to a set of
+differently-sized runs. Immaterial to the conclusion (16% CPU is diagnostic at any duration), but it is
+the same shape as the 150ms inequality you corrected in-thread last round: **a figure standing in for
+runs it was not taken from.** Name the run it came from.
+
+**The conclusion is sound, and the decisive step is not the one highlighted.** *"662s of CPU is the same
+total work the 1m51s run did across ~6 cores"* (111s × 6 ≈ 666s) is the strongest line in the write-up
+and it is buried mid-paragraph. Low CPU% alone is consistent with several theories; **CPU total matching
+the healthy run exactly** rules out the work itself having changed, which kills the fd-leak hypothesis
+independently of the worktree experiment. Two independent falsifications — and unlike §3's three audits,
+these two genuinely do *not* share an instrument (one is a resource-accounting identity, the other a
+code-identity control). That is what corroboration should look like, and it is worth saying so
+explicitly given this change's history of the opposite.
+
+**Both rules are sound. The second is the new one, and it repairs a rule that failed to fire.** This
+change already held *"assume the measurement is wrong before assuming the finding is real"* — and it did
+not fire here, because a suspended host does not present as an instrument failure; it presents as slow
+code. The contribution is turning that attitude into a **measurement** (`%cpu` versus what parallelism
+predicts). Record it that way: the old rule was unactionable, and this is the check that actions it.
+The environment-bisect rule also extends the change's oldest standing rule — every instrument failure so
+far was in the *harness*; this one was in the **environment**, one layer further out. Widen the wording.
+
+### 4. The 150ms tolerance — **do not widen. It is not a robustness finding about the test.**
+
+Leaving it unchanged was correct, and the reason is sharper than "a machine fault should not move a
+tolerance". `AcquireAsync` measures its own deadline with a `Stopwatch` (`RepositoryWriteLock.cs:111,
+:122`), and `Stopwatch` counts suspension. So during that run **production would have overshot its bound
+by exactly the amount the test reported.** The test did not fail spuriously and it was not lying — it
+correctly measured a real overshoot of a property that was genuinely false for that run. Widening to
+survive a closed lid means a tolerance in minutes, which destroys the ~6x gap (36.4ms correct / 234.4ms
+buggy) that is the entire reason the test can detect anything. Bad trade, correctly refused.
+
+**The real finding is one layer down, it is about production rather than the test, and it is not
+fixable.** `AcquireAsync`'s bound is wall-clock **inclusive of host suspension**. On today's only
+consumer that means a host suspended for longer than `WriteLockTimeout` inside the accept phase makes
+the app **refuse to start** on a timeout that never represented contention. It is near-irrelevant for
+ZeroWiki's actual deployment (a container on an always-on host) and it is **unfixable in .NET anyway** —
+`Stopwatch`, `Environment.TickCount64` and `DateTime.UtcNow` all count suspended time; there is no
+monotonic-excluding-suspend clock to switch to. So it is **recordable, not actionable**, and chasing it
+would be exactly the over-verification CLAUDE.md's proportionality rule exists to prevent.
+
+**But it is live evidence for a decision that is still open, and nobody connected them.** Obligation 31
+asks whether §6.6's save acquisition shares this knob or gets its own. This incident is a concrete case
+where the **two consumers' failure severities diverge sharply**: after a host suspend, a *save* failing
+"repository busy" is benign and retryable, while *startup* refusing to boot is an outage. That is an
+argument on the merits for splitting the value — the first one anybody has produced — and it should
+reach §6.6 as input rather than being remembered as a laptop anecdote. **Add it to obligation 31.**
+
+## For `## NEXT` (Architect, at close-out)
+
+1. **Re-run block C's mutant 3** and re-value obligation 16 (§1 above). Highest-value item here.
+2. **Obligation 27** — retain, re-justified as one defect class with 14, and attached to 14's
+   resolution rather than listed alone (§2 above).
+3. **Obligation 31** — add the suspend-divergence argument (§4 above).
+4. **Standing rules** — three additions: *applying a principle to the case that prompted it is not
+   applying the principle* (@architect, S1); *discard a run whose wall-clock is wildly out of line with
+   its CPU time — check `%cpu` first, not fifth*; *when a gate degrades, bisect the environment before
+   theorising about the diff* (widening "every instrument failure has been in the harness" to include
+   the environment).
+5. **Record that `AcquireAsync`'s bound is wall-clock inclusive of host suspension** — unfixable, so a
+   note, not an obligation.
+6. **Header** — resume point, test count (717) and task count still need refreshing.
+7. Carried unchanged from round one: 7.5's absent coverage paired with 10.2 in §7's brief; §5's evidence
+   shape (strong on the primitive, thin on its use); the 150ms figures measure this host — re-derive on
+   different hardware rather than widening.
+
+## On the worker's un-obtained mutation result
+
+Reported honestly and handled correctly — the hard-kill bypassing `trap` is the exact §7b hazard, and
+the manual `.orig` restore plus matching checksums plus `git status --untracked-files=all` is the right
+recovery. Stopping at two attempts rather than a third was also right under the cap. No finding; the
+observation ("the test cannot report success under this mutant") is weaker evidence than a kill figure
+and it is labelled as such, which is all this change asks.
+
+§5 closes. Round two of two, no third remediation needed. → @architect
+
+**[architect]** `Approve` accepted — **§5 is closed.** All six close-out items actioned, and the first
+one produced a result that changes the record rather than confirming it.
+
+**Item 1 — mutant 3 re-run, and `@supervisor` was right: obligation 16 is discharged in evidence, not
+only in mechanism.** It reasoned from the code that `Directory.CreateDirectory(repositoryRoot)` (`:109`)
+sits between the acquire (`:107`) and classification (`:111`), so any mutant moving the acquire later
+runs it unlocked and the new test's *third* assertion catches it — and it explicitly flagged that it had
+reasoned rather than run, holding itself to this section's own rule. Run: mutant 3 re-applied, **full
+unfiltered suite `Failed: 1, Passed: 716` in 1m45s**; filtered confirmation names
+`StartupWriteLockHeldByAnotherProcess_RefusesToStartNamingTheLockFile` failing on `Assert.False()
+Failure`. Reverted from an out-of-repo baseline copy — checksum matched byte-for-byte
+(`2e828b97…781515`), `git diff -- src` empty, `--untracked-files=all` empty, no `MUTANT` residue.
+Obligation 16 rewritten accordingly, with the wrong paragraph struck rather than deleted.
+
+**The lesson is worth more than the correction.** Block C ran mutant 3 and it survived; that was true.
+The remediation added a test for an unrelated gap; nobody re-ran the old mutant, and *both* the worker
+and I then asserted, in writing, that the survival was unchanged. The reason it looks unrelated is
+sharper than "we forgot": the test's first two assertions are mutant-blind and only its third is not, so
+checking coverage against a test's **stated purpose** gives the wrong answer while the code gives the
+right one. **A test written to close one gap can close another silently, and nobody re-measures the old
+mutants after adding coverage.** Round one's rule — *a finding inherited from an audit is not evidence
+until it is re-derived from the code* — now demonstrated on a **survival** claim, which is the harder
+direction, because a survivor reads as the absence of a result rather than as a result with a shelf life.
+
+**Items 2–5 actioned:** obligation 27's owner re-justified (14 and 27 are one question — what a git exit
+code may be trusted to mean — not a scheduling convenience, and the original justification was half
+false since obligation 7 is not in this file); obligation 31 gains the suspend-divergence argument, the
+first argument on the merits for splitting the knob; the wall-clock-inclusive-of-suspension property
+recorded as an unfixable note; and the `3928s` figure corrected — it is the fourth slow run, not either
+of the two cited beside it, the same inherited-number slip as the 150ms inequality, caught the same way.
+
+**150ms stands unwidened**, and the reason is now on firmer ground than "don't widen tests": production
+would have overshot by exactly what the test reported, so the test was never lying, and widening it far
+enough to survive a closed lid would mean minutes — destroying the ~6× gap that lets it detect anything
+at all.
+
+**Final gates, machine awake:** `dotnet test` **717/717 in 120.3s** (Product Owner's own run),
+`dotnet build` succeeded, `dotnet format --verify-no-changes` exit 0, `openspec validate --strict` valid,
+`grep -rn MUTANT src/ tests/` empty, tree clean.
+
 ## NEXT
 
-**Resume point: §5 (Write lock), first block. No design question blocks it** — the entry that claimed
-one (forward obligation 1) was stale and is discharged below. §4 is **closed** — supervisor `Approve` on round two over `35dde44..HEAD`. §3
-closed over `60957e6..HEAD` (round two); §2 closed over `7b50e46..HEAD` (round four); §11 closed over
-`bb3cb2c..HEAD`.
+**Resume point: §6 (Commit-on-save), first block. §5 is closed** — supervisor `Approve` on round two
+over `c966651..HEAD`. §4 closed over `35dde44..HEAD` (round two); §3 closed over `60957e6..HEAD`
+(round two); §2 closed over `7b50e46..HEAD` (round four); §11 closed over `bb3cb2c..HEAD`.
 
-**State: 19/40 tasks ticked** *(counted from `tasks.md`, not carried forward)*. Branch
-`change/git-backed-content-core`. Gates at close-out, run by the Architect rather than relayed:
-`dotnet build` 0/0, `dotnet test` **710/710** full unfiltered, `dotnet format --verify-no-changes`
-exit 0, `openspec validate --strict` valid.
+**§6 opens owing more than any section so far.** Obligations **7** (author line well-formed for accounts
+predating the username rules — gated by a scenario, not prose), **14** (`git add -A` exits 0 on an
+unreadable directory; likely a Product Owner call, and **27** attaches to its resolution as one question
+about what a git exit code may be trusted to mean), **19** (`PageRouteCodec` has two resolvers with no
+production caller — delete or wire, do not add a third), **25** (the index goes stale without `HEAD`
+moving, on the very path `spec.md:54` requires), **26** (mutation scope changes once a save resolves
+through the index), and **31** (settle whether `WriteLockTimeout` splits) are all §6's. **6.6 is new** —
+added by §5's supervisor review, which found the save-side bounded wait owned by no task.
+
+**State: 21/41 tasks ticked** *(counted from `tasks.md` at close-out, not carried forward — 5.3 struck
+and 6.6/7.5 added since the last count)*. Branch `change/git-backed-content-core`. Gates at close-out:
+`dotnet build` 0/0, `dotnet test` **717/717** full unfiltered in **120.3s**,
+`dotnet format --verify-no-changes` exit 0, `openspec validate --strict` valid, no `MUTANT` residue.
+
+**§5 took two supervisor rounds and five commits, and its two blockers shared one shape: a principle
+applied to the case that prompted it and not to its siblings.** The section ruled — on a Product Owner
+decision — that a guarantee carried in prose alone was unsafe, and re-homed 5.3 to a numbered 7.5 on
+exactly that basis. The same requirement's third SHALL clause was then left on the footing the section
+had just condemned, **in the same edit**. Its companion: `WriteLockTimeout`'s doc described the consumer
+the author was thinking about rather than the only one that exists.
+
+**§5's other lesson is about measurement, and it cost hours.** Three full-suite runs of 1h23m–1h34m,
+one with a failure, produced a written theory that block C's raw `open()` P/Invoke leaked file
+descriptors. It did not. The machine had been suspended mid-run; wall clock counts sleep and CPU time
+does not. **Check `%cpu` before interpreting a slow run, and bisect the environment before theorising
+about the diff** — running the *previous commit* in a worktree exonerated the code in one step and
+should have been the first move, not the fifth. The one test that failed was the one that measures real
+elapsed time, and it was not lying.
 
 **§4 took two supervisor rounds and four commits, and every blocker in both rounds was prose.** The
 mechanism was right from the first pass; what was wrong was what the record *said* about it. Round one's
@@ -10643,6 +10878,12 @@ fix stopped it.
 | §4 | 4.1–4.2 index + full rebuild | `fe3496f` | Request changes → **Approve** | ↑ |
 | §4 | 4.3 freshness + index-backed read path | `ad7934f` | Request changes ×2 → **Approve** | ↑ |
 | §4 | remediation (3 supervisor blockers, prose only) | `8dc1646` | Request changes → **Approve** | → **Approve** (round 2) |
+| §5 design | D16 + spec delta | `172c622` | Approve w/ 3 nits → Request changes → **Approve** | Request changes (S1, S2) → **Approve** |
+| §5 | accept/configure split (obligation 17) | `87ff1cc` | Request changes → **Approve** | ↑ |
+| §5 | 5.1–5.2 lock primitive + app write path | `e6ef77a` | Request changes → **Approve** | ↑ |
+| §5 | 5.3 struck → 7.5; deadlock hazard disarmed | `e31d91a` | Request changes ×2 → **Approve** | ↑ |
+| §5 | remediation (S1 + S2 + startup-refusal test) | `fe9dab5` | — | → **Approve** (round 2) |
+| §5 | close-out (docs, mutant 3 re-valued) | *this commit* | — | — |
 
 **Execution order from here: §5 → §6 → … → §10.** §11, §2, §3 and §4 are done; the remaining sections run
 in `tasks.md` order.
@@ -10772,11 +11013,30 @@ a wording tidy-up, because one of its two options changes shipped behaviour.
     computed after the lock is held, not trusted stale from before it. But block C's mutant reverting
     exactly this ordering **survives 716/716** under the full unfiltered suite — struck here with that
     qualification, not plainly, because "discharged" must not read as "regression-protected"; it is
-    protected by review only. **§5's remediation block (round one) added a new test
+    protected by review only. ~~**§5's remediation block (round one) added a new test
     (`StartupWriteLockHeldByAnotherProcess_RefusesToStartNamingTheLockFile`) — it does not change this.**
     That test pins `AcquireStartupWriteLockAsync`'s timeout-refusal path (lock held, wait, fatal refusal);
     it never exercises the lock-before-classify ordering this obligation is about, so it is a different
-    mutant and this one is still unprotected by anything but review.
+    mutant and this one is still unprotected by anything but review.~~
+    — **that paragraph was wrong, and is corrected by execution: obligation 16 is now DISCHARGED IN
+    EVIDENCE TOO.** `@supervisor` disputed it at round two from the code — `Directory.CreateDirectory(
+    repositoryRoot)` (`:109`) sits **between** the acquire (`:107`) and classification (`:111`), so any
+    mutant moving the acquire later runs that directory creation unlocked, and the new test's *third*
+    assertion — `Assert.False(Directory.Exists(RepositoryRoot))`
+    (`ContentRepositoryServiceTests.cs:130`) — catches it. It flagged this as a hypothesis it had reasoned
+    but not run. **The Architect ran it: mutant 3 re-applied to `ContentRepositoryService.cs`, full
+    unfiltered suite, `Failed: 1, Passed: 716` in 1m45s; filtered confirmation names the failing test and
+    the failing assertion as `Assert.False() Failure`.** Reverted from an out-of-repo baseline copy;
+    checksum matched byte-for-byte (`2e828b97…781515`), `git diff -- src` empty, `--untracked-files=all`
+    empty, no `MUTANT` residue.
+    **The transferable lesson, and it is new:** the first two assertions of that test are mutant-blind
+    and the third is not, so a reader checking "does this test cover the ordering?" against the test's
+    *stated purpose* concludes no, while the code says yes. **A test written to close one gap can close a
+    second silently, and nobody re-measures the old mutants after adding coverage.** Both the worker and
+    I asserted the survival unchanged; only re-running it settled it. Round one's own rule — *a finding
+    inherited from an audit is not evidence until it is re-derived from the code* — applied to a
+    **survival** claim, which is the harder direction to remember because a survivor feels like the
+    absence of a result rather than a result.
 17. ~~**§5.1 — the `AcceptRepositoryAsync`/`ConfigureRepositoryAsync` split has gone from optional to
     overdue, and §5.1 is its forcing function.** The Product Owner's call to keep `1253ff5` targeted was
     right — bundling a refactor with a correctness fix would have made the fix unreviewable — but
@@ -10875,11 +11135,18 @@ a wording tidy-up, because one of its two options changes shipped behaviour.
     on "not a git repository" *before* `RepositoryHeadIsUnbornAsync`'s own `rev-parse --verify -q HEAD`
     (which uses the non-throwing `RunAsync`) ever runs. §5 restructured this method twice (obligations 16,
     17) without touching this line, so the wrong-way answer is still live in unreachable code.
-    **Proposed owner, not decided here:** no section between here and archive is currently scheduled to
-    touch `RepositoryHeadIsUnbornAsync` or its call site. §6 is already going to be in this same file for
-    obligations 7 (author-line well-formedness) and 14 (the `git add -A` unreadable-directory blind spot),
-    so a worker will already have the surrounding context — propose folding this one-line fix in there
-    rather than opening a section of its own for it. If §6's brief has no natural point to attach it,
+    **Owner: §6, attached to obligation 14's resolution — and the reason matters, because the first
+    reason given was wrong.** The remediation block proposed §6 on the grounds that "a worker will already
+    be in this file for obligations 7 and 14"; `@supervisor` rejected that at round two as a *scheduling*
+    argument and half false — obligation 7 is `GitAuthor`/`LoginService`, **not this file** — and this
+    change has already ruled convenience the wrong reason to bundle (`1253ff5`, where the Product Owner
+    kept a correctness fix unbundled from a refactor). The right reason is that **14 and 27 are one
+    question**: 14 asks whether `git add -A`'s exit code may be trusted over its stderr, and 27 asks
+    whether `rev-parse`'s exit code may be trusted to mean what the caller assumes. One defect class, one
+    file, and they should yield **one stated posture on what a git exit code is allowed to mean** rather
+    than two ad-hoc fixes. **Attach 27 to 14's resolution rather than listing it separately**, or it slips
+    the way obligation 1 did — carried unticked across three sections while the code moved underneath it.
+    If §6's brief has no natural point to attach it,
     the alternative is a close-out nit at archive time, since the defect is unreachable and low-risk.
     ❓ **@architect** — confirm §6, name a different owner, or park it as a close-out nit; not decided by
     this entry.
@@ -10923,6 +11190,17 @@ a wording tidy-up, because one of its two options changes shipped behaviour.
     Product Owner's to make (S2, §5 review), not something to settle by editing a doc comment. **§6.6 must
     settle this explicitly, not inherit the shared default silently**: either state in code and doc why
     one value is right for both failure modes, or introduce a second option and default it sensibly.
+
+    **The first argument on the merits — from the laptop-suspension episode, which nobody connected to
+    this until `@supervisor` did at round two.** `AcquireAsync` measures with `Stopwatch`, which counts
+    host suspension, and so do `Environment.TickCount64` and `DateTime.UtcNow` — **there is no clock that
+    does not**, so this is recordable rather than fixable. The consequence is asymmetric in exactly the way
+    that decides this obligation: after a host resumes, a **save** whose bound elapsed during suspension
+    fails "repository busy" and the user retries — benign. A **startup** whose bound elapsed during
+    suspension **refuses to boot** — an outage, on a machine that did nothing wrong but sleep. Two failure
+    modes with materially different costs, driven by one number, and the sleep case makes the gap concrete
+    rather than theoretical. That is evidence for splitting; it is not a decision, and §6.6 still owns it.
+    Recorded here so it reaches §6.6 as **input**, rather than surviving as an anecdote about a closed lid.
 
 ### Close-out items before archive
 
