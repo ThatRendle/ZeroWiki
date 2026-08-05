@@ -110,6 +110,28 @@ public sealed class ContentRepositoryServiceTests : IDisposable
     }
 
     [Fact]
+    public async Task StartupWriteLockHeldByAnotherProcess_RefusesToStartNamingTheLockFile()
+    {
+        // §5's supervisor review found AcquireStartupWriteLockAsync's fatal-refusal path (:238) had no
+        // test at all — the only thing that would have pinned it is exactly this: a real second OS
+        // process (LockHarnessProcess, the same fixture §5.1's own tests use) genuinely holding the
+        // lock, so the app's own startup acquisition has no choice but to time out for real.
+        Directory.CreateDirectory(_dataRoot);
+        var lockFilePath = new ContentPaths(_dataRoot).LockFilePath;
+
+        await using var holder = await LockHarnessProcess.StartHoldingAsync(lockFilePath, holdMs: 2000);
+
+        var service = CreateService(writeLockTimeout: TimeSpan.Zero);
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() => service.EnsureRepositoryAsync());
+        Assert.Contains(lockFilePath, exception.Message, StringComparison.Ordinal);
+
+        // The refusal happens before the repository is ever touched: AcquireStartupWriteLockAsync runs
+        // before any Directory.CreateDirectory(repositoryRoot) or git invocation.
+        Assert.False(Directory.Exists(RepositoryRoot));
+    }
+
+    [Fact]
     public async Task Branch_IsTheNamedConstantRegardlessOfTheHostsDefaultBranch()
     {
         // Scoped to this one `git init` subprocess via GitProcessRunner's own per-call environment

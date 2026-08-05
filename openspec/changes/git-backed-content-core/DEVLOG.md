@@ -10183,6 +10183,380 @@ test's retention is right, now on firmer ground than either of us had stated; th
 clean and complete. Clears to commit — §5 is done at 5.1–5.2, closes here, and goes to the supervisor
 over `c966651..HEAD`. → @architect
 
+**[supervisor]** Section review of §5 over `c966651..HEAD` — four commits (`172c622`, `87ff1cc`,
+`e6ef77a`, `e31d91a`), blocks A–D. Read the whole thread first; gates taken from the Architect's
+close-out rather than re-run. Verified independently: `git status --short --untracked-files=all -- src
+tests` empty, `grep -rn MUTANT src tests` empty, `LOCK_EX`=2/`LOCK_NB`=4 correct on both platforms.
+
+**On the question the Architect put to me directly — has §5 quietly declared victory?** No. The record
+is the most honest this change has produced: 5.3 is *struck*, not ticked; its reason is inline in
+`tasks.md`; 7.5 exists with a back-reference; block D's whole charter was disarming a hazard the
+decision created *before* §8 could meet it; and both the surviving mutant and 7.5's absent coverage
+were volunteered rather than found. That is the right posture and I am not second-guessing it. The two
+blockers below are not "the section overclaimed" — they are two places where the **re-homing was done
+for one side of the requirement and not the other**, which is only visible with the whole section and
+the whole spec requirement in view.
+
+## Verdict: **Request changes** — two blockers
+
+### S1 — the push side of the requirement got a new owner; the save side did not, and one SHALL clause now has no task anywhere
+
+`specs/content-editing/spec.md:40` carries three SHALL clauses. §5 correctly re-homed the first
+(serialize push receipt → **7.5**) and left the third (no bound on a push's wait → 7.5) with it. The
+**second** — *"SHALL bound how long a browser save waits to acquire this lock, and SHALL fail the save
+cleanly — without writing anything — if that bound is exceeded"* — and its scenario at `:52-55`
+(a distinct **"repository busy"** result, explicitly *not* the stale-revision conflict result) are owned
+by **no task in `tasks.md`**. I checked every section: 6.1–6.5 name the base revision, the 409 CAS, the
+commit, coalescing and rollback, and never the lock or the busy result; 10.2 tests *serialization*, not
+the timeout path; 7.5 is the push side. D16 settles what the answer should be — nothing schedules
+building it.
+
+The asymmetry is what makes this a section finding rather than a §6 problem. This section established,
+on a Product Owner decision, that "bound by D3 in prose" was **not** sufficient to keep the push side's
+acquisition alive — it got an explicit numbered task. The save side was left on exactly the footing the
+section had just judged insufficient, in the same edit.
+
+Evidence it is already biting: `ContentStorageOptions.cs:27`'s `WriteLockTimeout` is the knob that
+clause exists to configure, and it currently has **no save-path consumer at all** (see S2), because no
+task owns building one.
+
+**Blocks involved:** D (`tasks.md:33`, `:53` — the struck/re-homed edit) against block A's spec delta
+(`specs/content-editing/spec.md:52-55`, added in `172c622`). Block A *added* the scenario; block D
+re-homed everything except it.
+
+### S2 — `WriteLockTimeout`'s binding doc is false against its only consumer, and one number now governs two failure modes with opposite severities
+
+`src/ZeroWiki/Content/ContentStorageOptions.cs:18-25` states the option is *"How long the app-side write
+path (**a browser save's commit, §5.2**) waits…"* and *"**Applies only to a save's acquisition**"*.
+
+Its only consumer is `ContentRepositoryService.AcquireStartupWriteLockAsync`
+(`ContentRepositoryService.cs:230-247`) — a **startup** acquisition whose failure is a **fatal refusal to
+start** (`InvalidOperationException`, `:238`). There is no save's acquisition. The shipped doc describes
+the one branch that does not exist and excludes the only one that does.
+
+That call site's own `<remarks>` (`:218-229`) says it plainly: D16 *"does not settle what **startup's**
+accept phase should do on the same timeout"*, and then answers it — a second, differently-motivated use
+of the same knob, reasoned at the call site and never reflected at the option. Both diffs were locally
+coherent, which is why neither block review could see it: block A wrote save-scoped prose with no code,
+block C wrote startup code with no reason to revisit block A's prose.
+
+The consequence is operational, not cosmetic. `ContentStorage:WriteLockTimeout` is documented as a
+per-request browser-latency knob. An operator who lowers it to 2s so a stuck save surfaces faster also
+shortens the window in which a rolling deploy's overlap (D3's own named justification for the lock, and
+obligation 16's case) is tolerated before the **incoming instance refuses to boot** — with `:239-243`'s
+message correctly telling them to wait it out, on a bound they just cut. Raising it to absorb a large
+push lengthens how long a browser tab hangs. Two tradeoffs, opposite directions, one number, and the doc
+names only one of them.
+
+This is also this change's own standing rule fired again: *when a guard's justification names a case,
+check the guard's branch.* The justification names a save's acquisition; the branch is startup's.
+
+**Blocks involved:** A (D16's save-scoped framing) → C (`e6ef77a`, both the option and its startup
+consumer).
+
+## Suggested remediation shape — one block, and it is small
+
+1. **S1** — give the save-side bound an owner. A task under §6 (e.g. `6.6`) for *"acquire the write lock
+   around the save's write+commit, bounded by `WriteLockTimeout`, failing with a distinct 'repository
+   busy' result rather than the 409"*, cross-referenced to `spec.md:52-55` the way 7.5 is
+   cross-referenced to §5's DEVLOG. No new `5.N` numbers; nothing ticked.
+2. **S2** — decide, then make the artefacts agree. Either the knob is deliberately shared (correct
+   `ContentStorageOptions.cs:18-25` to name **both** acquisitions and their two failure severities, and
+   say in D16 that sharing is intended) or it is not (a separate startup bound). ❓ **@product-owner**
+   if the split is preferred — it is a configuration-surface decision, not a wording fix. My read: one
+   knob is right for this product's scale; the doc is what is wrong.
+3. **Dead scaffolding, same block.** `ContentRepositoryServiceTests.cs:1105` —
+   `CreateService(TimeSpan? writeLockTimeout = null)`. All **33** call sites pass no argument. Block C
+   opened a seam for the startup-timeout test and the test was never written. Either write it (it is
+   cheap and it is the only assertion that would pin `:238`'s refusal at all) or drop the parameter.
+   Leaving an unused seam is how a later block concludes the path is covered.
+
+## Required `## NEXT` corrections before the section closes (Architect, not the fix block)
+
+Verified against the code, not the record — §4's lesson applied.
+
+- **Obligation 2 (lockfile outside the working tree) — discharged.** `ContentPaths.cs:25`,
+  `LockFilePath = <DataRoot>/wiki.lock`, a `DataRoot` sibling of `RepositoryRoot`, extending
+  `ContentPaths` exactly as the obligation demanded. Mark it struck.
+- **Obligation 16 (`repositoryHasNoCommitsYet` is a snapshot) — discharged in mechanism, undischarged
+  in evidence.** `ContentRepositoryService.cs:107` acquires the lock *before* `:111` classification and
+  `:136` derivation. But block C's third mutant — reverting exactly this — **survives 716/716**. Strike
+  it with that qualification attached, not plainly; a future reader must not read "discharged" as
+  "regression-protected". It is protected by review only.
+- **Obligation 17 (`Accept`/`Configure` split) — discharged.** `87ff1cc`; `:74-75`. Mark it struck.
+- **Obligation 3 (§8, no HTTP client) — must stay live, and its second clause is now false.** It reads
+  *"`flock` **is** present, so §5.3 is safe."* 5.3 does not exist and the hooks must **never** take this
+  lock. Block D swept `design.md`, the hook bodies and the tests for stale 5.3 references and did not
+  sweep `## NEXT` — the one artefact that briefs §8, which is precisely where the deadlock bites. An §8
+  implementer reading obligation 3 finds a sentence saying a hook-side `flock` is safe, four entries
+  above nothing that corrects it. Keep the obligation; delete the clause.
+- **Obligation 12** — *"the fact that makes §5.3's hooks land where git will actually run them"* also
+  references the struck task. Same sweep.
+- **Obligation 27 is §5-owned, undischarged, and its stated reason for being harmless is wrong.** It
+  assigns itself to §5 *"because obligations 16 and 17 already have §5 restructuring that method"* — §5
+  did that restructuring, twice, and `RepositoryHeadIsUnbornAsync` (`ContentRepositoryService.cs:525-533`)
+  still returns `!headProbe.Succeeded`, reading exit 128 as "unborn". It was not in the §5 brief. It is
+  still genuinely unreachable, but **not for the reason recorded**: obligation 27 says
+  `AssertGitResolvesRepositoryRootAsync` runs first — it does not, it is at `:199`, *after* `:136`. What
+  actually makes 128 unreachable is the `RunOrThrowAsync` bare-probe at `:119`, which throws first. Give
+  it a live owner and the correct reason, or it becomes an obligation orphaned by a closed section.
+- **Header** — `## NEXT` still names §5 as the resume point and reports 710/716 and 19/40; refresh at
+  close-out.
+
+## Architectural notes — for `## NEXT`, not the fix block
+
+- **The class doc asserts a push-side mechanism that does not exist, in the present tense, in two places
+  that will go stale in lockstep.** `RepositoryWriteLock.cs:30-32`: *"the app's own wrapper around `git
+  http-backend` (§7.5) **acquires** this same lock with a plain blocking `LOCK_EX`, a genuine
+  kernel-level unbounded block"*, and D16 says the same. The type exposes **no** such API —
+  `AcquireAsync` only ever polls `LOCK_EX|LOCK_NB` (`:153-154`). §7.5 can satisfy "unbounded" two ways,
+  and the cheap one (pass an effectively-infinite `timeout` to the existing poll loop) is a 50ms poll,
+  **not** a kernel-level block — at which point both sentences are false and neither is executed by
+  anything. This is @reviewer's note (a) with the stakes raised: not prose duplicated about existing
+  code, but prose duplicated about code that has not been written. §7.5's brief should be told it is
+  implementing a *claim already made in two places*, and must either honour it or correct both.
+- **@reviewer's note (b) — 7.5 has no coverage by construction — recorded and agreed.** Pair it with
+  10.2 in §7's brief so the obligation lands on a task rather than on goodwill.
+- **§5's evidence has a shape worth naming, and it is the same shape as §2's.** 5.1's tests are the
+  strongest in this change — a real second OS process, real `flock(1)` interop, a timing bound
+  characterised, corrected under load, and corrected *again* in the record when the inequality did not
+  hold. 5.2 has **none**: no test asserts `EnsureRepositoryAsync` takes the lock, none asserts `:238`'s
+  refusal, and the one mutant aimed at 5.2 survived. The section's evidence is excellent about the
+  *primitive* and silent about its *use*, which is exactly §2's "a fixture built by the code under test
+  cannot falsify that code" restated for concurrency: proving a lock excludes is not proving a caller
+  uses it. Whoever eventually builds genuine two-instance integration testing inherits both this and
+  obligation 16's unprotected mechanism — they are one fixture.
+- **On the 150ms tolerance — defensible, and defensible for the right reason.** 36.4ms on correct code
+  and 234.4ms on the reintroduced bug, both under the full unfiltered suite; 150ms sits between them with
+  ~114ms and ~84ms of margin. What makes it evidence rather than comfort is that the *first* number
+  (30ms, from a filtered run) was falsified by the gate the tolerance actually runs in, and the record
+  says so plainly, including the Architect's own wrong inequality being corrected in-thread rather than
+  silently edited. That is the correct handling of a timing constant under this change's rules. One
+  caveat for `## NEXT`: both figures measure *this host*, and §11's standing rule says a timing comment
+  may assert a direction or an order of magnitude, never a precise value. 150ms is a precise value. It is
+  justified here because the *gap* it separates is ~6x, not because 150 is meaningful — if CI ever runs
+  this suite on different hardware, re-derive rather than widen.
+
+## Checked clean — recorded so it is not re-litigated
+
+- **No dead scaffolding in `src/`.** `RepositoryLockTimeoutException` is thrown, caught and asserted;
+  `WriteLockTimeout` is consumed and validated (`ContentStorageStartupExtensions.cs:22-23`);
+  `ContentPaths.LockFilePath` is used. `ZeroWiki.LockTestHarness` is not premature — it is the only thing
+  in the repo that makes the cross-process claim falsifiable, and its namespaced `Program` sidesteps a
+  real collision with `WebApplicationFactory<Program>`. None of it is §6 arriving early.
+- **The write-path invariant chain still composes.** I re-ran @reviewer's sweep independently: every
+  `_git.Run*` call site under `src/ZeroWiki` outside `ContentRepositoryService` is a read
+  (`PageHistoryService`, `PageIndexBuilder`, `GitHookInstaller`'s `rev-parse --git-path hooks`). One
+  writer, and it holds the lock. §5 added no new write path that skips it.
+- **Lock scope is right, not merely convenient.** Lock at `:107` before `Directory.CreateDirectory` at
+  `:109` and every refusal; `DataRoot` creation at `:105` deliberately outside it. `ConfigureRepositoryAsync`
+  correctly outside — neither write is tracked content. D9's "no write precedes any refusal" ordering
+  survives the split intact.
+- **Render-mode discipline, identity/access-control uniformity, DI coherence** — §5 added no route, no
+  component, no circuit, and one constructor dependency (`IOptions<ContentStorageOptions>`) on an
+  existing service. Nothing to erode.
+- **Mutation scoping is right and its boundary was applied consistently.** Blocks A, B and D are prose
+  and comments; block C is the concurrency path and was mutated. The two mutants that could die, died,
+  under the full unfiltered suite, checksummed, reverted via `trap`/`finally`, with `git status
+  --untracked-files=all` used alongside `git diff` because both targets were untracked — the §7b hazard,
+  correctly anticipated. The survivor is recorded honestly and its reason is accurate: I confirmed against
+  both test files that nothing races two `EnsureRepositoryAsync` calls over one data root.
+- **Human-in-the-loop.** §5 ticked no task requiring it; the one Product Owner decision it did need
+  (5.3's disposition) is recorded in-thread with the question, the three options and the ruling.
+
+Two rounds available; this is round one. S1 and S2 are both small and neither reopens a block.
+→ @architect
+
+**[architect]** Both blockers accepted. **S1 is the better finding of the two and I want the reason on
+the record**, because it indicts my own reasoning rather than a worker's: §5 established — on a Product
+Owner ruling — that a guarantee carried in prose alone was not safe, which is exactly why 5.3 became a
+numbered 7.5. I then left the save-side SHALL clause on precisely the footing the section had just
+judged insufficient, **in the same edit that made the judgement**. The lesson is not "check for orphaned
+clauses"; it is that **applying a principle to the case that prompted it is not applying the principle**.
+A requirement with three SHALL clauses needed all three re-homed, and I re-homed the two I had been
+thinking about.
+
+`tasks.md` updated by me: **6.6 added** — "Save acquires the write lock with a bounded wait, and on
+expiry fails with a distinct 'repository busy' result", cross-referenced to `spec.md:52-55` and to this
+review. No `N.M` in §5 changes; §5 remains complete at 5.1–5.2 with 5.3 struck.
+
+**[architect]** Brief — **remediation block for §5 (supervisor round one). No new `N.M`, ticks nothing.**
+
+Read the `[supervisor]` post above in full first; it is precise about line numbers and I am not
+restating all of them.
+
+1. **S2 — `ContentStorageOptions.WriteLockTimeout`'s doc is false against its only consumer.** It says
+   *"a browser save's commit, §5.2"* and *"Applies only to a save's acquisition"*; the only caller is
+   `ContentRepositoryService.AcquireStartupWriteLockAsync`, a **startup** acquisition whose expiry is a
+   **fatal refusal to start**. Make the doc true about what exists today, and make D16 agree. **State the
+   operator consequence the supervisor identified** — lowering this as a request-latency knob also
+   shortens how long a rolling deploy's overlap is tolerated before the incoming instance refuses to
+   boot. Two tradeoffs in opposite directions on one number.
+   **Do not decide whether the knob should later split** into save-side and startup-side values: §6.6
+   adds the second consumer and that is where the decision belongs. Record it as a forward obligation
+   owned by §6.6, phrased so §6 must settle it rather than inherit it silently.
+
+2. **Dead scaffolding with a better fix than deletion.** `ContentRepositoryServiceTests.cs:1105` —
+   `CreateService(TimeSpan? writeLockTimeout = null)`, 33 call sites, every one of them no-arg. The
+   supervisor's options were "write the test or drop the parameter". **Write the test.** The parameter
+   exists because someone anticipated needing it, and the thing it enables is exactly §5's largest
+   evidence gap: `AcquireStartupWriteLockAsync`'s fatal-refusal path has **no test at all**, which is
+   the same silence that let block C's third mutant survive. A test that holds the lock from another
+   process, starts the accept phase with a short timeout, and asserts the refusal — including that the
+   message names the lockfile — closes the scaffolding finding and a real hole in 5.2's evidence at
+   once. If you find that genuinely can't be built here, drop the parameter and say why.
+
+3. **`## NEXT` obligation 3's second clause is now false, and `## NEXT` is the artefact that briefs
+   §8.** It reads *"`flock` **is** present, so §5.3 is safe."* There is no §5.3. Worse, §8 is precisely
+   where a `post-receive` gets filled in, and this sentence tells its implementer the opposite of block
+   D's warning. Block D swept `design.md`, the hook bodies and the tests and did **not** sweep
+   `## NEXT`. Fix it, and keep the obligation live — its first clause (the image has no HTTP client) is
+   still true and still §8's. **Obligation 12 has the same problem**; check it.
+
+4. **Obligation bookkeeping, verified against the code and not against the record.**
+   - **2 and 17 — discharged.** Strike them.
+   - **16 — discharged in mechanism, not in evidence.** The lock is taken before classification, but
+     block C's mutant reverting exactly this survives 716/716. Strike it **with that qualification
+     stated**, or a later reader takes "discharged" to mean "regression-protected". If (2) above lands
+     a startup test, say whether it changes this.
+   - **27 — §5-owned, undischarged, and its stated reason for being harmless is wrong.**
+     `RepositoryHeadIsUnbornAsync` still reads exit 128 as "unborn". It remains unreachable, but **not**
+     because `AssertGitResolvesRepositoryRootAsync` "runs first" — that is at `:199`, after `:136`; it is
+     the bare-probe `RunOrThrowAsync` at `:119` that throws. Correct the reason, and **propose an owner
+     with a justification** rather than reassigning it to whichever section is next. I will decide.
+
+5. **The `## NEXT` note that matters most for §7.** `RepositoryWriteLock.cs:30-32` and D16 both assert,
+   **present tense**, that the push side *"acquires this same lock with a plain blocking `LOCK_EX`, a
+   genuine kernel-level unbounded block"*. The type exposes no such API — `AcquireAsync` only ever polls
+   `LOCK_EX|LOCK_NB` — and §7.5's cheapest implementation (an effectively infinite timeout on the poll
+   loop) would falsify both sentences. **Rewrite both to describe what §7.5 must achieve rather than
+   what something already does**, and make it explicit that a poll-loop implementation satisfies the
+   *guarantee* (an unbounded wait) without satisfying the *mechanism* as currently written. This is
+   prose duplicated across two sites about code that does not exist yet — the reviewer's propagation
+   lesson with the stakes raised.
+
+**Out of scope**: implementing 6.6 or 7.5. No save path, no `http-backend` wrapper.
+
+**Gates**: `dotnet build`, `dotnet test` unfiltered (real figure or "not obtained" — a new test changes
+the count from 716; report the new number), `dotnet format --verify-no-changes`,
+`openspec validate git-backed-content-core --strict`.
+
+**Mutation testing: no**, unless (2) produces a startup-refusal test — in which case a single mutant
+(invert the timeout comparison so the refusal never fires) is worth running to prove the new test can
+fail, under CLAUDE.md's cap and with checksums before *and* after.
+
+→ @worker
+
+**[worker]** §5 remediation (round one) — all five items done, no new `N.M`, nothing ticked.
+
+1. **S2 fixed.** `ContentStorageOptions.WriteLockTimeout`'s doc now says what its only caller
+   (`AcquireStartupWriteLockAsync`) actually does — a **startup** acquisition, fatal refusal on expiry —
+   and states the operator consequence (lowering it as a latency knob also shortens the rolling-deploy
+   overlap tolerated before an incoming instance refuses to boot; raising it does the reverse). D16's
+   "Ceiling" paragraph in `design.md` gets a note that its save-scoped framing describes intent, not
+   what ships, pointing at the same doc comment. **Did not decide** whether §6.6 shares this value or
+   splits it — recorded as new forward obligation **31**, owned by §6.6, phrased so it must be settled
+   explicitly rather than inherited silently.
+2. **Wrote the test rather than dropping the parameter.**
+   `ContentRepositoryServiceTests.StartupWriteLockHeldByAnotherProcess_RefusesToStartNamingTheLockFile`
+   holds the lock from a real second process (`LockHarnessProcess`, the same fixture §5.1 uses), runs
+   `EnsureRepositoryAsync` with `writeLockTimeout: TimeSpan.Zero`, and asserts the `InvalidOperationException`
+   names the lockfile — plus that the repository directory was never created (the refusal happens before
+   any write). Passes in isolation and under the full 717/717 unfiltered suite.
+3. **Obligation 3's false clause fixed, obligation 12 too.** Obligation 3 no longer claims `flock`
+   presence makes "§5.3" safe — §5.3 doesn't exist, and the surviving true clause (no HTTP client in the
+   image) is restated with an explicit note against reading the old wording as license for a hook-side
+   `flock`. Obligation 12 had the same stale reference **and** was already recorded as discharged by
+   obligation 13 while still sitting live — struck for consistency, with the reference corrected.
+4. **Bookkeeping struck 2 and 17** (verified against `ContentPaths.cs:25` and `ContentRepositoryService.cs:74-75`
+   respectively). **16 struck with the qualification** — lock-before-classify ordering holds in code, block
+   C's mutant reverting it still survives 716/716, and item 2's new test does **not** change that: it pins
+   the timeout-refusal path, a different mutant target from the classify-ordering one. **27's reason
+   corrected** — unreachable because the `hasOwnGitEntry` branch's own bare-probe (`:119`, `RunOrThrowAsync`)
+   throws before `RepositoryHeadIsUnbornAsync` (`:136`) ever runs, not because
+   `AssertGitResolvesRepositoryRootAsync` "runs first" (`:199`, after both). **Proposed owner: §6**, since
+   a worker will already be in this file for obligations 7 and 14 — ❓ @architect to confirm or reassign.
+5. **`RepositoryWriteLock.cs:30-32` and D16 rewritten to future tense.** Both now say §7.5 must *achieve*
+   an unbounded wait rather than claiming a blocking-`LOCK_EX` API already exists — it doesn't;
+   `AcquireAsync` only polls — and both spell out that an effectively-infinite `timeout` on the existing
+   poll loop satisfies the guarantee without being a true kernel-level block, leaving §7.5 the explicit
+   choice of whether to add a real blocking path or accept the poll-loop route.
+
+**Mutation testing — attempted, not cleanly obtained.** Per the brief, ran exactly one mutant against
+`RepositoryWriteLock.cs:128` (`if (elapsed >= timeout)` → `if (false) // MUTANT`), checksummed before
+(`6a1415c…`) and after (`02dd016…`). Two attempts, both against the filtered new test only (never reached
+the full-suite step): the mutated test did not complete within the tool's timeout (first attempt 400s,
+second attempt >120s under a bounded `Monitor` wait) — it hangs rather than throwing a clean wrong-exception
+failure. I did not fully derive why (the poll loop's negative-`TimeSpan` arithmetic *should* throw
+`ArgumentOutOfRangeException` within milliseconds by my own reading of the code, and empirically it did
+not), so I'm reporting the observation rather than a diagnosed mechanism. **Both attempts were reverted
+immediately** — the first via a manual `cp` from a `.orig` backup after the tool's hard-kill bypassed the
+`trap` (the exact hazard CLAUDE.md names: exit code 143, trap never ran, mutant briefly live in `src/`
+with the working tree otherwise looking ordinary), the second via `TaskStop` + the same backup-restore
+pattern before touching anything else. Checksum after each revert matched the original
+(`6a1415c…`) both times; `git diff -- src` and `git status --short --untracked-files=all -- src tests`
+confirmed clean after each. Did not attempt a third run — the failure mode was consistent across both
+(hang, not flakiness), and a third multi-minute attempt against the same mechanism didn't seem likely to
+produce a different, cleaner signal without first understanding the hang, which is more investigation
+than a capped confirmation run. **The test does demonstrably not pass under this mutant** (it cannot
+report success within any reasonable bound), which is evidence the property is pinned, but I cannot
+report a clean full-suite kill figure the way CLAUDE.md's rules want — flagging this rather than
+papering over it.
+
+**Gates on the clean tree:** `dotnet build` 0 warnings/0 errors. `dotnet test` **717/717** full
+unfiltered (716 + the 1 new test). `dotnet format --verify-no-changes` exit 0.
+`openspec validate git-backed-content-core --strict` valid. `tasks.md` untouched by this block beyond the
+architect's pre-existing 6.6 edit (already in the tree when I started).
+
+→ @reviewer
+
+**[architect]** Gate verification of this block cost several hours and produced a **false defect
+report from me**, which is worth recording in full because the failure was in the *instrument*, and
+this change's oldest standing rule is that every instrument failure so far has been in the harness
+rather than the code.
+
+**What I observed.** `dotnet test` — which had run **716/716 in 1m51s** an hour earlier — exceeded 600s
+on three consecutive attempts, then completed at **1h23m**, then **1h34m with one failure**:
+`HeldByAnotherProcess_BoundedWaitGivesUpAfterRealElapsedTimeReachesTheTimeout`, block C's 150ms
+tolerance test.
+
+**What I concluded, wrongly, twice.** First that the suite was hanging — it was not, it completed.
+Then that block C's raw `open()` P/Invoke was leaking file descriptors, since the lock is the one thing
+§5 newly introduced into every affected test and a raw fd sits outside .NET's `SafeHandle` machinery.
+Per-test timings refuted it outright: all 35 tests of the slow class run in 60ms–2s and **sum to ~22
+seconds**, with the last as fast as the first. A leak produces progressive degradation; there was none.
+
+**What actually happened: the Product Owner closed the laptop mid-run.** Every unexplained observation
+follows from it. Wall clock advances while a machine is suspended and CPU time does not, which is
+exactly the `384s user + 278s system over 3928s wall = 16% CPU` signature the slow runs carried — the
+662s of CPU is the *same* total work the 1m51s run did across ~6 cores. Short filtered runs finished
+while the machine was awake and stayed fast; only runs long enough to meet a closed lid were affected.
+
+**And it explains why that specific test, of the 717, was the one to fail.** `AcquireAsync` measures
+elapsed time with a `Stopwatch`, which counts wall-clock **including suspension**. A machine sleeping
+during the bounded wait makes elapsed time jump by the sleep duration, blowing through any tolerance.
+The single test that failed is the single test that measures real time — and it was not lying: the
+overshoot genuinely occurred. Re-run awake: **717/717 in 120.3s**.
+
+**The transferable rule, which §6 onward should apply.** This change already knows that *a filtered run
+measures a condition the gate never runs in*. Add its sibling: **a run whose wall-clock duration is
+wildly out of line with its CPU time is not a result at all — it is a corrupted measurement, and must
+be discarded rather than interpreted.** I interpreted three of them, and built a plausible defect
+theory about production code on top. The check is cheap and should be routine: `time dotnet test`, and
+if `%cpu` is far below what parallelism predicts, throw the run away. Had I run it first rather than
+fifth, the descriptor-leak theory would never have been written down.
+
+**Also worth naming: I reached for the newest, most suspicious code first.** The raw `P/Invoke` was the
+obvious culprit precisely *because* it was new and unusual, and that intuition survived four
+measurements that did not support it. The decisive experiment — running the **previous commit** in a
+worktree and finding it equally slow — exonerated the code in one step and should have been the first
+move, not a late one. **When a gate degrades, bisect the environment before theorising about the diff.**
+
+**Gates on the final tree, run awake:** `dotnet test` **717/717 in 120.3s** (Product Owner's own run),
+`dotnet build` succeeded, `dotnet format --verify-no-changes` exit 0, `openspec validate --strict`
+valid, `grep -rn MUTANT src/ tests/` empty. The 150ms tolerance stands unchanged — it was never
+widened to accommodate a machine fault, which would have converted a real signal into a silent one.
+
 ## NEXT
 
 **Resume point: §5 (Write lock), first block. No design question blocks it** — the entry that claimed
@@ -10294,14 +10668,22 @@ a wording tidy-up, because one of its two options changes shipped behaviour.
    `## NEXT` is append-mostly and its *unticked* entries decay silently while the code moves. **Re-derive
    a forward obligation from the code before spending a decision on it**; a stale obligation costs more
    than a missing one, because it is acted upon.
-2. **§5 — the lockfile must not live in the working tree.** A lockfile under `/data/wiki/docs` is an
+2. ~~**§5 — the lockfile must not live in the working tree.** A lockfile under `/data/wiki/docs` is an
    untracked file, which makes the tree dirty, which D9 dutifully commits, and `updateInstead` then
    bounces every push against a tree it believes unclean. Put it under `.git/` or beside the
    repository, and **extend `ContentPaths`** rather than growing a parallel notion of where things
-   live.
+   live.~~ — **discharged.** `ContentPaths.cs:25`, `LockFilePath = <DataRoot>/wiki.lock`, a `DataRoot`
+   sibling of `RepositoryRoot`, extending `ContentPaths` exactly as demanded. (§5 remediation, round one.)
 3. **§8 — the image has no HTTP client.** `curl`, `wget` and `nc` are all absent from the runtime
-   image; `flock` **is** present, so §5.3 is safe. Decide how `post-receive` signals the app **before**
-   §8 starts, or it reopens §1's Dockerfile.
+   image. Decide how `post-receive` signals the app **before** §8 starts, or it reopens §1's Dockerfile.
+   **Correction (§5 remediation, round one):** this obligation used to also say *"`flock` **is** present,
+   so §5.3 is safe"*. §5.3 does not exist — it was struck in §5 and its lock acquisition moved to §7.5 —
+   and per §5's Product Owner decision the generated hooks must **never** attempt to acquire
+   `RepositoryWriteLock` themselves, on pain of deadlocking against their own parent process (see
+   `GitHookInstaller`'s remarks and design.md D16's "why no hook may attempt this acquisition itself").
+   An §8 implementer reading the old wording would have taken it as license for a hook-side `flock`; the
+   surviving clause here — no HTTP client in the image — is the only one that was ever true and it is
+   still §8's to solve.
 4. ~~**§7 — `git-receive-pack` returns `403 Forbidden`**~~ — **discharged in §2** (`ef2b75b`).
    `http.receivepack=true` is now set as repo configuration on **every** start, not only at init, so a
    repository made by an earlier image or restored from a backup receives it too. Kept here because the
@@ -10350,12 +10732,17 @@ a wording tidy-up, because one of its two options changes shipped behaviour.
     overwritten), a pre-existing `receive.denyCurrentBranch=refuse` (silently overwritten), a non-`main`
     branch, and an adopted repository with a **dirty** tree — the last is the one that exercises
     obligation 1's contradiction, so pair them.
-12. **Two `<remarks>` corrections owed** — neither affects behaviour, both are the recurring
+12. ~~**Two `<remarks>` corrections owed** — neither affects behaviour, both are the recurring
     wrong-justification defect: `FindStagedGitlinksAsync` says a tracked path replaced by a nested
     repository yields `M`; git emits `T` (the condition tests modes, not status letters, so behaviour is
     unaffected). And `GitHookInstaller` should record that `git rev-parse --git-path hooks` honours
     `core.hooksPath` — verified by execution, and the fact that makes §5.3's hooks land where git will
-    actually run them.
+    actually run them.~~ — **discharged in `f50f1ca`.** Obligation 13 already recorded this discharge;
+    this entry had been left live with a stale §5.3 reference while 13 said it was done — struck now for
+    consistency, and the reference corrected for anyone who reads this one first: `core.hooksPath` is the
+    fact that makes the *installed* hooks (there is no §5.3) land where git will actually run them, not
+    "§5.3's hooks". Both `<remarks>` read correctly today in `ContentRepositoryService.cs` and
+    `GitHookInstaller.cs`. (§5 remediation, round one.)
 13. ~~Carried: `GitAuthor.cs` "later"; `tasks.md:70`'s superseded 11.1 pattern~~ — **both discharged in
     `f50f1ca`**, along with the `T`-vs-`M` and `core.hooksPath` remarks from obligation 12.
 14. **`git add -A` has the same unreadable-directory blind spot the scan just closed in C#, and no C#
@@ -10376,18 +10763,29 @@ a wording tidy-up, because one of its two options changes shipped behaviour.
     tree. Assessed by `@reviewer` as closer to noise than a live risk for this product's content, and
     left unguarded deliberately rather than by oversight — recorded so that judgement is visible rather
     than implicit. Symlink loops are already handled, and are the realistic case.
-16. **§5.1 — `repositoryHasNoCommitsYet` is now a snapshot.** Unifying the scan's gate with the write's
+16. ~~**§5.1 — `repositoryHasNoCommitsYet` is now a snapshot.** Unifying the scan's gate with the write's
     predicate (`1253ff5`) means `EnsureInitialCommitAsync` no longer verifies `HEAD` immediately before
     committing; it trusts a value computed earlier in the call. Correct **today** only because startup
     is single-threaded and unlocked. §5.1 is where that stops being true, and this is the assumption it
-    invalidates.
-17. **§5.1 — the `AcceptRepositoryAsync`/`ConfigureRepositoryAsync` split has gone from optional to
+    invalidates.~~ — **discharged in mechanism, not in evidence.** `ContentRepositoryService.cs:107`
+    acquires `RepositoryWriteLock` before `:111` classification and `:136` derivation, so the value is
+    computed after the lock is held, not trusted stale from before it. But block C's mutant reverting
+    exactly this ordering **survives 716/716** under the full unfiltered suite — struck here with that
+    qualification, not plainly, because "discharged" must not read as "regression-protected"; it is
+    protected by review only. **§5's remediation block (round one) added a new test
+    (`StartupWriteLockHeldByAnotherProcess_RefusesToStartNamingTheLockFile`) — it does not change this.**
+    That test pins `AcquireStartupWriteLockAsync`'s timeout-refusal path (lock held, wait, fatal refusal);
+    it never exercises the lock-before-classify ordering this obligation is about, so it is a different
+    mutant and this one is still unprotected by anything but review.
+17. ~~**§5.1 — the `AcceptRepositoryAsync`/`ConfigureRepositoryAsync` split has gone from optional to
     overdue, and §5.1 is its forcing function.** The Product Owner's call to keep `1253ff5` targeted was
     right — bundling a refactor with a correctness fix would have made the fix unreviewable — but
     `git init` now sits in its own `if` outside the block that computed its boolean, so the classify
     block no longer owns its own action. A cross-process `flock` wants to wrap exactly the
     accept-and-write phase and **not** the configure phase, which is the shape the split already has.
-    Nearly free now; more expensive once a lock is threaded through the current shape.
+    Nearly free now; more expensive once a lock is threaded through the current shape.~~ — **discharged.**
+    `87ff1cc` made exactly this split: `AcceptRepositoryAsync` holds the lock for the whole accept-and-write
+    phase, `ConfigureRepositoryAsync` runs after it unlocked (`ContentRepositoryService.cs:74-75`).
 18. **A rationale that no longer covers its own trigger** (prose, non-blocking). The
     unreadable-directory refusal is justified partly by "the scan runs once per volume, while the
     operator is most likely still watching". Since `1253ff5` the scan also runs on an **unattended
@@ -10467,11 +10865,24 @@ a wording tidy-up, because one of its two options changes shipped behaviour.
 27. **§5 — `ContentRepositoryService.RepositoryHeadIsUnbornAsync` reads exit 128 as "unborn".** The exact
     defect block A was blocked on and fixed in `PageIndexBuilder`: `git rev-parse --verify -q HEAD` exits
     1 on an unborn `HEAD` but 128 on "not a git repository". The same question is now answered two ways in
-    two classes, and the §2 one is the wrong way. **Unreachable today** —
-    `AssertGitResolvesRepositoryRootAsync` runs first, so 128 cannot arrive — which is why it was parked
-    rather than folded into §4's prose-only remediation. §5 owns it because obligations 16 and 17 already
-    have §5 restructuring that method; fixing it there costs nothing and fixing it in §4 would have meant
-    a behaviour change inside a block carved as prose-only.
+    two classes, and the §2 one is the wrong way. **Unreachable today, but the previously-recorded reason
+    was wrong (corrected in §5's remediation block, round one).** This entry used to say
+    `AssertGitResolvesRepositoryRootAsync` "runs first", so 128 could never arrive — false:
+    `AssertGitResolvesRepositoryRootAsync` runs at `:199`, **after** `RepositoryHeadIsUnbornAsync` is
+    called at `:136`. What actually makes 128 unreachable is earlier: `RepositoryHeadIsUnbornAsync` is
+    only ever called from the `hasOwnGitEntry` branch (`:114-136`), and that same branch's own bare-probe
+    — `_git.RunOrThrowAsync(repositoryRoot, ["rev-parse", "--is-bare-repository"], …)` at `:119` — throws
+    on "not a git repository" *before* `RepositoryHeadIsUnbornAsync`'s own `rev-parse --verify -q HEAD`
+    (which uses the non-throwing `RunAsync`) ever runs. §5 restructured this method twice (obligations 16,
+    17) without touching this line, so the wrong-way answer is still live in unreachable code.
+    **Proposed owner, not decided here:** no section between here and archive is currently scheduled to
+    touch `RepositoryHeadIsUnbornAsync` or its call site. §6 is already going to be in this same file for
+    obligations 7 (author-line well-formedness) and 14 (the `git add -A` unreadable-directory blind spot),
+    so a worker will already have the surrounding context — propose folding this one-line fix in there
+    rather than opening a section of its own for it. If §6's brief has no natural point to attach it,
+    the alternative is a close-out nit at archive time, since the defect is unreachable and low-risk.
+    ❓ **@architect** — confirm §6, name a different owner, or park it as a close-out nit; not decided by
+    this entry.
 28. **§3's `NotFoundPage` trade was never recorded here, though the code says it was.**
     `WikiPage.razor:114` states that whether §4 or a later change should rework `Routes.razor`'s
     `NotFoundPage` (or move to the `NavigationManager.NotFound()` API) "is recorded in `## NEXT`" — and it
@@ -10498,6 +10909,20 @@ a wording tidy-up, because one of its two options changes shipped behaviour.
     commit can; what makes the staleness inert today is that no such writer runs *while the index is
     live*). Deliberately **not** a third supervisor round — CLAUDE.md caps at two, and a docs correction
     does not justify spending one.
+
+31. **§6.6 — whether `ContentStorage:WriteLockTimeout` is shared between startup and a save, or splits.**
+    Today the value has exactly one consumer: `ContentRepositoryService`'s startup accept-phase
+    acquisition, whose expiry is a fatal refusal to start. §6.6 adds the second consumer — a browser
+    save's acquisition, whose expiry must instead be a per-request "repository busy" result (D16,
+    `spec.md:52-55`). §5's remediation block (round one) fixed `ContentStorageOptions.WriteLockTimeout`'s
+    doc and D16's "Ceiling" paragraph to describe today's reality and name the operator consequence of
+    the gap (lowering it as a save-latency knob also shortens how long a rolling deploy's overlap is
+    tolerated before an incoming instance refuses to boot; raising it does the reverse), but deliberately
+    did **not** decide whether the two acquisitions should keep sharing one configured value or get
+    separately configurable ones — that is a configuration-surface decision the supervisor flagged as the
+    Product Owner's to make (S2, §5 review), not something to settle by editing a doc comment. **§6.6 must
+    settle this explicitly, not inherit the shared default silently**: either state in code and doc why
+    one value is right for both failure modes, or introduce a second option and default it sensibly.
 
 ### Close-out items before archive
 

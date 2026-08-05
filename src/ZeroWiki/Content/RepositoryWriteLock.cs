@@ -27,9 +27,14 @@ namespace ZeroWiki.Content;
 /// <see cref="AcquireAsync"/> therefore polls <c>LOCK_EX|LOCK_NB</c> on a fixed interval against a
 /// wall-clock deadline, composing with the caller's own <see cref="CancellationToken"/> via
 /// <see cref="Task.Delay(TimeSpan, CancellationToken)"/> rather than blocking a thread-pool thread for
-/// the whole wait. The push side has no such constraint — the app's own wrapper around
-/// <c>git http-backend</c> (§7.5) acquires this same lock with a plain blocking <c>LOCK_EX</c>, a
-/// genuine kernel-level unbounded block, taken directly by the app rather than by a hook (design.md D16).
+/// the whole wait. The push side (§7.5, not yet built) has no such constraint and must <b>achieve</b> an
+/// unbounded wait, taken directly by the app rather than by a hook — but this type exposes no blocking
+/// <c>LOCK_EX</c> acquisition API for it to call, only <see cref="AcquireAsync"/>'s polling one. §7.5's
+/// cheapest implementation (an effectively-infinite <c>timeout</c> passed to
+/// <see cref="AcquireAsync"/>) satisfies the <em>guarantee</em> — the wait never gives up — without being
+/// a genuine kernel-level blocking call; it would still be a poll loop, just one with no practical
+/// ceiling. Whether §7.5 instead adds a true blocking-<c>LOCK_EX</c> acquisition path to this type is
+/// its own decision to make, not one this type has made on its behalf (design.md D16).
 /// </para>
 /// <para>
 /// <b>Releasing is closing the file descriptor, not a separate unlock call.</b> The kernel drops an

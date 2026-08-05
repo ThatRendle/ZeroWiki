@@ -356,10 +356,14 @@ acquisition is therefore a **poll loop**: `LOCK_EX|LOCK_NB` on a fixed interval 
 matching what the spike's `FileStream` fallback already used) against a wall-clock deadline, driven by a
 `CancellationToken` so it composes with the rest of the request pipeline rather than blocking a thread
 pool thread for the whole wait. The push side has no such constraint: the app's own wrapper around the
-whole `git http-backend` invocation (§7.5) acquires the same lock with a plain blocking `LOCK_EX` —
-a genuine kernel-level unbounded block, taken directly by the app rather than by a hook (see D3's
-"why the hooks cannot be the lock point" and the acquisition-policy note below for why no hook may
-attempt this acquisition itself).
+whole `git http-backend` invocation (§7.5, not yet built) must instead **achieve** an unbounded wait,
+taken directly by the app rather than by a hook (see D3's "why the hooks cannot be the lock point" and
+the acquisition-policy note below for why no hook may attempt this acquisition itself). `RepositoryWriteLock`
+exposes no blocking-`LOCK_EX` acquisition today, only `AcquireAsync`'s polling one — §7.5's cheapest
+route is an effectively-infinite `timeout` passed to that same poll loop, which satisfies the
+*guarantee* (the wait never gives up) without being a genuine kernel-level block; it would still be
+polling, just with no practical ceiling. Whether §7.5 instead adds a true blocking `LOCK_EX` path to
+`RepositoryWriteLock` is §7.5's decision, not one this design has made for it.
 
 **Location — `ContentPaths.LockFilePath`, a sibling of `RepositoryRoot`, not a file under it.** The
 brief's framing ("outside `ContentPaths.WorkingTree`") understates the constraint: within
@@ -395,7 +399,13 @@ install time; neither hook needs to know it exists at all.
   by `appsettings.*.json` or an environment variable in the container). Ten seconds comfortably covers an
   ordinary commit-on-save (sub-second for a small text file) plus contention from a concurrent push of
   realistic size, while still failing well inside typical browser/reverse-proxy request timeouts (tens of
-  seconds), so a stuck save surfaces as a clear error rather than a silently hanging tab.
+  seconds), so a stuck save surfaces as a clear error rather than a silently hanging tab. **This
+  paragraph describes the save path's intended framing, not what ships today**: §6 (commit-on-save) is
+  not yet built, so the one implemented consumer of this value is `ContentRepositoryService`'s **startup**
+  accept-phase acquisition, whose expiry is a fatal refusal to start rather than a per-request failure —
+  see `ContentStorageOptions.WriteLockTimeout`'s own doc comment for the operator-facing consequence of
+  that gap. Whether §6.6's save acquisition shares this same configured value or gets its own is an open
+  decision owed to §6.6 (`## NEXT`), not settled by this paragraph.
 - **What the app does when it expires:** the save request fails outright — no file is ever written, since
   the lock is acquired *before* the write+commit begins — with a distinct error response (not D4's 409;
   this is lock contention, not a stale base revision) telling the caller the repository is busy and to
