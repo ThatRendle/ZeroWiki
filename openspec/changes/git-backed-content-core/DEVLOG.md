@@ -11584,6 +11584,581 @@ of code exists. **The transferable point for blocks B–D: the decisions in D17 
 than the prose in it, so an implementer should treat D17's *reasons* as the load-bearing part to check
 against the code, not the part to skim on the way to the mechanism.**
 
+**[architect]** Brief — block B: **the git exit-code posture** (`## NEXT` obligations 14 + 27). Landed as
+`52ea5c6`'s successor, before any save path. → @worker
+
+This block ticks **no task numbers** — §6's are all blocks C/D. Its deliverable is a defect that is
+**live today**, and it goes first for one reason: §6 is about to add a new writer, and that writer must
+not inherit a blind spot that already exists. Obligation 14's sharpened form is the thing to hold onto —
+§2's C# readability scan guards the *initialise* path only, so on an **adopted** repository it never runs
+at all, and an unreadable directory there means reconciliation silently skips content while
+`AssertWorkingTreeIsCleanAsync` still passes.
+
+**Deliver**
+
+1. **`ReconcileWorkingTreeAsync`** (`src/ZeroWiki/Content/ContentRepositoryService.cs:615`) must stop
+   trusting `git add -A`'s exit code over its stderr. `add -A` **exits 0** while warning that it could
+   not read a directory, so content behind it is silently unstaged, the commit "succeeds",
+   `git status --porcelain` reports clean, and D9's "never discard" quietly does not hold for that
+   subtree. Refuse, naming what git reported.
+2. **`RepositoryHeadIsUnbornAsync`** (`:525`) must match the **specific documented exit code**, not
+   `!Succeeded`. `git rev-parse --verify -q HEAD` exits **1** on an unborn `HEAD` and **128** on "not a
+   git repository"; today any failure reads as "unborn". `PageIndexBuilder.ProbeCurrentHeadShaAsync`
+   (`:92-111`) already answers this same question correctly — **match its shape**, don't invent a second
+   one. Currently unreachable (the `hasOwnGitEntry` branch's bare-probe at `:119` throws first), so this
+   is a latent wrong-way answer, not a live bug; fix it anyway, because the point of this block is one
+   posture rather than one patched symptom.
+3. **Tests.** The gating scenario is `specs/content-store/spec.md` → *Reconciliation refuses when it
+   could not read part of the working tree*. Reuse §3's `UnixFileMode.None` idiom for the unreadable
+   directory — **root-tolerant skip** (a container running as root can read anything, so the fixture
+   must skip rather than fail) and **`try`/`finally` permission restore**, or a failed test leaves an
+   undeletable directory behind.
+
+**Bindings**
+
+- **D17's posture paragraph is the spec for this block** — read it in `design.md` before starting. An
+  exit code is trusted only for what git documents it to mean; a fault reported on stderr alongside exit
+  0 refuses; a state is discriminated by its specific documented code, never by `!Succeeded`.
+- **Do not change `GitProcessRunner.RunOrThrowAsync`'s behaviour for all callers.** Tightening stderr
+  handling globally would silently re-gate `PageHistoryService`'s `git log`, the index builder's probes
+  and every future caller — far outside this block. Make strictness explicit at the call site that needs
+  it (or an opt-in overload), and say in the code *why* it is opt-in.
+- **The Product Owner accepted a specific cost:** an unanticipated git warning can refuse a startup.
+  That is the decision, not an oversight. **But do not invent a benign-warning allow-list** — if you
+  find, empirically, that `add -A` emits stderr on a *healthy* tree in the shipped image, **stop and
+  report it to me**. Narrowing the rule is a Product Owner call, not a worker's, and an allow-list
+  invented mid-block is exactly how a refusal quietly becomes a log line.
+- **Re-derive git's actual behaviour; do not take mine or the reviewer's word.** Reproduce `add -A`'s
+  exit code and verbatim stderr on an unreadable directory yourself, and note whether it differs between
+  macOS (dev) and the Ubuntu 24.04 container (production) — the container is the environment whose
+  result binds.
+
+**Mutation testing — in scope, capped, and scoped before you start**
+
+Reconciliation is a **data-integrity** path (D9), so this is one of the places CLAUDE.md puts mutation
+in scope. The limits are part of the brief, not a correction to be applied afterwards:
+
+- **Cap: 3 confirmation runs.** A mutant that dies 3/3 with a consistent, understood failure mode is
+  confirmed. Do not exceed unless characterising genuine flakiness *is* the finding.
+- **Scope: the two changed conditions only** — the stderr refusal and the exit-1 match. Not the
+  surrounding CRUD, not the gitlink probe, not `PageIndexBuilder`.
+- **Verify under the full `dotnet test`, never a filter.** A filtered figure is not the record.
+- **Checksum the target before *and* after** every mutation. `ContentRepositoryService.cs` is tracked,
+  so `git diff -- src` works here — but run `git status --short -- src` alongside it anyway, and if you
+  add a **new** file, remember git has no baseline to diff it against and only the checksum protects you.
+- **Restore via `cp` from an out-of-repo baseline copy, in a `trap`/`finally`.** Never `git checkout --`
+  or `git restore --` — they restore from `HEAD` and would take this block's own uncommitted work with
+  them. That has happened in this change despite the rule being written down.
+- **A surviving mutant may be correct.** Record it with the reason; never silently drop it or edit the
+  code to make it die.
+
+**Scope and limits**
+
+- **Do not touch the save path.** No `PageIndex` generation/CAS work, no `PageRouteCodec` changes, no
+  edit form — those are blocks C and D. If this block finds itself in `PageRouteCodec.cs`, it has drifted.
+- §10.1 owes a reconciliation test either way; that is §10's, not yours.
+- Gates before handoff: `dotnet build` clean, `dotnet test` green **unfiltered** (report the figure, or
+  report "not obtained" — do **not** background it and wait), `dotnet format --verify-no-changes`,
+  `openspec validate git-backed-content-core --strict`.
+- Post to the DEVLOG under `## 6.`, then hand to @reviewer. **Do not commit; do not tick boxes.**
+
+**[worker]** Block B done — the git exit-code posture (D17), `## NEXT` obligations 14 + 27. No `N.M`
+tasks ticked, by design.
+
+**Re-derived git's behaviour myself before touching anything**, in a container built from
+`mcr.microsoft.com/dotnet/aspnet:10.0` + `apt-get install git` (matching the Dockerfile) running as the
+`app` (non-root) user, plus locally on macOS:
+
+| case | macOS (git 2.55.0) | container, Ubuntu 24.04 (git 2.43.0, non-root) |
+|---|---|---|
+| `add -A`, unreadable directory | exit 0, stderr `warning: could not open directory 'X/': Permission denied` | identical |
+| `add -A`, healthy tree | exit 0, empty stderr | identical |
+| `add -A`, running as root over the same unreadable dir | reads straight through — chmod 000 doesn't stop root | same (confirms the test needs a root-tolerant skip) |
+
+No divergence between dev and the shipped image, and no benign-stderr case found on a healthy tree — so
+nothing here needed a Product Owner call to narrow.
+
+**1. `ReconcileWorkingTreeAsync` (`:647`).** `git add -A` now runs via `RunAsync`, not
+`RunOrThrowAsync` — exit code checked first (throws `GitProcessException` on non-zero, same as before),
+then, **after** the existing gitlink check, non-empty stderr refuses via a new
+`UnreadableWorkingTreeException(repositoryRoot, stderr)` naming exactly what git reported.
+
+One thing the re-derivation caught that the brief didn't anticipate: **git 2.55 (not 2.43) emits its own
+stderr on a *healthy-shaped* `add -A` too** — not for an unreadable directory, but for staging a nested
+repository: `warning: adding embedded git repository: <path>` plus a multi-line hint block. That's not
+the "healthy tree emits stderr" case the brief said to stop and report — a nested repository is already
+a refused condition (D9's addendum), just diagnosed by the existing `FindStagedGitlinksAsync` check with
+its own `git reset` cleanup and a specific message. A naive "any stderr → generic refusal" ordering broke
+that: it fired first, skipped the `git reset`, and left a staged gitlink in the index — regressed three
+existing tests (`NestedGitRepository_FailsToStartNamingThePathAndCommitsNothing` and two others) that
+pin "no commit, no `160000` in the index after refusal." Fixed by **running the gitlink check first**;
+only stderr the gitlink check doesn't already explain reaches the new generic refusal. This is a
+structural test (would committing now record a gitlink), not stderr pattern-matching, so it isn't the
+allow-list the brief ruled out — both branches still refuse, this only decides which of two refusals (and
+whose cleanup) fires. Recorded in a code comment at the gitlink check, since the ordering is now
+load-bearing.
+
+**2. `RepositoryHeadIsUnbornAsync` (`:530`).** Matches exit 1 specifically (unborn) vs. throwing on
+anything else (naming what git reported), rather than `!Succeeded`. Same shape as
+`PageIndexBuilder.ProbeCurrentHeadShaAsync`, referenced in the doc comment. Confirmed empirically that
+this site really is unreachable today: corrupting `.git/HEAD` to force `rev-parse --verify -q HEAD` to
+exit 128 also makes the earlier `rev-parse --is-bare-repository` bare-probe (line ~119, called first on
+the `hasOwnGitEntry` branch) fail with the same "not a git repository" fault and throw before this method
+is ever called — so the 128-branch has no live path through the public API, matching the brief's claim.
+Fixed anyway, per the brief, as one posture rather than one patched symptom.
+
+**3. Tests.** New: `ReconciliationOfAnUnreadableDirectory_RefusesRatherThanCommittingTheReadableSubset`
+(`ContentRepositoryServiceTests.cs`) — the spec's gating scenario, exercised on an *adopted* repository's
+reconciliation (second `EnsureRepositoryAsync` call, after history exists), not the pre-init scan.
+Windows-skipped (POSIX chmod), root-tolerant (`CanEnumerate` skip, matching §3's idiom), permissions
+restored in `finally`. Asserts the refusal names what git reported and that no recovery commit lands —
+and notes in-line that `git status --porcelain` itself reports clean here on stdout, which is exactly why
+this refusal, not a porcelain check, is the only thing that catches it. The exit-1 branch of
+`RepositoryHeadIsUnbornAsync` is already exercised reachably by the existing
+`GitInitializedButUnbornHead_*` fixtures (confirmed by mutation below); the exit-128 branch has no test,
+consistent with it being unreachable.
+
+**Mutation testing — both changed conditions, 3/3 each, unfiltered `dotnet test`, checksum-verified,
+restored via `cp` from an out-of-repo baseline in `trap`/`finally` (never `git checkout --`):**
+
+- **Mutant 1** — `ReconcileWorkingTreeAsync`'s stderr check forced to `if (false)`: dies 3/3, always the
+  same failure — `ReconciliationOfAnUnreadableDirectory_RefusesRatherThanCommittingTheReadableSubset`
+  expects `InvalidOperationException`, none thrown.
+- **Mutant 2** — `RepositoryHeadIsUnbornAsync`'s `ExitCode == 1` changed to `ExitCode == 2`: dies 3/3,
+  same 4-test failure each time (the three `GitInitializedButUnbornHead_*` fixtures plus one more), now
+  throwing `GitProcessException` where an `InvalidOperationException` refusal was expected — confirms the
+  exit-1 branch is genuinely exercised, not just present.
+
+`git diff -- src`/`git status --short -- src` after every run and at the end show only this block's
+intended edit; `grep -rn MUTANT src/ tests/` clean.
+
+**Gates:** `dotnet build` clean (0 warnings), `dotnet test` **718/718 passed, unfiltered** (0 skipped),
+`dotnet format --verify-no-changes` clean, `openspec validate git-backed-content-core --strict` valid.
+
+Files: `src/ZeroWiki/Content/ContentRepositoryService.cs`,
+`tests/ZeroWiki.Tests/Content/ContentRepositoryServiceTests.cs`.
+
+→ @reviewer
+
+**[reviewer]** Block B audit — **Request changes.** Gates reconfirmed independently, not relayed:
+`dotnet build` 0 warnings/0 errors; `dotnet test` **718/718, unfiltered**, ~1m50s; `dotnet format
+--verify-no-changes` clean; `openspec validate git-backed-content-core --strict` valid. Scope confirmed
+diff-local: `ContentRepositoryService.cs`, its tests, this DEVLOG — no `PageIndex`, `PageRouteCodec`, or
+edit-form touch.
+
+**Blocker — `ContentRepositoryService.cs:539-543`'s doc comment, and the design decision it restates
+(`design.md:729-732`), assert something about `git rev-parse --verify -q HEAD` exit 1 that is false, and
+the misclassification is live on every restart of every populated repository, not confined to the
+128-branch the worker checked reachability for.**
+
+The claim: "exits 1 on an unborn `HEAD` and 128 on 'not a git repository' or any other resolution
+fault." Reproduced independently (git 2.55.0, scratch repos, not `src/`) a third state exit 1 also
+covers: a **dangling symbolic-ref `HEAD`** — `HEAD` pointing at a branch name that does not exist,
+in a repository that has real, reachable commit history on a *different* ref:
+
+```
+$ git init -q -b main && echo x > f.txt && git add -A && git commit -qm init
+$ git symbolic-ref HEAD refs/heads/ghost      # simulates a botched rename / lost ref file
+$ git rev-parse --verify -q HEAD; echo $?
+                                                # empty stdout, empty stderr
+1
+$ git rev-parse refs/heads/main
+3908ff05b4f8c53ef9177c34bde334dd6581cc4e       # the real history is still there, untouched
+```
+
+Empty stderr, exit 1 — indistinguishable by this method's own instrument from a genuinely fresh,
+never-committed repository. `git rev-list --all --count` cleanly discriminates the two (`0` for
+genuinely unborn, `1`+ here) if an instrument is wanted; today's code has none.
+
+**This is reachable, not latent.** The worker's reachability check (correctly) showed the **128**-branch
+is dead: corrupting `.git/HEAD` to garbage makes the earlier `rev-parse --is-bare-repository` bare-probe
+(`:119`) fail the same way and throw first. But that probe does **not** guard against *this* corruption —
+`--is-bare-repository` only inspects repository shape, not `HEAD`'s resolvability, and succeeds (exit 0,
+`false`) even with a dangling symref `HEAD`, reproduced above. So `RepositoryHeadIsUnbornAsync` is
+reached, returns `true` (misread as "unborn"), and `AcceptRepositoryAsync` proceeds to
+`EnsureInitialCommitAsync` with `repositoryHasNoCommitsYet = true` on a `.git` that already exists
+(`hasOwnGitEntry` is true for essentially every real deployment past its first start). That method skips
+its early return, stages `docs/.gitkeep` (already present and already tracked — the index and working
+tree are untouched by this corruption) and runs `git commit -m InitialCommitMessage`, which — with `HEAD`
+resolving to nothing — creates a **new root commit on `refs/heads/ghost`** containing whatever the index
+already held (the real, current wiki content, since nothing on disk changed). `ReconcileWorkingTreeAsync`
+then finds nothing further to stage and returns cleanly. The app starts, serves correctly-contentful
+pages, and every gate this class enforces reports success — while the branch actually checked out is now
+a one-commit orphan disconnected from `main`'s real history, which sits in the repository unreferenced by
+anything ZeroWiki reads again. `PageHistoryService`'s "authorship read from git history" (D9/D10's whole
+model) would show a single `System`-authored commit for every page instead of the wiki's real edit
+history. This is exactly the class of silent-looking-like-success failure D9 and D17 exist to refuse —
+it just arrives through a `HEAD` state D17's own posture paragraph didn't enumerate.
+
+Not a hypothetical implementation slip: the false claim is already in `design.md:729-732`, stated as
+settled fact ("`PageIndexBuilder.ProbeCurrentHeadShaAsync` already answers the same question correctly")
+— so this block's fix is faithful to the design, and the design itself needs correcting, which is a
+call for you, not something I can direct the worker to patch under this block's brief. Raising as
+❓ @architect rather than a plain worker fix: is the dangling-symref case worth hardening against (e.g.
+gating `ExitCode == 1` on `git rev-list --all --count == 0` as well, in both this method and
+`PageIndexBuilder.ProbeCurrentHeadShaAsync`), or is it accepted as a named, documented edge case given
+CLAUDE.md's proportionality guidance ("not a system that warrants unbounded verification")? Either
+answer is legitimate; what isn't is leaving `design.md` and this comment stating something false as the
+reason the code is correct.
+
+**Same shape, second site, outside this diff (architectural note, not this block's to fix):**
+`PageIndexBuilder.ProbeCurrentHeadShaAsync` (`PageIndexBuilder.cs:92-111`) has the identical
+`ExitCode == 1 → return null` branch and would suffer the same dangling-`HEAD` misread on the *read*
+path — `BuildAsync` returns `PageIndexSnapshot.Empty`, so the symptom there is a wiki that suddenly
+shows zero pages rather than a silently orphaned history, a louder failure but still a wrong diagnosis
+of a real fault as "no commits yet." Whatever the architect decides above should apply to both sites,
+since D17 explicitly commits to "one posture rather than two" between them.
+
+**Verified correct — the gitlink-vs-stderr ordering claim.** Enumerated the cases empirically, not by
+argument:
+- New gitlink alone → stderr carries the "adding embedded git repository" advisory, `diff --cached
+  --raw` shows an `A` record (`oldMode 000000`) → `FindStagedGitlinksAsync` catches it, fires first, as
+  claimed.
+- Already-adopted gitlink whose nested `HEAD` merely advances → **empty stderr**, `M` record with
+  `oldMode 160000` → excluded by the existing `oldMode != 160000` guard, no refusal — correct, this is
+  the legitimate submodule-advance case D9's addendum carves out.
+- `advice.addEmbeddedRepo=false` (a plausible container default) → gitlink staged with **no stderr at
+  all**; still caught, because `FindStagedGitlinksAsync` is a structural index diff, not a stderr
+  pattern-match, and runs unconditionally. Confirms the "not an allow-list" claim: the gitlink check
+  never depends on stderr being present or absent.
+- Unreadable file (not directory) → `add -A` exits **128**, not 0; caught by the earlier
+  `!addResult.Succeeded` branch via `GitProcessException`, a different refusal than
+  `UnreadableWorkingTreeException` but still a refusal — not a gap.
+- **Combined fault** (a new gitlink *and* an unreadable directory in the same tree) → both warnings land
+  on the same stderr, `diff --cached --raw` still shows the gitlink's `A` record →
+  `FindStagedGitlinksAsync` fires first, throws the gitlink message, and the unreadable directory is
+  never named in that refusal. Reproduced directly. This is the case you asked me to check for masking:
+  nothing is silently discarded (git reset unstages everything cleanly, the operator fixes the gitlink,
+  restarts, then meets the unreadable-directory refusal on the *next* start) — diagnosis is serial, not
+  lost. **Nit, not blocking:** the comment at `:682-689` documents *that* the ordering decides which
+  refusal fires but doesn't say a combined fault costs the operator a second restart to see the second
+  cause; worth a clause.
+- Healthy tree → **empty stderr**, reproduced on git 2.55.0 (matches the worker's own table for both
+  macOS and the Ubuntu 24.04 container). No benign-warning case found; the worker did not narrow the
+  refusal.
+
+**Mutation testing — re-run independently, not relayed.** Cap observed (≤3 confirmation runs), full
+unfiltered `dotnet test` each time, checksummed before/after with `md5`, reverted via `Edit` back to the
+exact original text (not `git checkout`).
+- **Stderr-refusal condition** (`:701`): first attempt at disabling it was a wiring mistake on my
+  part — inverted to fire on *empty* stderr instead of suppressing the branch, which (correctly) broke
+  197 unrelated tests across the suite by refusing every healthy reconciliation; caught immediately by
+  the blast radius being obviously wrong, fixed to the intended `false &&` guard and re-run **3/3**:
+  exactly one failure each time,
+  `ReconciliationOfAnUnreadableDirectory_RefusesRatherThanCommittingTheReadableSubset`, `Assert.Throws()
+  — no exception was thrown`. Matches the worker's claim exactly.
+- **Exit-code-1 condition** (`:554`): changed `== 1` to `== 999` (worker used `== 2`; different literal,
+  same class of mutant). **1/1** confirmation run: 4 failures, the three `GitInitializedButUnbornHead_*`
+  fixtures plus one more, all `GitProcessException` thrown where `InvalidOperationException` refusal (via
+  the caller) was expected — same failure count and shape the worker reported. Did not run to 3/3 given
+  the finding above already supersedes this condition's correctness question; the mutation result itself
+  is not in doubt.
+- `git diff -- src` and `git status --short -- src` clean after every run and at the end; `grep -rn
+  MUTANT src/ tests/` clean. Final `md5` of `ContentRepositoryService.cs` matches the pre-mutation value.
+
+**Nit — test naming precision.** Not blocking:
+`ReconciliationOfAnUnreadableDirectory_RefusesRatherThanCommittingTheReadableSubset` and its surrounding
+comments are accurate and well-targeted; no note beyond the one above.
+
+**No other design-decision violations found.** D9's gitlink/never-discard posture, D16's lock ordering,
+and OpenSpec scope are all respected; nothing in this diff touches the save path, `PageIndex`,
+`PageRouteCodec`, or the edit form. C# idiom is clean — no `.Result`/`.Wait()`, `CancellationToken`
+threaded through both new git calls, no null-forgiving operators.
+
+**Verdict: Request changes.** One blocker (the exit-1 misread, live on the write path and its
+`PageIndexBuilder` twin) that needs your call before this can land — the fix may be small, but the
+premise it corrects is asserted as fact in `design.md` itself, so this isn't mine to wave through even
+though the two tested mutants both confirm the code does exactly what it claims to do *for the cases it
+was asked to handle*. One nit (combined-fault masking, comment clarity only).
+
+→ @architect
+
+**[architect]** ❗ **Blocker accepted — and re-derived before accepting it, which changed the fix.**
+Answering `❓ @architect` directly: **harden. It is not an accepted edge case.** `design.md` is corrected
+already (D17, the posture paragraph); the code fix is briefed below.
+
+**Reproduced independently** (scratchpad, not `src/`): repository with real history on `refs/heads/main`,
+then `git symbolic-ref HEAD refs/heads/ghost` → `git rev-parse --verify -q HEAD` exits **1 with empty
+stderr**, `git rev-parse --is-bare-repository` exits **0** (so the bare-probe at `:119` does not catch
+it), and `refs/heads/main` still holds the commit. Exactly as reported. `RepositoryHeadIsUnbornAsync`
+returns `true`, the repository is classified fresh, and `EnsureInitialCommitAsync` writes an orphan root
+commit on the phantom branch.
+
+**But the framing is wrong, and briefing a worker from it would send them hunting for something that
+does not exist.** Exit 1 is *not* an over-read here. It means precisely "`HEAD` does not resolve to a
+commit" — which **is** what git calls an unborn `HEAD`. Git conflates nothing: a new repository and one
+whose `HEAD` points at a deleted branch are **the same state** in its model. No refinement of exit-code
+handling can separate them. The defect is one level up: `RepositoryHeadIsUnbornAsync`'s caller does not
+want to know whether `HEAD` is unborn, it wants to know **whether this repository has any history**, and
+it has been using the first as a proxy for the second.
+
+**So the fix is a different question, not a better exit code:** `git for-each-ref --count=1
+--format='%(refname)'`, which answers by **output** — empty or not — and consults no exit code at all,
+which is D17's posture rather than an exception to it. Verified: empty on a genuinely fresh repository,
+`refs/heads/main` on the dangling one, exit 0 both times. **Preferred over the suggested
+`git rev-list --all --count == 0`**, which walks the whole history to answer a question `for-each-ref`
+answers in O(1) — and this runs on the startup path of every boot.
+
+**Why hardening rather than documenting, since the reviewer offered both as legitimate.** CLAUDE.md's
+proportionality guidance bounds *mutation testing*; it does not license accepting a silent data-loss
+path. The consequence here is that a populated wiki's entire history stops being reachable from anything
+ZeroWiki reads, with every gate green and the app serving correct-looking pages — strictly worse than the
+`add -A` case this whole block exists to fix. The Product Owner has already decided this class twice: D9
+("always commit-as-recovered, never discard") and, at this section's open, "refuse on unexpected stderr,
+accepting that an unanticipated warning can refuse a startup". Hardening follows from decisions already
+taken; accepting it would contradict both. **Not re-asked as a new Product Owner call** — it is the same
+call, applied to a worse failure.
+
+**The transferable finding, and it is the most valuable thing this block produced.** The condition was
+faithful to its stated intent, was mutation-confirmed **3/3 by two independent agents**, and was asking
+the **wrong question** — which is why the worker, the reviewer's own first pass, and I all read it as
+correct. This is §2's standing rule (*mutation is silent on whether the intent is the right question*)
+arriving at the level of a **design decision** rather than a guard, and D17 now carries it as a second
+clause of the posture: matching the documented code correctly still answers only the question that code
+is about. **Mutation agreement between two agents is not evidence the question is right** — it is the
+same instrument twice, which is this change's oldest standing rule.
+
+**[architect]** Brief — block B remediation (still block B; no new task numbers, ticks nothing).
+→ @worker
+
+1. **`RepositoryHeadIsUnbornAsync`** — keep the exit-1/128 discrimination you added (it is correct and
+   stays), and add the question that was missing. On exit 1, probe `git for-each-ref --count=1
+   --format='%(refname)'`: **empty output → genuinely fresh**, return `true`; **any ref → refuse**, with
+   an `InvalidOperationException` naming the unresolvable `HEAD`, what `git symbolic-ref HEAD` reports it
+   points at, and that refs exist — an operator needs to know *which* phantom branch to repoint.
+2. **Do not change `PageIndexBuilder.ProbeCurrentHeadShaAsync`'s logic.** Once startup refuses, the read
+   path can never observe this state — the guarantee moves upstream rather than being duplicated. **Do
+   correct its comment** if it claims to answer "has this repository history"; it answers "does `HEAD`
+   resolve", and it should say so and name where the stronger guarantee now comes from.
+3. **Test the dangling-symref case** — build it with `git symbolic-ref HEAD refs/heads/<ghost>` on a
+   repository with real history, assert startup refuses, and assert **the original commit is still
+   reachable** (`refs/heads/main` intact, no orphan root created). That second assertion is the one that
+   actually gates the defect; refusing is only half of it.
+4. **Take the nit:** note in the comment that a tree with *both* a gitlink and an unreadable directory
+   surfaces the gitlink first and costs the operator a second restart to see the second cause. Both
+   refuse, nothing is discarded — but say so rather than leaving a reader to work it out.
+
+**Limits, unchanged from the original brief and still binding:** do not touch the save path; do not
+change `RunOrThrowAsync` globally; mutation capped at **3 runs**, scoped to the two changed conditions
+plus this new one, verified under the **full unfiltered** suite, restored via `cp` from an out-of-repo
+baseline in a `trap` — never `git checkout --`. Gates before handoff, then → @reviewer. Do not commit.
+
+**[worker]** Block B remediation done. `RepositoryHeadIsUnbornAsync` now asks the right question on
+exit 1: the exit-1/128 discrimination stays exactly as it was, but exit 1 is no longer taken at face
+value as "fresh" — it triggers a second, output-based probe (`git for-each-ref --count=1
+--format=%(refname)`, no exit code consulted, per D17's posture), and only empty output is fresh.
+Any ref present refuses with an `InvalidOperationException` naming the unresolvable `HEAD`, what
+`git symbolic-ref HEAD` reports it points at, and that refs exist.
+
+1. **`ContentRepositoryService.RepositoryHeadIsUnbornAsync`** (`:546`) — exit 1 now branches on
+   `for-each-ref --count=1`'s stdout rather than returning `true` unconditionally. Empty → genuinely
+   fresh. Non-empty → `symbolic-ref HEAD` (best-effort, falls back to "a detached, unresolvable commit"
+   in the message if that itself fails) names what `HEAD` points at, and the refusal names the phantom
+   ref, what it points at, and that other refs hold real history. Chose `for-each-ref --count=1` over
+   `rev-list --all --count` exactly as briefed — O(1) against the ref database vs. a full history walk
+   on every boot.
+2. **`PageIndexBuilder.ProbeCurrentHeadShaAsync`** — logic untouched. Doc comment corrected: it now
+   says explicitly that exit 1 answers "does `HEAD` resolve", not "does this repository have history",
+   and that the stronger guarantee lives in `RepositoryHeadIsUnbornAsync` upstream — this method never
+   runs against a dangling-symref repository because startup already refused before ConfigureRepositoryAsync
+   / the index builder are ever reached.
+3. **Test** — `HeadIsADanglingSymbolicRef_RefusesRatherThanOrphaningRealHistory`: builds a foreign
+   repository with a real commit on `refs/heads/main` (`CreateForeignRepositoryAsync`), then
+   `git symbolic-ref HEAD refs/heads/ghost`, asserts `EnsureRepositoryAsync` throws
+   `InvalidOperationException` naming `ghost`, **and** asserts `refs/heads/main` still resolves to the
+   exact pre-refusal sha with `rev-list --count` still `1` (the assertion that actually gates the
+   defect — no orphan root landed anywhere), plus that nothing created `refs/heads/ghost` itself.
+4. **Nit taken** — added a paragraph at the gitlink-check comment (`:729` area) spelling out that a
+   combined fault (gitlink + unreadable directory) surfaces only the gitlink refusal, costing the
+   operator a second restart to see the second cause; nothing is discarded, but it's now said rather
+   than left for a reader to derive.
+
+**Mutation — one mutant, capped at 3, unfiltered `dotnet test`, checksum-verified, restored via `cp`
+from an out-of-repo baseline (never `git checkout --`).** The two original conditions (stderr refusal,
+exit-1/128 match) are unchanged by this remediation — untouched code, already mutation-confirmed 3/3 by
+both the worker and the reviewer independently in the prior round — so this round targets only the new
+condition: the `for-each-ref` empty-output check.
+
+- **Mutant** — `if (string.IsNullOrWhiteSpace(refProbe.StandardOutput))` forced to `if (true)`, i.e. the
+  branch always classifies exit 1 as fresh regardless of ref output, bypassing the refusal entirely.
+  Dies **3/3**, same single failure every run:
+  `HeadIsADanglingSymbolicRef_RefusesRatherThanOrphaningRealHistory` — `Assert.Throws()` — no exception
+  thrown. `dotnet build` shows `warning CS0162: Unreachable code detected` while the mutant is live
+  (expected — `if (true)` makes the `false` path dead code — and gone once reverted).
+
+`git diff --stat -- src` after revert shows only this block's two intended files
+(`ContentRepositoryService.cs`, `PageIndexBuilder.cs`); `git status --short -- src` clean of anything
+else; `grep -rn MUTANT src/ tests/` clean (the only hits are unrelated pre-existing binaries under
+`bin/`, not source). `md5` of `ContentRepositoryService.cs` after restore matches the pre-mutation
+value (`87ae6eeadb087ae36bd22e78ff144b3d`).
+
+**Gates:** `dotnet build` clean (0 warnings), `dotnet test` **719/719 passed, unfiltered** (0 skipped,
+up from 718 — the one new test), `dotnet format --verify-no-changes` clean,
+`openspec validate git-backed-content-core --strict` valid.
+
+Files: `src/ZeroWiki/Content/ContentRepositoryService.cs`, `src/ZeroWiki/Content/PageIndexBuilder.cs`,
+`tests/ZeroWiki.Tests/Content/ContentRepositoryServiceTests.cs`.
+
+No `N.M` tasks ticked (remediation block, as briefed). Do not commit.
+
+→ @reviewer
+
+**[reviewer]** Block B remediation re-audit — **Approve with nits.** Re-derived the re-framing, not
+accepted because it answers my own blocker; re-ran gates and mutation independently; found one further
+gap while checking the exact question I was asked to check, judged non-blocking below.
+
+**The re-framing is right, checked past the cases D17 enumerates, not just the dangling-branch one it
+was written for.** Built a scratch matrix (`git 2.55.0`) of every ref-topology D17's own posture
+("consult only *are there any refs*, never an exit code") could plausibly get wrong, all with HEAD
+detached to `refs/heads/ghost` so `rev-parse --verify -q HEAD` reads exit 1 with empty stderr in every
+row:
+
+| state | `for-each-ref --count=1` | correct? |
+|---|---|---|
+| genuinely fresh (`git init`, no commits ever) | empty | yes — fresh |
+| real history, branch deleted (the fixed case) | `refs/heads/main` | yes — refuse |
+| only a tag, branch deleted | `refs/tags/v1` | yes — refuse |
+| only a remote-tracking ref, no local branch | `refs/remotes/origin/main` | yes — refuse |
+| only `refs/stash` | `refs/stash` | yes — refuse |
+| history packed via `git pack-refs --all`, no loose refs | `refs/tags/v1` (still found) | yes — `for-each-ref` reads packed-refs too |
+| a tag pointing at a blob, not a commit | `refs/tags/blobtag` | refuses (conservative, correct given `EnsureInitialCommitAsync` would still misfire) |
+| detached HEAD at a **valid** commit | n/a — `rev-parse` itself exits 0 | never reaches this method at all, confirmed |
+
+No row found where the probe reports empty while real history exists, or reports a ref while the
+repository is genuinely fresh — `for-each-ref` answering "are there any refs" is sound for every
+topology this project's git usage can produce. `core.quotePath`/packed-refs interaction not a factor:
+`--format` sidesteps quoting (already established in block A) and `for-each-ref` reads packed and loose
+refs uniformly.
+
+**"The guarantee moves upstream" holds, verified against `Program.cs`, not asserted from the doc
+comment.** `Program.cs:97-98` calls `EnsureContentRepositoryAsync()` then `BuildPageIndexAsync()` in that
+literal order, and `ContentStorageStartupExtensions.BuildPageIndexAsync`'s own doc comment
+(`ContentStorageStartupExtensions.cs:66-70`) already states the dependency explicitly ("Must run after
+`EnsureContentRepositoryAsync`"). `PageIndexBuilder.ProbeCurrentHeadShaAsync` has no other caller in
+`src/` (`PageIndex.cs:54,66` are its only call sites, both behind `PageIndex.GetCurrentAsync`, which is
+never invoked before startup completes). So a dangling-symref repository is refused before
+`ProbeCurrentHeadShaAsync` can ever run against it in the shipped app — the comment's claim is accurate,
+and it correctly flags its own limit ("if a future caller … can be reached without going through
+repository acceptance first, that assumption needs re-checking").
+
+**The new test gates the defect, not merely the refusal — reproduced with my own mutant, not the
+worker's.** Independently mutated `ContentRepositoryService.cs:584`'s
+`string.IsNullOrWhiteSpace(refProbe.StandardOutput)` to `true` (bypassing the second probe entirely, the
+worker's own mutant shape): dies **3/3**, unfiltered `dotnet test`, identical single failure every run
+— `HeadIsADanglingSymbolicRef_RefusesRatherThanOrphaningRealHistory`, `Assert.Throws() — no exception
+was thrown`. Matches the worker's report exactly. **Went one step further, per this block's brief to
+consider whether the refusal branch itself deserves its own mutant:** replaced the `throw` at
+`ContentRepositoryService.cs:597-603` with `return false;` (i.e., the *refuse* branch fires but is
+disarmed — dangling `HEAD`-with-refs is silently treated as "already born" instead of unborn or
+refused). This is a materially different mutant than the worker's — it tests the refusal itself, not
+just whether the emptiness check routes to it. Dies **3/3**, unfiltered, same single failure every run
+(`Assert.Throws()` — no exception thrown). Confirms the single test assertion
+(`Assert.ThrowsAsync<InvalidOperationException>`) is load-bearing for both halves of this fix, not just
+the one the worker exercised. `refs/heads/main`-untouched assertion is defense-in-depth on the current
+code shape (the throw precedes `EnsureInitialCommitAsync` at `ContentRepositoryService.cs:206`, so
+nothing writes before either mutant's failure is observed) rather than something that fails independently
+today — correctly built for regression, not decoration.
+
+Checksummed before/after every run (`md5 87ae6eeadb087ae36bd22e78ff144b3d`, matches pre-mutation and
+post-restore); restored via `cp` from an out-of-repo baseline, never `git checkout --`. `git diff --stat
+-- src` and `git status --short -- src` clean after every run and at the end — exactly this block's two
+files, no `??` entries; `grep -rn MUTANT src/ tests/` clean.
+
+**Gates, reconfirmed myself, not relayed:** `dotnet build` 0 warnings/0 errors; `dotnet test`
+**719/719, unfiltered**, ~1m50s — matches the worker's reported figure exactly; `dotnet format
+--verify-no-changes` clean; `openspec validate git-backed-content-core --strict` valid. Scope confirmed:
+`git diff -- src` touches only `ContentRepositoryService.cs` and `PageIndexBuilder.cs`; no `PageIndex`
+CAS, no `PageRouteCodec`, no edit form.
+
+**Nit — `ContentRepositoryService.cs:597-603`'s refusal message can never exercise the `Replace` it
+calls, and its "still exist" wording implies a plurality the mechanism cannot produce.**
+`refProbe.StandardOutput` comes from `git for-each-ref --count=1 …` — bounded to *at most one* line by
+construction — so `.Trim().Replace("\n", ", ")` is dead code: there is never a second line for it to
+join. The message then reads "`refs/heads/main` still exist" — grammatically plural, and structurally
+implies there may be several, when this instrument can only ever name one. This is the same defect class
+this section has now named explicitly twice in its own design doc (implying something a mechanism cannot
+produce) — small, but exactly the shape of thing an operator reads while their repository's history is
+on the line. I'd fix it: drop the `.Replace` and either sit on the singular ("`refs/heads/main` still
+exists and may hold real history") or reword to acknowledge the bound explicitly ("at least one ref,
+e.g. `refs/heads/main`, still exists…") if a future caller of the underlying probe might ever drop
+`--count=1`. Not blocking — cosmetic, and the refusal itself is correct regardless of wording.
+
+**Architectural note, not blocking this block — a sibling gap in the same method, found by directly
+testing the exact question this block's brief asked me to check ("is a detached HEAD at an invalid one
+described accurately"), traced end-to-end rather than left as a hypothesis.** A **detached** `HEAD`
+(`.git/HEAD` holding a raw, syntactically valid 40-hex object id that does not exist in the object
+database — e.g. disk corruption, a truncated write, or an operator's bad `git reset --hard <sha>`) makes
+`git rev-parse --verify -q HEAD` exit **0**, echoing the unresolvable SHA back without checking the
+object exists (confirmed: `git cat-file -e <that sha>` on the same repo exits 1, proving the object is
+genuinely absent while `rev-parse --verify -q` reports success). This **never reaches the `ExitCode == 1`
+branch this block added at all** — `RepositoryHeadIsUnbornAsync` falls through to `return false;`,
+classifying the repository as already-born, and `EnsureInitialCommitAsync` correctly skips (no orphan
+commit is created there). Traced what actually happens next rather than stopping at the exit code:
+`ReconcileWorkingTreeAsync`'s `git diff --cached --raw` silently falls back to diffing against an empty
+tree for this state too — reproduced directly, every tracked file reported as a fresh `A` record — which
+is exactly the fallback `FindStagedGitlinksAsync`'s own doc comment (`ContentRepositoryService.cs:804-811`)
+says is "not why this code is safe today" for the unborn case; it is live here for a state that comment
+does not name. Unlike `diff`, `git commit` itself does validate `HEAD` before writing and refuses —
+reproduced (`fatal: could not parse HEAD`, exit 128) — so the actual outcome is **no data loss and no
+orphan commit**: the app fails to start, via an unhandled `GitProcessException` bubbling up from either
+that commit call or `AssertWorkingTreeIsCleanAsync`'s `git status --porcelain` (also confirmed to fail
+the same way, `fatal: bad object HEAD`), rather than one of this design's clear, named, actionable
+refusals. Loud, not silent — categorically safer than the defect this block exists to fix — but ugly:
+an operator meets a raw git stack trace instead of D17's usual "refusing to start because X, do Y."
+**One more thing worth recording plainly: the exception's own fallback text, `"a detached, unresolvable
+commit"` (for when `symbolic-ref HEAD` fails), appears to be dead code for the state its wording
+describes** — every input I could construct that makes a genuinely detached (non-symbolic) `HEAD` fail
+`rev-parse --verify -q` landed on exit 0 (this case) or exit 128 (garbage/empty `HEAD` content, already
+refused by the existing `!headProbe.Succeeded` branch), never exit 1; exit 1 only ever arose when `HEAD`
+*is* a symbolic ref, which always makes `symbolic-ref HEAD` succeed. Not asking for a fix inside this
+block — it's a lower-severity, exotic-corruption gap (requires direct `.git/HEAD` tampering or
+object-store corruption, not an ordinary git operation gone wrong the way the fixed case is), and the
+current behavior is fail-loud, not fail-silent. Flagging for `## NEXT` or a future D17 addendum: either
+peel `HEAD` to `^{commit}` in the exit-0 path to catch this too, or explicitly document the residual gap
+and why "loud but ugly" is accepted for it.
+
+**Verdict: Approve with nits.** My approval certifies: the working tree at this diff — `git diff 52ea5c6`
+across `ContentRepositoryService.cs`, `PageIndexBuilder.cs`, `ContentRepositoryServiceTests.cs`,
+`design.md`, and this DEVLOG — correctly closes the dangling-symbolic-ref `HEAD` misclassification
+(obligations 14 + 27) as D17 now states it, with `PageIndexBuilder`'s unchanged read-path logic verified
+safe under the real `Program.cs` startup ordering rather than assumed; that both changed conditions are
+mutation-confirmed including the refusal branch itself; that all four gates are green under my own
+foreground runs (`dotnet build` 0/0, `dotnet test` 719/719 unfiltered, `dotnet format
+--verify-no-changes`, `openspec validate --strict`); and that `git diff -- src` /
+`git status --short -- src` / `grep MUTANT` show no residue. The wording nit and the detached-HEAD
+architectural note are both non-blocking — clear to commit block B on this Approve.
+
+→ @architect
+
+**[architect]** Block B committed. **One post-Approve delta, declared rather than left to be found:** the
+wording nit the reviewer recommended and I flagged independently. `ContentRepositoryService.cs`'s refusal
+message dropped its `.Replace("\n", ", ")` — dead code, since `--count=1` bounds output to one ref — and
+now reads "at least one ref (for example `<ref>`) still exists" rather than "`<ref>` still exist", which
+implied both a plurality and an exhaustive inventory the mechanism cannot produce. A comment records why
+naming *one* ref is the right cost: the refusal only needs to establish the repository is not empty, and
+walking every ref to build a list answers a question nobody asked, at startup cost. **Message text only,
+no logic** — the reviewer's mutants and its 719/719 both still describe this tree.
+
+**Gates re-run by the Architect after that edit, not inherited from the Approve:** `dotnet build`
+**0/0**, `dotnet test` **719/719 unfiltered** in 1m39s, `dotnet format --verify-no-changes` exit 0,
+`openspec validate --strict` valid, `grep -rn MUTANT src/ tests/` **empty**.
+
+**The detached-`HEAD`-at-an-invalid-oid gap goes to `## NEXT` as obligation 32**, not into this block.
+It is a *diagnosis-quality* gap, not an integrity one — traced end to end, `git commit` refuses with
+`fatal: could not parse HEAD`, so nothing is orphaned — and block B had already found and fixed a live
+data-loss defect; widening it further on a non-integrity finding is how a block stops converging. The
+dead `"a detached, unresolvable commit"` fallback is recorded with it and **deliberately left in the
+code**: "no triggering input was found" is not "no triggering input exists", and deleting a cheap
+defensive branch on the strength of a failed search is the wrong trade on a startup path.
+
+**What this block cost and what it bought.** Two review rounds, one blocker, one nit — and the blocker
+was a **live data-loss defect on every restart of an affected repository**, found in code that was
+faithful to its stated intent and mutation-confirmed 3/3 by two independent agents. §6's opening premise
+holds up: obligation 14 was worth going first for. **Test count 717 → 719**; both new tests assert a
+*refusal* and the *survival of what the refusal protects*, which is the pairing the dangling-symref test
+made the case for — refusing is half a property, not preserving history is the half that would have been
+lost silently.
+
 ## NEXT
 
 **Resume point: §6 (Commit-on-save), first block. §5 is closed** — supervisor `Approve` on round two
@@ -12016,6 +12591,25 @@ a wording tidy-up, because one of its two options changes shipped behaviour.
     modes with materially different costs, driven by one number, and the sleep case makes the gap concrete
     rather than theoretical. That is evidence for splitting; it is not a decision, and §6.6 still owns it.
     Recorded here so it reaches §6.6 as **input**, rather than surviving as an anecdote about a closed lid.
+
+32. **A detached `HEAD` at a syntactically-valid but nonexistent object id exits 0, so it never reaches
+    §6 block B's refusal at all.** Found by `@reviewer` while testing block B's *own* error-message
+    fallback, which is the notable part: the gap is a sibling of the dangling-symref defect block B
+    fixed, and it sits on the one branch the fix does not cover. `git rev-parse --verify -q HEAD` exits
+    **0** for such a `HEAD` — no exit 1, so `RepositoryHeadIsUnbornAsync` returns `false` and startup
+    proceeds. **Traced end to end and it is not data loss:** `git commit` itself refuses with
+    `fatal: could not parse HEAD`, so nothing is orphaned. What it produces is a raw, unhandled git error
+    instead of the clean D17-style refusal every neighbouring fault now gets — a diagnosis-quality gap,
+    not an integrity one, which is why it was not made a blocker on a block that had already found and
+    fixed a live one.
+    **Also recorded, because it is the same defect class one level down:** block B's
+    `"a detached, unresolvable commit"` fallback string — the `symbolic-ref`-failed branch — appears to
+    be **dead for every input the reviewer could construct**. It is deliberately *left in place* rather
+    than deleted: "no triggering input was found" is not "no triggering input exists", and removing a
+    cheap defensive branch on the strength of a failed search is the wrong trade on a startup path. But
+    an unreachable string that describes a state is exactly the shape this change keeps producing, so it
+    should be either proven reachable or removed on evidence, not left ambiguous forever. Owner: a D17
+    addendum, or close-out — **not** §6, which has fixed what was live here.
 
 ### Close-out items before archive
 

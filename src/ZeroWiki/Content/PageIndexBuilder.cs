@@ -82,12 +82,25 @@ public sealed class PageIndexBuilder
     /// unborn-vs-genuine-failure distinction is made in exactly one place.
     /// </summary>
     /// <remarks>
-    /// Same probe <see cref="ContentRepositoryService.RepositoryHeadIsUnbornAsync"/> already uses. <c>-q</c>
-    /// only suppresses the error text for "no revision to resolve" (an unborn <c>HEAD</c>), which git
-    /// reports with exit code 1; a repository fault git can detect before it even gets to resolving
-    /// <c>HEAD</c> — e.g. "not a git repository" — exits 128 with its "fatal:" text intact regardless of
-    /// <c>-q</c>. Only exit 1 means "no pages"; anything else is a genuine failure and must throw naming
-    /// what failed, not be folded into the same silent empty-index outcome.
+    /// Same probe <see cref="ContentRepositoryService.RepositoryHeadIsUnbornAsync"/>'s first step uses.
+    /// <c>-q</c> only suppresses the error text for "no revision to resolve", which git reports with
+    /// exit code 1; a repository fault git can detect before it even gets to resolving <c>HEAD</c> —
+    /// e.g. "not a git repository" — exits 128 with its "fatal:" text intact regardless of <c>-q</c>.
+    /// Only exit 1 returns <see langword="null"/>; anything else is a genuine failure and must throw
+    /// naming what failed, not be folded into the same silent empty-index outcome.
+    /// <para>
+    /// D17's second clause: exit 1 answers only "does <c>HEAD</c> resolve to a commit", not "does this
+    /// repository have any history" — the two diverge when <c>HEAD</c> is a symbolic ref pointing at a
+    /// deleted or never-existing branch while real history exists on another ref, which also exits 1
+    /// with empty stderr and is indistinguishable from a genuinely fresh repository by this probe alone.
+    /// This method does <b>not</b> probe further to tell the two apart, unlike
+    /// <see cref="ContentRepositoryService.RepositoryHeadIsUnbornAsync"/>, which does — because that
+    /// method's refusal on startup is what keeps this read path from ever running against a repository
+    /// in that state at all. The stronger guarantee lives upstream, once, rather than being duplicated
+    /// here; a dangling-symref repository never gets far enough to be enumerated. If a future caller of
+    /// this method can be reached without going through repository acceptance first, that assumption
+    /// needs re-checking.
+    /// </para>
     /// </remarks>
     public async Task<string?> ProbeCurrentHeadShaAsync(CancellationToken cancellationToken)
     {

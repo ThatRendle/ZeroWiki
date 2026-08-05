@@ -727,14 +727,47 @@ code past what git documents it to mean:
   and D9's "never discard" quietly does not hold for that subtree. §2's C# scan does not reach this: it
   guards the *initialise* path only, so on an **adopted** repository it never runs at all.
 - `ContentRepositoryService.RepositoryHeadIsUnbornAsync` reads *any* failure as "unborn `HEAD`", but
-  `git rev-parse --verify -q HEAD` exits **1** on an unborn `HEAD` and **128** on "not a git
-  repository". `PageIndexBuilder.ProbeCurrentHeadShaAsync` already answers the same question correctly
-  by matching exit 1 specifically; this one is the wrong-way twin, currently unreachable.
+  `git rev-parse --verify -q HEAD` exits **1** when `HEAD` does not resolve and **128** on "not a git
+  repository". `PageIndexBuilder.ProbeCurrentHeadShaAsync` matches exit 1 specifically; this one is the
+  wrong-way twin.
 
 **The posture: an exit code is trusted only for what git documents that code to mean.** Where a command
 can report a fault on stderr while still exiting 0, the app inspects stderr and **refuses** rather than
 proceeding. Where an exit code discriminates a *state*, the specific documented code is matched — never
 `!Succeeded`, which folds every unanticipated failure into whichever state the caller happened to expect.
+
+**And a second clause, which the first does not imply and which cost this section a live data-loss
+defect to learn** (a reviewer blocker on block B, re-derived by the Architect before being accepted):
+**matching the documented code correctly still answers only the question that code is about — check that
+it is the question the caller needs.**
+
+Exit 1 from `rev-parse --verify -q HEAD` is not an over-read. It means precisely "`HEAD` does not
+resolve to a commit", and that *is* what git calls an unborn `HEAD` — git conflates nothing, because a
+new repository and a repository whose `HEAD` points at a deleted branch are **the same state** in its
+model. Verified: in a repository with real history on `refs/heads/main`, `git symbolic-ref HEAD
+refs/heads/ghost` makes `rev-parse --verify -q HEAD` exit **1 with empty stderr**, while
+`rev-parse --is-bare-repository` — the earlier probe that makes 128 unreachable here — still exits 0.
+
+So no refinement of exit-code handling can separate them, and an implementer who goes looking for one
+will not find it. The defect is that `RepositoryHeadIsUnbornAsync`'s caller does not actually want to
+know whether `HEAD` is unborn; it wants to know **whether this repository has any history**, and it has
+been using the first as a proxy for the second. The two diverge exactly when refs exist but `HEAD` does
+not resolve — at which point `EnsureInitialCommitAsync` creates an orphan root commit on the phantom
+branch, the app starts, serves correct-looking pages, and every gate reports success while the wiki's
+real history is reachable from nothing ZeroWiki reads. That is worse than the `add -A` case this
+decision opened with: silently orphaning history rather than silently skipping a subtree.
+
+**The question to ask instead is "are there any refs?"** — `git for-each-ref --count=1
+--format='%(refname)'`, which exits 0 in both cases and answers by *output*, empty or not, consulting no
+exit code at all (verified: empty on a fresh repository, `refs/heads/main` on the dangling-`HEAD` one).
+An unresolvable `HEAD` **with** refs present is a repository fault, not a fresh repository, and refuses
+under this decision's own "never silently write into a repository whose state we do not understand".
+
+*This is §2's standing rule arriving one level up.* §2 recorded that mutation measures whether a
+condition is faithful to its intent and is silent on whether the intent is the right question, and that
+every defect it actually produced was of the second kind. Block B's condition was faithful, was
+mutation-confirmed 3/3 by two independent agents, and was asking the wrong question — which is why both
+of them, and the Architect, initially read it as correct.
 
 *Why refuse rather than log and continue:* silently proceeding is precisely the failure D9 exists to
 prevent, and it is worse here than a refusal because it looks like success at every subsequent check.

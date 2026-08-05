@@ -279,6 +279,19 @@ public sealed class ContentRepositoryService
             "empty) and restart the application.");
 
     /// <summary>
+    /// D17: reconciliation's <c>git add -A</c> reported, on stderr, that it could not read part of the
+    /// working tree at <paramref name="repositoryRoot"/> — even though the process exited
+    /// successfully. Refusing here (rather than committing whatever was staged and reporting success)
+    /// is what keeps D9's "never discard" holding for the subtree git could not see at all.
+    /// </summary>
+    private static InvalidOperationException UnreadableWorkingTreeException(string repositoryRoot, string standardError) =>
+        new(
+            $"Startup reconciliation of the content repository at '{repositoryRoot}' could not read " +
+            $"part of the working tree: {standardError.Trim()} Content behind an unreadable directory " +
+            "would be silently unstaged and left out of the recovery commit while every later check " +
+            "still reports a clean tree. Refusing to start; fix the reported permissions and restart.");
+
+    /// <summary>
     /// Whether <paramref name="repositoryRoot"/> has a <c>.git</c> entry of its own — a directory for
     /// an ordinary repository, or a gitfile for a worktree/submodule layout. Either means "a repository
     /// is already here"; a gitfile is deliberately not treated as "absent", since initializing over a
@@ -516,20 +529,89 @@ public sealed class ContentRepositoryService
 
     /// <summary>
     /// Whether <paramref name="repositoryRoot"/>'s <c>HEAD</c> is unborn: <c>.git</c> exists, but no
-    /// commit has been made yet — for example a process that died between <c>git init</c> and the
-    /// initial commit that should have followed it. Only ever called once <c>.git</c> is already
-    /// confirmed present at <paramref name="repositoryRoot"/> itself (see <see cref="HasOwnGitEntry"/>),
-    /// for the same reason every other git invocation in this class requires that confirmation first:
-    /// without it, discovery could resolve to an unrelated ancestor repository instead.
+    /// commit has ever been made in this repository — for example a process that died between
+    /// <c>git init</c> and the initial commit that should have followed it. Only ever called once
+    /// <c>.git</c> is already confirmed present at <paramref name="repositoryRoot"/> itself (see
+    /// <see cref="HasOwnGitEntry"/>), for the same reason every other git invocation in this class
+    /// requires that confirmation first: without it, discovery could resolve to an unrelated ancestor
+    /// repository instead.
     /// </summary>
+    /// <remarks>
+    /// D17: matches the *specific documented* exit code rather than <c>!Succeeded</c>. <c>git
+    /// rev-parse --verify -q HEAD</c> exits <b>1</b> when <c>HEAD</c> does not resolve to a commit and
+    /// <b>128</b> on "not a git repository" or any other resolution fault — folding both into "unborn"
+    /// would read a genuine repository fault as the ordinary fresh-repository case and silently proceed
+    /// to write into it.
+    /// <para>
+    /// D17's second clause: matching that documented code correctly still only answers "does
+    /// <c>HEAD</c> resolve", not "does this repository have any history" — the question this method's
+    /// caller actually needs answered. Git does not distinguish a genuinely fresh repository from one
+    /// whose <c>HEAD</c> is a symbolic ref pointing at a branch that was deleted or never existed (e.g.
+    /// a botched rename, or a lost ref file): both make exit 1 with empty stderr, and no refinement of
+    /// exit-code handling can tell them apart. So exit 1 is followed by a second, output-based probe —
+    /// <c>git for-each-ref --count=1 --format='%(refname)'</c> — which answers by *output*, consulting
+    /// no exit code, exactly D17's posture: empty output means no ref exists anywhere, genuinely fresh;
+    /// any ref means real history exists somewhere and this is a repository fault, refused rather than
+    /// silently treated as fresh (which would otherwise make <see cref="EnsureInitialCommitAsync"/>
+    /// create an orphan root commit on the phantom branch, disconnecting the wiki's real history from
+    /// everything ZeroWiki reads while every later check still reports success). Deliberately
+    /// <c>for-each-ref --count=1</c> rather than <c>git rev-list --all --count</c>: the former answers
+    /// in O(1) against the ref database, the latter would walk the whole commit history to answer a
+    /// question that does not need it, on the startup path of every boot.
+    /// </para>
+    /// Same first probe and same shape as <see cref="PageIndexBuilder.ProbeCurrentHeadShaAsync"/>,
+    /// which answers "does HEAD resolve" for the read path; kept as one posture rather than two. That
+    /// method does not need the second probe below — this method's refusal keeps the read path from
+    /// ever observing a dangling-symref repository at all, so the stronger guarantee lives here once
+    /// rather than being duplicated on the read path.
+    /// </remarks>
     private async Task<bool> RepositoryHeadIsUnbornAsync(string repositoryRoot, CancellationToken cancellationToken)
     {
+        var headProbeArguments = new[] { "rev-parse", "--verify", "-q", "HEAD" };
         var headProbe = await _git.RunAsync(
             repositoryRoot,
-            ["rev-parse", "--verify", "-q", "HEAD"],
+            headProbeArguments,
             cancellationToken: cancellationToken);
 
-        return !headProbe.Succeeded;
+        if (headProbe.ExitCode == 1)
+        {
+            var refProbeArguments = new[] { "for-each-ref", "--count=1", "--format=%(refname)" };
+            var refProbe = await _git.RunOrThrowAsync(
+                repositoryRoot,
+                refProbeArguments,
+                cancellationToken: cancellationToken);
+
+            if (string.IsNullOrWhiteSpace(refProbe.StandardOutput))
+            {
+                return true;
+            }
+
+            var symbolicRefProbe = await _git.RunAsync(
+                repositoryRoot,
+                ["symbolic-ref", "HEAD"],
+                cancellationToken: cancellationToken);
+            var headTarget = symbolicRefProbe.Succeeded
+                ? symbolicRefProbe.StandardOutput.Trim()
+                : "a detached, unresolvable commit";
+
+            // `--count=1` stops at the first ref, so this names one example rather than an inventory:
+            // the refusal only needs to establish that the repository is not empty, and walking every
+            // ref to build a complete list would answer a question nobody asked at startup cost.
+            throw new InvalidOperationException(
+                $"The content repository at '{repositoryRoot}' has an unresolvable HEAD (it points at " +
+                $"{headTarget}, which does not resolve to a commit) but is not a genuinely fresh " +
+                $"repository — at least one ref (for example {refProbe.StandardOutput.Trim()}) still " +
+                "exists and may hold real history. Refusing to start rather than create a new initial " +
+                "commit on the unresolvable branch, which would silently orphan that history. Repoint " +
+                "HEAD at the branch holding the intended history and restart.");
+        }
+
+        if (!headProbe.Succeeded)
+        {
+            throw new GitProcessException(headProbeArguments, headProbe.ExitCode, headProbe.StandardError);
+        }
+
+        return false;
     }
 
     /// <summary>
@@ -619,7 +701,24 @@ public sealed class ContentRepositoryService
         // to populate a new ZeroWiki, and it arrives untracked. Staging only tracked changes (e.g.
         // `add -u`) would leave that content uncommitted — the tree still dirty, and every push
         // bouncing — while every existing check up to this point still looks like it succeeded.
-        await _git.RunOrThrowAsync(repositoryRoot, ["add", "-A"], cancellationToken: cancellationToken);
+        //
+        // D17: `add -A` exits 0 even when it could not read a directory — it warns on stderr and
+        // stages whatever it *could* read, so an unreadable subtree is silently unstaged while every
+        // later check (this method's own diff below, and AssertWorkingTreeIsCleanAsync) still reports
+        // success. `RunOrThrowAsync` only inspects the exit code, so it cannot catch this; called via
+        // `RunAsync` here instead, with stderr inspected explicitly below, deliberately local to this
+        // call site rather than a change to `RunOrThrowAsync` itself — tightening stderr handling
+        // globally would silently re-gate every other caller (PageHistoryService's `git log`, the
+        // index builder's probes) with faults this design never intended to catch there. Reproduced on
+        // git 2.55.0 (macOS, dev) and 2.43.0 (Ubuntu 24.04, the shipped image): both exit 0 with
+        // `warning: could not open directory '<path>/': Permission denied` on stderr for an unreadable
+        // directory, and both produce empty stderr for `add -A` on a healthy tree.
+        var addArguments = new[] { "add", "-A" };
+        var addResult = await _git.RunAsync(repositoryRoot, addArguments, cancellationToken: cancellationToken);
+        if (!addResult.Succeeded)
+        {
+            throw new GitProcessException(addArguments, addResult.ExitCode, addResult.StandardError);
+        }
 
         // D9 addendum (Product Owner decision): if any of what was just staged is itself a nested git
         // repository — an operator copying in an existing Obsidian vault or a cloned notes folder,
@@ -629,6 +728,21 @@ public sealed class ContentRepositoryService
         // assertion below would pass — while the actual file contents are not recoverable from this
         // repository's history at all, which defeats D9's own "an unwanted recovery commit is a plain
         // git revert" rationale. Refuse to start rather than commit a gitlink silently.
+        //
+        // Deliberately checked before the stderr check below, not after: staging a gitlink is *also*
+        // one of the cases that puts text on `add -A`'s stderr — git 2.55 emits an "adding embedded
+        // git repository" advisory hint alongside the warning this block exists to catch — and this
+        // check is the more specific, already-established diagnosis for that case, with its own
+        // cleanup (`git reset`, leaving the working tree exactly as the operator left it) that the
+        // stderr check below does not perform. This is not a benign-warning allow-list: both branches
+        // still refuse to start; this only decides which of the two refusals fires, and by a
+        // structural test (would committing now record a gitlink), not by pattern-matching stderr text.
+        //
+        // A tree with both faults at once (a gitlink *and* an unreadable directory) surfaces only the
+        // gitlink refusal here — nothing is discarded (git reset below unstages everything cleanly, the
+        // working tree is exactly as the operator left it), but the unreadable directory is not named
+        // in this refusal's message. The operator sees it only on the *next* restart, after fixing the
+        // gitlink. Diagnosis is serial rather than lost, but it does cost a second restart.
         var gitlinkPaths = await FindStagedGitlinksAsync(repositoryRoot, cancellationToken);
         if (gitlinkPaths.Count > 0)
         {
@@ -638,6 +752,11 @@ public sealed class ContentRepositoryService
             await _git.RunOrThrowAsync(repositoryRoot, ["reset"], cancellationToken: cancellationToken);
 
             throw new InvalidOperationException(BuildGitlinkErrorMessage(repositoryRoot, gitlinkPaths));
+        }
+
+        if (!string.IsNullOrWhiteSpace(addResult.StandardError))
+        {
+            throw UnreadableWorkingTreeException(repositoryRoot, addResult.StandardError);
         }
 
         var stagedDiff = await _git.RunAsync(

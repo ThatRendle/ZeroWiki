@@ -797,6 +797,68 @@ public sealed class ContentRepositoryServiceTests : IDisposable
         }
     }
 
+    [Fact]
+    public async Task ReconciliationOfAnUnreadableDirectory_RefusesRatherThanCommittingTheReadableSubset()
+    {
+        // D17/`specs/content-store/spec.md` "Reconciliation refuses when it could not read part of the
+        // working tree": `git add -A` exits 0 while warning on stderr that it could not read a
+        // directory, so an unreadable subtree would otherwise be silently unstaged, the recovery
+        // commit would "succeed", and `git status --porcelain` would report clean. Unlike the two tests
+        // above, this exercises an *adopted* repository's reconciliation path (a second
+        // EnsureRepositoryAsync call, after commit history already exists) rather than the pre-init
+        // filesystem scan — the scan does not run here at all (design.md D9 addendum: it guards only
+        // "about to create the initial commit"), so this is reconciliation's own gap, not the scan's.
+        if (OperatingSystem.IsWindows())
+        {
+            // chmod-based unreadability is a POSIX permissions concept; the container image (this
+            // check's actual deployment target) is Linux, matching the existing Windows-skip precedent
+            // elsewhere in this file.
+            return;
+        }
+
+        var service = CreateService();
+        await service.EnsureRepositoryAsync();
+
+        var repositoryRoot = RepositoryRoot;
+        var lockedDirectory = Path.Combine(repositoryRoot, "docs", "locked");
+        Directory.CreateDirectory(lockedDirectory);
+        await File.WriteAllTextAsync(Path.Combine(lockedDirectory, "hidden.md"), "# Hidden\n");
+
+        File.SetUnixFileMode(lockedDirectory, UnixFileMode.None);
+        try
+        {
+            // chmod 000 does not block root. If this process can still enumerate the directory despite
+            // the mode, it is running as root and the unreadable-directory case this test exists to
+            // exercise never actually held — `git add -A` would stage it normally instead of warning,
+            // and asserting the refusal below would pass for the wrong reason. Skip rather than let
+            // that happen silently.
+            if (CanEnumerate(lockedDirectory))
+            {
+                return;
+            }
+
+            var exception = await Assert.ThrowsAsync<InvalidOperationException>(() => service.EnsureRepositoryAsync());
+
+            // Names what git reported, not a generic message.
+            Assert.Contains("could not open directory", exception.Message, StringComparison.Ordinal);
+            Assert.Contains("locked", exception.Message, StringComparison.Ordinal);
+
+            // The whole point of this fixture: no recovery commit was made over the readable subset.
+            // `git status --porcelain` itself reports clean here (nothing readable changed, and it
+            // does not surface the unreadable directory on stdout either) — exactly the "every later
+            // check reports success" trap D17 exists to close, which is why the refusal above, not a
+            // porcelain check, is the only thing that catches this.
+            Assert.Equal("1", (await _git.RunOrThrowAsync(repositoryRoot, ["rev-list", "--count", "HEAD"])).StandardOutput.Trim());
+        }
+        finally
+        {
+            // Restore before Dispose() tries to recursively delete _dataRoot.
+            File.SetUnixFileMode(
+                lockedDirectory,
+                UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        }
+    }
+
     private static bool CanEnumerate(string directory)
     {
         try
@@ -1024,6 +1086,47 @@ public sealed class ContentRepositoryServiceTests : IDisposable
         // as OrdinaryMarkdownCopiedOntoAFreshVolumeWithNoNestedRepository_InitializesNormally above.
         var lsFiles = await _git.RunOrThrowAsync(repositoryRoot, ["ls-files", "docs/hello.md"]);
         Assert.Equal("docs/hello.md", lsFiles.StandardOutput.Trim());
+    }
+
+    [Fact]
+    public async Task HeadIsADanglingSymbolicRef_RefusesRatherThanOrphaningRealHistory()
+    {
+        // D17's second clause: `git rev-parse --verify -q HEAD` exits 1 both for a genuinely fresh
+        // repository (no ref exists anywhere) and for a HEAD symbolic ref pointing at a branch that
+        // does not exist while real history sits on a *different* ref — e.g. a botched rename or a
+        // lost ref file. The exit code alone cannot tell the two apart. Without the for-each-ref
+        // probe added to close this, the dangling case is misread as "fresh" and
+        // EnsureInitialCommitAsync creates a new orphan root commit on the phantom branch, silently
+        // disconnecting the wiki's real history from everything ZeroWiki reads while the app starts
+        // and serves correct-looking pages with every other check green.
+        var repositoryRoot = RepositoryRoot;
+        await CreateForeignRepositoryAsync(repositoryRoot, withDocsDirectory: true);
+
+        var realHeadSha = (await _git.RunOrThrowAsync(repositoryRoot, ["rev-parse", "refs/heads/main"]))
+            .StandardOutput.Trim();
+
+        // Simulates a botched rename / lost ref file: HEAD now points at a branch that was never
+        // created, while refs/heads/main still holds the repository's real history, untouched.
+        await _git.RunOrThrowAsync(repositoryRoot, ["symbolic-ref", "HEAD", "refs/heads/ghost"]);
+
+        var service = CreateService();
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() => service.EnsureRepositoryAsync());
+
+        Assert.Contains("ghost", exception.Message, StringComparison.Ordinal);
+
+        // The assertion that actually gates the defect: refusing alone is only half of it. The real
+        // history must still be exactly where it was — no orphan root commit created anywhere, and
+        // refs/heads/main untouched by the refused attempt.
+        Assert.Equal(
+            realHeadSha,
+            (await _git.RunOrThrowAsync(repositoryRoot, ["rev-parse", "refs/heads/main"])).StandardOutput.Trim());
+        Assert.Equal(
+            "1",
+            (await _git.RunOrThrowAsync(repositoryRoot, ["rev-list", "--count", "refs/heads/main"])).StandardOutput.Trim());
+
+        // Nothing created the branch HEAD was left pointing at either.
+        var ghostProbe = await _git.RunAsync(repositoryRoot, ["rev-parse", "--verify", "-q", "refs/heads/ghost"]);
+        Assert.False(ghostProbe.Succeeded);
     }
 
     [Fact]
