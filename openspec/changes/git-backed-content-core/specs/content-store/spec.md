@@ -135,9 +135,26 @@ The system SHALL maintain a lightweight index of pages (paths, titles, tags, and
 - **WHEN** a page's body is rendered
 - **THEN** the body is read from the working tree for that request rather than from the index, so no index entry can cause a superseded body to be served
 
+#### Scenario: An abandoned save leaves no metadata behind in the index
+
+- **WHEN** a save writes a file, the index reads that file's new metadata before the save's commit is created, and the save is then abandoned and the file restored to its committed state — so the repository's commit never advances
+- **THEN** the system does not go on serving the abandoned save's metadata for that page, even though the index's recorded commit still matches the repository's current commit
+
+#### Scenario: A rebuild already in flight cannot reinstate an abandoned save's metadata
+
+- **WHEN** an index rebuild that has already read a file's uncommitted bytes completes *after* the save that wrote them has been abandoned and the file restored
+- **THEN** the system discards that rebuild's result rather than serving it, so the abandoned metadata cannot be reinstated by a rebuild that was racing the save
+
 ### Requirement: Working-tree-clean invariant
 
 The system SHALL keep the working tree equal to `HEAD` (no uncommitted changes) at all times except for the brief, lock-protected window of an in-progress save, so that incoming pushes are always accepted.
+
+The system SHALL NOT report reconciliation as successful when the underlying git invocation reported that it could not read part of the working tree, even where that invocation exited successfully; it SHALL refuse instead.
+
+#### Scenario: Reconciliation refuses when it could not read part of the working tree
+
+- **WHEN** startup reconciliation stages the working tree and git reports that a directory could not be read, while still exiting successfully
+- **THEN** the system refuses to start, naming what git reported, rather than committing the subset it could read and reporting a clean tree
 
 #### Scenario: Tree is clean between saves
 

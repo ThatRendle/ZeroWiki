@@ -6,6 +6,8 @@ The system SHALL persist every browser save by writing the file to the working t
 
 The author identity the system records SHALL be a well-formed address for **every** account, including one whose username predates the username form rules. The username form rules govern only the choosing of a username, so they cannot make this true on their own.
 
+Where a save's content is identical to what is already committed, the system SHALL report the save as successful and SHALL NOT create a commit recording no change.
+
 #### Scenario: Save creates one authored commit
 
 - **WHEN** an authenticated user saves a page
@@ -15,6 +17,11 @@ The author identity the system records SHALL be a well-formed address for **ever
 
 - **WHEN** a user makes many keystroke-level changes within a short editing burst
 - **THEN** the system creates one commit for the resulting save-point rather than one commit per change
+
+#### Scenario: Saving unchanged content records nothing and still succeeds
+
+- **WHEN** a user saves a page whose content is byte-identical to the committed content
+- **THEN** the system reports the save as successful, adds no commit to the history, and does not report a failure — leaving the working tree exactly as clean as it already was, by the same invariant every other save path relies on rather than by a check unique to this one
 
 #### Scenario: An account predating the username rules still commits a well-formed author
 

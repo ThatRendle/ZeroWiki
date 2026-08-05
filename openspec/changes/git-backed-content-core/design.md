@@ -479,6 +479,280 @@ tracked content, hook installation touches only `.git/hooks` rather than the wor
 invariant governs, and pushes cannot arrive before configuration has already run once — so nothing in that
 phase needs the mutual exclusion the lock exists to provide.
 
+### D17 — The save path: what a base revision is, what stamps it, and what a git exit code may be trusted to mean
+
+D4 says a save carries "the revision it started from" and is rejected if the file has advanced; D5 and
+D10 say who authors the resulting commit; D16 says it runs under the write lock. This settles the six
+things §6 has to decide before any of that can be built, and records the three Product Owner calls taken
+at the section's open.
+
+**Surface — a minimal Static SSR edit form, not an editor (Product Owner decision).** `proposal.md`
+defers browser editor UX to a later change, so §6 ships the smallest browser-facing surface that makes
+the write path real: a `/wiki/{*Route}/edit` page carrying a `textarea`, the base revision in a hidden
+field, and a Save button, posting back to the same route. **Explicit save *is* the save-point.** This is
+what discharges 6.4, and it discharges it structurally rather than by mechanism: with a form post, no
+keystroke ever reaches the server, so there is nothing to debounce and no path by which more than one
+commit per save could be produced. A later editor change may add a client-side debounce on top; it can
+never make this weaker, because the commit is driven by the post, not by the keystrokes.
+
+**Base revision — the file's blob SHA at `HEAD`, not the repository's `HEAD` and not the file's
+last-commit SHA.** A save declares the object name of the content it loaded, and the server compares it
+against the one it reads back **after acquiring the write lock**.
+
+*Why not repository `HEAD`:* it advances on every commit to any file, so an Obsidian push touching an
+unrelated page would refuse a save that conflicts with nothing. The spec says "*the file* has advanced",
+and a check that cannot tell those apart manufactures conflicts the member cannot act on.
+
+*Why not the file's last-commit SHA* (`git log -1 -- <path>`): it answers "was this path touched", which
+is not the same question as "did this content move". A commit that touches the path and restores byte-
+identical content advances it, refusing a save that would lose nothing. It also costs a history walk per
+editor load where the blob name costs a single object lookup.
+
+*Why the blob name is the right identity:* it is exactly the content the member started from. If two
+revisions name the same blob there is by definition no lost update to prevent, and if they differ there
+certainly is. It is also stable under history rewriting in a way a commit SHA is not.
+
+**How the blob name is read — and why not `git rev-parse HEAD:<path>`, which is the obvious choice and
+is wrong for the reason this decision itself gives two sections below** (a reviewer blocker on this
+block; the defect class D17 exists to close, caught inside D17). Reproduced on `git 2.55.0`:
+`git rev-parse HEAD:<path>` exits **128** *both* when the path is absent at `HEAD`
+(`fatal: path '…' does not exist in 'HEAD'`) *and* when `HEAD` is unborn or invalid
+(`fatal: invalid object name 'HEAD'`). One exit code, two states that must be handled in opposite ways —
+the first is this decision's ordinary absent-sentinel, the second is precisely the fault D9 and the
+exit-code posture below require to refuse loudly. An implementer reading `128 → absent` off the first
+case would rebuild `RepositoryHeadIsUnbornAsync`'s exact defect in the section that fixes it.
+
+The instrument is therefore **`git ls-tree HEAD --format='%(objecttype) %(objectname)' -- <repo-relative
+path>`**, which discriminates every state without consulting an exit code for any of them. Verified by
+execution on the same version:
+
+| state | exit | stdout |
+|---|---|---|
+| path present at `HEAD` | 0 | `blob <sha>` |
+| path absent at `HEAD` | 0 | *(empty)* — the sentinel |
+| path names a directory | 0 | `tree <sha>` — refuse; a route may only ever resolve to a file |
+| `HEAD` unborn or invalid | 128 | *(stderr)* `fatal: Not a valid object name HEAD` — refuse |
+
+Exit 0 with unexpected stdout, and any non-zero exit, are both faults and both refuse. That catch-all is
+load-bearing rather than defensive: a **gitlink** (mode 160000) reports `commit <sha>` at exit 0, and it
+is genuinely reachable — §2's gitlink refusal is scoped to reconciliation and the initial commit, so it
+never runs against pushed content, and a gitlink can therefore arrive at `HEAD` by push. The catch-all is
+the only thing that refuses it. `--format` also sidesteps `core.quotePath` — which **does** mangle
+non-ASCII paths in `ls-tree`'s default output, and has bitten this change before — by emitting no path at
+all, so nothing in the output needs unquoting. The `--format` option requires git ≥ 2.36; the shipped
+image's `git` is 2.43 (verified inside `mcr.microsoft.com/dotnet/aspnet:10.0`, not inferred from the
+distribution).
+
+**This instrument's input contract: a repo-relative path that has already been through `PageRouteCodec`,
+and it is a contract rather than a courtesy.** Given a path with a **trailing separator** `ls-tree`
+recurses and prints one `blob <sha>` line *per child*, which passes a naive "starts with `blob`" check
+and yields an arbitrary child's object name as the base revision — a wrong answer reported as a right
+one, the same failure shape `rev-parse`'s doubled 128 had. §6's own call site cannot produce one
+(`TryDecodeCore` refuses empty segments and always appends `.md`), so this is not a live defect; it is
+written down because §7/§8 conflict detection is the likely next caller of a base-revision read and would
+not inherit that guarantee. A caller without it must trim trailing separators or refuse them.
+
+**"Present" here does not mean "an ordinary file."** Git models a symlink as a blob whose content is the
+link target, so `%(objecttype)` cannot distinguish one, and enumeration's reparse-point skip does not
+help: the save path accepts a route for a page that need not already be enumerated, so a symlink arriving
+by push can sit at a save's resolved path and read as an ordinary present blob. The instrument is not
+wrong by its own terms — the obligation lands on **the write step**, which must not follow a symlink out
+of `docs/`.
+
+The absent case is carried as an explicit sentinel rather than an empty string, so "I started from
+nothing" and "I did not declare a base" are distinct inputs and the second is refused rather than
+treated as the first.
+
+**A save whose content is byte-identical to `HEAD` commits nothing and succeeds.** The CAS passes (the
+base matches), the write is a no-op, `git add` stages nothing, and `git commit` would fail
+"nothing to commit" — which would otherwise drive the *rollback* path and report a failure to a member
+who did nothing wrong. So the save path checks whether anything was actually staged and, if not, returns
+success without a commit. `--allow-empty` is rejected: an empty commit is history every Obsidian vault
+then pulls, to record that nothing happened. This is a *clarification* of "exactly one commit per
+save-point", not an exception to it — the requirement exists to forbid many commits per save, and where
+there is no content change there is nothing to record. `specs/content-editing/spec.md` states it
+explicitly so the section review is gated on it rather than on this paragraph.
+
+**The comparison happens under the lock, and the lock is what makes it a CAS rather than a check.**
+Read-then-write is not atomic across processes; acquiring D16's lock, *then* re-reading the blob name,
+then writing, staging and committing, is. A base revision read before the lock is a value that may
+already be stale by the time it is acted on — the same defect `## NEXT` obligation 16 recorded against
+the startup path, in the one place where its consequence is a silently lost edit rather than a refused
+boot.
+
+**Authorship must be total over accounts, and D11 cannot make it so.** D10's *Consequence binding §6*
+requires a well-formed address for **every** account, including one whose username predates D11 and
+never will be subject to it (`LoginServiceTests.cs:271-289` pins `ab`, `_legacy_` and `.old.name.` still
+authenticating). The address is therefore constructed in two cases, not one:
+
+- A username that already satisfies RFC 5322 `dot-atom-text` is used directly as the localpart —
+  `<Username> <username@<configured host domain>>`, exactly D10.
+- One that does not gets a **deterministic fallback localpart drawn from a space no D11-legal username
+  can ever occupy.** D11 admits only `[A-Za-z0-9_.-]` with alphanumeric ends; RFC 5322 `atext` is
+  strictly wider, so a fallback built with an `atext` character D11 forbids — `+` — is legal as a
+  dot-atom and **unreachable by any username anyone can choose**. The account's own primary key
+  disambiguates, so two legacy usernames can never collapse onto one address.
+
+That last property is not decoration. D10's *Consequence binding §8.3* has the inbound resolver match
+the synthetic form *first*, ahead of registered `GitEmails`, precisely so a squatted row cannot capture
+another member's attribution; a fallback that a member could reproduce by choosing a username would
+reopen that hole from the other side. The display name stays the raw username — git's name field
+constrains only `<`, `>` and newline — so a legacy member's history still reads as themselves.
+
+**Rollback must invalidate the index, because the rollback path is the one content-changing event that
+does not advance `HEAD`.** D15's freshness rests on the invariant that every content change moves
+`HEAD`; `specs/content-editing/spec.md:62-69` requires the path that breaks it.
+
+*State the trigger as the invariant, not as one interleaving.* An earlier revision of this paragraph
+named a single concrete race — a push landing just before a save takes the lock, so the next reader's
+incremental refresh re-reads that same file mid-save — and the reviewer showed that the case *as
+literally told* is largely blocked by the CAS re-read under the lock, while the reachable class is
+strictly wider. Naming one interleaving would have sent block D hunting the wrong condition; this change
+has a standing rule about exactly that (*when a guard's justification names a case, check the guard's
+branch*), and a decision that only ever guards its own illustrative anecdote is the same defect
+one level up.
+
+The general statement: **the index reads file bytes from the working tree, and it does so on triggers it
+does not control and that are unrelated to which file a save is holding open.** A full rebuild
+(`BuildAsync`) walks the *whole* tree unconditionally — so any writer at all advancing `HEAD`, or a
+startup, or a previous snapshot carrying an unreadable directory, can make the index read some
+*other* in-flight save's uncommitted bytes; the incremental path can do the same whenever an unrelated
+writer's `HEAD` advance names a path a save happens to be mid-write on. In every such case the commit
+then fails, `git checkout --` restores the file, and `HEAD` sits wherever the *other* writer left it —
+which is exactly what the index is already stamped with. The aborted bytes' title and tags are now in
+the index, the stamp says it is fresh, and no later incremental refresh will revisit that path.
+
+The save path therefore **invalidates the snapshot as part of the rollback**, installing
+`PageIndexSnapshot.Empty` so the next read takes D15's no-previous-stamp branch and rebuilds in full. A
+full rebuild is the expensive option and is chosen deliberately: rollback is an exceptional path, and an
+exceptional path is the wrong place to be clever about which single entry to repair. A *successful* save
+needs no such handling — it advances `HEAD`, which is exactly what the incremental path is for.
+
+**Installing `Empty` is not by itself enough, and saying only that would leave the mechanism losable**
+(a reviewer blocker on this block, round two — the same paragraph's *second* correction, one level up
+from Note 1's). `PageIndex.Replace` is an unconditional `Volatile.Write`: a last-writer-wins swap, not a
+compare-and-swap. So a reader already inside `RefreshAsync` — holding `_refreshGate`, having *already*
+read the save's dirty bytes off disk — can call `Replace(refreshed)` **after** the rollback has called
+`Replace(Empty)`, and the contaminated snapshot wins. Its `CommitSha` still equals live `HEAD`, because
+the rollback never advanced it, so every later freshness check reports fresh and no incremental refresh
+ever revisits the poisoned entry. The invalidation is silently undone by the very rebuild it was racing.
+
+**The mechanism: generation and snapshot held as one immutable state, installed by compare-and-swap.**
+`PageIndex` holds a single reference to an immutable `(Generation, Snapshot)` pair rather than a
+snapshot field and a counter beside it.
+
+- `Invalidate()` installs a new state with the generation incremented and the snapshot `Empty`.
+- `GetCurrentAsync` **captures the whole state object** before the refresh begins its disk reads, and
+  installs the result with `Interlocked.CompareExchange`, succeeding only if the current state is still
+  the very object it captured. If it is not, the refreshed snapshot is *discarded* — it was computed over
+  bytes an invalidation has since disowned.
+- Exactly **one** unconditional installer is exposed for callers to use, it is the startup install, and
+  it is named for that rather than left as a general-purpose setter (`Program.cs` ordering makes it
+  unraceable, D16).
+
+*`Invalidate()` is deliberately an unconditional write too, and does not need to be a CAS loop.* It is
+not an exception to the rule above — the rule constrains what a *caller* may reach for, and the safety
+property is that no snapshot **computed before an invalidation** can be installed after one. The CAS
+enforces that by comparing object identity, so an unconditional bump always wins over an in-flight
+refresh and always must: an invalidation is never stale, because it asserts that what is on disk has
+changed rather than reporting something read from it. A CAS loop here would only make `Invalidate()`
+retry until it won, which is what an unconditional write already achieves in one step.
+
+The deeper reason, which is the one that will still hold if `Invalidate()` ever gains a second caller:
+**`Empty` makes no claim about any page**, so installing it can never be *wrong*, only wasteful. A losing
+refresh costs a rebuild; a losing invalidation would cost correctness. That asymmetry — not the disk
+having changed — is what makes the unconditional write the safe side to be on.
+
+*Why a CAS and not a capture-then-compare.* Reading the generation, comparing it, and then writing the
+snapshot is a check-then-act: an invalidation landing between the compare and the write is still lost,
+on a window that is narrow (no I/O in it) but real (a reviewer finding, round three — "closes it" was
+unqualified and was not quite true). Making the compare and the install one atomic operation removes the
+window rather than shrinking it, and costs nothing here, so there is no reason to accept a residual race
+and document it.
+
+*Why one unconditional installer and not a public `Replace`.* Leaving a general unconditional setter
+public reintroduces exactly the weakness this decision rejects gating for (round three, and the reviewer
+was right that the earlier wording oversold this): a future *refresher* calling it directly bypasses the
+CAS as silently as a future *reader* skipping `_refreshGate` would bypass a gate. The generation removes
+a dependence on invalidation-side and read-side discipline; it does not by itself remove a dependence on
+install-side discipline, and narrowing the installer is what does that.
+
+**On a discard, the request retries rather than serving what it built.** The refreshed snapshot is known
+to be contaminated, so it must not be returned even for the one render that produced it — obligation 25
+prevents serving an abandoned save's metadata, and doing it transiently to a live page is still doing it.
+Returning the now-`Empty` state instead is also wrong: it renders an existing page as missing. So the
+call **re-enters its own refresh**, bounded to a small number of attempts; the retry converges as soon as
+no rollback is concurrent with it, which is the overwhelmingly common case, because rollback is an
+exceptional path to begin with. If the bound is exhausted the call serves the empty state and logs it: at
+that point invalidations are arriving faster than the index can rebuild, which means repeated commit
+failures, and reporting the page as missing is the honest degradation where serving metadata known to be
+contaminated is not. **The invariant to preserve when implementing this is "never serve a discarded
+snapshot", not "always succeed".**
+
+*Why a generation rather than routing the rollback's install through `_refreshGate`.* Gating it would in
+fact work today, because every disk-read-into-a-snapshot currently happens inside that gate — but it
+works only *because* of that, and nothing enforces it: the startup path already installs outside the
+gate, and one future call site that reads outside it breaks the property silently. It would also make the
+save path (holding the write lock) block on the index's internal gate, adding a lock-ordering fact that
+is safe today only because readers never take the write lock. The CAS is local to `PageIndex` and depends
+on neither of those. `## NEXT` obligation 26 is the reason to prefer that: once a save resolves through
+the index, the index stops being a rebuildable convenience and becomes a data-integrity path, and a
+data-integrity path should not rest on "nobody adds a call site."
+
+**The rollback must restore the file *before* it invalidates, not after.** Invalidating first leaves a
+window in which a refresh starts after the generation bump, reads the still-dirty bytes, and installs
+with a generation that legitimately matches. Restore-then-invalidate removes that window: after the bump
+there are no dirty bytes left to read. A refresh whose read *straddles* the restore is handled by the CAS
+above, not by the ordering — it captured the pre-bump state, so its install fails and it retries.
+
+**Write-lock timeouts split into two options (Product Owner decision).** `ContentStorage:WriteLockTimeout`
+keeps its meaning and its 10s default: the startup accept phase, where expiry is a fatal refusal to
+start. A second option gates the save's acquisition and defaults **shorter** — a browser request budget,
+so a member meets a clear "repository busy, try again" rather than a hung tab.
+
+*Why they split rather than share:* the two expiries have materially different costs and would otherwise
+be tuned against each other. `AcquireAsync` measures with `Stopwatch`, and `Environment.TickCount64` and
+`DateTime.UtcNow` count host suspension too — **there is no clock that does not**, so this is recordable
+rather than fixable. After a host resumes, a save whose bound elapsed while the lid was shut fails busy
+and the member retries; a *startup* whose bound elapsed refuses to boot, on a machine that did nothing
+wrong but sleep. One number cannot be short enough to give fast save feedback and long enough to tolerate
+a rolling deploy's overlap at the same time. A git push's wait remains unbounded and unconfigured (D16).
+
+**One posture on what a git exit code may be trusted to mean (Product Owner decision).** Two sites
+answered this question two different ways, and both were wrong in the same direction — trusting an exit
+code past what git documents it to mean:
+
+- `git add -A` **exits 0** while warning on stderr that it could not read a directory, so content behind
+  it is silently unstaged while reconciliation reports success, `git status --porcelain` reports clean,
+  and D9's "never discard" quietly does not hold for that subtree. §2's C# scan does not reach this: it
+  guards the *initialise* path only, so on an **adopted** repository it never runs at all.
+- `ContentRepositoryService.RepositoryHeadIsUnbornAsync` reads *any* failure as "unborn `HEAD`", but
+  `git rev-parse --verify -q HEAD` exits **1** on an unborn `HEAD` and **128** on "not a git
+  repository". `PageIndexBuilder.ProbeCurrentHeadShaAsync` already answers the same question correctly
+  by matching exit 1 specifically; this one is the wrong-way twin, currently unreachable.
+
+**The posture: an exit code is trusted only for what git documents that code to mean.** Where a command
+can report a fault on stderr while still exiting 0, the app inspects stderr and **refuses** rather than
+proceeding. Where an exit code discriminates a *state*, the specific documented code is matched — never
+`!Succeeded`, which folds every unanticipated failure into whichever state the caller happened to expect.
+
+*Why refuse rather than log and continue:* silently proceeding is precisely the failure D9 exists to
+prevent, and it is worse here than a refusal because it looks like success at every subsequent check.
+*Accepted cost, named by the Product Owner at decision time:* an unanticipated git warning can refuse a
+startup. That is the trade this project has taken every previous time it arose — a fault that reaches
+content refuses loudly rather than degrading quietly.
+
+**`PageRouteCodec`'s two callerless resolvers are resolved here, not grown.** `TryResolveWorkingTreePath`
+and `TryResolveWorkingTreePathFromRouteValue` were built for §6 and have no production caller. The save
+path's route arrives from an HTTP request, already percent-decoded once by routing, so it uses
+`TryResolveWorkingTreePathFromRouteValue`; **`TryResolveWorkingTreePath` is deleted.** §6 adds no third
+resolver. The distinct-types redesign the block-3b reviewer asked for lands with it: the two decode
+states become distinct types so a contract mix-up is a compile error rather than a documentation duty.
+That was deferred in §3 on the grounds that the real shape of the caller was not yet known — it is now,
+and this is the section where getting the pairing wrong stops being a wrong *read* and becomes a **wrong-
+file write**, which the reviewer established cannot be detected at runtime because an encoded and a
+decoded string containing no `%` are the same string.
+
 ## Risks / Trade-offs
 
 - **Dirty tree blocks all pushes** → Transactional save (`git checkout -- <file>` on commit failure, under lock) plus startup reconciliation (commit-as-recovered or discard) guarantee the tree returns to clean.

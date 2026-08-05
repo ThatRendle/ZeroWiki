@@ -10769,6 +10769,821 @@ at all.
 `dotnet build` succeeded, `dotnet format --verify-no-changes` exit 0, `openspec validate --strict` valid,
 `grep -rn MUTANT src/ tests/` empty, tree clean.
 
+## 6. Commit-on-save
+
+**[architect]** Base: `97029e7` — the browser write path: a save declares the revision it started from,
+is refused if the file has moved on, and otherwise writes, stages and commits **once**, authored as the
+logged-in member, under D16's write lock, with the working tree restored if the commit fails.
+
+**[architect]** Pre-flight (CLAUDE.md §2): tree clean at `97029e7`, on `change/git-backed-content-core`,
+`openspec validate --strict` valid, `proposal.md` / `design.md` / `specs/content-editing/spec.md`
+re-read, plus D4, D5, D10, D12, D15 and D16. §5 carries a supervisor `Approve` (round two, `fe9dab5`),
+so nothing is owed backwards.
+
+**§6 opens owing more forward obligations than any section so far — 7, 8, 14+27, 19, 25, 26 and 31.**
+Three of them needed a Product Owner call before anyone could be briefed, and all three are now taken.
+
+**[architect]** ❓ @product-owner — three calls, asked together because each shapes the design block
+rather than an implementation detail. **All three answered:**
+
+1. **How far does §6's browser-facing surface go?** `proposal.md:32` defers "full browser Markdown
+   editor UX" to a later change, but 6.1 names a save endpoint and 6.4 a save-point.
+   → **Decision: a minimal Static SSR edit form.** A `/wiki/{route}/edit` page — textarea, hidden base
+   revision, Save button — posting to the save endpoint. **Explicit save is the save-point**, so 6.4 is
+   satisfied *structurally* rather than by a debounce: no keystroke ever reaches the server, so there is
+   nothing to coalesce. The rich editor (obligation 23, CodeMirror + its `style-src` cost) still lands
+   in a later change. This is what makes §9's Obsidian round-trip have a real browser-side writer.
+2. **Obligations 14 + 27 — what may a git exit code be trusted to mean?** Raised as *one* question, per
+   obligation 27's own instruction: 14 asks whether `git add -A`'s exit 0 may be trusted over a
+   directory-unreadable warning on its stderr, and 27 asks whether `rev-parse`'s exit 128 may be trusted
+   to mean "unborn `HEAD`".
+   → **Decision: refuse on unexpected stderr.** An exit code is trusted only for what git documents it
+   to mean; where git reports a fault on stderr while exiting 0, ZeroWiki **refuses** rather than
+   proceeding. Reconciliation fails loudly instead of silently dropping content — D9's "never discard"
+   and this project's fail-fast posture, applied to the one path that was quietly exempt from both.
+   Accepted cost, stated by the Product Owner at decision time: an unanticipated git warning can refuse
+   a startup.
+3. **Obligation 31 — does one `WriteLockTimeout` drive both acquisitions?** Today's only consumer is
+   startup, where expiry is a fatal refusal to boot; 6.6 adds a save, where expiry must be a per-request
+   "repository busy".
+   → **Decision: split into two options.** Each defaults for its own failure cost — a short save wait
+   (fast "busy" feedback, user retries) and a longer, more forgiving startup wait. This settles the
+   asymmetry §5's supervisor recorded from the closed-lid episode: after a host suspend, a timed-out
+   save is a retry and a timed-out startup is an outage, and no clock exists that does not count
+   suspension. The two knobs stop trading off against each other in opposite directions.
+
+**[architect]** Block carve — four blocks, in this order. The ordering is load-bearing, not cosmetic:
+
+- **A — design.** D17 + spec delta. Follows §3/§4/§5's own pattern (`50da7b0`, `c59ce13`, `172c622`):
+  the decisions that bind §6 are written down, and gated by a scenario where a section review must see
+  them, *before* any implementation block. Ticks no task.
+- **B — the git exit-code posture** (obligations 14 + 27). **Before** the save path, so §6's new writer
+  cannot inherit the blind spot §5's supervisor sharpened: on an *adopted* repository §2's C# scan never
+  runs at all, so an unreadable directory means reconciliation silently skips content while
+  `AssertWorkingTreeIsCleanAsync` still passes. Live today. Ticks no task; §10.1 owes the reconciliation
+  test either way.
+- **C — 6.1–6.4.** Base revision, CAS refusal, write + `add` + one authored commit, the save-point, and
+  the edit form. Carries obligations **7** (a well-formed author line for *every* account, including one
+  whose username predates D11 — `LoginServiceTests.cs:271-289` pins `.old.name.` still authenticating)
+  and **19** (`PageRouteCodec`'s two callerless resolvers: wire or delete, never add a third).
+- **D — 6.5–6.6.** Transactional rollback, the split bounded wait, and the distinct "repository busy"
+  result. Carries obligations **25** (the rollback path advances no `HEAD`, so D15's freshness invariant
+  breaks on the very path `spec.md:54` requires), **26** (`ApplyIncrementalUpdateAsync` becomes a
+  data-integrity path the moment a save resolves through it) and **8** (`GitProcessRunner` still does
+  not kill its subprocess on cancellation — no longer inert since `ad7934f`).
+
+Not §6's, recorded so no block picks them up by accident: **20** (`img-src 'self'` vs the link
+allow-list on external images) stays moot — §6 serves no static content; **21**'s page-size cap remains
+unowned; **22** (S3's untested enumeration race) is *revisitable* once D16's lock makes it closable, but
+is not a §6 task and must not be smuggled into one.
+
+**[architect]** Block A (design) — **D17 + spec delta, written, `openspec validate --strict` valid.**
+Docs only; no `src/` or `tests/` change. D17 settles six things and records why each is decided rather
+than left to an implementer:
+
+- **Surface** — the minimal Static SSR edit form, and *why 6.4 is discharged structurally*: with a form
+  post no keystroke reaches the server, so there is nothing to coalesce and no path that could produce
+  more than one commit per save. A later editor may add a client debounce; it cannot weaken this.
+- **Base revision = the file's blob SHA at `HEAD`** (`git rev-parse HEAD:<path>`), with both rejected
+  alternatives argued rather than asserted. Repository `HEAD` manufactures conflicts from unrelated
+  pushes; the file's last-commit SHA answers "was this path touched", which a commit restoring
+  byte-identical content advances while losing nothing. The blob name *is* the content the member
+  started from. Absent-at-`HEAD` is an explicit sentinel, so "started from nothing" and "declared no
+  base" stay distinct and the second is refused.
+- **The CAS is a CAS because of the lock** — acquire, *then* re-read the blob name, then write/stage/
+  commit. A base read before the lock is obligation 16's defect with a lost edit instead of a refused
+  boot as its consequence.
+- **Authorship total over accounts** (obligation 7) — legal usernames go straight in as the localpart;
+  the rest get a deterministic fallback built from an `atext` character **D11 forbids** (`+`), so it is
+  a legal dot-atom and *unreachable by any username anyone can choose*, disambiguated by the account's
+  primary key. That unreachability is load-bearing, not tidiness: D10's §8.3 consequence resolves the
+  synthetic form ahead of registered `GitEmails` so a squatted row cannot steal attribution, and a
+  fallback a member could reproduce by picking a username reopens exactly that hole from the other side.
+  Display name stays the raw username, so a legacy member's history still reads as themselves.
+- **Rollback invalidates the index** (obligation 25) — with the concrete interleaving spelled out, since
+  the reason it bites is non-obvious: a push must land *just before* the save takes the lock, so the
+  next reader's refresh takes the incremental branch and re-reads the file while it holds the save's
+  uncommitted bytes. Rollback then restores the file with `HEAD` unmoved and the stamp already matching,
+  so no later incremental refresh ever revisits that path. Fix: install `PageIndexSnapshot.Empty` on the
+  rollback path and let D15's no-previous-stamp branch rebuild. Full rebuild chosen **deliberately** —
+  an exceptional path is the wrong place to be clever about repairing one entry.
+- **Timeouts split** (obligation 31) and **one posture on git exit codes** (obligations 14 + 27), both as
+  the Product Owner decided them above, with the accepted costs named in `design.md` rather than only
+  here.
+- **`PageRouteCodec`** (obligation 19) — the save path wires `TryResolveWorkingTreePathFromRouteValue`,
+  `TryResolveWorkingTreePath` is **deleted**, no third resolver is added, and the distinct-types
+  redesign lands with it. §3 deferred that redesign because the caller's shape was unknown; it is known
+  now, and §6 is where a wrong pairing stops being a wrong read and becomes a **wrong-file write** —
+  which the 3b reviewer established cannot be caught at runtime, since an encoded and a decoded string
+  containing no `%` are the same string.
+
+Two obligations are gated by **new scenarios**, not by prose, because §5 is where this change learned
+that an obligation carried only in prose is not gated at all: `content-store` gains *Reconciliation
+refuses when it could not read part of the working tree* (14) and *An abandoned save leaves no metadata
+behind in the index* (25). `content-editing` needed no delta — its existing scenarios already gate 6.1
+through 6.6 and obligation 7.
+
+→ @reviewer — block A diff is `97029e7..` working tree, docs only: `design.md` D17,
+`specs/content-store/spec.md`, this DEVLOG.
+
+**[reviewer]** Block A (design: D17 + spec delta) — **Request changes.** Docs-only, so this is a
+re-derivation audit, not a code audit; every claim below was reproduced, not read on trust.
+
+**Blocker — `design.md:498-515` (base revision) doesn't cover its own new git call under the exit-code
+posture it establishes two paragraphs later.** `git rev-parse HEAD:<path>` exits **128** for two
+completely different states, and D17 only distinguishes one of them:
+- absent-at-`HEAD` (the sentinel D17 wants): `fatal: path 'docs/nope.md' does not exist in 'HEAD'`
+- unborn/invalid `HEAD` (a state D9 and D17's own posture say must refuse loudly, not be folded into
+  "no base"): `fatal: invalid object name 'HEAD'.`
+
+Reproduced directly (scratchpad, `git init` + `rev-parse`): existing path → exit 0 + blob SHA; absent
+path at a real `HEAD` → exit 128 + the "does not exist in" stderr; unborn `HEAD` (fresh `git init`, no
+commits) → exit 128 + the "invalid object name" stderr. Both share exit code 128. D17's own
+`design.md:574-588` posture — "an exit code is trusted only for what git documents it to mean… match
+the specific documented code when discriminating a state, never `!Succeeded`" — is exactly what this
+call needs and doesn't get: nothing in D17 tells block C how to tell "absent" from "unborn" apart, so a
+plausible-looking `exitCode == 128 → absent` implementation reintroduces the identical defect class
+`RepositoryHeadIsUnbornAsync` is being fixed for elsewhere in this same document
+(`ContentRepositoryService.cs:532`, confirmed still `!headProbe.Succeeded` as D17 describes) — just
+folding two *different* states into one meaning instead of folding many failures into one. In practice
+`HEAD` should never be unborn by the time §6 is reachable (`Program.cs`'s ordering guarantee, D16
+obligation 16), so this is not live today, but D17 says it "settles… what a git exit code may be trusted
+to mean" and this is the one place its own new mechanism needs that answer and doesn't state it.
+Requested fix: one sentence in the base-revision paragraph requiring the absent-sentinel branch to match
+on exit 128 **and** the specific stderr text (or explicitly stating the unborn-`HEAD` precondition and
+refusing rather than treating any other 128 as absent) — small, and precisely the shape of every other
+fix this project has made to this defect class.
+
+**Note, not blocking — `design.md:546-557`'s rollback scenario is right in its fix, imprecise in its
+illustration.** As literally described ("a push commits just before a save takes the lock… re-reads the
+saved file… which at that instant holds the save's uncommitted content"), push and the save share the
+same file — but if the push actually changed that file's blob, the save's own CAS re-read *under the
+lock* (D17's own "acquire, then re-read the blob name" ordering) would see a mismatch against the
+declared base and reject the write before anything reaches disk, so this specific telling likely can't
+occur through a CAS-guarded write. The reachable version doesn't need push and save to share a file at
+all: `PageIndex.GetCurrentAsync` (`PageIndex.cs:51-80`) only ever triggers a read when `HEAD` has moved,
+but when it does and takes a **full rebuild** (`PageIndexBuilder.BuildAsync`, three call sites inside
+`RefreshAsync` per `PageIndexBuilder.cs:141,158,184`, plus the startup call), that rebuild reads the
+*entire* working tree unconditionally, not just a diff — so it can read a page's dirty on-disk bytes
+while a save on that same page (holding the write lock, but reads aren't gated by it) is mid-write, from
+any unrelated writer's `HEAD`-advance triggering the rebuild. If that save's own commit then fails,
+`HEAD` never having moved for it, the contamination is permanently pinned exactly as D17 describes. The
+fix — install `PageIndexSnapshot.Empty` unconditionally on every rollback — closes this regardless of
+which telling is right: confirmed `PageIndexSnapshot.Empty.CommitSha` is `null`
+(`PageIndexSnapshot.cs:37`) and `PageIndexBuilder.cs:135`'s existing "no previous stamp" guard already
+forces a full rebuild on exactly that condition, so this wires into an already-tested mechanism rather
+than a new one. Not asking for a change — flagging so block D's implementer doesn't go looking for a way
+to make push-touches-the-same-file the trigger to guard against; the guard needed is unconditional on
+every rollback, which the design already says.
+
+**Note, not blocking — the identical-content re-save isn't addressed.** `content-editing/spec.md`'s
+*Save creates one authored commit* scenario reads unconditional (every save → one commit), but a save
+whose declared base matches current and whose content is byte-identical to what's already committed
+leaves `git commit` nothing staged to commit. D17 says it settles what §6 needs decided before build;
+this is one more thing block C or D will hit and have to decide (`--allow-empty` vs. treating "nothing
+changed" as a distinct non-error outcome) that isn't mentioned. Worth a line, not blocking this block.
+
+**Verified correct, stated for the record rather than as findings:**
+- Blob-SHA base revision and lock-then-reread CAS ordering (`design.md:498-524`) — sound; the
+  load-time base read queries the immutable object graph via `HEAD:<path>`, not the working tree, so it
+  needs no lock to be trustworthy, and the re-read after acquiring the lock is what actually makes it a
+  CAS.
+- The `+`-fallback (`design.md:527-544`, obligation 7): confirmed `CredentialPolicy.UsernamePattern`
+  (`CredentialPolicy.cs:124-125`) and every prior revision back to `d90b00e` restrict usernames to
+  `[A-Za-z0-9._-]`, so `+` is unreachable by any username ever chosen or grandfathered; confirmed `+` is
+  RFC 5322 `atext`; confirmed git and `GitAuthor.ToEnvironmentVariables` pass a `+`-bearing
+  `GIT_AUTHOR_EMAIL` through untouched (`GIT_AUTHOR_EMAIL="42+legacyuser@example.com"` committed
+  cleanly, `git log` shows it verbatim); re-derived — not read off D11's prose — that D11's regex only
+  ever produces strings satisfying dot-atom-text (no leading/trailing/double dot, every character
+  `atext`), so `accepted ⊆ legal` genuinely holds and the direct-localpart branch is safe. Also confirmed
+  the discriminator D17 specifies is "is this username itself dot-atom-text legal", not "does it match
+  D11's current regex" — the right test, since e.g. `_legacy_` is a legal dot-atom (no dots at all) but
+  is refused by current D11 despite predating it; conflating the two would have been a bug.
+- Obligations 14+27's exit-code claims (`design.md:574-588`): reproduced both independently.
+  `git add -A` over a `chmod 000` subdirectory warns `could not open directory … Permission denied` to
+  stderr and exits **0** (macOS; same git dir-walking code as Ubuntu's for this behaviour, but not
+  independently re-verified on the container's Linux — cheap to confirm in block B, not urgent).
+  `RepositoryHeadIsUnbornAsync` (`ContentRepositoryService.cs:525-533`) does read any failure as unborn
+  exactly as described. Reproduced `git rev-parse --verify -q HEAD` exits 1 for unborn `HEAD` and 128 for
+  "not a git repository". Confirmed `PageIndexBuilder.ProbeCurrentHeadShaAsync`
+  (`PageIndexBuilder.cs:92-111`) already matches exit code 1 specifically and throws on anything else —
+  D17's claim that this one "already answers the same question correctly" holds.
+- `PageRouteCodec` (`design.md:590-601`, obligation 19): confirmed zero production callers of either
+  `TryResolveWorkingTreePath` or `TryResolveWorkingTreePathFromRouteValue`
+  (`PageRouteCodec.cs:341,353`); their existing doc comments already state the exact contract split D17
+  describes, so the deletion/wiring plan matches what's already documented in code, not a retcon.
+- `core.quotePath`: checked and it doesn't apply to `HEAD:<path>` — quotePath governs how git *prints*
+  paths (why it matters for `PageHistoryService`/`PageIndexBuilder`'s existing
+  `-c core.quotePath=false`), not paths the app *supplies* as an argument; verified with a non-ASCII
+  filename (`héllo.md`) resolving cleanly through `rev-parse HEAD:docs/héllo.md`.
+- The suspension-clock claim in the timeout-split rationale (`design.md:562-564`) is not a fresh
+  assertion — it's the already-reproduced §5 "closed-lid episode" finding, correctly cited rather than
+  reinvented.
+- A directory-shaped path passed to `HEAD:<path>` returns a **tree** SHA with exit 0, not a blob SHA
+  (reproduced) — inconsistent with D17's "blob SHA" framing in the abstract, but not reachable through
+  D12's route resolution as it stands (routes only ever resolve to files), so not raised as a finding —
+  recorded as checked.
+
+No contradiction found against D3, D4, D9, D10, D12, D15 or D16 — D17 elaborates each without
+overriding any of them, and the timeout split explicitly resolves the open question D16 itself deferred
+to §6.6. Scope: docs-only, confined to §6's binding decisions and the two `content-store` scenarios that
+gate it; no drive-by changes. `openspec validate git-backed-content-core --strict` re-run clean.
+
+→ @architect — one blocker (the `HEAD:<path>` exit-128 ambiguity) before block B/C should start against
+this. The other two notes are forward flags for block C/D, not asks for this block.
+
+**[architect]** All three addressed in `design.md` — `design.md` is the Architect's artifact, so this is
+mine to fix, not a worker's. **`openspec validate --strict` re-run clean.**
+
+**Blocker — accepted without qualification, and it is the sharpest finding of the block.** D17 spent two
+paragraphs establishing that an exit code may be trusted only for what git documents it to mean, and
+then picked, for its own newest git call, an instrument that violates it. Reproduced independently
+before rewriting (`git 2.55.0`, scratchpad repo, not `src/`): `git rev-parse HEAD:<path>` exits **128**
+for *both* `fatal: path '…' does not exist in 'HEAD'` and `fatal: invalid object name 'HEAD'` — the
+absent-sentinel and the refuse-loudly fault, indistinguishable by exit code.
+
+The replacement is **`git ls-tree HEAD --format='%(objecttype) %(objectname)' -- <path>`**, chosen
+because it discriminates every state *without consulting an exit code for any of them*, which is the
+posture rather than a workaround for it. Verified by execution, and the table is in D17: present →
+`blob <sha>`; absent → exit 0, empty stdout; **a directory → exit 0, `tree <sha>`** — a state the
+reviewer's blocker did not name and which `rev-parse` would have resolved to a tree SHA and silently
+accepted as a base revision; unborn/invalid `HEAD` → 128, refuse. Two further things fell out of running
+it rather than reasoning about it: `--format` emits **no path at all**, so `core.quotePath` — which
+*does* mangle non-ASCII in `ls-tree`'s default output, confirmed on `docs/café.md`, and which has bitten
+this change before — cannot reach it; and `--format` needs git ≥ 2.36, comfortably met by Ubuntu 24.04.
+
+**Note 1 (obligation 25's trigger) — treated as a blocker in substance, not as a note.** The reviewer is
+right, and the failure was mine: I asked it to check whether D17's stated trigger was too narrow, it
+found that it was, and a worker briefed from the original paragraph would have guarded the wrong
+condition. Rewritten to state the **invariant** instead of one interleaving — the index reads working-tree
+bytes on triggers it does not control and that are unrelated to which file a save holds open, so a full
+`BuildAsync` walk (any writer's `HEAD` advance, a startup, or a snapshot carrying an unreadable
+directory) can catch *some other* in-flight save's uncommitted bytes. The fix is unchanged and was
+already correct; only its reason was wrong, which is this change's most-repeated defect class and is
+recorded as such in the paragraph itself.
+
+**Note 2 (identical-content re-save) — promoted from a forward flag to a decision here**, because
+leaving it to block C would mean an implementer meeting `nothing to commit` mid-block and inventing an
+answer under time pressure. D17 now settles it: the CAS passes, nothing stages, and the save returns
+**success with no commit** rather than falling into the rollback path and reporting a failure to a member
+who did nothing wrong. `--allow-empty` rejected — an empty commit is history every Obsidian vault then
+pulls in order to record that nothing happened. Gated by a new `content-editing` scenario (*Saving
+unchanged content records nothing and still succeeds*) rather than by D17's prose, for the same reason
+obligations 14 and 25 got scenarios: §5 taught this change that an obligation carried only in prose is
+not gated at all.
+
+→ @reviewer — re-audit. Diff is still `97029e7..` working tree, still docs-only, now four files:
+`design.md`, `specs/content-store/spec.md`, `specs/content-editing/spec.md`, this DEVLOG.
+
+**[reviewer]** Block A re-audit — **Request changes.** Every claim below was re-derived, not read off
+the previous round's findings or D17's own prose — including the fix that answered my own prior
+blocker.
+
+**Blocker — `design.md:604-608`'s rollback-invalidation fix can lose the race against a concurrent full
+rebuild's own `Replace()`, and D17 settles *what* to install but not *how* the install survives that
+race.** Traced the actual mechanism, not just the prose: `PageIndex.Replace`
+(`PageIndex.cs:36`) is an unconditional `Volatile.Write` — a last-writer-wins swap, not a
+compare-and-swap. `PageIndex.GetCurrentAsync` (`PageIndex.cs:51-80`) is single-flighted through
+`_refreshGate` *for concurrent callers of itself*, but nothing in that gate, or anywhere else in
+`PageIndex`/`PageIndexBuilder`, is aware of a rollback's own install. Concretely:
+
+1. Reader R calls `GetCurrentAsync`, sees a stale stamp, acquires `_refreshGate`, and starts
+   `PageIndexBuilder.RefreshAsync` → a full `BuildAsync` (one of the three call sites at
+   `PageIndexBuilder.cs:141,158,184` — confirmed these are the only `BuildAsync` call sites besides the
+   startup one at `ContentStorageStartupExtensions.cs:76`, which cannot race anything per D16
+   obligation 16's own `Program.cs` ordering argument). This is exactly Note 1's own scenario: the walk
+   reads save S's dirty on-disk bytes while S is still mid-write, because reads aren't gated by the
+   write lock.
+2. S's commit then fails; S's rollback runs `git checkout --` and, per this fix, installs
+   `PageIndexSnapshot.Empty`.
+3. If R's `RefreshAsync` — already in flight before step 2, holding `_refreshGate` — finishes and calls
+   `Replace(refreshed)` (`PageIndex.cs:73`) *after* S's rollback has called `Replace(Empty)`, R's
+   `Replace` wins: the contaminated snapshot overwrites the invalidation. Its `CommitSha` still equals
+   the live `HEAD` (S's rollback never advanced it — that is the entire reason this mechanism exists),
+   so `GetCurrentAsync`'s stamp check (`PageIndex.cs:55/67`) reports "fresh" forever afterward. No later
+   `HEAD` advance ever revisits the poisoned entry, because nothing about a future advance's diff names
+   a path that was never part of any commit.
+
+Nothing serializes S's rollback-install against R's gated install to rule this ordering out — a rollback
+`Replace(Empty)` that isn't itself routed through `_refreshGate` (or otherwise made a conditional/
+generation-checked write) can be clobbered by an in-flight rebuild that already has the gate. Note that
+routing rollback's invalidate through `_refreshGate` alone is not obviously sufficient either: the gate
+serializes *installs*, not R's prior *disk read*, so the losing interleaving is available regardless of
+which side goes through the gate — it needs either a generation/version check on `Replace` (refuse to
+install a snapshot computed before the last invalidation) or an explicit argument for why gating the
+install is enough once the read-vs-restore ordering is accounted for. This is a correctness gap in the
+*mechanism* D17 specifies, not merely a missing illustration — the class of defect this change has a
+standing rule about (*a guard that only ever protects its own anecdote*), one level up from where Note 1
+already found it once in this same paragraph.
+
+The existing `content-store` scenario this fix is supposed to gate — *An abandoned save leaves no
+metadata behind in the index* (`specs/content-store/spec.md:139-142`) — doesn't catch this either: as
+worded, it is a single-writer sequence (save writes → index reads → save abandoned → restored) with no
+second, concurrent reader/rebuild in the picture, so a test built strictly from its wording would pass
+under an implementation that loses the race described above. Per this change's own §5 lesson ("an
+obligation carried only in prose is not gated at all"), the scenario needs a second clause or a
+companion scenario naming the concurrent case before it can be trusted to gate what D17 now claims to
+guarantee.
+
+Requested fix: one more paragraph in D17 stating how the rollback install is made safe against a
+concurrent gated rebuild's own `Replace()` — a generation-stamped `PageIndex.Replace`/`Invalidate` pair
+is the shape that seems to close it, but that is an implementation call for block D, not mine to make —
+plus a scenario clause that actually exercises a concurrent rebuild racing the rollback, not just the
+sequential illustration already there.
+
+**Verified correct — the blocker this round answered, re-derived rather than trusted:**
+- `git rev-parse HEAD:<path>` exits 128 conflating absent-at-`HEAD` and unborn/invalid `HEAD` —
+  reproduced again independently (`git 2.55.0`, fresh scratch repo): existing path → `blob <sha>`;
+  absent path → `fatal: path '…' does not exist in 'HEAD'`, exit 128; unborn `HEAD` →
+  `fatal: invalid object name 'HEAD'`, exit 128. Confirms the blocker was real and the replacement
+  instrument was necessary.
+- **The `ls-tree` state table, run against every row plus the ones it doesn't list**, on a fresh
+  scratch repo (`docs/page.md`, `docs/sub/{nested.md,nested2.md}`, `docs/café.md`, a symlink, a
+  `160000` gitlink built with `git update-index --cacheinfo`):
+  - present file → `blob <sha>`, exit 0. Matches table.
+  - absent file → empty stdout, exit 0. Matches table.
+  - directory (no trailing slash) → `tree <sha>`, exit 0. Matches table; refused correctly.
+  - **directory with a trailing slash → NOT `tree <sha>`.** `git ls-tree HEAD --format='%(objecttype)
+    %(objectname)' -- docs/sub/` recurses and prints one `blob <sha>` line per child file instead
+    (two lines once a second child existed) — output that satisfies a naive "starts with `blob `"
+    check and would be accepted as a *present file* with the wrong blob SHA (an arbitrary child's),
+    not refused as a directory. **Checked reachability, not just existence:** `PageRouteCodec.TryDecodeSegment`
+    (`PageRouteCodec.cs:255-260`) refuses any empty segment, which is the only way a leading, trailing,
+    or doubled `/` could survive decoding, and `TryDecodeCore` (`PageRouteCodec.cs:247`) always appends
+    `.md` to the joined segments — so the repo-relative path `TryResolveWorkingTreePathFromRouteValue`
+    hands to this instrument can never end in a separator. **Not reachable through §6's actual call
+    site as D17 specifies it**, so not a blocker — but it is a real footgun in the instrument itself,
+    worth one line in D17 (or a defensive trim of trailing separators before invoking `ls-tree`) so a
+    future caller that doesn't share `PageRouteCodec`'s guarantee — §7/§8 conflict detection is the
+    likely next user of a base-revision read — doesn't reintroduce it silently.
+  - symlink → `blob <sha>` — git's object model makes a symlink a blob (its content is the link
+    target text), so `%(objecttype)` genuinely cannot distinguish it from an ordinary file; this is not
+    a wrong report by the instrument's own terms, but it means "present" per this table does not imply
+    "an ordinary regular file." `PageEnumerationService.Walk`'s reparse-point skip (cited in
+    `PageIndexBuilder.cs:317`) keeps a symlink out of enumeration/browsing, but the save endpoint (per
+    D17's own "started from nothing" sentinel) accepts a route for a page that need not already be
+    enumerated — so a symlink that arrived via an incoming push (not through any browser path) sitting
+    at a save's resolved path would read as an ordinary present blob here, and whether the write step
+    then follows it off `docs/` is a question for block C's write implementation, not this instrument.
+    Flagging as a forward note, not a blocker on this docs-only block.
+  - gitlink (mode `160000`) → `commit <sha>`, exit 0 — a fourth state the table's four rows don't name,
+    but D17's own catch-all ("exit 0 with unexpected stdout… refuse") correctly refuses it: `commit `
+    matches neither `blob `, empty, nor `tree `. **Correcting one assumption, not raising a finding:**
+    §2's gitlink refusal is reconciliation/initial-commit-scoped only (`specs/content-store/spec.md:164-167`,
+    D9's addenda) — it never runs against incoming push content, so a gitlink genuinely *can* reach
+    `HEAD` at this call site via a push, contrary to treating §2 as having made it unreachable. It is
+    saved here only by the catch-all, not by any push-time guard — worth knowing, not worth fixing,
+    since the catch-all already does the job.
+  - empty path → `fatal: empty string is not a valid pathspec…`, exit 128 — a different fault than
+    unborn `HEAD` but caught by the same blanket "any non-zero exit refuses" rule, so no meaning gets
+    conflated the way `rev-parse`'s two-128s did. Not reachable via the resolver in any case
+    (`TryDecodeCore` returns false on an empty route).
+  - path outside `docs/` (e.g. `.git`) — empty stdout, exit 0 (same as "absent"), but
+    `TryResolveWorkingTreePathFromRouteValue`'s containment check (`PageRouteCodec.cs:367-378`) means no
+    repo-relative path this call site ever constructs can name anything outside the working tree, so
+    this row is unreachable by construction, not by luck.
+- **`core.quotePath` checked empirically both ways, not read off D17**: `git ls-tree HEAD --format=…`
+  against `docs/café.md` produced byte-identical output (`blob <sha>`) with `core.quotePath` set to
+  `true` and to `false`, while the plain `git ls-tree HEAD -- docs/café.md` (no `--format`) visibly
+  differed between the two (octal-escaped vs. raw UTF-8) — confirms `--format` really does sidestep it,
+  not merely that it's undocumented either way.
+- **`--format` version claim**: confirmed via Git's own 2.36.0 release notes ("`git ls-tree` learns
+  `--oid-only` option, similar to `--name-only`, and more generalized `--format` option") — the feature,
+  not just the number, checks out.
+- **Dockerfile base image, checked by running it, not reading the `FROM` line**: `docker run --rm
+  mcr.microsoft.com/dotnet/aspnet:10.0 cat /etc/os-release` → `Ubuntu 24.04.4 LTS (Noble Numbat)`.
+  `apt-get update && apt-cache policy git` inside that same image → candidate `1:2.43.0-1ubuntu7.3`,
+  comfortably past 2.36. Both halves of D17's claim hold, independently verified rather than trusted
+  from "Ubuntu 24.04 is well past that."
+- **The architect's directory-row justification, re-derived rather than accepted because it answered my
+  own blocker**: `git rev-parse HEAD:docs` (reproduced on the same scratch repo) returns a tree SHA —
+  `f8d549023482fdcfb5fecf7a166375aea9b8768c`, exit 0 — silently, with no indication it isn't a blob. The
+  claim that `rev-parse` "would have resolved to a tree SHA and silently accepted as a base revision" is
+  correct, not merely plausible-sounding. **This decision and its stated reason are both right.**
+- **Note 1's rewrite** (`design.md:594-602`): re-read as the invariant it now claims to be, not the
+  interleaving it replaced — "the index reads working-tree bytes on triggers it does not control,
+  unrelated to which file a save holds open" is accurate against the three `BuildAsync` call sites and
+  `ApplyIncrementalUpdateAsync` (`PageIndexBuilder.cs:211-313`, which reconstructs claimants from
+  `current.Pages`/`AmbiguousRoutes` rather than re-reading arbitrary bytes, so it inherits whatever
+  `BuildAsync` already contaminated rather than contaminating independently) and `ReadFrontmatterAsync`
+  (`PageIndexBuilder.cs:366-391`, a leaf read `BuildAsync`/`ApplyIncrementalUpdateAsync` both call, not
+  a fifth independent trigger). The rewritten reason is sound as far as it goes — the blocker above is
+  that "install `Empty` on rollback" doesn't yet say enough about *how* to close it against a concurrent
+  installer.
+- **Note 2's decision** (`design.md:545-553`, `specs/content-editing/spec.md`'s new scenario): the
+  "nothing staged → success, no commit" decision itself is sound and matches every existing scenario's
+  own trust model — no path in this section's design ever runs a whole-tree `git status` before
+  declaring success; the ordinary non-empty commit path doesn't either, it just commits whatever got
+  staged for the one path it wrote and trusts the lock-maintained invariant that nothing else was
+  already dirty. Note 2 doesn't weaken that trust, it just makes one more branch that relies on it.
+  **Non-blocking wording note:** the new scenario's "does not… leave the working tree dirty" reads as a
+  fresh guarantee this specific path establishes, when it is exactly the same inherited assumption
+  every other scenario in this section already depends on — worth a half-sentence tying it back to that
+  assumption so a future reader doesn't take it as a claim this path uniquely verifies.
+
+No contradiction found against D3, D4, D9, D10, D12, D15 or D16. Scope: still docs-only, confined to
+§6's binding decisions and the `content-store`/`content-editing` scenarios that gate it — no drive-by
+changes. `openspec validate git-backed-content-core --strict` re-run clean. `git status --short` and
+`git diff --stat -- src` both confirm no code in this diff (four files: `design.md`,
+`specs/content-store/spec.md`, `specs/content-editing/spec.md`, this DEVLOG) — nothing to mutate, no
+residue to check for.
+
+→ @architect — one blocker (the rollback-install race against a concurrent rebuild's `Replace()`) before
+block D can be briefed against this paragraph. Everything else above is either confirmed correct or a
+forward note for block C/D, not an ask for this block.
+
+**[architect]** Blocker accepted and fixed, plus all three forward notes folded in. `openspec validate
+--strict` re-run clean; still docs-only.
+
+**The blocker is right, and it is the *same paragraph's second* correction.** Re-derived from the code
+rather than from the post: `PageIndex.Replace` (`PageIndex.cs:36`) is `Volatile.Write` — last-writer-wins,
+no CAS — and `GetCurrentAsync` installs at `PageIndex.cs:73` from inside `_refreshGate` having read disk
+outside any coordination with a save. So a rebuild that already holds the save's dirty bytes can land
+*after* the rollback's `Replace(Empty)` and silently undo it, with a `CommitSha` that still matches live
+`HEAD` because a rollback never advances it. Round one of this review corrected the paragraph's stated
+*trigger*; round two corrects its stated *mechanism*. Both times the fix was right and the reasoning
+underneath it was not — this change's most-repeated defect class, now twice in eight paragraphs.
+
+**Mechanism now specified: a monotonic generation on `PageIndex`.** `Invalidate()` bumps it and installs
+`Empty`; `GetCurrentAsync` captures it **before the refresh begins its disk reads** and installs only if
+it is unchanged on return, discarding the snapshot otherwise. The unconditional `Replace` survives for
+the startup install alone, which cannot race.
+
+**Two things the reviewer asked for that I decided rather than deferred**, because leaving either to
+block D would have it invented under time pressure:
+
+- **Ordering: restore the file, *then* invalidate.** Invalidating first leaves a window where a refresh
+  starts after the bump, reads still-dirty bytes, and installs with a generation that legitimately
+  matches. This is exactly the kind of detail that evaporates between a design and an implementation.
+- **Why a generation rather than routing the rollback's install through `_refreshGate`.** The reviewer
+  was careful not to make this call, and it deserves the argument rather than a preference: gating
+  *would* work today — every disk-read-into-a-snapshot currently happens inside that gate — but only
+  because of that, and nothing enforces it. `Replace` is public, startup already installs outside the
+  gate, and one future call site reading outside it breaks the property with no symptom. Gating would
+  also have the save path (holding the write lock) block on the index's internal gate, which is safe
+  today only because readers never take the write lock — a second unenforced invariant. The generation
+  depends on neither. Obligation **26** is the reason that matters here: once a save resolves through the
+  index, the index stops being a rebuildable convenience and becomes a data-integrity path, and those
+  should not rest on "nobody adds a call site."
+
+**Forward notes, all three folded into D17 rather than carried to `## NEXT`** — a note that lives only in
+the DEVLOG is a note block C/D will not read:
+
+- **Trailing-separator footgun.** `ls-tree` given a trailing `/` recurses and prints one `blob` line per
+  *child* — passing a naive "starts with `blob`" check and yielding an arbitrary child's object name as
+  the base revision. Unreachable through §6's call site, as the reviewer established from
+  `PageRouteCodec` rather than assuming it. Recorded as the instrument's **input contract**, because
+  §7/§8 conflict detection is the likely next caller and inherits no such guarantee.
+- **A gitlink genuinely can reach `HEAD`.** The reviewer corrected an assumption I would otherwise have
+  carried: §2's gitlink refusal is reconciliation/initial-commit-scoped and never runs against pushed
+  content. `commit <sha>` at exit 0 is refused **only** by D17's catch-all, so that catch-all is
+  load-bearing, not defensive — now stated as such.
+- **"Present" does not mean "an ordinary file."** Git models a symlink as a blob, so `%(objecttype)`
+  cannot distinguish one, and enumeration's reparse-point skip does not cover the save path because a
+  save accepts a route for a page that need not already be enumerated. The instrument is not wrong by
+  its own terms; the obligation lands on **block C's write step**, which must not follow a symlink out
+  of `docs/`. Written into D17 where block C will meet it.
+
+**Scenario nit taken as well** — the identical-content scenario no longer reads as though that path
+uniquely verifies a clean tree; it now names the inherited invariant it actually relies on. And the
+blocker gets its own gate rather than prose: `content-store` gains *A rebuild already in flight cannot
+reinstate an abandoned save's metadata*, wording the **concurrent** case the existing sequential scenario
+could not catch.
+
+→ @reviewer — re-audit, round three. Same four docs files, `97029e7..` working tree.
+
+**[reviewer]** Block A re-audit, round three — **Request changes.** Re-derived the mechanism against
+`PageIndex.cs`/`PageIndexBuilder.cs` as they actually stand, not against the prose that answered my own
+round-two blocker. It closes the failure mode it names; it leaves two things unstated that block D would
+otherwise have to invent, and one that already exists — I checked both files below carefully for anything
+that might close them and found neither.
+
+**Blocker — `design.md:640-649` never says what `GetCurrentAsync` returns to the request that triggered
+the discarded refresh.** Traced the caller: `WikiPage.razor:155` is `GetCurrentAsync`'s only production
+caller today, and its return value drives real logic three lines later (`snapshot.AmbiguousRoutes` decides
+a 409, and further down it supplies the page's own metadata for this render). D17 says the *installed*
+state on discard is `Empty` — clear — but says nothing about the value this specific call *returns*, and
+the current code shape (`PageIndex.cs:51-80`) offers no fewer than three different answers, all
+plausible, none decided:
+- return `refreshed` anyway (the discarded snapshot itself) — the caller renders the abandoned save's
+  title/tags for one request, never installed globally, but still served once to a live page;
+- return `Current` after the discard (i.e. re-read, which is now `Empty` because the rollback's own
+  install already landed) — the caller renders an index with no pages in it for one request;
+- loop back into a fresh `RefreshAsync` before returning, so this caller gets what the *next* reader
+  would have gotten, at the cost of a second walk inline on the request that lost the race.
+These are not equivalent, and the difference is exactly the class of leak D17's whole mechanism exists to
+prevent — obligation 25 is about an abandoned save's metadata not going on being served, and the first
+option serves it, once, to a real render. This is not a hypothetical implementer's mistake to catch later;
+it's an open question the current wording doesn't resolve either way, and I'd rather it were a decision in
+`design.md` than three plausible readings for block D to pick from under time pressure — the same reason
+Note 2 got promoted out of a forward flag two rounds ago.
+
+**Note, weighted like a blocker but resolvable either way — "restore-then-invalidate… closes it" overclaims
+by the width of a plain check-then-act.** `design.md:643-646` describes capture-then-conditional-install as
+two separate steps ("captures the generation… installs the result only if the generation is unchanged"),
+not one atomic compare-and-swap, and nothing in `PageIndex.cs` today gives it one — `Replace`
+(`PageIndex.cs:36`) is a bare `Volatile.Write`, and the generation field the mechanism adds isn't described
+as read-and-swapped together with it. That leaves a window strictly narrower than the one this fix closes,
+but real: reader R's post-`RefreshAsync` generation check can read the *pre-bump* value, and R's own
+`Replace(refreshed)` call can still execute *after* rollback S's `Invalidate()` has already written `Empty`
+— because nothing correlates R's two-statement "check, then write" with S's own write; both are plain
+field operations racing on ordinary thread-pool concurrency, not synchronized against each other except by
+`Volatile`'s memory-visibility guarantee, which orders visibility, not the relative timing of two
+*different* threads' operations. This is categorically narrower than either of this block's first two
+blockers — those were reliably reproducible given an ordinary I/O-bound interleaving (a slow tree walk
+outlasting a fast rollback); this one needs the OS scheduler to land a preemption between two adjacent,
+non-awaited statements with no I/O in between, which is not "cannot happen" but is a different order of
+rarity, and I don't think it earns a fourth full round on its own. Two ways to close it, either is cheap:
+name the residual window and accept it explicitly (this project has done that before, for the suspension
+clock), or make the final step a true CAS — e.g. carry generation and snapshot as one immutable pair
+swapped via a single `Interlocked.CompareExchange`, which is a small, idiomatic tightening given `PageIndex`
+already leans on `Volatile`/atomics rather than a lock. Either is fine; leaving it unsaid is what I'm
+objecting to, given the paragraph's own claim is unqualified ("closes it").
+
+**Note, not blocking — `design.md:661-662`'s "depends on neither invariant… total over invalidation
+sources" is true for the two invariants it names and no further than that.** Checked deliberately, since
+this is the sentence the task asked me not to accept on the strength of answering my own blocker. The two
+invariants gating *would* depend on — "every disk-read happens inside `_refreshGate`" and "readers never
+take the write lock" — are correctly not depended on by the generation. But the sentence's own framing
+("total… including [sources] this change has not thought of") reads as claiming the generation is
+structurally *enforced* in a way gating isn't, and it isn't: `Replace` stays `public` and unconditional
+(`design.md:647-648`, `PageIndex.cs:36`), so a future refresher that calls `Replace` directly — exactly
+as easy to write as a future call site that reads outside `_refreshGate`, the failure mode named two
+sentences earlier as gating's weakness — bypasses the generation check just as silently. The claim holds
+for *invalidation* sources (anything that wants to call `Invalidate()` needs no coordination with existing
+refreshers, which is genuinely true and is the useful half of the claim); it doesn't hold for *refresh*
+sources, and the paragraph doesn't distinguish the two. Not asking for a rewrite — flagging because the
+task asked me to verify this specific sentence rather than wave it through, and it oversold itself by one
+clause. Worth a half-sentence, or worth tightening `Replace`'s visibility/doc comment in block D so the
+promise is actually structural rather than aspirational — Architect's call.
+
+**Verified sound — checked, not merely re-read:**
+- **Capture placement is not actually ambiguous, despite `design.md:643`'s "before the refresh begins its
+  disk reads" being loose prose.** `PageIndex.cs:51-80` has exactly one call to `RefreshAsync`
+  (`PageIndex.cs:72`), inside `_refreshGate`, after the re-probe (`PageIndex.cs:65-66`). No disk read of
+  page content happens anywhere before that line — the re-probe is one `git rev-parse HEAD`, not a tree
+  walk. So "before the refresh begins its disk reads" resolves to exactly one place in the actual method
+  regardless of how loosely it reads in isolation; a reasonable implementer reading D17 against this file
+  has nowhere else to put it. This is the sub-question I went in expecting to find a gap in, and didn't.
+- **The concurrent `content-store` scenario (`specs/content-store/spec.md:145-148`) does gate the specific
+  mechanism, not any implementation that merely looks right.** Checked the mirror failure mode explicitly:
+  a naive fix that serializes rollback and refresh installs behind a shared mutex (so whichever finishes
+  *last* wins, deterministically) would satisfy round two's sequential scenario but **fails** this one on
+  its own terms — the scenario requires that a rebuild whose *read* predates the abandonment but whose
+  *completion* postdates it still gets discarded, which a plain last-writer-wins mutex would not do (the
+  later-completing rebuild would still win the mutex and overwrite `Empty`). Only a reject-stale-installs
+  mechanism — generation-tagged or equivalent — satisfies it. Confirms round two's flaw (a scenario a
+  losing implementation could pass) is fixed here, not reintroduced in a new shape.
+- **Testability forward note, not a blocker on this docs-only block.** No test seam exists yet in
+  `PageIndexBuilder.cs`/`PageIndex.cs` for deterministically pausing a refresh mid-flight to interleave it
+  with an `Invalidate()` call — block D will need one (a hook, an injectable delay, or a fake builder) to
+  test the new scenario without resorting to real-time `Task.Delay` races, which this project's own
+  mutation-testing rules already warn against for a different reason. Not this block's job to design; flagging
+  so block D budgets for it rather than discovering it mid-implementation.
+- **All three folded-in forward notes reproduced against round two's actual findings, not against D17's
+  own restatement of them** — no drift found, the failure mode this project calls its most-repeated
+  defect class:
+  - Trailing-separator footgun (`design.md:546-553`): matches round two's finding verbatim in substance —
+    not live through §6's call site, named as §7/§8's obligation, "trim… or refuse them" preserved.
+  - Gitlink reachability (`design.md:536-539`): matches — §2's refusal is reconciliation/initial-commit
+    scoped only, a gitlink can arrive at `HEAD` by push, the catch-all is what actually refuses it, now
+    stated as load-bearing rather than defensive.
+  - Symlink-as-blob (`design.md:555-560`): matches — `%(objecttype)` cannot distinguish a symlink,
+    enumeration's reparse-point skip doesn't cover the save path, obligation lands on "the write step."
+    All three read as accurate transcriptions, not restatements that drifted in meaning.
+- **The wording nit's fix** (`specs/content-editing/spec.md:22-25`): "by the same invariant every other
+  save path relies on rather than by a check unique to this one" directly answers round two's note; no
+  new claim of uniqueness survives.
+- `openspec validate git-backed-content-core --strict` re-run clean. `git status --short` and
+  `git diff 97029e7 --stat -- src` both confirm no code in this diff — four files again (`design.md`,
+  `specs/content-store/spec.md`, `specs/content-editing/spec.md`, this DEVLOG) — nothing to mutate, no
+  residue to check for.
+
+No contradiction found against D3, D4, D9, D10, D12, D15 or D16. Scope unchanged from round two.
+
+→ @architect — one blocker (the discarding caller's return value), and one thing weighted like a blocker
+that I'd accept resolved either way (name the residual TOCTOU window explicitly, or close it with a true
+CAS) — both are one paragraph, not a redesign. The "total over invalidation sources" note and the
+testability forward flag are not asks for this block.
+
+**[architect]** All three taken; all three were right. `openspec validate --strict` clean, still
+docs-only.
+
+**Blocker — the discarding caller's return value. Decided: retry, bounded.** The reviewer is right that
+this was an open decision and not an implementer's detail, and that the three plausible answers are not
+equally safe. Returning the discarded snapshot serves an abandoned save's metadata to a live render —
+transiently, but obligation 25 is not a rule about *duration*. Returning the now-empty state is also
+wrong in a way that is easy to miss: it renders an existing page as missing. So the call re-enters its
+own refresh, bounded, converging as soon as no rollback is concurrent — which is the common case, since
+rollback is exceptional by construction. On exhausting the bound it serves the empty state and logs:
+invalidations arriving faster than the index rebuilds means repeated commit failures, and reporting the
+page missing is the honest degradation where serving known-contaminated metadata is not. D17 states the
+invariant an implementer must hold — **"never serve a discarded snapshot", not "always succeed"** — so
+the bound cannot be quietly traded away for a nicer-looking success rate.
+
+**The TOCTOU window — closed with a real CAS, not named and accepted.** The reviewer offered both and
+weighted it as resolvable either way; closing it is the right call because it costs nothing here. A
+capture-then-compare-then-write is a check-then-act and loses an invalidation landing between the compare
+and the write, so the generation and the snapshot become **one immutable state object installed by
+`Interlocked.CompareExchange`** — the compare and the install are one operation, and the window is
+removed rather than shrunk. Accepting a documented race would have been the worse trade: it would sit in
+`design.md` binding §7 and §8 as precedent, and this change has spent two sections learning what a
+carried caveat costs. It also lets the restore-then-invalidate ordering stop overclaiming — a refresh
+whose read *straddles* the restore is now handled by the CAS, not by the ordering, and D17 says so.
+
+**The "depends on neither invariant" note — the reviewer caught me making the exact criticism I had just
+levelled at gating.** I argued against `_refreshGate` because a public unconditional `Replace` lets a
+future call site bypass it silently, then left a public unconditional `Replace` in the design, where a
+future *refresher* bypasses the CAS just as silently. The generation removes a dependence on
+invalidation-side and read-side discipline; it does **not** remove one on install-side discipline. Fixed
+by narrowing to exactly one unconditional installer, named for the startup install it exists for rather
+than left as a general-purpose setter — and the prose now says what the mechanism does and does not buy,
+instead of the broader claim.
+
+Round three found no new mechanism defects — the generation-capture placement I asked about turned out
+unambiguous, and the concurrent scenario does exclude a naive last-writer-wins fix. The three findings
+were all in what D17 *claimed*, which is where rounds one and two also landed.
+
+→ @reviewer — re-audit, round four. Same four docs files, `97029e7..` working tree. The only mechanism
+change is `Replace`-plus-counter → a CAS on one immutable state object; the rest is the discard-retry
+decision and two corrected claims.
+
+**[reviewer]** Block A re-audit, round four — **Approve with nits.** Re-derived against the code the
+mechanism will replace (`PageIndex.cs`, `PageIndexBuilder.cs`, `PageIndexSnapshot.cs`) and against the
+one production caller (`WikiPage.razor`), not against D17's own restatement of round three's findings.
+
+**Re-derivation: the CAS closes the window it claims to, with no new one opened.** `PageIndex.cs:51-80`
+today captures `Current` via a bare property read and installs via `Replace` (`PageIndex.cs:36`,
+`Volatile.Write`) — a last-writer-wins swap, exactly the defect rounds two and three found. The design's
+replacement — a single immutable `(Generation, Snapshot)` reference, `GetCurrentAsync` capturing that
+*exact object* before `RefreshAsync`'s disk reads and installing via `Interlocked.CompareExchange`
+gated on reference identity against the captured comparand — removes the check-then-act window
+structurally rather than narrowing it: compare and install are one hardware-atomic operation, so there is
+no instant between them for a concurrent `Invalidate()` to land in. Confirmed the capture point is
+unambiguous (`PageIndex.cs:65`, the only call to `RefreshAsync` at `PageIndex.cs:72`, both inside
+`_refreshGate` — matches round three's own finding, not re-litigated). Confirmed nothing else in
+`PageIndex`/`PageIndexBuilder` reads or writes the snapshot outside this state object: `Current`'s only
+other reader is `PageIndexBuilder.RefreshAsync`'s own stamp comparisons, which take the passed-in
+snapshot as a parameter rather than re-reading the field, so there is no second, uncoordinated read/write
+path into the state.
+
+**The bounded-retry decision, traced end to end against `WikiPage.razor:155-171`.** On a discard the
+call re-enters `GetCurrentAsync` rather than returning the discarded (contaminated) snapshot or the bare
+`Empty` state directly; on bound exhaustion it serves `Empty`. Confirmed `PageIndexSnapshot.Empty`
+(`PageIndexSnapshot.cs:37`) is `new([], [], [], null)` — empty lists, not null — so `WikiPage.razor`'s
+`AmbiguousRoutes.FirstOrDefault`/`Pages.FirstOrDefault` (`WikiPage.razor:157,166`) do not throw against
+it; both come back null, `pageMatch is null` short-circuits at `WikiPage.razor:168-171`, and the
+component falls through to its third branch — **200, "Page not found."** That is exactly what D17 calls
+"reports the page as missing," not an approximation of it: an existing page renders, for that one
+request only, indistinguishably from one that was never created. Scope is per-request, not sticky — the
+next request calls `GetCurrentAsync` fresh and is unaffected unless the same exceptional condition
+(repeated rollbacks racing repeated rebuilds) is still ongoing. Sound, and the invariant D17 states
+("never serve a discarded snapshot", not "always succeed") is what the traced code path actually
+delivers.
+
+**`_refreshGate` interaction: no starvation or livelock shape found.** Each retry is a fresh call to
+`GetCurrentAsync`, which re-acquires `_refreshGate` fresh; the losing attempt's `finally`
+(`PageIndex.cs:76-79`) releases the semaphore before returning, so a retry can never deadlock against its
+own prior attempt. Termination is structural, not probabilistic: the retry is a counted loop, so it
+terminates after N attempts regardless of what an adversarial scheduler does — there is no interleaving
+that makes it spin forever. The only way to keep failing every attempt is a concurrent `Invalidate()`
+landing between every single capture and install, which (per `PageIndex.cs`'s own shape) can only be
+driven by a rollback, and a rollback only ever follows a failed commit — so sustained exhaustion requires
+sustained *repeated commit failures*, exactly the condition D17 names as the cost of hitting the bound,
+not a hand-waved worst case.
+
+**The three corrected claims — checked for what they say now, not what they were corrected from:**
+
+1. *"Never serve a discarded snapshot, not always succeed"* (`design.md:675-676`) — true of the traced
+   code path above; not overselling.
+2. *"The compare and the install are one atomic operation… removes the window rather than shrinking it"*
+   (`design.md:652-658`) — true; `Interlocked.CompareExchange` genuinely admits no interleaving between
+   its compare and its write.
+3. **"Exactly one unconditional installer exists, it is the startup install"** (`design.md:645-647`) —
+   this is the one claim I'd push back on, and it is the same failure shape this block has hit twice
+   already (a right decision, imprecisely justified). `Invalidate()` (`design.md:642`, "installs a new
+   state with the generation incremented and the snapshot `Empty`") is *also*, mechanically, an
+   unconditional write to the same field `GetCurrentAsync`'s CAS writes to — it has no compare step of
+   its own, and correctness doesn't require one: because the CAS gates on *object-reference identity*
+   rather than a numeric generation comparison, any genuinely-new object `Invalidate()` publishes
+   correctly fails a concurrently-in-flight CAS regardless of whether `Invalidate()` itself checked
+   anything first. So the "exactly one" count is right only under a narrower reading than the sentence
+   states — one unconditional installer *of an arbitrary, externally-computed snapshot* — which the very
+   next paragraph (`design.md:659-664`, "why one unconditional installer and not a public `Replace`")
+   does support: its concern is a future *refresher* bypassing the CAS via a general-purpose setter,
+   which `Invalidate()` structurally cannot do since it only ever installs the fixed `Empty` sentinel.
+   The mechanism is correct; the document just never states outright that `Invalidate()` is unconditional
+   by the same word and why that's safe, so a reader who takes "exactly one unconditional installer"
+   literally could reasonably wonder whether `Invalidate()` needs to be a CAS loop too (it doesn't) or
+   whether the sentence is describing a bug.
+
+**Not worth a fifth round.** The mechanism itself is sound under re-derivation — this is a precision gap
+in what D17 *claims about its own installer count*, not a defect in what it specifies block D to build.
+Recommend one clarifying sentence after `design.md:664` — e.g. "`Invalidate()` is also an unconditional
+write, and safely so: it always installs a fixed sentinel rather than a computed snapshot that could be
+stale, so it needs no compare step of its own" — either folded into `design.md` now (cheap, and this
+file is already open) or carried as an explicit line in block C/D's brief. Architect's call which; either
+closes it.
+
+**Scope and gates.** `openspec validate git-backed-content-core --strict` re-run clean. `git status
+--short` and `git diff 97029e7 --stat -- src tests` both confirm no code in this diff — four files
+(`design.md`, `specs/content-store/spec.md`, `specs/content-editing/spec.md`, this DEVLOG) — nothing to
+mutate, no residue to check for. No mutation testing run (no code in scope, per this round's brief). Spec
+files unchanged since round three, confirmed by diff-stat rather than assumed; the concurrent scenario at
+`specs/content-store/spec.md:143-146` ("discards that rebuild's result rather than serving it") still
+gates the mechanism as specified without needing an update for the retry decision, since it deliberately
+doesn't say what happens *instead* of serving — the retry is a valid instance of "not serving it," not a
+change the scenario needed to anticipate.
+
+No contradiction found against D3, D4, D9, D10, D12, D15 or D16 in the changed passage.
+
+→ @architect — **Approve with nits.** My approval certifies: D17's CAS/discard/retry mechanism
+(`design.md:640-687`) and the two `content-store`/`content-editing` scenarios that gate it are sound,
+re-derived against the code they will replace and against `WikiPage.razor`'s actual handling of the
+degraded-empty case, and ready to brief block C/D against. The one nit (the "exactly one unconditional
+installer" sentence) does not need to hold up implementation — take it now or fold it into the brief, my
+read is it's genuinely optional either way.
+
+**[reviewer]** Targeted certification of the post-Approve edit (`design.md:645-658`) — **clean, no fifth
+round needed.** Confirmed the diff is exactly what was described: the installer bullet now reads
+"exposed for callers to use," and a new italic paragraph (`design.md:653-658`) follows, arguing
+`Invalidate()` is deliberately unconditional and safe without a CAS loop. `git status --short` and `git
+diff --stat -- src tests` both confirm no other file moved and no code entered the diff; `openspec
+validate --strict` re-run clean.
+
+**"An invalidation is never stale" is true, and it is true for the reason that matters, not a plausible-
+sounding new one.** Checked against every caller D17 actually gives `Invalidate()` — there is exactly
+one, the rollback path, and it is specified to fire strictly after `git checkout --` has restored the
+file (`design.md:697-700`, "restore, then invalidate" — re-confirmed unchanged by this edit). At that
+call site the literal claim holds: disk content genuinely did change twice in sequence (the abandoned
+save's dirty write, then the restore), so "it asserts that what is on disk has changed" is not a loose
+gloss, it is what that caller is doing.
+
+**Stress-tested the "could an unconditional bump clobber something it should not" question directly, past
+the one caller D17 names:**
+- *Two concurrent rollbacks racing each other's `Invalidate()`.* Harmless either order — the CAS gates on
+  object identity, not on the `Generation` field's numeric value being a strict global counter, so a
+  non-atomic read-then-increment inside `Invalidate()` (if that's how block D writes it) cannot corrupt
+  anything: whichever write lands last still installs a genuinely distinct object, and `Empty` overwriting
+  `Empty` is a no-op in effect.
+- *`Invalidate()` clobbering a refresh that had already legitimately, correctly finished installing* (not
+  the in-flight case D17's scenario covers, but one step later — a `CompareExchange` that already
+  succeeded before the rollback's write lands). This does throw away a perfectly good snapshot and force
+  an unnecessary full rebuild on the next read — but it is not a correctness violation: the coarse
+  granularity (invalidating the whole index rather than just the contaminated page) is a cost this same
+  passage already accepts on purpose one paragraph earlier ("full rebuild is the expensive option and is
+  chosen deliberately… an exceptional path is the wrong place to be clever about which single entry to
+  repair," `design.md:623-625`). The added paragraph's claim is scoped to correctness ("never installs
+  something wrong"), not to avoiding all spurious rebuilds, and doesn't overreach into the latter.
+- *A hypothetical future second caller of `Invalidate()` outside the rollback path.* Out of scope for this
+  confirmation — the claim as written is a property of the rollback caller D17 actually specifies
+  (restore-then-invalidate), not a blanket guarantee about callers this section doesn't name. Obligation
+  26's own framing (a data-integrity path "should not rest on nobody adds a call site," `design.md:686`)
+  already covers the *install* side of that risk; it says nothing new the *invalidate* side needs here.
+
+**One optional refinement, not a defect — the stated reason is true but not the deepest one, and I don't
+think it's worth touching.** The paragraph frames safety as flowing from "content on disk actually
+changed." The safety would hold even if it hadn't: `Empty` carries no claim about content at all, so there
+is nothing in what `Invalidate()` installs that could be *wrong* — worst case a wasted rebuild, never
+served-bad-data. The written reason is correct for the one caller that exists and reads naturally; the
+more general reason is a nuance a future reader extending `Invalidate()` to a second caller would want,
+not something this caller needs stated. Flagging so it's on record, not asking for a change — this is
+squarely a "carry forward if it ever matters" note, not the wrong-justification failure mode this task
+asked me to hunt for.
+
+→ @architect — clean to commit block A on the round-four Approve plus this confirmation. Nothing further
+from me on this passage.
+
+**[architect]** Block A committed. **One clause added after the confirmation, declared here rather than
+left for the section review to find** — the reviewer's "not asking for a change" nuance, taken anyway:
+D17 now states that the deeper reason `Invalidate()`'s unconditional write is safe is that **`Empty`
+makes no claim about any page**, so a losing invalidation would cost correctness while a losing refresh
+costs only a rebuild. That asymmetry, not "the disk changed", is what makes the unconditional write the
+safe side. No mechanism, decision or scenario changed; it is a reason-deepening clause on a passage
+already certified, and it is the one the reviewer said a future second caller of `Invalidate()` would
+want. Flagged explicitly because a reviewer's Approve certifies a *state*, and this change has twice had
+that gap open silently — the fix for that is declaring the delta, not pretending it did not happen.
+
+**Gates, run by the Architect in the foreground rather than relayed:** `dotnet build` **0 warnings, 0
+errors**; `dotnet test` **717/717 unfiltered** in 1m29s; `dotnet format --verify-no-changes` exit 0;
+`openspec validate --strict` valid. `git diff --stat -- src tests` **empty** — block A touched no code at
+all, so there was nothing to mutate and no mutation residue to sweep for. Test count is unchanged from
+§5's close-out, as a docs-only block should leave it.
+
+**Ticks nothing** — §6's task numbers all belong to blocks B–D. Block A's deliverable is D17 and the two
+gating scenarios, exactly as §3's `50da7b0`, §4's `c59ce13` and §5's `172c622` ticked nothing.
+
+**Four review rounds plus a targeted confirmation, and not one of them found a wrong decision.** Every
+finding was in the *reasoning attached to a right one*: round one, an instrument (`rev-parse HEAD:<path>`)
+that violated the exit-code posture D17 itself established two paragraphs later; round two, a rollback
+invalidation that was losable because `Replace` is last-writer-wins; round three, three claims that
+overreached — including my arguing against `_refreshGate` on the grounds that a public unconditional
+setter lets a future caller bypass it, while leaving a public unconditional setter in my own design.
+That is this change's signature defect class, and §6 has now produced four instances of it before a line
+of code exists. **The transferable point for blocks B–D: the decisions in D17 have been attacked harder
+than the prose in it, so an implementer should treat D17's *reasons* as the load-bearing part to check
+against the code, not the part to skim on the way to the mechanism.**
+
 ## NEXT
 
 **Resume point: §6 (Commit-on-save), first block. §5 is closed** — supervisor `Approve` on round two
