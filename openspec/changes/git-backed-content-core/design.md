@@ -488,12 +488,102 @@ at the section's open.
 
 **Surface — a minimal Static SSR edit form, not an editor (Product Owner decision).** `proposal.md`
 defers browser editor UX to a later change, so §6 ships the smallest browser-facing surface that makes
-the write path real: a `/wiki/{*Route}/edit` page carrying a `textarea`, the base revision in a hidden
-field, and a Save button, posting back to the same route. **Explicit save *is* the save-point.** This is
-what discharges 6.4, and it discharges it structurally rather than by mechanism: with a form post, no
-keystroke ever reaches the server, so there is nothing to debounce and no path by which more than one
-commit per save could be produced. A later editor change may add a client-side debounce on top; it can
-never make this weaker, because the commit is driven by the post, not by the keystrokes.
+the write path real: a `textarea` carrying the page's Markdown, the base revision in a hidden field, and
+a Save button, posting back to the address it was served from. **Explicit save *is* the save-point.**
+This is what discharges 6.4, and it discharges it structurally rather than by mechanism: with a form
+post, no keystroke ever reaches the server, so there is nothing to debounce and no path by which more
+than one commit per save could be produced. A later editor change may add a client-side debounce on top;
+it can never make this weaker, because the commit is driven by the post, not by the keystrokes.
+
+**The address is `/wiki/{*Route}` with an `edit` flag on the query string — editing is a *mode of the
+page*, not a second address for it (Product Owner decision, §6 block D1).** An earlier revision of this
+decision said `/wiki/{*Route}/edit`, and that is **not a legal route template**: a catch-all parameter
+may only occupy the last segment. Verified by execution rather than read off documentation —
+`RoutePatternFactory.Parse("wiki/{*Route}/edit")` throws `RoutePatternException: A catch-all parameter
+can only appear as the last segment of the route template`, while `wiki/edit/{*Route}`,
+`edit/{*Route}` and today's `wiki/{*Route}` all parse. **The decision was unimplementable as written
+and shipped through block A's four review rounds unnoticed**, which is worth more than the correction
+itself: every round audited what the paragraph *argued*, and nobody parsed the string it *named*.
+
+*Why the query flag rather than a legal sibling route.* The two legal shapes each claim route space,
+and one of them collides. Routes mirror directories (`PageRouteCodec.Encode` maps the separator
+straight through), so a file at `docs/edit/foo.md` has the route `edit/foo` — and under
+`/wiki/edit/{*Route}` a literal segment outranks a catch-all, so that page's own view address would
+serve the *edit form for `foo`* and the page itself would be unreachable. Not theoretical: nothing
+stops a member creating `edit/` in the vault, and §9's Obsidian round-trip means content arrives from
+outside the app's control. `/edit/{*Route}` avoids the collision by claiming a second top-level path.
+The query flag claims **nothing** — no new template, no reserved name, and no page route that can ever
+be shadowed, now or by any content anyone adds later. That permanence is the reason, not the URL's
+looks.
+
+*The consequence, named rather than discovered:* view and edit share one component and one route, so
+the component branches on the flag, and the flag's **presence** is what selects the mode. A valueless
+`?edit` is a real binding hazard — the bound value is empty, not "true" — so the exact parameter form
+and its binding is something block D3 must **run**, not assume; this change's standing rule about
+tracing a premise applies to the correction as much as to what it corrected.
+
+**The edit surface creates as well as edits (Product Owner decision, §6 block D1).** A route that
+resolves to no existing page opens an empty form declaring `PageBaseRevision.AbsentAtHead`, and saving
+it writes and commits a new file. The mechanism is already built and already spec'd — C2's CAS treats
+"declared absent, still absent" as a match precisely so a brand-new page is a first-class save — so
+this decision buys surface, not machinery. It is also what makes §9's round-trip demonstrable in both
+directions from the browser rather than only in the pull direction.
+
+*What this does not weaken:* the created path goes through `TryResolveWorkingTreePathFromRouteValue`
+and the canonical-route refusal exactly as an edit does, so creation cannot reach a path an edit could
+not. That is the whole of the guarantee, and it is narrower than it sounds — see immediately below.
+
+**D12's ambiguity rule does *not* govern the save path today, and exposing creation is what makes that
+reachable (a reviewer blocker on this block; the claim it replaces was mine and was false).** An earlier
+revision of the paragraph above asserted that "a route that is ambiguous, non-canonical or undecodable
+is refused for creation exactly as it is for viewing". Only two thirds of that is true. Verified by
+reading the code rather than by re-reading the sentence: `PageSaveService` touches `IPageIndex` exactly
+once in the whole class — `_index.Invalidate()` on the rollback path — and **never consults
+`AmbiguousRoutes`**. Its only route defences are the resolve and the canonical-route check. The
+ambiguity refusal lives solely on the read path, in `WikiPage.razor`.
+
+The two surfaces therefore disagree, and the encoder supplies the witness: `Chapter_1.md` encodes to
+`Chapter__1` (literal `_` doubles) and `Chapter  1.md` encodes to `Chapter__1` (two spaces, each to
+`_`). D12 calls that route ambiguous and the read path answers 409 naming both claimants; a save through
+the same route passes `IsCanonicalRouteValue` cleanly and writes to whichever one the decode picks,
+silently, while the other file becomes unaddressable. **This predates creation** — C2's edit path has it
+too — but it has been unreachable because nothing calls `SaveAsync` from a browser yet. D3 is what ends
+that, and creation is what makes the consequence *new content on an ambiguous route* rather than only a
+misdirected edit.
+
+**Decision: the save itself must refuse a route that does not identify exactly one file, and the refusal
+must live in the save path, not only at the surface.** A surface-only check is bypassable two ways, and
+the second is not exotic: a form post can be submitted directly, and — more importantly — a route can
+*become* ambiguous between the open and the save, because §9 means an Obsidian push can land
+`Chapter  1.md` while a member is editing `Chapter_1.md`. That is the same read-then-write-is-not-atomic
+argument the base-revision CAS already rests on, applied to identity instead of content: a check made
+before the lock is a value that may be stale by the time it is acted on.
+
+*The mechanism is deliberately left to D3, and the constraint that makes it non-obvious is named here so
+D3 does not rediscover it the expensive way.* "Consult the index under the write lock" is **not** a free
+answer: this decision already rejects making the save path block on `PageIndex`'s internal refresh gate,
+for the lock-ordering reason recorded above, and it is safe today only because readers never take the
+write lock. An answer derived from the working tree instead needs to handle collisions arising in a
+*directory* segment — `a_b/` and `a  b/` (two spaces) both encode to `a__b/`, the same pairing D12's own
+table records and the directory-level twin of the `Chapter_1.md`/`Chapter  1.md` witness above — and not
+only in the filename, so a single-directory scan is not sufficient either. D3 owns choosing between
+these and justifying the choice; D1 records that one of them must be chosen, because leaving the save
+path as the one surface D12 does not govern is not an option once a browser can reach it.
+
+**Every failure outcome stays distinguishable at the browser surface, and none of them discards what the
+member typed (Product Owner decision, §6 block D1).** There are **five**, not the four this section's
+DEVLOG has been counting since C2: conflict, repository-busy, refused, failed-and-rolled-back, and
+failed-with-the-rollback-also-failed. `Refused` was the one dropped from the tally, and it is not merely
+an open-time answer — it is reachable at *write* time, from the symlink refusal and from a base-revision
+probe git cannot answer with a blob-or-absent state. The surface must not collapse these into one "save
+failed", because they call for different actions — retry now, retry in a moment, fix the address or the
+file behind it, reload, and tell an operator respectively. On a **stale-base conflict** specifically the
+form re-renders
+carrying **exactly the text that was submitted**, with a message saying the page changed underneath the
+save and that nothing was written. The member copies their work out and reloads; §6 offers no merge and
+no automatic reload, because a minimal form that silently replaced a member's text with someone else's
+would lose the edit the CAS exists to protect. `specs/content-editing/spec.md` gates this, so a section
+review sees it rather than this paragraph.
 
 **Base revision — the file's blob SHA at `HEAD`, not the repository's `HEAD` and not the file's
 last-commit SHA.** A save declares the object name of the content it loaded, and the server compares it

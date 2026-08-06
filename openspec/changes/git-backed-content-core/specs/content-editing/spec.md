@@ -28,6 +28,68 @@ Where a save's content is identical to what is already committed, the system SHA
 - **WHEN** a user whose username would not satisfy the current username form rules saves a page
 - **THEN** the system still records a well-formed author address for that commit, rather than emitting a malformed one or refusing the save
 
+#### Scenario: Saving a page that does not yet exist creates it
+
+- **WHEN** an authenticated user saves a page at an address where no file exists, declaring that it did not exist at the base revision
+- **THEN** the system creates the file and commits it as that user, by the same single-commit and authorship rules as an edit to an existing page
+
+### Requirement: A save refuses an address that does not identify exactly one file
+
+The system SHALL refuse a save whose address does not identify exactly one content file, and SHALL make that refusal in the save itself rather than only in whatever surface submitted it. The refusal SHALL hold when the address became ambiguous after the content being saved was loaded, since an address can acquire a second claimant between a save being prepared and being applied. That second claimant arrives from content entering the repository outside the browser's own addressing — an incoming push, or a change made directly to the content volume — and not from another browser save, which can only ever write to the single file its address resolves to.
+
+A save refused for this reason SHALL be reported distinctly from a save rejected for a stale base revision: the first means the address no longer names one file, the second means the file it names has moved on.
+
+#### Scenario: Save through an ambiguous address is refused
+
+- **WHEN** a save is submitted for an address that more than one content file resolves to
+- **THEN** the system refuses the save, writes and commits nothing, and does not silently apply it to one of the claiming files
+
+#### Scenario: An address that becomes ambiguous before the save is applied is refused
+
+- **WHEN** a save was prepared for an address identifying exactly one file, and a second file resolving to that same address arrives before the save is applied
+- **THEN** the system refuses the save rather than applying it, because the address no longer identifies the file the save was prepared against
+
+#### Scenario: Save through an address that resolves to no content file is refused
+
+- **WHEN** a save is submitted for an address that does not decode to a path inside the content tree, or that is not the canonical address for the file it resolves to
+- **THEN** the system refuses the save and writes nothing, under the same requirement that refuses an ambiguous address — each is a way of failing to identify exactly one file
+
+### Requirement: Browser editing surface
+
+The system SHALL provide an authenticated browser surface that loads a page's Markdown for editing together with the base revision it was loaded at, and submits both back as one explicit save. The surface SHALL open for an address that identifies no existing page, so a page can be created as well as edited; it SHALL NOT open for an address that does not identify exactly one file, which is a different condition from no page existing yet.
+
+The surface SHALL keep every distinct save failure distinguishable to the member — a stale-base conflict, a busy repository, a refused address, a failed save whose working tree was restored, and a failed save whose restore also failed SHALL NOT be reported as one undifferentiated failure, because each calls for a different action. On any failure the surface SHALL re-present the content the member submitted rather than replacing or discarding it.
+
+#### Scenario: Editing surface loads a page with its base revision
+
+- **WHEN** an authenticated user opens the editing surface for an existing page
+- **THEN** the system presents that page's current Markdown together with the base revision it was read at, so the save that follows declares what it started from
+
+#### Scenario: Editing surface opens for an address with no page yet
+
+- **WHEN** an authenticated user opens the editing surface for an address that identifies no existing file
+- **THEN** the system presents an empty editor declaring that the page did not exist at the base revision, so saving creates it
+
+#### Scenario: Editing surface refuses an address that identifies no single file
+
+- **WHEN** an authenticated user opens the editing surface for an address that is ambiguous, non-canonical, or does not decode to a content path
+- **THEN** the system refuses to open an editor for it rather than treating it as a page that does not exist yet
+
+#### Scenario: A rejected save re-presents the member's own content
+
+- **WHEN** a member's save is rejected because the page advanced beyond the base revision they started from
+- **THEN** the system re-presents the content that member submitted, reports that the page changed underneath the save and that nothing was written, and does not replace their content with the newer committed content
+
+#### Scenario: A failed save whose rollback also failed is reported distinctly
+
+- **WHEN** a save fails after writing and the system's attempt to restore the working tree also fails
+- **THEN** the system reports that outcome distinctly from a failed save that was successfully rolled back, because the working tree may remain dirty and is recovered by startup reconciliation or by an operator rather than by the member retrying
+
+#### Scenario: A save refused for its address is reported distinctly from a stale base
+
+- **WHEN** a member's save is refused because its address does not identify exactly one file
+- **THEN** the system reports that distinctly from a stale-base conflict, since retrying the same address cannot succeed while a conflict is resolved by reloading
+
 ### Requirement: Optimistic concurrency on save
 
 The system SHALL require each save to declare the base revision it started from and SHALL reject the save with a conflict result when the file has advanced beyond that base revision, rather than overwriting the newer content.

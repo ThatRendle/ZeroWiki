@@ -13766,20 +13766,610 @@ Corrected to `git worktree add`, and both endpoints independently re-derived.
 busy, rollback-failed, ordinary failure) must stay distinguishable at the surface as well as in the
 service.
 
+**[architect]** ❗ **D17's stated address for the edit surface is not a legal route template, and block
+A's four review rounds did not catch it.** Found while writing block D's brief, by parsing the string
+D17 names instead of reading the paragraph around it.
+
+`/wiki/{*Route}/edit` cannot be routed: a catch-all parameter may only occupy the **last** segment.
+Reproduced by execution on the shipped framework (`net10.0`, `Microsoft.AspNetCore.App`), not read off
+documentation — `RoutePatternFactory.Parse` over four templates:
+
+| template | result |
+|---|---|
+| `wiki/{*Route}/edit` | **throws** `RoutePatternException: A catch-all parameter can only appear as the last segment of the route template.` |
+| `wiki/edit/{*Route}` | parses |
+| `edit/{*Route}` | parses |
+| `wiki/{*Route}` | parses (today's route) |
+
+**This is the section's signature defect one level up from where it has been appearing.** §6's running
+lesson has been *right mechanism, wrong stated reason* — six instances, two of them mine. This is the
+inverse: the reasoning in D17's surface paragraph is entirely sound (minimal form, explicit save as the
+save-point, 6.4 discharged structurally) and every review round audited **that argument**. The one token
+nobody exercised was the route string itself, which is not an argument at all — it is an input to a
+parser, and it was never fed to one. Four rounds of a reviewer re-deriving claims against the code, and
+the defect sat in the one part of the paragraph that made no claim.
+
+Recorded as a standing rule, because it generalises past routes: **an identifier a framework parses is
+not prose and cannot be reviewed as prose — feed it to the parser.** Route templates, format strings,
+globs, regexes, connection strings, `--format` specifiers. §0 already learned the regex form of this
+(*any regex harness must carry an instrument self-check*); this is the same rule with no harness
+involved, which is why it did not transfer.
+
+**[architect]** ❓ @product-owner — three calls, all answered. Each was forced by the finding above or
+by a gap block D would otherwise have improvised past.
+
+1. **What address does the edit surface live at, given `/wiki/{*Route}/edit` is unroutable?**
+   → **Decision: `/wiki/{*Route}` with an `edit` flag on the query string.** Editing is a *mode of the
+   page*, not a second address for it. The deciding argument is route space rather than aesthetics: the
+   two legal alternatives each claim some, and `/wiki/edit/{*Route}` **collides** — routes mirror
+   directories, so `docs/edit/foo.md` has the route `edit/foo`, and a literal segment outranks a
+   catch-all, so that page's own view address would serve the edit form for `foo` while the page itself
+   became unreachable. Live rather than theoretical: §9 means content arrives from outside the app's
+   control, so nothing stops `edit/` existing in a vault. `/edit/{*Route}` avoids the collision by
+   claiming a second top-level path; the query flag claims **nothing** — no template, no reserved name,
+   no page route shadowable by any content anyone adds later.
+2. **Does §6's surface create pages, or only edit existing ones?**
+   → **Decision: it creates as well as edits.** A route resolving to no existing file opens an empty
+   form declaring `PageBaseRevision.AbsentAtHead`; saving writes and commits a new file. C2 already
+   built this — its CAS treats "declared absent, still absent" as a match precisely so a new page is a
+   first-class save — so the decision buys surface, not machinery, and it makes §9's round-trip
+   demonstrable in **both** directions from the browser rather than only the pull direction.
+3. **What does a member meet when their base is stale?**
+   → **Decision: keep their text, explain, offer no merge and no automatic reload.** The form
+   re-renders carrying exactly what was submitted, with a message that the page changed underneath the
+   save and nothing was written. A minimal form that replaced a member's text with someone else's would
+   lose the very edit the CAS exists to protect. The other three failure outcomes stay separately
+   reportable for the same reason they are separate in `SaveOutcome`: retry now, retry shortly, tell an
+   operator, reload are four different actions.
+
+**[architect]** **Block D is split into D1, D2 and D3 — by surface, following C1/C2's precedent.** The
+carve at `13088` scoped D as one browser-surface block. Three things have changed since: D17's address
+is wrong and must be corrected *before* anything is built against it, the two new Product Owner
+decisions need spec gating, and obligation 8 is still homeless. Landing all of that as one commit would
+put a design correction, a process-lifetime fix and a new browser surface in one diff — the conflation
+this section has spent seven blocks refusing.
+
+- **D1 — the design correction and its spec gate.** D17's surface paragraph rewritten (address, create,
+  failure presentation) plus the `content-editing` spec delta. Architect's own artifact, per block A.
+  **Ticks nothing.**
+- **D2 — obligation 8: `GitProcessRunner` kills its git subprocess on cancellation.** Placed **before**
+  the new surface for exactly the reason block B was placed before the save path: D3 adds request-path
+  callers to the runner, and a foundation gets fixed before callers are added to it, not after.
+  **Ticks nothing.**
+- **D3 — the browser surface.** The `?edit` mode on `/wiki/{*Route}`, the save post, and how all four
+  outcomes reach the member. **Ticks 6.1 and 6.4.**
+
+**[architect]** Block D1 (design + spec gate) — **written, `openspec validate --strict` valid.** Docs
+only; no `src/` or `tests/` change. → @reviewer
+
+`design.md` — D17's surface paragraph replaced by four:
+
+- **Surface** — unchanged in substance (minimal Static SSR form, explicit save *is* the save-point, 6.4
+  discharged structurally); the dead route string removed from it and the address moved into its own
+  paragraph, so the shape of the address and the shape of the *form* are no longer one sentence.
+- **The address**, with the illegality recorded as *verified by execution*, the parse table, the
+  `edit/foo` collision traced through `PageRouteCodec.Encode`, and the reason stated as **permanence**
+  (the query flag claims no route space that content could ever collide with) rather than preference.
+  **A consequence is named rather than left for D3 to discover:** view and edit now share one component
+  and one route, so the component branches on the flag — and a valueless `?edit` is a genuine binding
+  hazard, since the bound value is empty rather than "true". D1 deliberately does **not** assert the
+  parameter's exact form; it obliges D3 to **run** it. Asserting an untraced answer inside the
+  correction for an untraced answer is a trap this section has fallen into before.
+- **Creation**, with what it does *not* weaken stated explicitly: creation still goes through
+  `TryResolveWorkingTreePathFromRouteValue` and the canonical-route refusal, so it cannot reach a path
+  an edit could not, and "no page here yet" stays a different answer from "this address does not
+  identify one file".
+- **The four outcomes at the surface**, and the conflict presentation.
+
+`specs/content-editing/spec.md` — one scenario added to **Commit-on-save** (saving a page that does not
+yet exist creates it) and a new **Browser editing surface** requirement with five: loads content plus
+its base revision; opens for an address with no page yet; **refuses** an address that identifies no
+single file; a rejected save re-presents the member's own content; and a rollback-failed save is
+reported distinctly from a rolled-back one. **That last scenario discharges C2's carried-forward nit**
+— `SaveOutcome.RollbackFailed` now has a spec scenario of its own.
+
+Two things worth an auditor's attention specifically:
+
+1. **The refusal scenario is the one that carries risk.** "No page yet" and "not one file" are now both
+   reachable at the same surface, and D12's whole ambiguity apparatus depends on them staying apart. If
+   the spec wording lets an ambiguous route read as an empty page, a save through it would create a
+   *third* claimant on a route that already has two. Check the wording is tight enough to forbid that,
+   not merely to describe it.
+2. **`RollbackFailed`'s scenario asserts a reason** ("recovery requires intervention rather than a
+   retry"). This change's standing rule is that a justification is a claim to reproduce, not to write
+   down — verify it against `SaveOutcome.RollbackFailed`'s own remarks and C2's actual rollback path,
+   rather than against this post.
+
+**[reviewer]** Block D1 (design: D17 correction + `content-editing` spec delta) — **Request changes.**
+Every load-bearing claim was re-derived, not read off the diff. Most of it holds. One does not, and it
+is the one the brief specifically asked me to trace.
+
+**Re-derived and confirmed correct (no finding):**
+
+- **The route-template parse table.** Fed all four templates to
+  `RoutePatternFactory.Parse` on `net10.0` directly: `wiki/{*Route}/edit` throws
+  `RoutePatternException` exactly as stated; `wiki/edit/{*Route}`, `edit/{*Route}`, and `wiki/{*Route}`
+  all parse. Table is right.
+- **The `edit/foo` collision.** `PageRouteCodec.Encode` (`src/ZeroWiki/Content/PageRouteCodec.cs:91-103`)
+  does map `docs/edit/foo.md` → route `edit/foo` — it splits and rejoins on `/` with no special-casing.
+  Then stood up both routes (`wiki/edit/{*Route}` and `wiki/{*Route}`) on a real `TestServer` and hit
+  `/wiki/edit/foo`: it resolves to `wiki/edit/{*Route}` (`route=foo`), never to `wiki/{*Route}`
+  (`route=edit/foo`). A literal segment does outrank a catch-all, confirmed by execution, not by reading
+  precedence rules. The stated reason for the chosen address is correct.
+- **"The query flag claims nothing."** True as stated — a query parameter is per-request and shares no
+  namespace with page routes, so no future content path can ever be shadowed by it. Holds.
+- **The valueless-`?edit` binding hazard.** Design.md deliberately does not assert how binding resolves
+  and obliges D3 to run it — correctly hedged, not merely correctly worded. I ran it anyway to check the
+  premise underneath the hedge: `HttpContext.Request.Query["edit"]` for a bare `?edit` **is** present
+  with an empty-string value (confirmed via `TestServer`), and a naive `bool?` minimal-API parameter
+  bound to it returns **400**, not `true`. The hazard is real, worse than "ambiguous" — it can 400 the
+  page outright — and D1's refusal to assume an answer is the right call.
+
+**Blocker — the "Creation" paragraph's parity claim is false against the code as it stands
+(`design.md:532-536`):**
+
+> "...the created path still goes through `TryResolveWorkingTreePathFromRouteValue` and the
+> canonical-route refusal, so creation cannot reach a path an edit could not, and D12's ambiguity rule
+> still governs which routes resolve at all. A route that is ambiguous, non-canonical or undecodable is
+> refused for creation exactly as it is for viewing..."
+
+The first clause is true — I traced `PageSaveService.SaveAsync` (`src/ZeroWiki/Content/PageSaveService.cs:84-94`)
+and creation and edit share the identical `TryResolveWorkingTreePathFromRouteValue` +
+`IsCanonicalRouteValue` gate; nothing about creating is looser than editing.
+
+The second clause — "D12's ambiguity rule still governs which routes resolve at all... refused for
+creation exactly as it is for viewing" — is not true of the code today, and I demonstrated it rather
+than argued it. D12's actual ambiguity check (`PageEnumerationService`, surfaced as
+`PageIndexSnapshot.AmbiguousRoutes`) is consulted **only** by the read path —
+`Components/Pages/WikiPage.razor:163-170` looks it up and returns a 409 before ever touching the
+filesystem. `PageSaveService.SaveAsync` never references `IPageIndex.AmbiguousRoutes` at all; the
+`_index` field it holds is used exactly once, to call `Invalidate()` after a failure. Its own
+"canonical-route refusal" (`IsCanonicalRouteValue`) only checks that the one file the route greedily
+decoded to round-trips back to the same route — it has no way to know a *second* file also claims that
+route, because it never looks at any file but the one it resolved to.
+
+I built the actual D12 collision and ran it through the real types (`ProjectReference` to
+`ZeroWiki.csproj`, no test doubles):
+
+```
+Encode(Chapter_1.md)   = 'Chapter__1'
+Encode(Chapter  1.md)  = 'Chapter__1'      // both files claim the same route — genuinely ambiguous per D12
+TryDecodeRouteValue('Chapter__1') -> path='Chapter_1.md'   // greedy decode, as D12 says it must
+IsCanonicalRouteValue(request, Encode(resolved)) = True    // <-- passes. SaveAsync sees nothing wrong here.
+```
+
+`SaveAsync`'s own gate — the only gate a save goes through — says yes to a route that `WikiPage.razor`'s
+gate says 409 to. Viewing and creating are **not** symmetric today; the paragraph asserts they are.
+
+This is not a hypothetical for D3 to discover later — it is exactly the risk named in this block's own
+attention note #1, and it is real: nothing in `content-store/spec.md`'s existing "serve a route" wording
+binds *saving*, and the new "Browser editing surface" requirement's refusal clause binds only the
+surface's **open** behaviour — "The surface... SHALL NOT **open**..." and the scenario's own `WHEN` is
+"an authenticated user **opens** the editing surface..." Nothing requires the **save** action itself to
+refuse an ambiguous/non-canonical address. Given `SaveAsync` cannot currently detect that condition at
+all (demonstrated above), a spec-compliant D3 could correctly refuse to *open* an editor on an ambiguous
+route and still let a directly-submitted POST — or one racing a push that makes the route ambiguous
+between open and submit — through to a write, creating the third claimant D12 exists to prevent. The
+"open" gate and the "write" gate are not the same gate, and only one of them currently exists.
+
+Fix needed, not a mechanism fix but a docs fix (this is still D1's job): either (a) reframe this
+paragraph as an obligation D3 must discharge — analogous to how the `?edit` binding is correctly punted
+rather than asserted — stating plainly that the save action does not yet check route ambiguity and must
+gain that check (reusing `IPageIndex.AmbiguousRoutes`, the one place the check already exists), or (b)
+add the equivalent refusal explicitly to the spec delta's "Browser editing surface" requirement so it
+binds the **save**, not only the **open**, and correct the paragraph to stop asserting parity that does
+not exist yet.
+
+**Nit — `RollbackFailed`'s stated reason narrows its own source's story.** The new scenario says
+recovery "requires intervention rather than a retry." `SaveOutcome.RollbackFailed`'s own remarks
+(`src/ZeroWiki/Content/SaveOutcome.cs:44-54`) say recovery is "**only** by D9's startup reconciliation on
+the next restart, **or** by an operator's own intervention" — two distinct paths, and the first one is
+not intervention, it is automatic recovery on the next restart for any reason (a redeploy, a health-check
+restart), with nobody touching anything. "Requires intervention" collapses that to one path and
+overstates what a member needs to be told. Doesn't change the scenario's testability, so a nit rather
+than a blocker, but per this change's own standing rule the "because" clause is a claim to reproduce, and
+this one only reproduces half its source.
+
+**Architectural note, not blocking this block:** the same design.md paragraph and the new spec
+requirement both enumerate exactly four distinguishable save failures (conflict, busy, failed-rolled-
+back, rollback-failed) and never mention `SaveOutcome.Refused` as a possible outcome of a *submitted*
+save (as opposed to a refusal at open time). `Refused` is reachable from `SaveAsync` itself at write time
+— the symlink check and the `HeadPathState.Refuse` branch both return it under the lock, after a form
+was legitimately opened — so a member can submit a save and get `Refused` back. Neither document says
+what the surface does with it. Worth a line in whichever of (a)/(b) above D1 picks, since it's the same
+shape of gap as the ambiguity finding: something `SaveAsync` can return at write time that the docs only
+account for at open time.
+
+**Spec-delta discipline — otherwise clean.** `openspec validate git-backed-content-core --strict` passes.
+Both new scenarios and the new requirement are in OpenSpec form, testable, and scoped to the minimal
+Static SSR form `proposal.md` permits — no editor UX (toolbar, highlighting, autosave) is smuggled in;
+"loads... for editing" and "submits... as one explicit save" is all the new requirement asks for.
+`tasks.md`'s 6.1/6.4 wording is address-agnostic and unaffected by the correction. I found one stale
+cross-reference, informational only since `## NEXT` is explicitly living and gets rewritten at commit
+time: the `§6 progress` table under `## NEXT` (line ~13906) still lists block D as delivering
+`` `/wiki/{*Route}/edit` `` — the address this very block retracts — and still shows the pre-split single
+block D rather than D1/D2/D3. Not this block's diff to fix, but flagging so it isn't forgotten when D1
+commits and rewrites `## NEXT`.
+
+**Verdict: Request changes.** One blocker (the Creation paragraph's false parity claim, and the spec's
+save-path gap it exposes), one nit (RollbackFailed's narrowed reason), one architectural note (Refused
+unaddressed at save time), one informational note (stale `## NEXT` table entry, not blocking). Everything
+else in the block — the route correction itself, the collision argument, the query-flag reasoning, and
+the deliberately-unasserted binding hazard — was re-derived by execution and holds. → @architect
+
+**[architect]** ❗ **Blocker accepted, and re-derived before accepting it — the finding is right and it
+is larger than a doc error.** Two independent checks, neither relayed from the reviewer's post:
+
+- `grep -n '_index\.' src/ZeroWiki/Content/PageSaveService.cs` returns **one** line — `_index.Invalidate()`
+  at 295. `AmbiguousRoutes` is never consulted anywhere in the class. The save path's entire route
+  defence is `TryResolveWorkingTreePathFromRouteValue` + `IsCanonicalRouteValue`.
+- The collision falls out of `EncodeSegment` by reading it: layer 1 maps `' ' → '_'` and `'_' → '__'`,
+  so `Chapter_1.md` and `Chapter  1.md` both encode to `Chapter__1`. Same witness the reviewer executed,
+  reached a different way.
+
+**What makes this more than a wrong sentence: it is a live asymmetry in shipped code, not just in my
+prose.** `WikiPage.razor` answers 409 on that route and names both claimants; `SaveAsync` writes to
+whichever one the greedy decode picks and leaves the other unaddressable. C2 shipped that, block C2's
+review did not see it, and it has been invisible only because nothing calls `SaveAsync` from a browser
+yet. **D3 is what ends that.** The reviewer's compounding point is the sharper half and I have taken it
+whole: my spec delta bound the surface's *open* and left the *save* ungoverned, so a D3 that satisfied
+it exactly could still write a third claimant onto a two-claimant route.
+
+**This is the third instance in §6 of my own "right mechanism, wrong stated reason" — and the first that
+was wrong about a *guarantee* rather than a rationale.** The previous two overstated why something held;
+this one asserted a defence that does not exist, in a paragraph headed *What this does not weaken*. It
+also landed in the same edit whose neighbouring paragraph warns against asserting an untraced answer
+inside a correction. Writing that warning did not make me apply it one paragraph down, which is the part
+worth keeping: **a rule stated in a document does not enforce itself on the document it is stated in.**
+
+Remediation, all in D1's own artifacts:
+
+1. `design.md` — the false parity claim is **retracted in place**, not quietly rewritten. The narrowed
+   true guarantee stays (creation reaches no path an edit could not), followed by a paragraph stating
+   what was verified, the `Chapter__1` witness, and that the gap predates creation.
+2. `design.md` — **new decision:** the refusal lives in the **save path**, not only the surface. A
+   surface-only check is bypassable by a direct post and, more importantly, by a route *becoming*
+   ambiguous between open and save — §9 makes an Obsidian push landing `Chapter  1.md` mid-edit an
+   ordinary event. That is the base-revision CAS's own read-then-write-is-not-atomic argument applied to
+   **identity** instead of content.
+3. `design.md` — **the mechanism is deliberately not chosen**, and the constraint is named so D3 does
+   not pay for it twice: "consult the index under the write lock" is not free, because D17 already
+   rejects making the save block on `PageIndex`'s refresh gate; and a working-tree answer must handle a
+   collision in a *directory* segment (`a_b/` vs `a b/`), so a single-directory scan is insufficient.
+   D3 chooses and justifies. D1 records only that one must be chosen.
+4. `specs/content-editing/spec.md` — **new requirement, *A save refuses an address that does not identify
+   exactly one file***, with two scenarios: refusal on an ambiguous address, and refusal when the address
+   *became* ambiguous after the content was loaded. It binds the save, explicitly "rather than only in
+   whatever surface submitted it", which is the reviewer's gap closed at the level it existed on.
+
+**Nit taken** — `RollbackFailed`'s scenario said recovery "requires intervention rather than a retry",
+narrowing `SaveOutcome`'s own remarks, which name D9 startup reconciliation **or** an operator. The
+first is automatic. Reworded to "recovered by startup reconciliation or by an operator rather than by the
+member retrying". The reviewer is right that this matters: the mis-stated version would have justified a
+surface message telling a member to call an operator when a restart fixes it.
+
+**Architectural note taken, and it corrects a count this section has been carrying since C2.** `Refused`
+is reachable at *write* time — the symlink refusal and a probe git cannot answer blob-or-absent — so
+there are **five** failure outcomes at the surface, not four. "Four" has been repeated in C2's
+carried-forward nit, in this block's brief, and in my own spec paragraph; every one of them silently
+dropped the same outcome. `design.md` and the spec now say five and name `Refused`'s two write-time
+sources, and a sixth surface scenario distinguishes it from a stale base — retrying the same address
+cannot succeed, where a conflict is resolved by reloading.
+
+**Informational note taken** — `## NEXT`'s §6 progress table still describes the pre-split block D and
+the retracted address. It is rewritten when D1 commits, per `## NEXT` being the one living section.
+
+`openspec validate git-backed-content-core --strict` — valid. Docs only; `git status` shows
+`design.md`, `specs/content-editing/spec.md` and this file. → @reviewer for re-audit.
+
+**[reviewer]** Block D1 remediation — **Request changes.** One blocker, small and mechanical. Everything
+else re-derived independently, not accepted because it agreed with my own prior finding.
+
+**Re-derived and confirmed accurate — no finding:**
+
+- **`_index` used once.** `grep -n '_index' src/ZeroWiki/Content/PageSaveService.cs` — field declaration,
+  constructor assignment, and exactly one call site, `_index.Invalidate()` at line 295.
+  `IPageIndex.AmbiguousRoutes` is never referenced in the class. Matches the retraction exactly.
+- **The `Chapter__1` witness.** `git diff --stat HEAD -- src tests` is empty — the code this witness
+  depends on is untouched since my first pass, so my own executed reproduction from that round
+  (`Encode("Chapter_1.md")` and `Encode("Chapter  1.md")` both yield `Chapter__1`;
+  `IsCanonicalRouteValue` returns `true` for the greedily-decoded file) still stands unchanged.
+- **"Predates creation... unreachable because nothing calls `SaveAsync` from a browser yet."** True on
+  both counts: the gap is in the shared resolve/canonical gate `SaveAsync` uses for edit and create
+  alike, and `grep -rln "SaveAsync" src/ZeroWiki` finds no caller outside the class itself — no
+  Razor component or endpoint invokes it yet.
+- **The became-ambiguous-in-flight race is real, traced through C2's actual ordering, not asserted.**
+  `PageSaveService.SaveAsync`'s base-revision re-read (`ProbeHeadPathAsync`, step 3) is a
+  `git ls-tree HEAD -- <the one resolved repository-relative path>` — scoped to that single path string.
+  A push landing a second, colliding file at a different path under a shared route never changes that
+  path's own blob SHA, so the CAS at step 4 still matches, the write proceeds, and the resolve+canonical
+  gate (run once, before the lock, at step 1) is never re-examined after the lock is taken. The window is
+  exactly "member opens the editor" to "member's save acquires the write lock" — arbitrarily long, spans
+  a full push-and-release cycle before the save's own lock wait even begins — and nothing in that ordering
+  closes it. The scenario is not manufacturing a hazard for D3 to chase; it is real.
+- **The lock-ordering constraint on D3's mechanism.** "Consult the index under the write lock" is not
+  free, and this is D17's own established reasoning, not a new claim: `design.md:801-806` (unchanged by
+  this diff) already argues against routing the rollback's install through `PageIndex`'s `_refreshGate`
+  for exactly this reason — "the save path (holding the write lock) block on the index's internal
+  gate... safe today only because readers never take the write lock." I read `PageIndex.GetCurrentAsync`
+  (`src/ZeroWiki/Content/PageIndex.cs:136-189`) to check whether this is live or decorative: the fast
+  path (index already fresh) never touches `_refreshGate` at all, only the stale branch does, and no
+  code anywhere acquires `_refreshGate` and then waits on `RepositoryWriteLock` (`grep` for
+  `RepositoryWriteLock` in `PageIndexBuilder.cs` and `IPageIndexBuilder.cs` returns nothing), so there is
+  no proven deadlock today. That is exactly D17's own qualification too ("safe today only because...") —
+  the new paragraph extends an already-reviewed argument to a structurally identical new call site rather
+  than inventing one, and it doesn't overclaim beyond what D17 already established. Holds.
+- **The five-outcome count.** Enumerated `SaveOutcome` directly: `Saved, Conflict, RepositoryBusy,
+  Refused, Failed, RollbackFailed` — one success, five non-success. Each of the five is independently
+  reachable at a submitted save, including `Refused` at write time (the symlink check at
+  `PageSaveService.cs:142-149` and the `HeadPathState.Refuse` branch at `PageSaveService.cs:122-125`
+  both return it from inside a save that a member actually submitted, not only from a GET that never
+  opened a form). Five is right, not four and not six.
+
+**Blocker — the directory-segment collision example is wrong, and it's the one place this remediation
+states a concrete witness (`design.md:567`):**
+
+> "...needs to handle collisions arising in a *directory* segment (`a_b/` and `a b/` encode alike)..."
+
+Ran it rather than read it, the same standard this whole re-audit is held to:
+
+```
+Encode("a_b/file.md")  = "a__b/file"
+Encode("a b/file.md")  = "a_b/file"
+```
+
+These are **different routes** — `a_b/` and `a b/` do not collide. This isn't a fresh derivation either:
+D12's own table, forty lines into this same document (`design.md:146-148`), already states the correct
+pairing and has done since before this block existed — `a b` → `a_b` (round-trips), `a_b` → `a__b`
+(round-trips), and only `a  b` (**two** spaces) → `a__b` **collides with** `a_b`. The witness this
+paragraph needed was sitting in the document that contains it. The genuine directory-segment analogue
+(confirmed by execution above) is `a_b/` vs `a  b/` (two spaces), exactly mirroring the file-level
+`Chapter_1.md` vs `Chapter  1.md` example used earlier in this same block.
+
+The underlying point — that a collision can arise in a directory segment, not only in the filename, so a
+single-directory scan is insufficient — is correct and worth keeping; only the illustrating pair is
+wrong. But it's wrong in the one sentence whose entire job is to hand D3 a concrete case to defend
+against, in a block whose own opening post (`13769`) is *about* exactly this failure mode — a claim
+nobody fed to anything before writing it down. Fix is one line: swap `a b/` for `a  b/` (two spaces), or
+pick a fresh pair and verify it the way this one wasn't.
+
+**Nit — the new requirement's `SHALL` is broader than its own scenarios, and broader than it needs to
+be.** "A save refuses an address that does not identify exactly one file" reads as covering three
+conditions: zero files (undecodable), more than one (ambiguous), and one-but-wrongly-addressed
+(non-canonical). Its two scenarios (`spec.md:42-49`) exercise only the ambiguous case and the
+became-ambiguous race. That's not a live gap — I checked
+`tests/ZeroWiki.Tests/Content/PageSaveServiceTests.cs` and both other conditions are already refused by
+`SaveAsync`'s pre-existing, pre-D1 checks and already covered by existing tests
+(`Save_UnresolvableRouteValue_IsRefusedAndWritesNothing`,
+`Save_RouteValueThatIsNotCanonicalForItsResolvedFile_IsRefused` — both from block C2, both untouched by
+this diff). But nothing in the spec tree has ever stated that guarantee before this requirement's title
+implicitly claims to, and its own scenarios don't demonstrate it. Either narrow the `SHALL` to what the
+two scenarios actually test (ambiguous, including in-flight), or add the two missing scenarios so the
+requirement's text and its evidence agree — not blocking, since the behaviour is real and tested, just
+not through this requirement.
+
+**Verdict: Request changes** — the one-line `a_b/`/`a b/` witness at `design.md:567`. Everything else in
+this remediation — the retraction, the save-path decision, the two named constraints (bar the witness),
+the reworded `RollbackFailed` reason, and the five-outcome correction — was re-derived independently and
+holds. → @architect
+
+**[architect]** **Blocker accepted, re-derived, fixed.** Read out of `EncodeSegment` rather than taken on
+report: layer 1 maps `'_' → '__'` and `' ' → '_'`, so `a_b → a__b` while `a b → a_b` — two different
+routes, and my sentence was simply false. The colliding pair is `a_b` and `a  b` (two spaces), both
+`a__b`. **`design.md`'s own D12 table at lines 147–148 already stated this correctly** and has since
+block 3; the sentence contradicted a table 400 lines above it in the same file. Corrected, and now
+written as the directory-level twin of the `Chapter_1.md`/`Chapter  1.md` witness the same paragraph
+already uses, so the two examples corroborate instead of disagreeing.
+
+**Third unrun witness by me in this one block, and the pattern is now specific enough to name.** All
+three failures were the same act: writing a *token a machine parses* — a route template, an encoder
+input, a filename pair — into prose, and reviewing the prose. The block's own thesis says exactly this
+("an identifier a framework parses is not prose"), and stating it did not stop me doing it twice more
+inside the block that states it. **What actually caught all three was a reviewer executing the token;
+what caught none of them was anyone reading the sentence, including me writing it.** So the rule needs a
+mechanical form to be worth anything: *a design paragraph containing a literal a machine consumes does
+not ship until that literal has been fed to that machine and the output pasted back.* Not "check your
+examples" — that is what I believed I was doing all three times.
+
+**Nit taken.** The new requirement's `SHALL` covered three ways of failing to identify one file while its
+scenarios exercised one. `@reviewer` confirmed the other two are already refused by pre-existing
+`SaveAsync` code and already tested (`Save_UnresolvableRouteValue_IsRefusedAndWritesNothing`,
+`Save_RouteValueThatIsNotCanonicalForItsResolvedFile_IsRefused`), so this was under-stated spec rather
+than absent behaviour. Added a third scenario covering an undecodable and a non-canonical address,
+framed as the same rule rather than a separate one — the requirement's text and its evidence now agree,
+and D3 inherits a spec whose scenarios span its `SHALL`.
+
+`openspec validate --strict` valid. Docs only. → @reviewer
+
+**[reviewer]** Block D1, round three — **Request changes.** The requested fix is right; re-derivation
+surfaced one more untraced claim in the text right next to it.
+
+**The corrected witness — verified by execution, and it now agrees with the other two statements of the
+same property in this document:**
+
+```
+Encode("a_b/file.md")     = "a__b/file"
+Encode("a  b/file.md")    = "a__b/file"      // matches the corrected paragraph exactly
+Encode("Chapter_1.md")    = "Chapter__1"
+Encode("Chapter  1.md")   = "Chapter__1"     // the file-level witness in the same paragraph
+Encode("a b.md")  = "a_b"   // D12's table, design.md:146
+Encode("a_b.md")  = "a__b"  // D12's table, design.md:147
+Encode("a  b.md") = "a__b"  // D12's table, design.md:148 — collides with a_b.md
+```
+
+Three independent statements of one encoder property, all executed, all agree. Fixed.
+
+**The third scenario doesn't overreach — confirmed by re-tracing the requirement's own gate, not by
+reading the scenario.** I checked whether any of the three scenarios together could oblige refusing a
+legitimate save: a stale-base conflict (existing file edited concurrently) still routes to `Conflict`,
+not `Refused`, because `ProbeHeadPathAsync` re-reads the *specific resolved path's* blob SHA and the
+requirement's own text keeps that outcome distinct; a file deleted between open and save likewise CASes
+to `Conflict` (declared blob vs. now-`Absent`), never into this new refusal. Nothing here refuses
+something that should be accepted.
+
+**"By the same rule" — accepted as written, but only under the spec-level reading, and it's worth being
+explicit about that rather than leaving both readings live.** Read as "the same *requirement* governs
+all three" it's true — there is one `SHALL`. Read as "the same *mechanism* enforces all three" it isn't:
+`TryResolveWorkingTreePathFromRouteValue` (undecodable) and `IsCanonicalRouteValue` (non-canonical) are
+two separate, pre-existing checks that predate this block, and the ambiguity check doesn't exist as code
+anywhere yet — D1 says so itself two paragraphs earlier ("the mechanism is deliberately left to D3").
+Three conditions, at least three code paths, one `SHALL`. I'm not blocking on this reading alone because
+the surrounding prose (this post's own summary: "framed as the same rule rather than a separate one")
+makes the spec-level intent clear in context — but the scenario text itself, read in isolation by
+someone who only has the spec (which is what D3 gets briefed off), doesn't rule out the mechanism
+reading. A one-clause fix removes the ambiguity: e.g. "...by the same requirement that refuses an
+ambiguous address, not a separate one" makes the noun do the disambiguating instead of context.
+
+**New finding, same shape as the last two, in the paragraph the fix landed next to
+(`design.md`, the "Decision" paragraph, second sentence) — untraced claim about mechanism:**
+
+> "...an address can acquire a second claimant — from an incoming push, **or from another save** —
+> between a save being prepared and being applied."
+
+Traced whether a second browser save can actually do this, rather than accepting that it can. It can't,
+given the gates this block leaves unchanged:
+
+- `TryDecodeRouteValue`'s decode is a pure function of the route string — the same route value always
+  decodes to the same `relativePath`, for any caller. Two saves through the *same* route can therefore
+  only ever race for the *same* file — the ordinary stale-base `Conflict`, not a second claimant.
+- Two saves through *different* canonical routes can't collide either: if `Encode(F1) == Encode(F2)`
+  for two different files `F1 ≠ F2`, then a request using that shared route string decodes — greedily,
+  deterministically — to only one of them. The other is not reachable through any route string that
+  would pass `IsCanonicalRouteValue`, because that route's canonical form is, by definition, the other
+  file's. I checked this concretely at the level D3 will actually build against: encoding
+  `Chapter  1.md` — the file whose creation *would* complete the ambiguous pair — produces `Chapter__1`,
+  and decoding `Chapter__1` greedily always yields `Chapter_1.md`, never `Chapter  1.md` (D12's own
+  stated invariant, "a greedy left-to-right decode always yields the one that takes underscores
+  first"). There is no route string a browser can submit that `IsCanonicalRouteValue` accepts and that
+  resolves to `Chapter  1.md` — the existing canonical-route gate forecloses it by construction, not by
+  luck. The same argument holds one level up for a colliding *directory* segment, by the identical
+  reasoning.
+- The surface has no rename capability (`proposal.md` and this block's own surface paragraph scope it to
+  load-edit-save at a fixed address), so a second claimant can't arise from a save re-pointing an
+  existing file at a new path either.
+
+So the only way a second claimant actually arrives, given everything this change specifies, is content
+that never passed through `PageRouteCodec`'s own gate at all — a push, or an operator writing the volume
+directly. "Or from another save" names a vector that the browser's own pre-existing checks already
+foreclose, in the same sentence that's explaining why the *save path* needs a new check. It doesn't
+create an over-refusal risk and it doesn't weaken the scenario that follows it (the became-ambiguous
+scenario's own `WHEN` — "a second file resolving to that same address arrives" — is agnostic to source
+and stays correct either way) — but it misstates why the hazard exists, in a decision paragraph whose
+whole job this round is to name causes precisely enough that D3 doesn't have to re-derive them. Suggest
+either dropping the clause ("...from an incoming push, since §9 means one can land mid-edit") or
+replacing it with the actual second vector if one exists that I haven't found — an operator editing the
+volume directly.
+
+`openspec validate --strict` — reran, valid. `git status`/`git diff --stat` — `design.md`,
+`specs/content-editing/spec.md`, this file; `src`/`tests` empty on both.
+
+**Verdict: Request changes** — one finding, one line, same shape as the last two: a claim about what the
+code (and the routing scheme built on it) actually allows, sitting one clause away from the fix that was
+just made for exactly this reason. Everything requested this round was re-derived independently: the
+corrected witness holds under execution and now agrees with the other two statements of the same
+property in the document; the third scenario doesn't overreach; "by the same rule" is acceptable in
+context with a one-clause tightening suggested, not required. → @architect
+
+**[architect]** **Blocker accepted, re-derived, fixed — and the finding is better than the fix.** Read
+out of `TryDecodeSegment` (`PageRouteCodec.cs:305-327`): the layer-1 reverse scans left to right, `__` →
+`_`, lone `_` → space. So `Chapter__1` decodes to `Chapter_1` and there is no route string that decodes
+to `Chapter  1`. Generalised, which is what makes it a property rather than an example: **a save can
+only ever write to `decode(route)`, and only when `Encode(decode(route)) == route`.** Where two files
+collide on one route, at most one of them is that route's decode — so a browser save can only ever reach
+the canonical claimant and can never bring the *other* one into existence. `@reviewer` is right: "or from
+another save" was false, and the canonical-route gate forecloses it **by construction**, not by luck.
+
+**The decision is unchanged and the race is still real** — a push (or an operator on the volume) is a
+sufficient vector on its own, and §9 makes it an ordinary event rather than an exotic one. What was
+wrong was the *list of vectors*, which claimed a second one the routing scheme rules out. Corrected in
+`specs/content-editing/spec.md:38` to name where a second claimant actually comes from — content
+entering the repository outside the browser's own addressing — and to say explicitly that another
+browser save is **not** such a vector, since it can only ever write to the single file its address
+resolves to. That clause is worth stating positively rather than deleting the wrong one silently: it
+tells D3 something load-bearing about the shape of the check it has to build.
+
+**Nit taken** — "by the same rule" tightened to "under the same **requirement**". `@reviewer` is right
+that both readings were live and only one is true: there is one `SHALL`, but three different mechanisms,
+one of which does not exist yet. The mechanism reading would have contradicted this block's own
+"deliberately left to D3" two paragraphs earlier.
+
+**On the shape of this block's four rounds, since the pattern is now the record.** Every blocker was the
+same act and they got strictly smaller: a false *guarantee* (the save enforces D12 — it does not), then
+a false *witness* (`a_b`/`a b`), then a false *vector list* (another save). Each sat next to the fix for
+the one before it. All four were caught by someone executing the claim; none by anyone reading the
+sentence, and I re-derived each one before accepting it, which changed nothing about the verdict any of
+the four times. **The honest reading is not "the reviewer was thorough" but "prose about a mechanism is
+not evidence about a mechanism, and I kept producing the former while believing I was producing the
+latter."** D1's own thesis, arrived at four separate times from four different directions.
+
+`openspec validate --strict` valid. Docs only — `design.md`, `specs/content-editing/spec.md`, this file;
+`src/` and `tests/` untouched. → @reviewer
+
+**[reviewer]** Block D1, round four — **Approve.**
+
+**The generalisation holds, checked two ways rather than one.**
+
+- **Structurally.** `PageSaveService.SaveAsync` has exactly one public entry point (the constructor and
+  `SaveAsync` are the class's only two `public` members) and exactly one `absolutePath` local, computed
+  once at `PageSaveService.cs:84` by `TryResolveWorkingTreePathFromRouteValue` and never reassigned.
+  Every later operation that touches disk — `WriteFileAsync` (152), the rollback's `File.Delete` (373),
+  `RollBackFailedSaveAsync`'s target (287) — takes that same variable. There is no second path to a
+  filesystem write anywhere in the class.
+- **Empirically, exhaustively rather than on one example.** For the `Chapter__1` collision, I fed every
+  route-value spelling that plausibly decodes to the non-canonical claimant (`Chapter  1`, `Chapter_ 1`,
+  `Chapter _1`, alongside the canonical `Chapter__1`) through `TryDecodeRouteValue` +
+  `IsCanonicalRouteValue`:
+
+  ```
+  'Chapter__1'  -> decodes to 'Chapter_1.md',  Encode(decoded)='Chapter__1',  IsCanonicalRouteValue=True
+  'Chapter  1'  -> decodes to 'Chapter  1.md', Encode(decoded)='Chapter__1',  IsCanonicalRouteValue=False
+  'Chapter_ 1'  -> decodes to 'Chapter  1.md', Encode(decoded)='Chapter__1',  IsCanonicalRouteValue=False
+  'Chapter _1'  -> decodes to 'Chapter  1.md', Encode(decoded)='Chapter__1',  IsCanonicalRouteValue=False
+  ```
+
+  Every spelling that reaches the non-canonical claimant fails the canonical check; only the one that
+  reaches the canonical claimant passes. Combined with `TryDecodeSegment`'s left-to-right, no-backtracking
+  scan (single-valued: one route value has exactly one decode), this isn't a property of this one pair —
+  it can't be, structurally. The generalisation is correct, and correct in the safer direction: nothing
+  it claims lets D3 skip a case.
+
+**The new clause doesn't narrow the requirement.** "Not from another browser save" answers *where the
+claimant comes from*, not *when the check must run*. The sentence right before it — "the refusal SHALL
+hold when the address became ambiguous after the content being saved was loaded" — is untouched, and
+still obligates a check spanning the whole prepare-to-apply window regardless of which vector fills it.
+Ruling out one vector doesn't reduce that window; the push/volume-write vector alone still forces the
+same late check the design's own "consult under the write lock" paragraph already names. I can't
+construct a reading where this clause gives D3 permission to check only at open time — the timing
+obligation lives in a different sentence and nothing here touches it.
+
+**Final sweep of the whole diff, not just this round's lines — no fifth finding.** Re-checked every
+remaining machine-parseable token in `design.md`'s new text against the code: `PageBaseRevision.AbsentAtHead`
+exists exactly as named (`PageBaseRevision.cs:23`); the `_index.Invalidate()` call site is still the only
+one, still at line 295; the "readers never take the write lock" quote at `design.md:807` is pre-existing
+D17 text, untouched by this diff, and says what the new paragraph cites it as saying. Nothing else in the
+diff names a route template, an encoder input, or an identifier that hasn't already been run.
+
+`openspec validate --strict` — valid. `git status`/`git diff --stat` — `design.md`,
+`specs/content-editing/spec.md`, this file only; `src/` and `tests/` empty on both.
+
+**Verdict: Approve.** Four rounds, four findings, all re-derived independently rather than taken on
+report, all now closed: the false parity claim, the wrong directory witness, the false vector, and this
+round confirms the fix that replaced all three holds under direct execution. Clean to commit.
+
 ## NEXT
 
-**Resume point: §6 (Commit-on-save), block D — the browser surface.** §6 is **in progress, not closed**:
-four blocks have landed and **no supervisor review has run yet**. §5 closed over `c966651..HEAD`
-(round two); §4 over `35dde44..HEAD` (round two); §3 over `60957e6..HEAD` (round two); §2 over
-`7b50e46..HEAD` (round four); §11 over `bb3cb2c..HEAD`.
+**Resume point: §6 (Commit-on-save), block D2 — obligation 8, the git subprocess cancellation kill.**
+§6 is **in progress, not closed**: five blocks have landed and **no supervisor review has run yet**. §5
+closed over `c966651..HEAD` (round two); §4 over `35dde44..HEAD` (round two); §3 over `60957e6..HEAD`
+(round two); §2 over `7b50e46..HEAD` (round four); §11 over `bb3cb2c..HEAD`.
 
 **§6's base commit is `97029e7`** — the supervisor's review scope when the section closes is
 `git diff 97029e7..HEAD`.
 
-**State: 25/41 tasks ticked.** Branch `change/git-backed-content-core`. Gates at C2's close, run in the
-foreground by the Architect: `dotnet build` **0/0**, `dotnet test` **743/743** full unfiltered in 1m51s,
-`dotnet format --verify-no-changes` exit 0, `openspec validate --strict` valid, no `MUTANT` residue,
-`ZeroWiki.csproj` byte-identical to `HEAD`.
+**State: 25/41 tasks ticked.** Branch `change/git-backed-content-core`. Gates at D1's close, run in the
+foreground by the Architect: `dotnet build` **0/0**, `dotnet test` **743/743** full unfiltered in 2m1s
+(unchanged — D1 is docs-only), `dotnet format --verify-no-changes` exit 0, `openspec validate --strict`
+valid, `src/` and `tests/` untouched by the block.
 
 ### §6 progress — read this before the numbered obligations below
 
@@ -13789,7 +14379,14 @@ foreground by the Architect: `dotnet build` **0/0**, `dotnet test` **743/743** f
 | B | `b3d0d44` | — | One posture on git exit codes; fixed a **live data-loss defect** |
 | C1 | `ae3d963` | — | Author identity total over accounts; codec distinct types |
 | C2 | `618e8fa` | 6.2, 6.3, 6.5, 6.6 | The save service |
-| D | *not started* | 6.1, 6.4 | `/wiki/{*Route}/edit` + the save endpoint |
+| D1 | *this commit* | — | D17 address correction + 3 PO decisions; found a **live save/read asymmetry** |
+| D2 | *not started* | — | Obligation 8: `GitProcessRunner` kills its subprocess on cancellation |
+| D3 | *not started* | 6.1, 6.4 | The `?edit` surface, the save post, **and** the save-path ambiguity refusal |
+
+**Block D was re-carved into D1/D2/D3** — see the `[architect]` post under `## 6.`. The original single
+block D, and the `/wiki/{*Route}/edit` address it named, are both **retracted**: that template is not
+routable (a catch-all may only be the last segment, verified by execution), and the address is now
+`/wiki/{*Route}` with an `edit` query flag.
 
 **Obligations 7, 14, 19, 25, 27 and 31 are DISCHARGED — do not act on their numbered entries below.**
 They are left unstruck only because striking six long entries by hand is itself an error surface; this
@@ -13803,15 +14400,40 @@ obligation from the code before acting on it.**
 - **Obligation 8 — `GitProcessRunner` still does not kill its git subprocess on cancellation, and C2 made
   it materially more live.** It was parked in §2 as inert, went live in §4 when the freshness check put
   git on the request path, and C2 has now put a *write* path there too: a cancelled save can orphan
-  `ls-tree`, `add`, `commit` or `rev-parse`. **Nothing in §6 has fixed it.** Block D, or a §6 remediation,
-  should own it — or it must be explicitly re-homed, not carried silently for a third section.
+  `ls-tree`, `add`, `commit` or `rev-parse`. **Now explicitly homed: block D2**, placed before D3 for
+  the same reason block B preceded the save path — a foundation is fixed before callers are added to it.
+  **Not yet briefed**, and it carries an unresolved trade the Architect has flagged to the Product Owner:
+  `Process.Dispose()` kills nothing, so today a cancelled request orphans a live `git`; but nothing in
+  the codebase clears a stale `.git/index.lock`, so a naive kill mid-`commit` would refuse every later
+  git operation including startup reconciliation. The shape to settle is whether the **lock-held critical
+  section becomes non-cancellable** (a submitted save runs to completion) with the kill applying only
+  outside it.
 - **Obligation 26 — partially addressed.** C2 mutated the CAS install and the rollback ordering (both
   killed, independently re-derived), but `ApplyIncrementalUpdateAsync`'s claimant reconstruction — the
   specific condition 26 names — was **not** mutated. Confirm or close it at the section review.
+- **NEW, owed by D3 — the save path does not enforce D12's ambiguity rule, and D3 is what makes that
+  reachable.** Found by `@reviewer` on D1. `PageSaveService` consults `IPageIndex` exactly once
+  (`Invalidate()`); `AmbiguousRoutes` is never read there, so `WikiPage.razor` answers 409 on an
+  ambiguous route while `SaveAsync` writes to whichever claimant the greedy decode picks. Shipped in C2,
+  invisible only because nothing calls `SaveAsync` from a browser yet. D1 decides **that** the refusal
+  must live in the save path (not merely the surface, because a push can make a route ambiguous between
+  open and save) and deliberately leaves **which mechanism** to D3, with two constraints recorded:
+  consulting the index under the write lock is barred by D17's own lock-ordering reasoning, and a
+  working-tree answer must handle a collision in a *directory* segment (`a_b/` and `a  b/` both encode
+  to `a__b/`), so a single-directory scan is insufficient.
 
-**Block D also owes a spec scenario for `SaveOutcome.RollbackFailed`** (C2's reviewer nit): four failure
-outcomes — stale-base conflict, repository busy, rollback failed, ordinary failure — must stay
-distinguishable at the browser surface as well as inside the service.
+**`SaveOutcome.RollbackFailed`'s spec scenario is DISCHARGED** — D1 wrote it, along with the correction
+that there are **five** failure outcomes at the surface, not four. `Refused` was omitted from every
+previous tally in this DEVLOG; it is reachable at *write* time (the symlink refusal, and a base-revision
+probe git cannot answer blob-or-absent), not only at resolve time.
+
+**Standing rule earned by D1, four times in one block:** *a design paragraph containing a literal a
+machine consumes — a route template, an encoder input, a filename pair — does not ship until that
+literal has been fed to that machine and the output pasted back.* D1's four blockers were a false
+guarantee, a false witness, and a false vector list, each sitting beside the fix for the one before it.
+All four were caught by a reviewer **executing** the claim; none by anyone reading the sentence,
+including the Architect writing it, who re-derived each before accepting and changed no verdict. "Check
+your examples" is not the rule — that is what was believed to be happening all four times.
 
 **New in §6, for the section review and for §7/§8:** obligation **32** (a detached `HEAD` at a valid-
 looking but nonexistent object id exits 0 and bypasses block B's refusal — diagnosis-quality, not
