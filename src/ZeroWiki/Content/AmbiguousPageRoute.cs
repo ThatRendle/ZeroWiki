@@ -10,4 +10,4 @@ namespace ZeroWiki.Content;
 /// claimants in the first case, the single file in the second — sorted for a deterministic error message.
 /// Every other route is unaffected.
 /// </summary>
-public sealed record AmbiguousPageRoute(string Route, IReadOnlyList<string> RelativePaths);
+public sealed record AmbiguousPageRoute(EncodedRoute Route, IReadOnlyList<string> RelativePaths);

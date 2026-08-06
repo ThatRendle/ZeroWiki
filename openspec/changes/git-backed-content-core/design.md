@@ -593,6 +593,26 @@ authenticating). The address is therefore constructed in two cases, not one:
   dot-atom and **unreachable by any username anyone can choose**. The account's own primary key
   disambiguates, so two legacy usernames can never collapse onto one address.
 
+**The domain defaults to `zerowiki.org` (Product Owner decision, §6 block C1).** D10 already fixes *how*
+the domain is supplied — deployment configuration, never the request's `Host` header — but not what a
+deployment gets when it configures nothing, and "point it at a folder and it Just Works" means that
+default has to be a working one rather than a refusal.
+
+`zerowiki.org` **is the Product Owner's own domain**, which is what makes this the right default rather
+than merely a convenient one: it is the same namespace `GitAuthor.System`'s `system@zerowiki.org` already
+stamps on D9 recovery commits, so a repository's history carries **one** authorship convention covering
+both the software's own identity and its members', and no address ZeroWiki writes ever names a domain
+belonging to a third party. An earlier draft of this decision proposed `zerowiki.invalid` (RFC 2606,
+guaranteed non-resolvable) on the mistaken belief that `zerowiki.org` was someone else's — the reasoning
+was sound and the premise was false, and it is recorded here because the two are separable and only the
+premise was wrong.
+
+*Accepted, and named rather than discovered later:* an address under a domain that genuinely resolves
+**looks** deliverable, so it can be harvested from any repository that reaches a public remote, and a
+member may reasonably assume it is a real mailbox. D10's "synthetic, need not be deliverable" still
+governs — nothing is obliged to receive mail there — but the Product Owner keeps the option open, which
+`.invalid` would have foreclosed permanently for every deployment.
+
 That last property is not decoration. D10's *Consequence binding §8.3* has the inbound resolver match
 the synthetic form *first*, ahead of registered `GitEmails`, precisely so a squatted row cannot capture
 another member's attribution; a fallback that a member could reproduce by choosing a username would
@@ -785,6 +805,52 @@ That was deferred in §3 on the grounds that the real shape of the caller was no
 and this is the section where getting the pairing wrong stops being a wrong *read* and becomes a **wrong-
 file write**, which the reviewer established cannot be detected at runtime because an encoded and a
 decoded string containing no `%` are the same string.
+
+**`Encode` returns the encoded-route type, and the cascade through `EnumeratedPage`, `PageIndexEntry`,
+`AmbiguousPageRoute` and `PageIndexBuilder` is carried out rather than deferred.** This paragraph reached
+the opposite conclusion twice before landing here, and both earlier versions are worth stating because
+the second was wrong in a way that is easy to repeat.
+
+The implementing block left `Encode` returning `string` and justified it by the change staying confined —
+a **scope** argument, which this change had already ruled the wrong basis for a design call (`1253ff5`).
+The Architect replaced it with a **property** argument: that the redesign's job was to turn an *invisible*
+mix-up (two indistinguishable `string`s, undetectable at runtime, per the block-3b reviewer) into a
+compile error, which it does, while wrapping a wrong string requires explicitly writing
+`new EncodedRoute(…)` — a written assertion at a countable number of sites rather than a slip. That much
+is true. The argument then claimed the cascade would reduce those sites "**but not to zero**, since a
+route read back from any stored or enumerated form still has to be asserted into the type somewhere."
+
+**That premise is false, and the review disproved it by tracing rather than by reading.** Every
+construction of `EnumeratedPage`, `PageIndexEntry` and `AmbiguousPageRoute` — five sites — sources its
+route from a fresh `PageRouteCodec.Encode` call, and there are exactly three `Encode` call sites in
+production. Nothing reads a route back from anywhere: D15 keeps the index **in process memory only**,
+rebuilt from the repository, never deserialised, and the only other route-shaped input is an HTTP request
+value, which is a `RouteValue` and not this type at all. So `EncodedRoute` values originate at exactly
+one place, and threading the type through `Encode` removes **every** manual assertion, not merely most of
+them — a *stronger* property than the one the argument settled for, not a smaller number of the same
+thing.
+
+With the premise corrected the conclusion inverts: the cascade is worth doing, and **doing it now is what
+makes it cheap**. §5's `## NEXT` obligation 17 recorded this exact shape — a refactor that is "nearly free
+now; more expensive once [the caller] is threaded through the current shape" — and §6's C2 is about to add
+the callers that would make it expensive. The type is therefore constructed in exactly one place, and the
+compiler, rather than a reviewer's enumeration, is what guarantees it.
+
+**One honest limit on that guarantee, stated because overclaiming it is the defect this change keeps
+producing.** An `internal` constructor stops a caller *building* an `EncodedRoute`, but C# gives every
+struct a public `default` — `default(EncodedRoute)` is available to anyone and carries a null `Value`.
+So the property is "no caller can construct a route with content of their choosing", not "no caller can
+obtain an instance". The escape is harmless here rather than by luck: the only value it can produce is the
+empty one, and `TryDecodeCore` already refuses a null-or-empty route before anything else looks at it —
+which is the same refusal that has guarded this path since §3, not something added to paper over this.
+Worth stating plainly, because "constructible only inside the assembly" is the kind of sentence a later
+reader trusts to be total.
+
+*Recorded at this length deliberately.* Three passes produced a scope argument, then a property argument
+resting on a false premise, then this. Each was more sophisticated than the last and the second was the
+most dangerous, because it *sounded* like the kind of reasoning this change asks for. **A property
+argument is not self-certifying — its premises are claims about the code and have to be traced like any
+other.**
 
 ## Risks / Trade-offs
 

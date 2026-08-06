@@ -29,8 +29,8 @@ namespace ZeroWiki.Content;
 /// than refusing cleanly, which is exactly the failure this check exists to prevent), or a segment that
 /// decodes to contain a fresh path separator (e.g. a segment <c>a%2fb</c> percent-decodes to <c>a/b</c>,
 /// which would otherwise let one encoded segment smuggle in an extra directory level).
-/// <see cref="TryResolveWorkingTreePath"/> adds a second, independent layer on top: it canonicalizes the
-/// result with <see cref="Path.GetFullPath(string)"/> and verifies containment against
+/// <see cref="TryResolveWorkingTreePathFromRouteValue"/> adds a second, independent layer on top: it
+/// canonicalizes the result with <see cref="Path.GetFullPath(string)"/> and verifies containment against
 /// <see cref="ContentPaths.WorkingTree"/> plus a trailing directory separator — a bare <c>StartsWith</c>
 /// against the working tree alone would let a sibling directory whose name happens to start with the same
 /// prefix (e.g. <c>docs-evil</c> against <c>docs</c>) pass as contained. Both layers refuse rather than
@@ -39,24 +39,27 @@ namespace ZeroWiki.Content;
 /// </para>
 /// <para>
 /// <b>There are two decode entry points, and they are not interchangeable</b> (3b): <see cref="TryDecode"/>
-/// expects a route that has not yet been percent-decoded — the canonical, <see cref="Encode"/>d form — and
-/// <see cref="TryDecodeRouteValue"/> expects one ASP.NET Core routing has already percent-decoded once, as
-/// a <c>/wiki/{*Route}</c> catch-all parameter's value always has been by the time a page sees it. Applying
-/// the wrong one double-decodes or under-decodes; see <see cref="TryDecodeRouteValue"/>'s remarks for the
-/// empirical evidence. <see cref="TryResolveWorkingTreePath"/> and
-/// <see cref="TryResolveWorkingTreePathFromRouteValue"/> mirror this same split one layer up, sharing one
-/// private containment check so the security-critical part of that class exists exactly once regardless
-/// of which decode contract a caller starts from.
+/// expects a route that has not yet been percent-decoded — the canonical, <see cref="Encode"/>d form,
+/// carried by the <see cref="EncodedRoute"/> type — and <see cref="TryDecodeRouteValue"/> expects one
+/// ASP.NET Core routing has already percent-decoded once, as a <c>/wiki/{*Route}</c> catch-all parameter's
+/// value always has been by the time a page sees it, carried by <see cref="RouteValue"/>. Applying the
+/// wrong decode pass to the wrong contract double-decodes or under-decodes; see
+/// <see cref="TryDecodeRouteValue"/>'s remarks for the empirical evidence.
+/// <see cref="TryResolveWorkingTreePathFromRouteValue"/> is the one resolver this class exposes one layer
+/// up — it and <see cref="TryDecodeRouteValue"/> are §6's only entry points for a route arriving off an
+/// HTTP request; a canonical <see cref="EncodedRoute"/> has no resolver of its own because no caller
+/// needs one (§3's read path resolves a canonical route to a file via the enumerated index, never via the
+/// filesystem directly).
 /// </para>
 /// <para>
-/// <b>This split is enforced by naming and documentation, not by the type system</b> (a reviewer/architect
-/// finding, block 3b round 2) — nothing stops a caller from passing an already-decoded value to
-/// <see cref="TryDecode"/>/<see cref="TryResolveWorkingTreePath"/> and having it silently accept a
-/// syntactically-valid-but-wrong string. A durable fix would give the two decode states distinct types
-/// (e.g. an <c>EncodedRoute</c>/<c>DecodedRoutePath</c> pair) so the mix-up is a compile error rather than
-/// a documentation duty. Deliberately not built here — this class's callers so far are all internal to
-/// §3, and the redesign is §6's to make when the save path exists and the real shape of that caller is
-/// known, not to guess at in advance.
+/// <b>The split is enforced by the type system, not merely by naming and documentation</b> (closing a
+/// finding from block 3b round 2 and §6's own D17). <see cref="EncodedRoute"/> and <see cref="RouteValue"/>
+/// are distinct types precisely so a caller cannot pass an already-decoded value to
+/// <see cref="TryDecode"/>, or a still-encoded one to <see cref="TryDecodeRouteValue"/> or
+/// <see cref="TryResolveWorkingTreePathFromRouteValue"/>, and have it silently accept a
+/// syntactically-valid-but-wrong string — the compiler refuses the call outright. Before this, an encoded
+/// route and a decoded route value containing no <c>%</c> were the same <see cref="string"/> and the mix-up
+/// was undetectable at runtime; in §6 that mix-up is a wrong-file <em>write</em>, not merely a wrong read.
 /// </para>
 /// <para>
 /// <b>Decoding a route value is not the same question as whether it is the *right* route value for a
@@ -80,7 +83,12 @@ public static class PageRouteCodec
     /// with <c>/</c>. Does not include the <c>/wiki/</c> prefix; that belongs to whichever Razor
     /// component builds the final URL.
     /// </summary>
-    public static string Encode(string workingTreeRelativePath)
+    /// <remarks>
+    /// This is the one production place an <see cref="EncodedRoute"/> is ever constructed (D17, §6 block
+    /// C1 delta) — its constructor is <see langword="internal"/> precisely so that is true by construction
+    /// rather than by convention.
+    /// </remarks>
+    public static EncodedRoute Encode(string workingTreeRelativePath)
     {
         ArgumentException.ThrowIfNullOrEmpty(workingTreeRelativePath);
 
@@ -91,7 +99,7 @@ public static class PageRouteCodec
         }
 
         var segments = normalized.Split(RouteSeparator);
-        return string.Join(RouteSeparator, segments.Select(EncodeSegment));
+        return new EncodedRoute(string.Join(RouteSeparator, segments.Select(EncodeSegment)));
     }
 
     private static string EncodeSegment(string segment)
@@ -149,19 +157,21 @@ public static class PageRouteCodec
     /// whose decoded form contains a directory separator it did not have before decoding, or a segment
     /// whose decoded form contains a control character (including a percent-encoded NUL, <c>%00</c>) —
     /// no enumerated file could ever produce one, and passing it through would crash a caller such as
-    /// <see cref="TryResolveWorkingTreePath"/> instead of refusing cleanly.
+    /// <see cref="TryResolveWorkingTreePathFromRouteValue"/> instead of refusing cleanly.
     /// </summary>
     /// <remarks>
-    /// <b>This method expects a route that has not yet been percent-decoded.</b> It is what
-    /// <see cref="PageEnumerationService"/> uses to check a freshly-<see cref="Encode"/>d route's own
-    /// round trip, and it is safe there because that route is the canonical, still-encoded form. A route
-    /// arriving through ASP.NET Core routing (a <c>/wiki/{*Route}</c> catch-all parameter's value) has
-    /// already been percent-decoded once by the framework — <see cref="TryDecodeRouteValue"/> is the
-    /// entry point for that value; calling this method on it instead double-decodes. See
-    /// <see cref="TryDecodeRouteValue"/>'s remarks for the empirical evidence and the failure this causes.
+    /// <b>This method expects a route that has not yet been percent-decoded</b> — carried by the
+    /// <see cref="EncodedRoute"/> type, not a bare <see cref="string"/>, so a caller cannot pass it a
+    /// value from the other contract by mistake. It is what <see cref="PageEnumerationService"/> uses to
+    /// check a freshly-<see cref="Encode"/>d route's own round trip, and it is safe there because that
+    /// route is the canonical, still-encoded form. A route arriving through ASP.NET Core routing (a
+    /// <c>/wiki/{*Route}</c> catch-all parameter's value) has already been percent-decoded once by the
+    /// framework — <see cref="TryDecodeRouteValue"/> is the entry point for that value; calling this
+    /// method on it instead double-decodes. See <see cref="TryDecodeRouteValue"/>'s remarks for the
+    /// empirical evidence and the failure this causes.
     /// </remarks>
-    public static bool TryDecode(string route, out string workingTreeRelativePath) =>
-        TryDecodeCore(route, decodePercentEncoding: true, out workingTreeRelativePath);
+    public static bool TryDecode(EncodedRoute route, out string workingTreeRelativePath) =>
+        TryDecodeCore(route.Value, decodePercentEncoding: true, out workingTreeRelativePath);
 
     /// <summary>
     /// Decodes <paramref name="routeValue"/> — the value ASP.NET Core routing has already bound to a
@@ -194,9 +204,14 @@ public static class PageRouteCodec
     /// percent-decode — ASP.NET Core's — never two. <see cref="TryDecode"/> and this method must never
     /// both be applied to the same string.
     /// </para>
+    /// <para>
+    /// <paramref name="routeValue"/> is carried by the <see cref="RouteValue"/> type rather than a bare
+    /// <see cref="string"/>, so a caller cannot pass it a still-encoded <see cref="EncodedRoute"/> by
+    /// mistake — the compiler refuses the call instead of silently under-decoding.
+    /// </para>
     /// </remarks>
-    public static bool TryDecodeRouteValue(string routeValue, out string workingTreeRelativePath) =>
-        TryDecodeCore(routeValue, decodePercentEncoding: false, out workingTreeRelativePath);
+    public static bool TryDecodeRouteValue(RouteValue routeValue, out string workingTreeRelativePath) =>
+        TryDecodeCore(routeValue.Value, decodePercentEncoding: false, out workingTreeRelativePath);
 
     /// <summary>
     /// Whether <paramref name="routeValue"/> — a value ASP.NET Core routing has already percent-decoded
@@ -217,10 +232,14 @@ public static class PageRouteCodec
     /// re-encoding happens on this path at all, so there is nothing for two different requests to collide
     /// into. Every caller that resolves a route value to a specific, already-identified page (the read path
     /// here; a save path, later) MUST apply this check before treating the match as trustworthy — reuse it
-    /// rather than re-deriving the same comparison.
+    /// rather than re-deriving the same comparison. Both parameters are the <see cref="RouteValue"/>/
+    /// <see cref="EncodedRoute"/> types rather than bare <see cref="string"/>s so the two cannot be
+    /// swapped at a call site — <see cref="Uri.UnescapeDataString(string)"/> is applied to
+    /// <paramref name="canonicalRoute"/> only, and passing the arguments in the wrong order would silently
+    /// change which side gets decoded if both were plain strings.
     /// </remarks>
-    public static bool IsCanonicalRouteValue(string routeValue, string canonicalRoute) =>
-        string.Equals(Uri.UnescapeDataString(canonicalRoute), routeValue, StringComparison.Ordinal);
+    public static bool IsCanonicalRouteValue(RouteValue routeValue, EncodedRoute canonicalRoute) =>
+        string.Equals(Uri.UnescapeDataString(canonicalRoute.Value), routeValue.Value, StringComparison.Ordinal);
 
     private static bool TryDecodeCore(string route, bool decodePercentEncoding, out string workingTreeRelativePath)
     {
@@ -275,7 +294,7 @@ public static class PageRouteCodec
         // Reject the whole class of control characters, not just '\0': EncodeSegment escapes every
         // control character on the way in (mirroring this check), and a route can carry one directly
         // (e.g. a percent-encoded NUL, '%00') without ever needing to have come from a real filename.
-        // Passing a NUL through to Path.GetFullPath (in TryResolveWorkingTreePath) throws an unhandled
+        // Passing a NUL through to Path.GetFullPath (in TryResolveWorkingTreePathFromRouteValue) throws an unhandled
         // ArgumentException — this class's own contract is to refuse a hostile route outright, not let
         // one crash the caller.
         if (percentDecoded.Any(char.IsControl))
@@ -321,45 +340,22 @@ public static class PageRouteCodec
     }
 
     /// <summary>
-    /// Decodes <paramref name="route"/> — a canonical, still percent-encoded route, the same contract as
-    /// <see cref="TryDecode"/> — and resolves it to an absolute path guaranteed to sit inside
-    /// <paramref name="paths"/>'s <see cref="ContentPaths.WorkingTree"/>, or refuses.
-    /// </summary>
-    /// <remarks>
-    /// <b>Input contract, stated because getting it wrong here is the sharpest hazard in this class</b>
-    /// (3b): this method expects the same still-encoded form <see cref="TryDecode"/> does — e.g.
-    /// <see cref="EnumeratedPage.Route"/>, or anything freshly produced by <see cref="Encode"/>. A route
-    /// obtained from ASP.NET Core routing (a <c>/wiki/{*Route}</c> catch-all parameter's value, or
-    /// anything else routing has already percent-decoded once) is the <i>other</i> contract —
-    /// <see cref="TryResolveWorkingTreePathFromRouteValue"/> is that entry point. Calling this method on
-    /// an already-decoded value double-decodes and can resolve the wrong file; see
-    /// <see cref="TryDecodeRouteValue"/>'s remarks for the empirical evidence. A save path (§6) that gets
-    /// its route from an HTTP request must use <see cref="TryResolveWorkingTreePathFromRouteValue"/>, not
-    /// this one — <c>WikiPage.razor</c> (3b) makes the identical read-side distinction between the two
-    /// decode entry points, for the identical reason.
-    /// </remarks>
-    public static bool TryResolveWorkingTreePath(ContentPaths paths, string route, out string absolutePath) =>
-        TryResolveWorkingTreePathCore(paths, route, decodePercentEncoding: true, out absolutePath);
-
-    /// <summary>
     /// Decodes <paramref name="routeValue"/> — the value ASP.NET Core routing has already percent-decoded
-    /// once, the same contract as <see cref="TryDecodeRouteValue"/> — and resolves it to an absolute path
-    /// guaranteed to sit inside <paramref name="paths"/>'s <see cref="ContentPaths.WorkingTree"/>, or
-    /// refuses. This is the containment-checked resolver a save path (§6) needs when its route comes from
-    /// an HTTP request: the trailing-separator containment check below is security-critical and must
-    /// exist exactly once, shared with <see cref="TryResolveWorkingTreePath"/> via the same private core
-    /// rather than reimplemented at each call site.
+    /// once, the same contract <see cref="TryDecodeRouteValue"/> takes, carried by <see cref="RouteValue"/>
+    /// — and resolves it to an absolute path guaranteed to sit inside <paramref name="paths"/>'s
+    /// <see cref="ContentPaths.WorkingTree"/>, or refuses. This is the containment-checked resolver §6's
+    /// save path uses: its route always comes from an HTTP request, so this is the only working-tree
+    /// resolver this class exposes — there is deliberately no canonical-route counterpart, because no
+    /// caller has ever needed one (§3's read path resolves a canonical route to a file through the
+    /// enumerated index, not the filesystem). The trailing-separator containment check below is
+    /// security-critical and exists exactly once here.
     /// </summary>
-    public static bool TryResolveWorkingTreePathFromRouteValue(ContentPaths paths, string routeValue, out string absolutePath) =>
-        TryResolveWorkingTreePathCore(paths, routeValue, decodePercentEncoding: false, out absolutePath);
-
-    private static bool TryResolveWorkingTreePathCore(
-        ContentPaths paths, string route, bool decodePercentEncoding, out string absolutePath)
+    public static bool TryResolveWorkingTreePathFromRouteValue(ContentPaths paths, RouteValue routeValue, out string absolutePath)
     {
         ArgumentNullException.ThrowIfNull(paths);
         absolutePath = string.Empty;
 
-        if (!TryDecodeCore(route, decodePercentEncoding, out var relativePath))
+        if (!TryDecodeCore(routeValue.Value, decodePercentEncoding: false, out var relativePath))
         {
             return false;
         }

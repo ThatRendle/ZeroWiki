@@ -58,7 +58,12 @@ public sealed class PageEnumerationService
 
     public PageEnumerationResult EnumeratePages()
     {
-        var claimsByRoute = new Dictionary<string, List<string>>(StringComparer.Ordinal);
+        // Default equality on EncodedRoute delegates to string.Equals/GetHashCode on Value, which are
+        // ordinal by default (unlike string comparison operators generally, which can be culture-aware
+        // elsewhere in .NET) — verified in AccountGitAuthorFactoryTests's sibling suite, EncodedRouteTests.
+        // No explicit comparer is needed or available here (EncodedRoute is not a string), matching the
+        // StringComparer.Ordinal this dictionary used before the route type existed.
+        var claimsByRoute = new Dictionary<EncodedRoute, List<string>>();
         var unreadableDirectories = new List<string>();
 
         if (Directory.Exists(_paths.WorkingTree))
@@ -69,7 +74,7 @@ public sealed class PageEnumerationService
         var pages = new List<EnumeratedPage>();
         var ambiguousRoutes = new List<AmbiguousPageRoute>();
 
-        foreach (var (route, relativePaths) in claimsByRoute.OrderBy(entry => entry.Key, StringComparer.Ordinal))
+        foreach (var (route, relativePaths) in claimsByRoute.OrderBy(entry => entry.Key.Value, StringComparer.Ordinal))
         {
             var evaluation = EvaluateRouteClaim(route, relativePaths);
 
@@ -128,7 +133,7 @@ public sealed class PageEnumerationService
     private static void Walk(
         string workingTreeRoot,
         string directory,
-        Dictionary<string, List<string>> claimsByRoute,
+        Dictionary<EncodedRoute, List<string>> claimsByRoute,
         List<string> unreadableDirectories)
     {
         List<string> entries;
@@ -222,9 +227,12 @@ public sealed class PageEnumerationService
     /// that file's own path. Shared by <see cref="EnumeratePages"/>'s full walk and
     /// <see cref="PageIndexBuilder"/>'s incremental re-index (4.3, D15) so this invariant is checked in
     /// exactly one place regardless of whether the claimant set came from a fresh walk or an updated
-    /// in-memory tally.
+    /// in-memory tally. <paramref name="route"/> is always canonical in both callers — a
+    /// <c>claimsByRoute</c> dictionary key, itself always built from <see cref="PageRouteCodec.Encode"/>'s
+    /// output — which the <see cref="EncodedRoute"/> parameter type now states to the compiler rather than
+    /// to a reader of this comment (D17, §6 block C1 delta: no manual wrap needed at either call site).
     /// </summary>
-    public static RouteClaimEvaluation EvaluateRouteClaim(string route, IReadOnlyList<string> claimants)
+    public static RouteClaimEvaluation EvaluateRouteClaim(EncodedRoute route, IReadOnlyList<string> claimants)
     {
         var identifiesExactlyOneFile =
             claimants.Count == 1 &&

@@ -49,7 +49,7 @@ public sealed class PageEnumerationServiceTests : IDisposable
         var result = CreateService().EnumeratePages();
 
         var page = Assert.Single(result.Pages);
-        Assert.Equal("Project_Notes/Kick_Off", page.Route);
+        Assert.Equal("Project_Notes/Kick_Off", page.Route.Value);
         Assert.Equal(
             Path.GetFullPath(Path.Combine(Paths.WorkingTree, "Project Notes", "Kick Off.md")),
             Path.GetFullPath(page.AbsolutePath));
@@ -65,7 +65,7 @@ public sealed class PageEnumerationServiceTests : IDisposable
         var result = CreateService().EnumeratePages();
 
         var page = Assert.Single(result.Pages);
-        Assert.Equal("page", page.Route);
+        Assert.Equal("page", page.Route.Value);
     }
 
     [Fact]
@@ -78,7 +78,7 @@ public sealed class PageEnumerationServiceTests : IDisposable
         var result = CreateService().EnumeratePages();
 
         var page = Assert.Single(result.Pages);
-        Assert.Equal("visible", page.Route);
+        Assert.Equal("visible", page.Route.Value);
     }
 
     [Fact]
@@ -91,13 +91,13 @@ public sealed class PageEnumerationServiceTests : IDisposable
 
         var result = CreateService().EnumeratePages();
 
-        Assert.DoesNotContain(result.Pages, p => p.Route == "a___b");
+        Assert.DoesNotContain(result.Pages, p => p.Route.Value == "a___b");
         var ambiguous = Assert.Single(result.AmbiguousRoutes);
-        Assert.Equal("a___b", ambiguous.Route);
+        Assert.Equal("a___b", ambiguous.Route.Value);
         Assert.Equal(["a _b.md", "a_ b.md"], ambiguous.RelativePaths);
 
         var unaffected = Assert.Single(result.Pages);
-        Assert.Equal("unaffected", unaffected.Route);
+        Assert.Equal("unaffected", unaffected.Route.Value);
     }
 
     [Fact]
@@ -112,13 +112,13 @@ public sealed class PageEnumerationServiceTests : IDisposable
 
         var result = CreateService().EnumeratePages();
 
-        Assert.DoesNotContain(result.Pages, p => p.Route == "Chapter__1");
+        Assert.DoesNotContain(result.Pages, p => p.Route.Value == "Chapter__1");
         var refused = Assert.Single(result.AmbiguousRoutes);
-        Assert.Equal("Chapter__1", refused.Route);
+        Assert.Equal("Chapter__1", refused.Route.Value);
         Assert.Equal(["Chapter  1.md"], refused.RelativePaths);
 
         var unaffected = Assert.Single(result.Pages);
-        Assert.Equal("unaffected", unaffected.Route);
+        Assert.Equal("unaffected", unaffected.Route.Value);
     }
 
     [Fact]
@@ -132,7 +132,7 @@ public sealed class PageEnumerationServiceTests : IDisposable
 
         Assert.Empty(result.AmbiguousRoutes);
         var page = Assert.Single(result.Pages);
-        Assert.Equal("Chapter_1", page.Route);
+        Assert.Equal("Chapter_1", page.Route.Value);
     }
 
     [Fact]
@@ -150,13 +150,13 @@ public sealed class PageEnumerationServiceTests : IDisposable
         var logs = new CapturingLogger<PageEnumerationService>();
         var result = new PageEnumerationService(Paths, logs).EnumeratePages();
 
-        Assert.DoesNotContain(result.Pages, p => p.Route == "Page");
+        Assert.DoesNotContain(result.Pages, p => p.Route.Value == "Page");
         var refused = Assert.Single(result.AmbiguousRoutes);
-        Assert.Equal("Page", refused.Route);
+        Assert.Equal("Page", refused.Route.Value);
         Assert.Equal(["Page.MD"], refused.RelativePaths);
 
         var unaffected = Assert.Single(result.Pages);
-        Assert.Equal("unaffected", unaffected.Route);
+        Assert.Equal("unaffected", unaffected.Route.Value);
 
         var message = Assert.Single(logs.Messages);
         Assert.Contains("extension", message, StringComparison.OrdinalIgnoreCase);
@@ -202,8 +202,8 @@ public sealed class PageEnumerationServiceTests : IDisposable
 
         var result = CreateService().EnumeratePages();
 
-        Assert.Single(result.Pages, p => p.Route == "real/page");
-        Assert.DoesNotContain(result.Pages, p => p.Route.StartsWith("linked/", StringComparison.Ordinal));
+        Assert.Single(result.Pages, p => p.Route.Value == "real/page");
+        Assert.DoesNotContain(result.Pages, p => p.Route.Value.StartsWith("linked/", StringComparison.Ordinal));
     }
 
     [Fact]
@@ -223,8 +223,8 @@ public sealed class PageEnumerationServiceTests : IDisposable
 
         var result = CreateService().EnumeratePages();
 
-        Assert.DoesNotContain(result.Pages, p => p.Route == "linked");
-        Assert.Contains(result.Pages, p => p.Route == "target");
+        Assert.DoesNotContain(result.Pages, p => p.Route.Value == "linked");
+        Assert.Contains(result.Pages, p => p.Route.Value == "target");
     }
 
     [Fact]
@@ -263,8 +263,8 @@ public sealed class PageEnumerationServiceTests : IDisposable
             var result = CreateService().EnumeratePages();
 
             Assert.Contains("locked", result.UnreadableDirectories);
-            Assert.DoesNotContain(result.Pages, p => p.Route.StartsWith("locked", StringComparison.Ordinal));
-            Assert.Contains(result.Pages, p => p.Route == "visible");
+            Assert.DoesNotContain(result.Pages, p => p.Route.Value.StartsWith("locked", StringComparison.Ordinal));
+            Assert.Contains(result.Pages, p => p.Route.Value == "visible");
         }
         finally
         {

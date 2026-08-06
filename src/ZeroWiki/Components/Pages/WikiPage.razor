@@ -127,12 +127,15 @@ else
 
         // Route arrives already percent-decoded once by ASP.NET Core routing — TryDecodeRouteValue is
         // the only correct entry point here; TryDecode would decode it a second time (see its remarks).
-        if (string.IsNullOrEmpty(Route) || !PageRouteCodec.TryDecodeRouteValue(Route, out var relativePath))
+        // Wrapped in RouteValue rather than passed as a bare string so the compiler enforces that
+        // contract rather than a comment.
+        if (string.IsNullOrEmpty(Route) || !PageRouteCodec.TryDecodeRouteValue(new RouteValue(Route), out var relativePath))
         {
             return;
         }
 
-        var canonicalRoute = PageRouteCodec.Encode(relativePath);
+        var routeValue = new RouteValue(Route);
+        var canonicalRoute = PageRouteCodec.Encode(relativePath); // Encode returns EncodedRoute directly (D17)
 
         // S2 (block 3 remediation): Encode is not injective, so decode-then-re-Encode alone can land a
         // request on a different file's canonical route than the one it actually named — e.g. a route
@@ -141,7 +144,7 @@ else
         // here, before any enumeration lookup, means a non-canonical request can never resolve to a
         // different file than a canonical one would — the request-side twin of enumeration's own "the
         // route identifies exactly this file" invariant.
-        if (!PageRouteCodec.IsCanonicalRouteValue(Route, canonicalRoute))
+        if (!PageRouteCodec.IsCanonicalRouteValue(routeValue, canonicalRoute))
         {
             return;
         }
@@ -154,8 +157,11 @@ else
         // existing, narrow gap this call makes reachable from the request path, not one it introduces.
         var snapshot = await PageIndex.GetCurrentAsync(context.RequestAborted);
 
+        // EncodedRoute's synthesized equality delegates to string.Equals on Value, which is ordinal by
+        // default — the same comparison StringComparison.Ordinal made explicit before the route type
+        // existed (D17, §6 block C1 delta).
         var ambiguousMatch = snapshot.AmbiguousRoutes
-            .FirstOrDefault(candidate => string.Equals(candidate.Route, canonicalRoute, StringComparison.Ordinal));
+            .FirstOrDefault(candidate => candidate.Route == canonicalRoute);
         if (ambiguousMatch is not null)
         {
             _ambiguousRoute = ambiguousMatch;
@@ -164,7 +170,7 @@ else
         }
 
         var pageMatch = snapshot.Pages
-            .FirstOrDefault(candidate => string.Equals(candidate.Route, canonicalRoute, StringComparison.Ordinal));
+            .FirstOrDefault(candidate => candidate.Route == canonicalRoute);
         if (pageMatch is null)
         {
             return;

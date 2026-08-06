@@ -86,7 +86,7 @@ public sealed class PageIndexBuilderTests : IDisposable
         var snapshot = await CreateBuilder().BuildAsync(CancellationToken.None);
 
         var page = Assert.Single(snapshot.Pages);
-        Assert.Equal("Kick_Off", page.Route);
+        Assert.Equal("Kick_Off", page.Route.Value);
         Assert.Equal("Kick Off.md", page.RelativePath);
         Assert.Equal("Kick Off", page.Title);
         Assert.Equal(["meeting", "project-x"], page.Tags);
@@ -194,13 +194,13 @@ public sealed class PageIndexBuilderTests : IDisposable
             var snapshot = await CreateBuilder().BuildAsync(CancellationToken.None);
 
             var ambiguous = Assert.Single(snapshot.AmbiguousRoutes);
-            Assert.Equal("a___b", ambiguous.Route);
-            Assert.DoesNotContain(snapshot.Pages, p => p.Route == "a___b");
+            Assert.Equal("a___b", ambiguous.Route.Value);
+            Assert.DoesNotContain(snapshot.Pages, p => p.Route.Value == "a___b");
 
             Assert.Contains("locked", snapshot.UnreadableDirectories);
-            Assert.DoesNotContain(snapshot.Pages, p => p.Route.StartsWith("locked", StringComparison.Ordinal));
+            Assert.DoesNotContain(snapshot.Pages, p => p.Route.Value.StartsWith("locked", StringComparison.Ordinal));
 
-            Assert.Contains(snapshot.Pages, p => p.Route == "unaffected");
+            Assert.Contains(snapshot.Pages, p => p.Route.Value == "unaffected");
         }
         finally
         {
@@ -347,7 +347,7 @@ public sealed class PageIndexBuilderTests : IDisposable
 
         Assert.Empty(refreshed.Pages);
         var ambiguous = Assert.Single(refreshed.AmbiguousRoutes);
-        Assert.Equal("a___b", ambiguous.Route);
+        Assert.Equal("a___b", ambiguous.Route.Value);
         Assert.Equal(["a _b.md", "a_ b.md"], ambiguous.RelativePaths);
     }
 

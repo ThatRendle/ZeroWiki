@@ -246,15 +246,19 @@ public sealed class PageIndexBuilder
             return current with { CommitSha = newCommitSha };
         }
 
+        // .Distinct() with no comparer: EncodedRoute is a record struct whose synthesized equality
+        // delegates to string.Equals/GetHashCode on Value, which are ordinal by default -- the same
+        // semantics StringComparer.Ordinal gave the string-keyed version of this list (verified in
+        // EncodedRouteTests, D17 §6 block C1 delta). EncodedRoute has no comparer of its own to pass here.
         var affectedRoutes = affectedRelativePaths
             .Select(PageRouteCodec.Encode)
-            .Distinct(StringComparer.Ordinal)
+            .Distinct()
             .ToList();
 
         // The previous claimant set for every affected route, reconstructed from the current snapshot
         // rather than re-walked -- this is what lets an affected path be judged against claimants the
         // diff never mentioned (an unaffected file already sharing the same encoded route).
-        var claimsByRoute = new Dictionary<string, List<string>>(StringComparer.Ordinal);
+        var claimsByRoute = new Dictionary<EncodedRoute, List<string>>();
         foreach (var route in affectedRoutes)
         {
             claimsByRoute[route] = [];
@@ -293,7 +297,7 @@ public sealed class PageIndexBuilder
             }
         }
 
-        var affectedRoutesSet = new HashSet<string>(affectedRoutes, StringComparer.Ordinal);
+        var affectedRoutesSet = new HashSet<EncodedRoute>(affectedRoutes);
         var updatedPages = current.Pages.Where(page => !affectedRoutesSet.Contains(page.Route)).ToList();
         var updatedAmbiguousRoutes = current.AmbiguousRoutes
             .Where(ambiguousRoute => !affectedRoutesSet.Contains(ambiguousRoute.Route))

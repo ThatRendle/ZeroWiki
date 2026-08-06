@@ -11,7 +11,7 @@ namespace ZeroWiki.Content;
 /// entry (<c>WikiPage</c>'s existing display fallback), not to the index.
 /// </remarks>
 public sealed record PageIndexEntry(
-    string Route,
+    EncodedRoute Route,
     string RelativePath,
     string AbsolutePath,
     string? Title,

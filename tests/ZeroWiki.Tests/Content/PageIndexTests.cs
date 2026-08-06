@@ -78,7 +78,9 @@ public sealed class PageIndexTests : IDisposable
     public void Replace_InstallsTheNewSnapshotWholesale()
     {
         using var index = new PageIndex(CreateBuilder());
-        var entry = new PageIndexEntry("route", "route.md", "/abs/route.md", "Title", ["tag"], null);
+        // PageRouteCodec.Encode("route.md") legitimately produces the "route" value this fixture needs —
+        // no InternalsVisibleTo-dependent construction required (reviewer recommendation, §6 block C1 delta).
+        var entry = new PageIndexEntry(PageRouteCodec.Encode("route.md"), "route.md", "/abs/route.md", "Title", ["tag"], null);
         var snapshot = new PageIndexSnapshot([entry], [], [], "deadbeef");
 
         index.Replace(snapshot);

@@ -9,4 +9,4 @@ namespace ZeroWiki.Content;
 /// <see cref="RelativePath"/> and <see cref="AbsolutePath"/> use the platform directory separator;
 /// <see cref="Route"/> uses <c>/</c> and does not include the <c>/wiki/</c> prefix.
 /// </summary>
-public sealed record EnumeratedPage(string Route, string RelativePath, string AbsolutePath);
+public sealed record EnumeratedPage(EncodedRoute Route, string RelativePath, string AbsolutePath);

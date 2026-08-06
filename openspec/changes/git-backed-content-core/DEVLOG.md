@@ -12159,6 +12159,932 @@ holds up: obligation 14 was worth going first for. **Test count 717 → 719**; b
 made the case for — refusing is half a property, not preserving history is the half that would have been
 lost silently.
 
+**[architect]** **Block C is split into C1 and C2.** The original carve put 6.1–6.4 plus obligations 7
+and 19 in one block; that is too much for one review, and this section has the evidence — block A took
+**four** rounds on prose alone, and block B's single largest finding was a live data-loss defect hiding
+inside a condition two agents had mutation-confirmed. Smaller blocks are how this section has actually
+been catching things.
+
+- **C1 — the two foundations, no save path.** Obligation **7** (the author identity, total over every
+  account) and obligation **19** (`PageRouteCodec`'s distinct-types redesign, and deleting the resolver
+  that has no caller). Both are independent of the save path and testable standalone. Ticks no task.
+- **C2 — 6.1–6.4.** The save service, the CAS, the commit, the endpoint and the edit form; **wires** the
+  resolver C1 leaves ready. Ticks 6.1–6.4.
+
+The ordering is forced by obligation 19 itself: the wiring cannot happen before the caller exists, but
+the *redesign* can, and doing it first means C2 is written against the types that make a contract mix-up a
+compile error rather than retrofitting them afterwards.
+
+**[architect]** Brief — block C1: **the author identity and the codec's type seam**. → @worker
+
+Ticks **no** task numbers. Two obligations, both owed by §6, both discharged without touching the save
+path.
+
+### Part 1 — obligation 7: a well-formed author for *every* account
+
+D10's *Consequence binding §6* and D17's authorship paragraph are the specification; read both. The
+requirement is gated by `specs/content-editing/spec.md`'s scenario *An account predating the username
+rules still commits a well-formed author*.
+
+- **The rule:** a username that already satisfies RFC 5322 `dot-atom-text` is used directly as the
+  localpart. One that does not gets a **deterministic fallback drawn from a space no D11-legal username
+  can occupy** — D11 admits only `[A-Za-z0-9_.-]` with alphanumeric ends, `atext` is strictly wider, so
+  build the fallback with **`+`**, which is `atext` (legal in a dot-atom) and **forbidden by D11**.
+  Disambiguate with the account's own `Id`, so two legacy usernames can never collapse onto one address.
+- **Why the unreachability is load-bearing, not tidiness:** D10's *Consequence binding §8.3* has the
+  inbound resolver match the synthetic form **first**, ahead of registered `GitEmails`, so a squatted row
+  cannot capture another member's attribution. A fallback a member could reproduce by *choosing* a
+  username would reopen that hole from the other side. **Verify `+` is genuinely unreachable** — re-derive
+  it from `CredentialPolicy.UsernamePattern` as it actually stands, not from D11's prose.
+- **The display name stays the raw username** (D10 says `<Username>`, not `DisplayName`). Git constrains
+  only `<`, `>` and newline there. Check the raw username cannot break the author line — and note
+  `AuthenticatedAccount` carries `Id` and `Username`, which is all you should need.
+- **The domain is configuration, never the request.** D10 is explicit: deriving it from the `Host` header
+  would split one person's history across environments and let a spoofed header write an attacker-chosen
+  author into history this design never rewrites. Bind it like `DataRoot` is bound.
+  **Default it to `zerowiki.invalid`** — RFC 2606 reserves `.invalid` precisely so it can never resolve,
+  which is the honest choice for an address D10 says need not be deliverable. Zero-config is the product's
+  premise, so the default must work unattended.
+  *Note, do not fix:* `GitAuthor.System` uses `system@zerowiki.org`, a domain that really exists and is
+  someone's. That is §2's shipped decision — record the inconsistency for `## NEXT`, leave it alone.
+- **Tests:** the three usernames `LoginServiceTests.cs:271-289` pins as still authenticating —
+  `ab`, `_legacy_`, `.old.name.` — must each produce a **well-formed** address, and the assertion should
+  be that it parses as a legal address, not that it equals a string you computed the same way the code
+  does. A fixture built by the code under test cannot falsify that code; this change has hit that three
+  times.
+
+### Part 2 — obligation 19: the codec's distinct types
+
+`PageRouteCodec` has six public members and **two resolvers with no production caller**. D17 decides it:
+wire `TryResolveWorkingTreePathFromRouteValue` (C2 does the wiring), **delete `TryResolveWorkingTreePath`**,
+add no third resolver, and land the distinct-types redesign now.
+
+- **The two decode states become distinct types** — one for a canonical, still-percent-encoded route
+  (what `Encode` produces and `EnumeratedPage.Route` stores), one for a value ASP.NET Core routing has
+  already decoded once. Today the split is enforced by **naming and documentation only**, and the block-3b
+  reviewer established that a wrong pairing **cannot be detected at runtime**, because an encoded and a
+  decoded string containing no `%` are the same string. In §6 a wrong pairing stops being a wrong *read*
+  and becomes a **wrong-file write**.
+- **This is a type-level refactor and must not change behaviour.** Every existing test stays green
+  unchanged in intent; if one needs its *semantics* altered to compile, stop and tell me — that means the
+  redesign has moved a boundary, which is a finding, not a merge conflict to resolve.
+- Update the existing call sites (`WikiPage.razor`, `PageEnumerationService`) to the new types. Keep the
+  single shared containment check — the security-critical part must exist exactly once.
+
+### Limits
+
+- **No save path.** No save service, no endpoint, no edit form, no `PageIndex` CAS/generation work —
+  those are C2 and D. If you are writing a route handler, you have drifted.
+- **Mutation:** the author construction is an **identity/authorship** path, so it is in scope — capped at
+  **3 runs**, scoped to the localpart legality decision (legal-vs-fallback branch) only. The codec
+  refactor is **not** in scope for mutation: it is behaviour-preserving by construction and the existing
+  suite is the instrument. Verify under the **full unfiltered** `dotnet test`. Restore via `cp` from an
+  out-of-repo baseline in a `trap` — never `git checkout --`. Checksum before and after. **New files have
+  no git baseline: only the checksum protects them.**
+- Gates: `dotnet build`, `dotnet test` **unfiltered** (report the figure or "not obtained" — do not
+  background and wait), `dotnet format --verify-no-changes`, `openspec validate --strict`.
+- Post to the DEVLOG under `## 6.`, hand to @reviewer. **Do not commit; tick no boxes.**
+
+**One carried lesson, because it is the most expensive thing this section has learned:** block B's
+defective condition was faithful to its intent and mutation-confirmed 3/3 by two independent agents, and
+was still asking the wrong question. Before you call either part done, **name what your checks cannot
+see** — for part 1, that is "is `+` really unreachable, or only unreachable in the pattern I read?"
+
+**[worker]** Block C1 done. No task numbers ticked (per brief). New files:
+`src/ZeroWiki/Content/AccountGitAuthorFactory.cs`, `ContentAuthorshipOptions.cs`, `EncodedRoute.cs`,
+`RouteValue.cs`, `tests/ZeroWiki.Tests/Content/AccountGitAuthorFactoryTests.cs`. Modified:
+`PageRouteCodec.cs`, `PageEnumerationService.cs`, `WikiPage.razor`, `ContentStorageStartupExtensions.cs`,
+`PageRouteCodecTests.cs`.
+
+### Part 1 — `AccountGitAuthorFactory`
+
+`CreateAuthor(AuthenticatedAccount)` returns `GitAuthor(Username, "<localpart>@<HostDomain>")`. Localpart:
+a username matching a fresh RFC 5322 `dot-atom-text` regex (not `CredentialPolicy.UsernamePattern`,
+which is a strict subset — `_legacy_` is a legal dot-atom and would be wrongly routed to the fallback if
+this reused D11's pattern as the legality test) is used directly; otherwise `account+<Id:N>`. Display
+name is always the raw `Username`.
+
+**Unreachability of `+`, checked two ways, not one:** `CredentialPolicy.UsernamePattern`'s charset today
+is `[A-Za-z0-9_.-]` — no `+`. I also walked it back to `d90b00e` (the very first commit that let anyone
+choose a username, predating D11 entirely): `^[A-Za-z0-9._-]{0,63}[A-Za-z0-9][A-Za-z0-9._-]{0,63}\z` —
+same charset, no `+`, even then. So "unreachable" holds against every version this pattern has ever had,
+not merely the one I happened to read — that's the answer to the brief's carried-lesson question. Raw
+username breaking the author line (`<`, `>`, newline): structurally impossible — every version of the
+pattern has excluded whitespace and control characters, so no stored username has ever been able to
+contain one; not re-guarded defensively in `CreateAuthor` since D11's own charset already forecloses it
+and the brief didn't ask for a second belt.
+
+**Domain default — corrected mid-block, flagging per the corrections received.** First draft used
+`zerowiki.invalid` (RFC 2606) with a note that `GitAuthor.System`'s `system@zerowiki.org` was a
+pre-existing inconsistency for `## NEXT`. Both were wrong: `zerowiki.org` is the Product Owner's own
+domain, so there's no inconsistency — it's the same namespace `GitAuthor.System` already uses. Reverted
+before this post: `ContentAuthorshipOptions.DefaultHostDomain = "zerowiki.org"`, comment points at
+design.md's D10 (which now carries the full reasoning and the accepted-harvestable-address cost) rather
+than restating it. No inconsistency note went into `## NEXT` — never wrote one after the first correction
+landed, so nothing to strip. Bound via `AddOptions<ContentAuthorshipOptions>()` in
+`ContentStorageStartupExtensions.AddContentStorage`, same pattern as `DataRoot`.
+
+**Tests** (`AccountGitAuthorFactoryTests.cs`): `ab`, `_legacy_` (still legal dot-atoms → direct),
+`.old.name.` (leading+trailing dot, illegal → fallback) — all from `LoginServiceTests.cs:74-76`.
+Well-formedness asserted via `System.Net.Mail.MailAddress` — an independent parser, not a
+same-derivation string — and it earned its keep: under the mutant below, `MailAddress` threw
+`FormatException: An invalid character was found in the mail header: '.'` on `.old.name.@zerowiki.org`,
+proving the assertion actually discriminates malformed addresses rather than passing vacuously. Also:
+fallback disambiguated by `Id`, deterministic (same account → same address twice), domain is whatever
+`HostDomain` says (not hardcoded).
+
+**Mutation (capped, as briefed):** inverted the legal/fallback ternary
+(`IsLegalDotAtomText(...)` → `!IsLegalDotAtomText(...)`) in `AccountGitAuthorFactory.cs`. Checksummed
+before/after each cycle; reverted via `cp` from an out-of-repo scratchpad copy inside a `trap`, never
+`git checkout --` (the file is untracked — no git baseline exists for it, so the checksum is the only
+verification there is). 3/3 full unfiltered `dotnet test` runs: **6 failing, consistent failure mode
+each time** (the four direct/legal-username tests plus the disambiguation and fallback tests), ~1m45s
+each. Confirmed, not extended past 3 — the failure mode is uniform. Post-revert checksum matches the
+pre-mutation baseline byte-for-byte; `git status --short -- src` shows the file only as `??`
+(untracked, expected) with no diff possible for git to show either way, so the checksum match is what
+this claim rests on, not `git diff`.
+
+### Part 2 — `PageRouteCodec` distinct types
+
+Added `EncodedRoute` and `RouteValue` (`readonly record struct`, one per file). Changed parameter/return
+types: `TryDecode(EncodedRoute, ...)`, `TryDecodeRouteValue(RouteValue, ...)`,
+`IsCanonicalRouteValue(RouteValue, EncodedRoute)`, `TryResolveWorkingTreePathFromRouteValue(paths,
+RouteValue, ...)`. Deleted `TryResolveWorkingTreePath` (no production caller); its private
+`TryResolveWorkingTreePathCore`'s now-vestigial `decodePercentEncoding` bool is gone too, folded into the
+one surviving public method. **`Encode`'s return type stays `string`, deliberately** — every downstream
+consumer of its output (`EnumeratedPage.Route`, `PageIndexEntry.Route`, `AmbiguousPageRoute.Route`,
+`PageIndexBuilder`'s dictionaries) is `string`-typed and lives outside this block's two named call
+sites; wrapping `Encode`'s return would have cascaded into `PageIndexBuilder.cs`, which the brief didn't
+name. The actual hazard the reviewer flagged — a wrong pairing at a *decode* call — is fully closed by
+the parameter types alone: nothing changed in `PageIndexBuilder.cs`. `EvaluateRouteClaim` (still
+`string route` in its own signature, called by both `PageEnumerationService` and `PageIndexBuilder`)
+wraps internally with `new EncodedRoute(route)` before calling `TryDecode` — safe by construction, since
+its `route` argument is always canonical there in every caller.
+
+Call sites: `WikiPage.razor` wraps `Route` as `RouteValue` for `TryDecodeRouteValue`/
+`IsCanonicalRouteValue`, and the locally-computed `canonicalRoute` as `EncodedRoute`; unwraps `.Value`
+where it still compares against `EnumeratedPage.Route` (plain string). `PageEnumerationService`'s only
+change is the one-line wrap inside `EvaluateRouteClaim` above.
+
+**❓ Flagging the one place this needed semantic awareness, per the brief's own instruction** —
+`TryDecodeRouteValue_DoesNotDoubleDecodeAFileNameContainingALiteralPercentSign` had a second assertion
+that called `TryDecode` *on the same routeValue* to demonstrate the double-decode bug the type split now
+makes a compile error — that demonstration can no longer be written by accident. Resolved by keeping the
+assertion but making the unwrap explicit and visible (`new EncodedRoute(routeValue.Value)`), with a
+comment stating this is now only reachable by a deliberate bypass. Judged this a faithful adaptation
+rather than a semantic change — the test's claim ("these two functions behave differently on this
+input") is unchanged; what changed is that reaching the misuse now requires writing `.Value` where it
+used to require nothing. Flagging per the brief rather than presenting it as settled — tell me if you'd
+rather this assertion were dropped instead of adapted.
+
+Also deleted the four `TryResolveWorkingTreePath_*` tests (method gone); their coverage — control-char
+refusal without throwing, sibling-directory containment, ordinary resolution, refusing what decode
+already refuses — survives unchanged as the pre-existing `TryResolveWorkingTreePathFromRouteValue_*`
+twins against the same shared private core. No other test needed semantic changes; all remaining edits
+were mechanical wraps (`new EncodedRoute(...)`/`new RouteValue(...)`) around otherwise-unchanged
+assertions.
+
+### Gates
+
+`dotnet build`: 0 warnings, 0 errors. `dotnet test` full unfiltered (final, post mutation-revert):
+**725/725**, ~1m55s. Reconciles against the 719 baseline: +14 new `AccountGitAuthorFactoryTests` cases
+(counting `[Theory]` `InlineData` individually), −8 deleted `TryResolveWorkingTreePath_*` cases (two
+`[Fact]`s plus two 3-case `[Theory]`s) = 719 + 14 − 8 = 725. `dotnet format --verify-no-changes`: clean.
+`openspec validate git-backed-content-core --strict`: valid. `git diff -- src`, `git status --short --
+src`, and `grep -rn MUTANT src/ tests/` all clean post-revert.
+
+No task numbers ticked (remediation-style block, as briefed). Do not commit.
+
+→ @reviewer
+
+**[reviewer]** Block C1 audit (obligation 7 + obligation 19) — **Approve with nits.**
+
+**Gates, re-run myself, not relayed.** `dotnet build`: 0 warnings, 0 errors. `dotnet test` unfiltered on
+the clean tree: **725/725**, 1m52s — matches the worker's figure exactly. `dotnet format
+--verify-no-changes`: clean. `openspec validate git-backed-content-core --strict`: valid.
+`grep -rn MUTANT src/ tests/`: empty.
+
+**Scope.** Confirmed no save-path work: `PageIndex.cs`/`PageIndexBuilder.cs` untouched (`git diff
+b3d0d44` on both is empty), `ContentStorageStartupExtensions.cs`'s only change is the
+`AddOptions<ContentAuthorshipOptions>()` block plus `AddSingleton<AccountGitAuthorFactory>()` with an
+explicit "no production caller yet" comment. No endpoint, no edit form, no CAS. Ticks no task numbers,
+as briefed.
+
+**Mutation — independently re-run, not trusted on report.** Same mutant (inverted the
+`IsLegalDotAtomText` ternary in `AccountGitAuthorFactory.cs`), checksummed the untracked file
+before (`035d526c…`) and after, applied the mutation, ran full unfiltered `dotnet test` under a `trap`
+that restores via `cp` on exit (never `git checkout --`, since the file is untracked and has no git
+baseline). Result: **6 failing, 719 passing** — the same six tests the worker names
+(`OrdinaryUsername_IsUsedDirectlyAsTheLocalpart` ×2, `LegacyUsernameThatIsStillALegalDotAtom…`,
+`LegacyUsernameThatIsNotALegalDotAtom_GetsTheDeterministicFallback`,
+`FallbackLocalpart_IsDisambiguatedByAccountId…`). Post-revert checksum matched byte-for-byte;
+`git status --short -- src tests` still shows only the five expected `??` entries, no tracked-file diff.
+One run, not three — it reproduced the worker's 3/3 exactly, so I didn't spend the remaining budget
+re-confirming an already-uniform failure mode. Confirmed.
+
+### Item 1 — the type seam: acceptable narrowing, but the DEVLOG's stated reason is the wrong kind
+
+Checked every production construction site of both new types (`grep -rn "new EncodedRoute(\|new
+RouteValue(" src/` — exactly three lines, all previously read in full):
+
+- `WikiPage.razor:132,137` — `new RouteValue(Route)`, wrapping the framework-bound `[Parameter]` string
+  directly off the request. This is the one true source of a "routing already decoded this once" value;
+  nothing else in this file could plausibly be handed here instead.
+- `WikiPage.razor:138` — `new EncodedRoute(PageRouteCodec.Encode(relativePath))`, wrapping `Encode`'s
+  literal, freshly-computed return value with nothing in between.
+- `PageEnumerationService.cs:235` (inside `EvaluateRouteClaim`) — `new EncodedRoute(route)`, where
+  `route` is a dictionary key built exclusively from `PageRouteCodec.Encode(...)` at both call sites
+  (`PageEnumerationService.cs:192`, `PageIndexBuilder.cs:250,292` — grepped, both are `Encode(...)` fed
+  straight into the same dictionary this key is drawn from).
+
+So: **every wrap that exists today is provably safe by inspection**, and the concrete defect the
+block-3b reviewer named — an *existing, ambiguous-origin* string handed to the wrong decode function at
+a call site holding both a `RouteValue`-shaped and an `EncodedRoute`-shaped value — is closed. At
+`WikiPage.razor`'s two-variable call site, the compiler now genuinely refuses the swap; that was the
+live hazard.
+
+What is *not* closed, and can't be by this design: `new EncodedRoute("anything")` compiles anywhere,
+because a `readonly record struct`'s primary constructor is public and there's no private-constructor/
+factory restriction. That's a real, if much narrower, residual — it requires someone to affirmatively
+fabricate a route string and box it, not to accidentally hand an existing variable to the wrong
+function. I judge this an acceptable narrowing on the property (the swap-at-a-shared-call-site hazard,
+which is what actually caused 3b's runtime-undetectable mix-up), not a regression against D17's goal.
+
+**But the reason recorded for leaving `Encode` returning `string` is the reason this project has
+already ruled out** (per the brief, referencing `1253ff5`): the worker's report gives "would have
+cascaded into `PageIndexBuilder.cs`, which the brief didn't name" — that's a diff-size/scope argument,
+not a property argument. It happens to land on the right side of the call this time (verified above,
+independently, from the property), but the record shouldn't rest on the reason that got a prior
+decision overturned. **Nit, not a blocker**: the Architect should replace or supplement that sentence in
+the DEVLOG/design.md with the actual argument — every current construction site is safe by inspection,
+full opacity would require touching `PageIndexBuilder`'s `Dictionary<string,...>` keys and
+`EnumeratedPage`/`PageIndexEntry.Route`, and that's a §7/§8 concern (the next caller of a base-revision
+read, per D17's own forward note) rather than something obligation 19 needed today.
+
+### Item 2 — check the instrument: a real gap, not a live defect
+
+Per the brief's own carried lesson, I didn't take "an independent parser" at face value. Wrote a
+throwaway probe against `System.Net.Mail.MailAddress` with known-good/known-bad local parts (scratch
+file, not committed). Result: **`MailAddress` accepts a trailing-dot local part** —
+`new MailAddress("trailingdot.@zerowiki.org")` does **not** throw, returning `User = "trailingdot."` —
+which is not a legal RFC 5322 `dot-atom-text` (a dot-atom cannot end on a dot). It correctly rejects a
+*leading* dot (`.leadingdot@...` throws) and a doubled interior dot (`a..b@...` throws), so the
+leniency is specifically one-sided: trailing-dot-only local parts pass through uncaught.
+
+Consequence, traced through the actual test file (`AccountGitAuthorFactoryTests.cs`): most tests don't
+actually depend on `MailAddress` to catch a misclassification — `OrdinaryUsername_…` and
+`LegacyUsernameThatIsStillALegalDotAtom_…` both assert an **exact** `$"{username}@{domain}"` string, so
+a ternary flip is caught by `Assert.Equal` before `AssertWellFormedAddress` ever runs, and
+`LegacyUsernameThatIsNotALegalDotAtom_GetsTheDeterministicFallback` is caught by
+`Assert.DoesNotContain(username, author.Email)` at line 73, *before* line 76's well-formedness check —
+I confirmed this directly: under my mutation run, this test's failure was the `DoesNotContain` message,
+not a `FormatException`. The one test where `MailAddress` is genuinely load-bearing with **no**
+structural assertion ahead of it is `FallbackLocalpart_IsDisambiguatedByAccountId_SoTwoLegacyUsernamesNeverCollapse`
+— `Assert.NotEqual` alone would pass on two different but equally-malformed addresses, and it was
+`AssertWellFormedAddress` that failed there in my run (`FormatException: An invalid character was found
+in the mail header: '.'`, thrown against `.old.name.@zerowiki.org`). So the worker's specific claim ("it
+earned its keep... proving the assertion actually discriminates") is accurate for *that* test and *that*
+input — `.old.name.` has a **leading** dot, which `MailAddress` does catch.
+
+The gap: nothing in the current fixture set (`ab`, `_legacy_`, `.old.name.`) isolates a **trailing-dot-
+only** illegal username, and if one did, `MailAddress` would not catch a misclassification of it — the
+one test relying solely on the oracle would pass vacuously on that specific shape. This is not
+hypothetical scope-creep: the worker's own historical excavation established that the *earliest* version
+of `CredentialPolicy.UsernamePattern` (`d90b00e`,
+`^[A-Za-z0-9._-]{0,63}[A-Za-z0-9][A-Za-z0-9._-]{0,63}\z`) permits exactly this shape (e.g. `a.`), so a
+legacy account with a trailing-dot-only username is a coherent instance of the very population obligation
+7 is required to be total over — it's just not one of the three `LoginServiceTests.cs` happens to pin.
+I re-derived the code itself is correct here (`IsLegalDotAtomText`'s regex requires `atext` after every
+dot including the last, per `\z` anchoring — a lone trailing dot fails to match, verified by inspection,
+not by the test suite), so **this is not a live defect**, only a coverage/oracle-soundness gap.
+
+**Nit, not a blocker, given the code is correct by inspection and CLAUDE.md's proportionality rule**:
+add one more fixture — a trailing-dot-only legacy username (e.g. `legacy.`) — asserted the same
+structural way `.old.name.` already is (`Assert.Contains($"+{id:N}", ...)`), which doesn't depend on
+`MailAddress` and would catch a regression in the trailing-dot branch that the oracle alone cannot.
+Also recommend narrowing the `AssertWellFormedAddress` doc comment's claim from "an independent parser"
+to name the specific leniency this review found, so a future reader doesn't lean on it for more than it
+delivers.
+
+### Items 3, 4, 5 — confirmed, no findings
+
+- **`+`'s unreachability** — re-derived independently and further than the worker did: walked the full
+  history of `UsernamePattern` (`git log -p --follow -- src/ZeroWiki/Identity/CredentialPolicy.cs`), not
+  just the two endpoints the worker checked. All three versions ever committed
+  (`d90b00e`, `70a31aa`, current) share the charset `[A-Za-z0-9._-]` (order of `.`/`-` differs, `+` never
+  present). `+` is `atext` per RFC 5322 §3.2.3 (confirmed in the code's own comment, which lists the
+  grammar correctly). Git and `GitAuthor` pass it through unmangled — `GitAuthor`'s constructor does no
+  filtering (read in full), and `+` is not one of `<`, `>`, or newline, the only characters that break a
+  git author/committer line. `Id` (a `Guid`, formatted `N` — 32 hex chars, no dashes) makes collision
+  between two fallback addresses impossible by construction, not merely unlikely: two distinct GUIDs
+  never produce the same 32-hex string short of a UUID collision, which is outside this project's threat
+  model.
+- **The unwrap test's semantics** — confirmed unchanged, syntax-only. The claim
+  (`TryDecode(new EncodedRoute(routeValue.Value))` on the same bytes `TryDecodeRouteValue` correctly
+  decoded resolves a *different* file) is bit-for-bit the same assertion as before the type split; only
+  the mechanical wrap changed. Correctly reported as syntax, not semantics, and correctly not treated as
+  a stop-and-report trigger.
+- **`ContentAuthorshipOptions` / the domain default** — bound identically to `DataRoot`
+  (`ContentStorageStartupExtensions.cs:26-32`, same `AddOptions<T>().Bind(...).Validate(...).ValidateOnStart()`
+  shape). Nothing derives it from `Request.Host` — grepped both new files, no `HttpContext` reference at
+  all (no production caller yet, so this is enforced by absence, not merely by discipline). `design.md`'s
+  new paragraph (D17, `zerowiki.org` as the Product Owner's own domain) matches
+  `ContentAuthorshipOptions.DefaultHostDomain` and `GitAuthor.System`'s `system@zerowiki.org` exactly —
+  one namespace, no inconsistency, confirmed by reading `GitAuthor.cs:15` directly.
+
+### C# idiom / style
+
+No null-forgiving operators in any of the five new files (grepped). One top-level type per file, file
+names matching type names, file-scoped namespaces. `readonly record struct` for the two wrapper types is
+the right call for zero-allocation, value-equality identity markers. Nothing to add.
+
+**What this approval certifies.** The working tree as of this post: the five untracked files
+(`AccountGitAuthorFactory.cs`, `ContentAuthorshipOptions.cs`, `EncodedRoute.cs`, `RouteValue.cs`,
+`AccountGitAuthorFactoryTests.cs`) verified **by direct reading in full**, not by `git diff` (which has
+no baseline for them) — content matches what's described above, and my own mutation run (checksum
+before/after, `cp`-restore under `trap`) confirms no residue. The five modified tracked files
+(`WikiPage.razor`, `ContentStorageStartupExtensions.cs`, `PageEnumerationService.cs`,
+`PageRouteCodec.cs`, `PageRouteCodecTests.cs`) verified against `git diff b3d0d44`. `design.md`'s D17
+domain paragraph verified against the code it describes. Gates re-run by me, not inherited: build 0/0,
+test 725/725 unfiltered, format clean, validate clean, `grep MUTANT` empty, `git status --short -- src
+tests` shows only the five expected `??` entries and no unexpected tracked diff.
+
+Two nits, neither blocking: (1) the "`Encode` stays `string`" rationale in the DEVLOG should be
+re-argued from the property rather than left resting on diff-size, even though the property argument
+would land on the same answer; (2) add a trailing-dot-only legacy-username fixture to close the
+`MailAddress`-blind-spot gap this review found, verified structurally rather than solely through the
+oracle.
+
+→ @architect
+
+**[worker]** Both nits addressed per the Architect's direction (nit 1 — the `Encode`/`string` rationale —
+fixed directly in `design.md`'s D17; nit 2 briefed to me). No production code changed — this delta is
+test-only (`AccountGitAuthorFactoryTests.cs`), plus a correction to this DEVLOG's own record. No task
+numbers touched; still not committed.
+
+**Nit 1 — corrected the record, not the code.** Checked `PageRouteCodec.cs` and
+`ContentStorageStartupExtensions.cs` first: no production comment ever stated the scope-based reason, so
+there was nothing to replace with a pointer to D17. The scope-based reasoning lived only in my own
+handoff post above ("every downstream consumer... lives outside this block's two named call sites... the
+brief didn't name [`PageIndexBuilder.cs`]"). That framing is superseded by design.md's D17 addendum
+(*"`Encode` keeps returning `string`... and the reason is a property, not a diff size"*) — the invisible
+mix-up (indistinguishable strings, undetectable at runtime) becomes a compile error either way; threading
+the type through `Encode` would only shrink the three enumerable, reviewable `new EncodedRoute(…)` sites
+this block's review already counted, not eliminate them, since something still has to assert a stored or
+enumerated route into the type. Recording this here because the DEVLOG is the durable account and the
+posted reasoning was the "right conclusion, wrong stated reason" shape `1253ff5` already named — read
+D17 itself for the argument; not restating it a third time.
+
+**Nit 2 — fixed in `AccountGitAuthorFactoryTests.cs`.**
+
+- Added `TrailingDotOnlyUsername_WasGenuinelyChoosableBeforeD11`: an **executable** proof, not a prose
+  claim — asserts `"legacy."` matches the pre-D11 pattern read back from `d90b00e`
+  (`^[A-Za-z0-9._-]{0,63}[A-Za-z0-9][A-Za-z0-9._-]{0,63}\z`, kept as a local constant for exactly this
+  check) and fails `CredentialPolicy.UsernameMatcher()` today — genuinely choosable then, refused now.
+- Added `MailAddressOracle_AcceptsATrailingDotLocalpart_DocumentedLeniencePin`: re-verified the reviewer's
+  finding myself rather than taking it on faith (`new MailAddress("trailingdot.@zerowiki.org")` does not
+  throw, `parsed.User == "trailingdot."`) — confirmed, and pinned as a regression guard against a future
+  .NET runtime tightening the parser.
+- `LegacyUsernameThatIsNotALegalDotAtom_GetsTheDeterministicFallback` is now a `[Theory]` over
+  `".old.name."` (leading+trailing) and `"legacy."` (trailing-only) — its existing structural assertions
+  (`DoesNotContain` raw username, `Contains "+{id:N}"`, `EndsWith` domain) already covered the property
+  the oracle can't; adding the fixture here needed no new assertion shape.
+- `FallbackLocalpart_IsDisambiguatedByAccountId_SoTwoLegacyUsernamesNeverCollapse` — the test the review
+  named as leaning on `MailAddress` alone — now pairs `".old.name."` with `"legacy."` (leading vs.
+  trailing-only, not two leading-dot fixtures) and asserts structurally via a new
+  `AssertLocalPartIsTheFallbackForm` helper (localpart ≠ raw username, contains `+`, no dot at either
+  end). `MailAddress` stays as an addition, never the only check.
+- `AssertWellFormedAddress`'s doc now states the leniency in place: a convenience cross-check, not a
+  conformance oracle, pointing at `AssertLocalPartIsTheFallbackForm` for the property it can't be trusted
+  to catch.
+
+**Gates, full unfiltered:** `dotnet build` 0 warnings/0 errors. `dotnet test`: **728/728** (~1m57s;
+725 → 728 is the +3 new facts above — no theory case count changed). `dotnet format
+--verify-no-changes`: clean. `openspec validate git-backed-content-core --strict`: valid. No mutation
+run for this delta — test-only, no new production branch to mutate (per CLAUDE.md: general test
+reinforcement isn't a mutation-testing surface; the underlying `AccountGitAuthorFactory` branch was
+already mutation-confirmed 3/3 in the block C1 post above and is unchanged by this delta).
+
+Only `tests/ZeroWiki.Tests/Content/AccountGitAuthorFactoryTests.cs` and this DEVLOG changed since the
+reviewer's approve-with-nits post. Not committed, no boxes ticked.
+
+→ @reviewer for the delta only.
+
+**[reviewer]** Delta certification — **not clean**. Test-file fixes are sound; the record fix for the
+seam nit is not, and the specific claim I was asked to confirm does not survive tracing the call graph.
+
+**No production code changed, confirmed independently, not relayed.** `git diff b3d0d44 --stat -- src/`
+is byte-identical to what it was at my original Approve (same four files, same line counts). Checksummed
+the four untracked production files against my prior review — `AccountGitAuthorFactory.cs` matches the
+hash I recorded then (`035d526c…`); `ContentAuthorshipOptions.cs`, `EncodedRoute.cs`, `RouteValue.cs`
+re-read in full, byte-identical to what I read and quoted in my original post. Only
+`AccountGitAuthorFactoryTests.cs` and `design.md` changed. `grep -rn "cascade\|scope\|didn't name" src/`
+turns up nothing about `Encode`/`EncodedRoute` — the worker's claim that no production comment ever
+carried the superseded scope reasoning is correct; there was nothing to fix in code.
+
+**Gates, re-run myself:** `dotnet build` 0/0. `dotnet test` unfiltered: **728/728** (~1m45s, matches).
+`dotnet format --verify-no-changes`: clean. `openspec validate git-backed-content-core --strict`: valid.
+`grep -rn MUTANT src/ tests/`: empty.
+
+**Nit 2 (the instrument) — confirmed sound, all four pieces.**
+
+- `TrailingDotOnlyUsername_WasGenuinelyChoosableBeforeD11`'s `PreD11UsernamePattern` constant
+  (`^[A-Za-z0-9._-]{0,63}[A-Za-z0-9][A-Za-z0-9._-]{0,63}\z`) is not a re-typed approximation —
+  `git show d90b00e:src/ZeroWiki/Identity/CredentialPolicy.cs | grep "UsernamePattern ="` returns the
+  identical string, character for character. This is what "asks the historical pattern rather than
+  prose" is supposed to look like, and it does.
+- `MailAddressOracle_AcceptsATrailingDotLocalpart_DocumentedLeniencePin` re-derives my exact finding
+  (`new MailAddress("trailingdot.@zerowiki.org")` does not throw, `User == "trailingdot."`) — checked
+  against my own probe from the original review, same result.
+- The `[Theory]` conversion and the new `AssertLocalPartIsTheFallbackForm` helper — this is the one the
+  Architect specifically asked me to scrutinize for the "fixture built by the code under test" failure
+  mode. It is **not** that failure mode: it does not reference `AccountGitAuthorFactory.SyntheticLocalPartPrefix`
+  or recompute `$"{prefix}{id:N}"` and compare — the antipattern would look exactly like that, mirroring
+  production's own formula so a bug in the formula reproduces identically in the assertion and never
+  fails. Instead it asserts four properties independent of that formula: localpart ≠ raw username
+  (catches the direct-use bypass regardless of the trailing-dot MailAddress blind spot — verified this is
+  what fires: under my mutation run in the original review, `Assert.NotEqual(rawUsername, localPart)`
+  would have failed here before `AssertWellFormedAddress` was ever reached, for the same reason
+  `LegacyUsernameThatIsNotALegalDotAtom_GetsTheDeterministicFallback`'s `DoesNotContain` did), localpart
+  contains `+` (consistent with the fallback shape without hard-coding it), and no dot at either boundary
+  (the property `MailAddress` can't be trusted for). Sound.
+
+**Nit 1 (the seam) — the record's fix is not confirmed; the "never reaches zero" claim looks wrong, not
+merely under-argued.** Traced the actual production call graph rather than reasoning about it abstractly,
+since that's what the brief asked for:
+
+- Every construction of the three route-carrying records is production code, all five sites
+  (`grep -rn "new EnumeratedPage(\|new PageIndexEntry(\|new AmbiguousPageRoute(" src/`):
+  `PageEnumerationService.cs:80,85` construct from a local `route` variable that is
+  `PageRouteCodec.Encode(relativePath)`'s own dictionary key (nothing else populates that dictionary);
+  `PageIndexBuilder.cs:66` constructs from `page.Route`, itself an `EnumeratedPage.Route` sourced the
+  same way; `PageIndexBuilder.cs:313,317` construct from `route`, drawn from `affectedRoutes =
+  affectedRelativePaths.Select(PageRouteCodec.Encode)` (line 250). **There is no production site, anywhere
+  in `src/`, that builds an `EnumeratedPage`, `PageIndexEntry`, or `AmbiguousPageRoute` from a route
+  string that did not just come out of a fresh call to `Encode`.**
+- Given that, a *full* cascade — the exact one design.md names (`Encode` returns `EncodedRoute`;
+  `EnumeratedPage.Route`, `PageIndexEntry.Route`, `AmbiguousPageRoute.Route` become `EncodedRoute`;
+  `PageIndexBuilder`'s `Dictionary<string,…>`s become `Dictionary<EncodedRoute,…>`;
+  `EvaluateRouteClaim(string route, …)` becomes `EvaluateRouteClaim(EncodedRoute route, …)`) — removes
+  **both** of the two `EncodedRoute` wraps I found in production (`WikiPage.razor:138`,
+  `PageEnumerationService.cs:235`), not merely "fewer". `WikiPage.razor:138` collapses to
+  `var canonicalRoute = PageRouteCodec.Encode(relativePath);` with nothing to wrap. `EvaluateRouteClaim`'s
+  internal `new EncodedRoute(route)` disappears because its parameter is already the right type. Every
+  `.Route` read anywhere downstream (`WikiPage.razor`'s two `snapshot.*.FirstOrDefault` comparisons,
+  `PageIndexBuilder`'s `claimsByRoute.TryGetValue(page.Route, …)` / `.TryGetValue(ambiguousRoute.Route,
+  …)`) already yields an `EncodedRoute` by that point — a `record`'s property read doesn't re-assert
+  anything, so none of these becomes a new wrap site either.
+- So "a route read back from any stored or enumerated form still has to be asserted into the type
+  somewhere" is true only in the trivial sense that *some* code, once, has to be the place a `string`
+  first becomes an `EncodedRoute` — and under the full cascade that place is `Encode`'s own return
+  statement, not an external caller. That's a *stronger* form of the property design.md is arguing for
+  (exactly one, singular, reviewed producer, rather than an "enumerable, greppable" but non-zero count of
+  caller-side wraps), not a reason the cascade falls short of it. As stated, the claim reads as if fewer-
+  but-still-some caller sites are unavoidable; my trace says caller sites go to **zero**, and the only
+  survivor is the constructor of the type doing what a constructor does.
+- I may be missing a site outside the five I found, or a future caller design.md has in mind that isn't
+  in `src/` yet (§7/§8, the save path) — if so I'd like it named, since "the brief didn't name
+  `PageIndexBuilder.cs`" was exactly the reasoning this correction was supposed to replace, and I don't
+  want a claim I can't verify to stand in its place for the same underlying reason.
+
+**This doesn't reopen the code approval** — Item 1's actual verdict (the type seam as *built* is an
+acceptable narrowing; every current wrap is safe by inspection) stands unchanged, and nothing here
+touches `AccountGitAuthorFactory.cs` or the mutation-confirmed branch. It's specifically the corrected
+design.md paragraph's central claim that I can't confirm — recommend either weakening it to the version
+above (moves the boundary to one place, doesn't eliminate it from existence, and that's still a
+legitimate reason not to do the cascade in *this* block) or naming the site I'm not seeing.
+
+**What's certified, precisely.** Code: the five files from my original Approve, unchanged, re-verified by
+checksum/full-read (`src/ZeroWiki/Content/AccountGitAuthorFactory.cs`, `ContentAuthorshipOptions.cs`,
+`EncodedRoute.cs`, `RouteValue.cs`) plus the four modified tracked production files
+(`WikiPage.razor`, `ContentStorageStartupExtensions.cs`, `PageEnumerationService.cs`,
+`PageRouteCodec.cs`) — all still exactly as approved. Tests: `AccountGitAuthorFactoryTests.cs` (now with
+the four fixes above) and `PageRouteCodecTests.cs`, both re-verified. Gates: build 0/0, test 728/728
+unfiltered, format clean, validate clean, `grep MUTANT` empty, `git status --short -- src tests` shows
+only the five expected `??` entries. **Not yet certifying `design.md`'s seam-nit paragraph** — that's the
+one open item.
+
+→ @architect
+
+**[worker]** The reviewer's trace was right and the "never reaches zero" claim is retracted — confirmed
+independently by re-tracing the same five construction sites before touching anything, then doing the
+cascade. `Encode` now returns `EncodedRoute`, threaded through `EnumeratedPage.Route`,
+`PageIndexEntry.Route`, `AmbiguousPageRoute.Route`, `PageEnumerationService` and `PageIndexBuilder`.
+
+**`EncodedRoute` is constructible only from within the assembly.** Not a positional record struct
+anymore — hand-written with a `private get`-only `Value` property and an `internal` constructor,
+so `new EncodedRoute(...)` fails to compile from `WikiPage.razor` or any other consumer. C# has no
+narrower grant than `internal` (no friend-class mechanism), so `ZeroWiki.Tests` needed
+`InternalsVisibleTo` to keep constructing arbitrary — including deliberately hostile —
+fixtures for `PageRouteCodecTests.cs`'s traversal/control-character theories, which `Encode` itself can
+never be made to produce. Added one `<InternalsVisibleTo Include="ZeroWiki.Tests" />` to
+`ZeroWiki.csproj`, documented inline. This is the "whatever record struct shape achieves it" the brief
+allowed for; didn't need to escalate as a design question — the shape is ordinary C#, not contorted.
+
+**Both named manual wraps are gone, confirmed by grep, not by re-reading the diff:**
+`grep -rn "new EncodedRoute(" src/` returns exactly one hit — `PageRouteCodec.cs`'s own `Encode`, the
+single legitimate producer. `WikiPage.razor:138` collapses to `PageRouteCodec.Encode(relativePath)`
+with nothing to wrap, exactly as the reviewer traced; `EvaluateRouteClaim`'s internal wrap disappeared
+because its parameter is now `EncodedRoute` directly (its signature changed from `string route` to
+`EncodedRoute route` — both callers, `PageEnumerationService.EnumeratePages` and
+`PageIndexBuilder.ApplyIncrementalUpdateAsync`, already held the right type at the call site).
+
+**"Watch for" — ordinal equality verified, not assumed**, in a new `EncodedRouteTests.cs`:
+value-based equality (`a == b` for two independently-`Encode`d equal strings, matching `GetHashCode`s),
+explicitly **not** case-insensitive (`"Page"` vs `"page"` stay distinct — the property
+`PageEnumerationService`'s old `StringComparer.Ordinal`-keyed dictionary and `PageIndexBuilder`'s
+`Distinct(StringComparer.Ordinal)`/`HashSet<string>(..., StringComparer.Ordinal)` all relied on),
+correct behaviour as a `Dictionary` key and `HashSet` member with **no explicit comparer** (there is
+none to pass — `EncodedRoute` isn't a `string`), and `ToString()` returning the raw value (so structured
+logging in `PageEnumerationService` still renders the route text, not a type name). Every comparison
+`PageIndexBuilder.ApplyIncrementalUpdateAsync` makes — `.Distinct()`, `HashSet<EncodedRoute>`,
+`Dictionary<EncodedRoute, List<string>>.TryGetValue` — now relies on exactly this, and the full suite
+(including that method's own incremental-refresh tests) passing is the second, end-to-end confirmation.
+
+**Files touched beyond the reviewer's list of five, all mechanical once the record types changed:**
+`EnumeratedPage.cs`, `PageIndexEntry.cs`, `AmbiguousPageRoute.cs` (`Route: string` → `EncodedRoute`),
+`PageEnumerationService.cs` (`claimsByRoute` dictionary type, `OrderBy` key selector,
+`EvaluateRouteClaim`'s signature), `PageIndexBuilder.cs` (`affectedRoutes`'s `.Distinct()`,
+`claimsByRoute`/`affectedRoutesSet` types), `ZeroWiki.csproj` (`InternalsVisibleTo`), plus test-side
+mechanical fixes in `PageRouteCodecTests.cs`, `PageEnumerationServiceTests.cs`,
+`PageIndexBuilderTests.cs`, `PageIndexTests.cs` — every `.Route` comparison against a string literal
+became `.Route.Value` against the literal (or, where both sides were already `EncodedRoute`, left as
+struct equality). **No test needed a semantic change** — every adaptation was "unwrap to compare against
+a string" or "the manual wrap I added in the previous delta is now redundant, remove it"; none required
+deciding what a test should mean differently than before.
+
+**Gates, full unfiltered:** `dotnet build` 0 warnings/0 errors. `dotnet test`: **735/735** (~1m58s;
+728 → 735 is the 7 new `EncodedRouteTests` facts, nothing else). `dotnet format --verify-no-changes`:
+clean. `openspec validate git-backed-content-core --strict`: valid. `git diff -- src`,
+`git status --short -- src tests`, `grep -rn MUTANT src/ tests/` all clean — no mutation run for this
+delta per the brief (behaviour-preserving by construction, the suite is the instrument); did not touch
+`AccountGitAuthorFactory.cs`, so its 3/3 mutation-confirmed result stands unchanged.
+
+Not committed, no boxes ticked.
+
+→ @reviewer for the delta only.
+
+**[reviewer]** Delta review over production code — **Approve, with one recommended follow-up I think
+should land before this commits.**
+
+**Gates, re-run myself, unfiltered:** `dotnet build` 0/0. `dotnet test`: **735/735** (~1m48s, matches).
+`dotnet format --verify-no-changes`: clean. `openspec validate git-backed-content-core --strict`: valid.
+`grep -rn MUTANT src/ tests/`: empty.
+
+**Single-construction-site claim — confirmed.** `grep -rn "new EncodedRoute(" src/` returns exactly one
+line, `PageRouteCodec.cs:102`, inside `Encode`. Both previously-flagged manual wraps are genuinely gone —
+read `WikiPage.razor:138` (`var canonicalRoute = PageRouteCodec.Encode(relativePath);`, no wrap) and
+`PageEnumerationService.EvaluateRouteClaim` (now takes `EncodedRoute route` directly, no `new
+EncodedRoute(route)` inside it) directly, not inferred from the diff.
+
+**Equality claim — re-derived, not trusted.** `EncodedRoute` is a `record struct` whose only field is a
+`string`; the compiler-synthesized `Equals`/`GetHashCode` delegate to `EqualityComparer<string>.Default`,
+which is ordinal by construction in .NET regardless of culture — that's a language guarantee, not
+something that can silently regress. `EncodedRouteTests.Equality_IsOrdinal_NotCaseInsensitive` doesn't
+just assert this in the abstract, it exercises the property that actually matters here: `Encode("Page.md")`
+vs `Encode("page.md")` produce **different** `EncodedRoute` values (`"Page"` vs `"page"`, genuinely
+different strings, not a vacuous same-string check), which is the exact case-sensitivity a
+case-insensitive filesystem would blur if this were ever accidentally OrdinalIgnoreCase. Traced every
+`Dictionary<EncodedRoute,…>`/`HashSet<EncodedRoute>`/`.Distinct()` use in `PageIndexBuilder.cs` and
+`PageEnumerationService.cs` (both files read in full) — none passes an explicit comparer, all rely on this
+same default, and the full suite (including the incremental-refresh tests that exercise exactly these
+collections) passing is the second, end-to-end confirmation.
+
+**Behaviour preservation — confirmed, not merely claimed mechanical.** Read every hunk of the diffs to
+`PageEnumerationServiceTests.cs`, `PageIndexBuilderTests.cs`, `PageIndexTests.cs`, and the additional
+`PageRouteCodecTests.cs` changes beyond what I already approved. Every edit is one of: `.Route` →
+`.Route.Value` against an unchanged string literal, `.Route == "x"` → `.Route.Value == "x"`, or a
+bare-string argument replaced with `new EncodedRoute(...)`/`new RouteValue(...)` wrapping the identical
+literal. No assertion's target value, expected outcome, or Theory data changed. `PageIndexTests.cs`'s
+`new PageIndexEntry("route", …)` → `new PageIndexEntry(new EncodedRoute("route"), …)` is the one place a
+test newly depends on `InternalsVisibleTo` for construction rather than merely unwrapping a read — noted
+below.
+
+**D17's rewritten paragraph — the "no read-back" premise holds, verified independently:**
+- Grepped `PageIndex.cs`/`PageIndexSnapshot.cs` for `Serialize`/`Deserialize`/`JsonSerializer`/`DbSet`/
+  `SQLite` — nothing. The index really is in-process-memory-only; nothing reads a route back from any
+  external store.
+- Grepped `.Route\b` across every `.cs`/`.razor` under `src/ZeroWiki/`: confined to
+  `PageRouteCodec.cs`, `EncodedRoute.cs`, `EnumeratedPage.cs`, `PageIndexEntry.cs`,
+  `AmbiguousPageRoute.cs`, `PageEnumerationService.cs`, `PageIndexBuilder.cs`, `WikiPage.razor` — no
+  other route-shaped input anywhere in the app. `RouteValue` genuinely is the only other route-shaped
+  input, confirmed by absence rather than assumed.
+- Minor nit, not substantive: design.md says "exactly three `Encode` call sites in production" — grepping
+  `PageRouteCodec\.Encode` in `src/` finds **four** call expressions across **three files**
+  (`PageEnumerationService.cs:197`, `PageIndexBuilder.cs:254` and `:296`, `WikiPage.razor:138`). Reads as
+  counting by file rather than by call, which is a defensible way to count "sites," but as written it's
+  ambiguous. Doesn't affect the paragraph's actual claim (one *construction* site, which I verified
+  independently above) — cosmetic, fix opportunistically.
+
+**One structural nuance the doc slightly overclaims, not a defect:** "Constructible only from within this
+assembly" (`EncodedRoute.cs:18`) is true for any *non-default* value, but `default(EncodedRoute)` /
+`new EncodedRoute()` (the implicit parameterless struct constructor) is unavoidably public from anywhere
+in .NET — structs can't suppress that, and `default` bypasses constructors entirely regardless of
+accessibility. This yields `Value == null`, which `TryDecodeCore`'s existing `IsNullOrEmpty` check already
+refuses cleanly, and no production code constructs `default(EncodedRoute)` and treats it as meaningful, so
+there's no live consequence. Nit: soften the doc claim to "constructible with a chosen value only from
+within this assembly" or similar, so it doesn't overstate what the type system actually enforces.
+
+**The `InternalsVisibleTo` question — I agree with your instinct: drop it, and move the hostile-input
+tests onto `RouteValue`/`TryDecodeRouteValue`.**
+
+Traced rather than reasoned abstractly, per your ask:
+
+- `TryDecode` and `TryDecodeRouteValue` share one private engine, `TryDecodeCore` — the only difference
+  between them is the `decodePercentEncoding` flag. Every refusal *branch* in that engine (empty segment,
+  `.`/`..`, control character, smuggled separator) is already independently exercised via
+  `TryDecodeRouteValue_RefusesPathTraversalAttempts`/`_RefusesControlCharacters`, both constructed through
+  the **public** `RouteValue(string)` constructor — no `InternalsVisibleTo` needed for that coverage, and
+  it's already there.
+- I checked whether `Encode` can produce *any* of the specific hostile strings the `TryDecode`-side
+  theories use (`".."`, `"%2e%2e"`, `"a%2fb"`, `"a%5cb"`, `"%00"`, control chars) by reading
+  `EncodeSegment` line by line: it percent-escapes exactly `%`, `#`, `?`, and control characters — a
+  literal `.` is never escaped. So `Encode` can never emit a segment that decodes to `.`/`..`, and can
+  never emit a bare `%2e%2e`/`%00`/`%2f`/`%5c` (any literal `%` in a real filename is *always* first
+  escaped to `%25`, so a raw two-hex-digit escape sequence never survives into `Encode`'s output). Real
+  filesystem entries also can't literally be named `.`/`..` at all. So every one of these hostile cases is
+  now provably unreachable through the only production entry point (`Encode` → `EvaluateRouteClaim`), not
+  merely unlikely.
+- What's left that `TryDecodeRouteValue`'s tests structurally *can't* cover is narrower than "the hostile
+  input hazard": it's "percent-decoding, when `TryDecode`'s flag enables it, runs *before* the same
+  refusal checks" — an internal ordering property, not a security property, since the input that would
+  exercise it can no longer arrive from anywhere production calls `TryDecode` from.
+- Given that, paying a **permanent, assembly-wide** internal-visibility grant to keep that one ordering
+  property under adversarial-input testing is the wrong side of the trade — it's exactly the shape CLAUDE.md's
+  own proportionality rule warns against (unbounded verification for a small trusted-group wiki), and it
+  reopens the "tests exercise a state the type system precludes" pattern the whole redesign existed to
+  close, just one level down (now it's the *test* holding the type's contract open by hand instead of a
+  caller).
+
+**Recommendation, concretely:** delete `TryDecode_RefusesPathTraversalAttempts` and
+`TryDecode_RefusesControlCharacters` (redundant with the `TryDecodeRouteValue` twins over the shared
+engine), rewrite `TryDecodeRouteValue_DoesNotDoubleDecodeAFileNameContainingALiteralPercentSign`'s last
+three lines to demonstrate the double-decode hazard without touching `TryDecode`/`EncodedRoute` directly
+if possible (or accept that one deliberate, narrow exception if not — it's proving a genuinely different
+thing, the double-decode bug, not hostile-input refusal), retarget `PageIndexTests.cs`'s
+`new PageIndexEntry("route", …)` fixture to `PageRouteCodec.Encode("route.md")` (which legitimately
+produces the exact value needed, no internal access required), and delete
+`EncodedRouteTests.ConstructibleWithinThisAssembly_ForFixturesEncodeCanNeverProduce` along with the
+`InternalsVisibleTo` element in `ZeroWiki.csproj`. If the ordering property (decode-before-refuse) is
+worth keeping some direct coverage of, it can be proven with *legitimate* `Encode` output containing
+escapable characters (`%`, `#`, `?`) round-tripping through `TryDecode` correctly — which is a positive
+test, needs no hostile fixture, and needs no special access.
+
+**This is a recommendation, not a blocker on this delta** — nothing here is broken, gates are green, and
+the code as written is correct; I'd carve it as a small follow-up remediation rather than send this delta
+back, since it's a test-hygiene/attack-surface-of-the-test-project question rather than a defect in
+`src/`. Your call whether to fold it in now or park it.
+
+**What this Approve certifies.** Production code: `PageRouteCodec.cs`, `EncodedRoute.cs`,
+`EnumeratedPage.cs`, `PageIndexEntry.cs`, `AmbiguousPageRoute.cs`, `PageEnumerationService.cs`,
+`PageIndexBuilder.cs`, `WikiPage.razor`, `ZeroWiki.csproj`, `ContentStorageStartupExtensions.cs` — all
+read in full or verified against `git diff b3d0d44`. Untracked files: `AccountGitAuthorFactory.cs`,
+`ContentAuthorshipOptions.cs`, `RouteValue.cs` checksummed against my previous review and byte-identical
+(this delta didn't touch them); `EncodedRouteTests.cs` read in full (new file, no git baseline — content
+inspection is the only verification, per this project's own standing hazard note); `AccountGitAuthorFactoryTests.cs`
+unchanged since the last delta. Tests: `PageRouteCodecTests.cs`, `PageEnumerationServiceTests.cs`,
+`PageIndexBuilderTests.cs`, `PageIndexTests.cs` verified against `git diff b3d0d44`, all edits confirmed
+mechanical. `design.md`'s D17 paragraph verified true against the code (one call-count wording nit noted,
+not substantive). Gates: build 0/0, test 735/735 unfiltered, format clean, validate clean, `grep MUTANT`
+empty, `git status --short -- src tests` shows only the expected untracked entries and no stray tracked
+diff.
+
+→ @architect
+
+**[worker]** `InternalsVisibleTo` dropped, per the reviewer's plan followed exactly.
+
+- Deleted `TryDecode_RefusesPathTraversalAttempts` (10 cases) and `TryDecode_RefusesControlCharacters`
+  (6 cases) from `PageRouteCodecTests.cs` — a comment at the deletion site records why: `TryDecode` and
+  `TryDecodeRouteValue` share `TryDecodeCore`, every refusal branch is already covered via
+  `TryDecodeRouteValue`'s twins built through the public `RouteValue` constructor, and `Encode` can never
+  produce any of these hostile strings through the only production entry point.
+- Rewrote `TryDecodeRouteValue_DoesNotDoubleDecodeAFileNameContainingALiteralPercentSign`'s last three
+  lines to demonstrate the double-decode hazard via `Uri.UnescapeDataString` directly — the exact
+  primitive `TryDecodeCore`'s decode step calls — rather than through `TryDecode`/`EncodedRoute`, so the
+  "without touching them directly" option in the reviewer's plan was achievable, not just the fallback
+  exception. Noted in-line that layer 1 (`__`/`_` reversal) is a no-op on this fixture, so the plain
+  double-unescape reproduces exactly what the old assertion checked.
+- Retargeted `PageIndexTests.cs`'s `PageIndexEntry` fixture from `new EncodedRoute("route")` to
+  `PageRouteCodec.Encode("route.md")` — legitimate output, same value, no internal access.
+- Deleted `EncodedRouteTests.ConstructibleWithinThisAssembly_ForFixturesEncodeCanNeverProduce` and the
+  `<InternalsVisibleTo Include="ZeroWiki.Tests" />` element in `ZeroWiki.csproj`. The csproj is now
+  byte-identical to `HEAD` (`git diff` on it is empty) — the grant was added and removed within this
+  same uncommitted block.
+- **Did not touch any refusal branch in `PageRouteCodec.cs`** — the question was only ever whether tests
+  need to reach past the type to exercise them, not whether the guards should exist; `TryDecodeCore`'s
+  empty/null/`.`/`..`/control-character/smuggled-separator checks are unchanged.
+- **`design.md` untouched** — did not "fix" the call-site-count wording per your correction; verified my
+  own understanding matches (`grep -rn "PageRouteCodec\.Encode(" src/` → three files, no unqualified
+  internal calls) but made no edit, since you'd already confirmed D17's "three" stands.
+- Tightened `EncodedRoute.cs`'s doc comment to "constructible **with a chosen value** only from within
+  this assembly" and folded in the `default(EncodedRoute)` caveat inline (it previously just said
+  "constructible only from within this assembly," the overclaim you flagged) — this was the one place I'd
+  written that exact claim; grepped for it repo-wide first rather than assuming it was the only site.
+
+**Gates, full unfiltered — figure and delta, not just green:** `dotnet build` 0 warnings/0 errors.
+`dotnet test`: **718/718** (was 735 → **−17**: 10 + 6 deleted `TryDecode`-hostile cases + 1 deleted
+`EncodedRouteTests` fact = 17, reconciles exactly), ~1m22s. `dotnet format --verify-no-changes`: clean.
+`openspec validate git-backed-content-core --strict`: valid. `grep -rn InternalsVisibleTo src/`: no
+hits. `git status --short -- src tests`: only the five expected untracked entries remain untracked;
+`ZeroWiki.csproj` shows no diff at all (reverted to `HEAD`, not merely edited-then-fixed). No mutation
+run — no production behaviour changed, test-only delta.
+
+Not committed, no boxes ticked.
+
+→ @reviewer for the delta only.
+
+**[reviewer]** Delta certification — **clean, with one precise finding on item 3 that I'd fix before
+commit since it's a one-line addition, not a reason to hold the rest.**
+
+**Gates, re-run myself, unfiltered:** `dotnet build` 0/0. `dotnet test`: **718/718** (~2m). `dotnet format
+--verify-no-changes`: clean. `openspec validate git-backed-content-core --strict`: valid.
+`grep -rn MUTANT src/ tests/`: empty. `git diff -- src/ZeroWiki/ZeroWiki.csproj`: empty, confirmed —
+byte-identical to `HEAD`, and `grep -rn InternalsVisibleTo src/ tests/` finds only explanatory comments
+in test files, no live grant anywhere.
+
+**1. The 719 → 718 reconciliation, traced end to end, not accepted on the arithmetic alone.**
+
+| step | count | delta | source |
+|---|---|---|---|
+| §5 close | 719 | — | baseline |
+| C1 first pass | 725 | +6 | +14 `AccountGitAuthorFactoryTests` cases (Theory rows counted individually), −8 deleted `TryResolveWorkingTreePath_*` cases (2 Facts + 2×3-case Theories) |
+| delta 1 (instrument nit) | 728 | +3 | 2 new Facts + 1 Theory gaining a row (`LegacyUsernameThatIsNotALegalDotAtom…` 1→2 cases) |
+| delta 2 (cascade) | 735 | +7 | new `EncodedRouteTests.cs`, 7 cases |
+| delta 3 (this one) | 718 | −17 | −10 `TryDecode_RefusesPathTraversalAttempts`, −6 `TryDecode_RefusesControlCharacters`, −1 `EncodedRouteTests.ConstructibleWithinThisAssembly…` |
+
+Net 719→718 = −1, and I recomputed it independently of the running total rather than trusting the
+posted deltas: summed every `[Fact]`/`[Theory]` case actually present in the two files C1 touched, in
+their **final** state. `AccountGitAuthorFactoryTests.cs`: 17 cases. `EncodedRouteTests.cs`: 6 cases
+(post-deletion). Total added by the whole block: 23. Total deleted by the whole block:
+`TryResolveWorkingTreePath_*` (8) + `TryDecode_Refuses*` (16) = 24. 23 − 24 = **−1**, matching the
+running total exactly — the arithmetic is sound, not merely consistent.
+
+**Is the −1 a genuine loss?** No — traced each deletion, not asserted:
+- The 8 `TryResolveWorkingTreePath_*` cases tested a method that no longer exists; their exact
+  functional twins survive unchanged as `TryResolveWorkingTreePathFromRouteValue_*` (verified in my very
+  first C1 review and unchanged since).
+- Of the 16 `TryDecode_Refuses*` cases, the 5 literal-traversal and 4 literal-control-char inputs have
+  **exact string twins** in `TryDecodeRouteValue_RefusesPathTraversalAttempts`/`_RefusesControlCharacters`
+  (compared InlineData lists directly, not by memory).
+- The remaining 7 (`%2e%2e`, `%2e%2e/secret`, `a/%2e%2e/secret`, `a%2fb`, `%00`, `a%00b`, `%00/secret`,
+  `%01`, `%1f`, `%7f` — the percent-encoded forms) test states I independently confirmed `Encode` can
+  never produce: `EncodeSegment` (read again this round, unchanged) escapes exactly `%`, `#`, `?`, and
+  control characters — a literal `.` is never escaped, and any literal `%` is always escaped to `%25`
+  first — so a real filename can never round-trip into a bare `%2e%2e`/`%00`/etc. These are provably
+  unreachable through the only remaining production entry point, exactly as before deletion.
+- **One case is not a clean twin, and I want it named rather than folded into "redundant": `a%5cb`.**
+  Decoded, it produces a literal backslash, exercising `TryDecodeSegment`'s
+  `percentDecoded.Contains('\\')` branch. This is the **one** branch of the shared refusal engine that,
+  after this deletion, **has no test anywhere exercising it** — not through `TryDecode` (rightly gone,
+  unreachable via `Encode`) and not through `TryDecodeRouteValue` either, because
+  `TryDecodeRouteValue_RefusesPathTraversalAttempts`'s theory list (`"..", "../secret",
+  "a/../../secret", "/etc/passwd", "a//b"`) has never included a literal-backslash case, in any round of
+  this block. That's a **pre-existing** gap on the `RouteValue` side, not one this delta introduced — but
+  this delta removed the *only* test in the whole suite that exercised this branch at all, via the
+  now-closed door. And it's not hypothetical: `PageRouteCodec.cs`'s own remarks (read again, unchanged)
+  state as an *established, empirically-probed fact* that "an unescaped literal `%5c` **is** decoded into
+  a real backslash" by ASP.NET Core's own routing before `TryDecodeRouteValue` ever runs — meaning a
+  request to `/wiki/a%5cb` delivers a **literal backslash** in `Route`, exactly the `RouteValue` shape
+  this branch exists to catch, and the class's own documentation claims this hazard is caught. Right now
+  nothing proves that claim.
+  **Recommend, before commit:** add `[InlineData("a\\b")]` (or equivalent) to
+  `TryDecodeRouteValue_RefusesPathTraversalAttempts`. One line, needs no `InternalsVisibleTo`, and closes
+  the one place "redundant" isn't quite the right word for what happened. This is not a reason to hold
+  the rest of the delta — it's a one-line addition, not a design question.
+
+**2. The rewritten double-decode test — precise answer, not a blanket yes/no.**
+
+Read `TryDecodeRouteValue_DoesNotDoubleDecodeAFileNameContainingALiteralPercentSign` in full, current
+state. It has two halves with different jobs:
+
+- **Lines computing `correct` via `PageRouteCodec.TryDecodeRouteValue(routeValue, out var correct)`** —
+  this calls **actual production code** and asserts `correct == "a%20b.md"`. This is the real regression
+  guard: if `TryDecodeCore`'s `decodePercentEncoding: false` path ever regressed to decode anyway,
+  `correct` would come back `"a b.md"` and this assertion would fail. **This half is untouched by the
+  rewrite and still calls the codec.**
+- **The tail (`doubleDecodedStem = Uri.UnescapeDataString(routeValue.Value)` …)** — this calls
+  `Uri.UnescapeDataString` **directly**, not through `TryDecodeCore`/`TryDecode`. In isolation this
+  three-line tail is exactly what you suspected: it would **not** fail if `TryDecodeCore`'s own decode
+  mechanism regressed (say, swapped for a different, buggy decoder), because it never calls into
+  `PageRouteCodec` for this part at all. Judged strictly as its own claim, it's decorative — it pins a
+  fact about `Uri.UnescapeDataString`, not about ZeroWiki's code.
+
+So: **the tail alone is decorative; the test as a whole is not**, because the tail was never the part
+carrying the regression-catching weight — that was always the `correct == "a%20b.md"` assertion above it,
+which the rewrite didn't touch. The comment is honest about this rather than overclaiming (`"What remains
+worth pinning is the underlying string mechanics TryDecodeCore's percent-decode step relies on"` — it
+says "mechanics [it] relies on," not "TryDecodeCore's behaviour," and doesn't claim to exercise the codec
+for this part). Given `EncodedRoute` can no longer be constructed with an arbitrary value from test code
+at all (that capability was deliberately removed, correctly), there was no way to keep a *literal*
+demonstration through `TryDecode` without re-adding exactly the access this delta exists to remove — the
+tail's honest, narrower framing is the right resolution, not a finding.
+
+**3. Deleted-coverage redundancy, verified against the tree after the deletion, not before.** Confirmed
+by direct comparison above (item 1) rather than re-asserting my pre-deletion argument: 15 of 16 deleted
+cases have live twins or are provably unreachable; the 16th (`a%5cb`) is the one gap, named precisely
+above with a concrete fix.
+
+**4. Gates and file state**, all reconfirmed myself: build 0/0, test 718/718 unfiltered, format clean,
+validate clean, `grep MUTANT` empty, `git diff -- src/ZeroWiki/ZeroWiki.csproj` empty, no
+`InternalsVisibleTo` anywhere live. `PageRouteCodec.cs`'s refusal logic (`TryDecodeCore`/
+`TryDecodeSegment`) re-read in full and byte-identical to what I certified in the previous round — no
+production refusal branch touched, confirmed by direct comparison, not by trusting the report.
+
+**What this certifies, including untracked files by name.** `src/ZeroWiki/Content/EncodedRoute.cs`
+(doc tightened to "constructible **with a chosen value** only from within this assembly," the
+`default(EncodedRoute)` caveat now explicit and accurate — read in full, matches exactly what I asked
+for), `AccountGitAuthorFactory.cs`, `ContentAuthorshipOptions.cs`, `RouteValue.cs` (unchanged, not
+touched by this delta). `tests/ZeroWiki.Tests/Content/EncodedRouteTests.cs` (6 cases, `.../
+PageIndexTests.cs`'s fixture retargeted to `PageRouteCodec.Encode("route.md")` — legitimate construction,
+no internal access), `AccountGitAuthorFactoryTests.cs` (unchanged). All tracked production files
+(`PageRouteCodec.cs`, `EnumeratedPage.cs`, `PageIndexEntry.cs`, `AmbiguousPageRoute.cs`,
+`PageEnumerationService.cs`, `PageIndexBuilder.cs`, `WikiPage.razor`, `ZeroWiki.csproj`,
+`ContentStorageStartupExtensions.cs`) and test files (`PageRouteCodecTests.cs`,
+`PageEnumerationServiceTests.cs`, `PageIndexBuilderTests.cs`, `PageIndexTests.cs`) verified against
+`git diff b3d0d44` and/or direct re-read this round.
+
+**Recommend the one-line `a\b` fixture land before commit** — it's small enough not to warrant another
+round, but I'd rather it be in the same commit that removed its last cover than filed as a `## NEXT` item
+that's easy to forget. Your call whether to fold it in now or take it as a fast-follow; either way, ready
+for you to commit C1 and move to C2.
+
+→ @architect
+
+**[worker]** `a\b` restored to `TryDecodeRouteValue_RefusesPathTraversalAttempts`, with the red-run
+evidence the coordinator asked for rather than a green report alone.
+
+- Added `[InlineData("a\\b")]`, with a comment explaining it restores the smuggled-backslash coverage
+  `TryDecode_RefusesPathTraversalAttempts`'s deleted `"a%5cb"` case gave `TryDecodeCore`'s
+  `Contains('\\')` branch — as the already-decoded form (`a\b`, not `a%5cb`), since that's the input
+  `TryDecodeRouteValue` actually receives per this class's own empirically-probed remarks.
+- **Proved it fails without the guard, not just asserted it would.** Checksummed
+  `PageRouteCodec.cs` before mutating (`e65f8902…4dee26d`), then removed `|| percentDecoded.Contains('\\')`
+  from `TryDecodeCore`'s smuggled-separator check (leaving the `/` half intact — narrowest possible
+  mutation of the one branch in question). Ran the full unfiltered suite:
+  ```
+  [xUnit.net]  ZeroWiki.Tests.Content.PageRouteCodecTests.TryDecodeRouteValue_RefusesPathTraversalAttempts(hostileRouteValue: "a\\b") [FAIL]
+    Error Message:
+     Assert.False() Failure
+    Expected: False
+    Actual:   True
+  Failed!  - Failed: 1, Passed: 718, Skipped: 0, Total: 719
+  ```
+  Exactly and only the new case failed — `TryDecodeRouteValue` returned `true` (accepted) once the
+  backslash check was gone, so nothing upstream of it swallows this input; the fixture genuinely
+  exercises the branch, not a decorative pass.
+- Restored via `cp` from the out-of-repo scratchpad baseline inside a `trap`, never `git checkout --`.
+  Post-restore checksum matches the pre-mutation one byte-for-byte; `diff` against the baseline copy is
+  empty. `git diff -- src` shows only this block's accumulated changes since `b3d0d44`, nothing from the
+  mutation cycle; `grep -rn MUTANT src/ tests/` empty.
+- One formatting nit self-caught, not from the coordinator: my first draft of the `[InlineData]` comment
+  used hand-aligned continuation indentation, which `dotnet format` rejected (8 `WHITESPACE` errors).
+  Reflowed to the project's ordinary block-comment style above the attribute; re-verified format clean
+  before re-running gates.
+
+**Gates, full unfiltered, post-restore:** `dotnet build` 0 warnings/0 errors. `dotnet test`: **719/719**
+(was 718 → **+1**, exactly the restored case), ~1m24–1m47s across runs. `dotnet format
+--verify-no-changes`: clean. `openspec validate git-backed-content-core --strict`: valid.
+
+No other changes — no production edit survives, no other fixture touched, no further deletions.
+
+Not committed, no boxes ticked.
+
+→ @reviewer for this single delta.
+
+**[architect]** Block C1 committed **on `@reviewer`'s standing Approve**, which explicitly pre-authorised
+the `a\b` fixture landing without a further round ("small enough not to warrant another round … I'd rather
+it be in the same commit that removed its last cover"). Folded in rather than filed: a `## NEXT` item for a
+security guard whose only test was just deleted is precisely the shape obligation 1 took when it decayed
+across three sections.
+
+**Gates re-run by the Architect in the foreground, not inherited:** `dotnet build` **0/0**; `dotnet test`
+**719/719 unfiltered** in 1m26s; `dotnet format --verify-no-changes` exit 0; `openspec validate --strict`
+valid; `git diff -- src/ZeroWiki/ZeroWiki.csproj` **empty**; `grep -rn MUTANT src/ tests/` **empty**;
+`grep -rn InternalsVisibleTo src/` **empty**.
+
+**What C1 cost, and the one thing that made it worth the length.** Five review passes on one block —
+scope argument → property argument on a false premise → cascade → `InternalsVisibleTo` removal → coverage
+restoration. Two of those were caused by *my* reasoning, not a worker's: I told the block to leave `Encode`
+returning `string` on an argument whose premise I never traced, and `@reviewer` disproved it by tracing.
+**The record now says a property argument is not self-certifying** (D17), and that is the durable output.
+
+**The other durable output is a method, not a fact.** I refused to accept `718/718` as an answer and made
+the reviewer reconcile the count end to end against the baseline — 719 → 725 → 728 → 735 → 718. The
+arithmetic reconciled; the *baseline* did not, and the recount found that `a%5cb` was the only case in the
+entire suite exercising `TryDecodeCore`'s smuggled-backslash branch. Not a state the types preclude:
+`PageRouteCodec`'s own remarks record, as an empirically probed fact, that ASP.NET Core decodes `%5c` into
+a real backslash **before** `TryDecodeRouteValue` runs, so it is a live path-traversal surface that had
+just lost its only test. **A green total is not an answer to "did coverage go down" — and this block hid a
+coverage drop behind an unrelated increase twice** (the codec's −4 masked by the author tests' +6, then
+this).
+
+**And the fixture was proved rather than added.** Guard inverted, full unfiltered suite, exactly one
+failure naming the new case and its assertion — so nothing upstream swallows the input. A new
+`[InlineData]` that passes trivially would have been one more decorative test in a block whose whole second
+half was about removing those.
+
+**Ticks nothing.** Obligations **7** and **19** are discharged; §6's task numbers all belong to C2 and D.
+
 ## NEXT
 
 **Resume point: §6 (Commit-on-save), first block. §5 is closed** — supervisor `Approve` on round two

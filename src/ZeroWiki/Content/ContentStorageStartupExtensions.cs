@@ -23,6 +23,14 @@ public static class ContentStorageStartupExtensions
                 "ContentStorage:WriteLockTimeout must be greater than zero.")
             .ValidateOnStart();
 
+        services
+            .AddOptions<ContentAuthorshipOptions>()
+            .Bind(configuration.GetSection(ContentAuthorshipOptions.SectionName))
+            .Validate(
+                options => !string.IsNullOrWhiteSpace(options.HostDomain),
+                "ContentAuthorship:HostDomain must not be empty.")
+            .ValidateOnStart();
+
         services.AddSingleton(sp =>
             new ContentPaths(sp.GetRequiredService<IOptions<ContentStorageOptions>>().Value.DataRoot));
 
@@ -46,6 +54,10 @@ public static class ContentStorageStartupExtensions
         // (BuildPageIndexAsync, called after EnsureContentRepositoryAsync below).
         services.AddSingleton<PageIndexBuilder>();
         services.AddSingleton<PageIndex>();
+
+        // §6 block C1: builds the synthetic author identity a save is committed under (D10, D17). No
+        // production caller yet — the save path itself is a later block in this section.
+        services.AddSingleton<AccountGitAuthorFactory>();
 
         return services;
     }
