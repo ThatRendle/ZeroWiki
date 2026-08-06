@@ -200,6 +200,52 @@ public sealed class PageSaveServiceTests : IDisposable
     }
 
     [Fact]
+    public async Task Save_WhenTheRequestIsCancelledAfterTheLockIsHeld_StillCompletesAndCommits()
+    {
+        // §6 block D2, Product Owner decision: once SaveAsync holds the write lock, the caller's own
+        // cancellation stops applying. A pre-commit hook signals the moment it starts running -- proof
+        // the save is already past lock acquisition, the write, staging and the no-op diff check, deep
+        // inside the "commit" git subprocess -- before the test cancels. If the fix regressed (the
+        // critical section started honouring the caller's token again), the cancelled "commit"
+        // invocation would throw, and this save would roll back instead of completing.
+        await InitializeRepositoryAsync();
+        var sha = await CommitPageDirectlyAsync("page.md", "v1");
+
+        var startedMarkerPath = Path.Combine(Path.GetTempPath(), $"zerowiki-hook-started-{Guid.NewGuid():n}");
+        await InstallHookThatSignalsThenSleepsAsync(startedMarkerPath, sleepSeconds: 1);
+
+        try
+        {
+            var service = CreateService(out _);
+            using var cts = new CancellationTokenSource();
+
+            var saveTask = service.SaveAsync(
+                new RouteValue("page"),
+                "v2",
+                PageBaseRevision.ForBlob(sha),
+                Author(),
+                cts.Token);
+
+            await WaitForFileAsync(startedMarkerPath);
+            cts.Cancel();
+
+            var result = await saveTask;
+
+            Assert.Equal(SaveOutcome.Saved, result.Outcome);
+            Assert.NotNull(result.CommitSha);
+            Assert.Equal("v2", await File.ReadAllTextAsync(Path.Combine(WorkingTree, "page.md")));
+            await AssertPorcelainIsEmptyAsync();
+        }
+        finally
+        {
+            if (File.Exists(startedMarkerPath))
+            {
+                File.Delete(startedMarkerPath);
+            }
+        }
+    }
+
+    [Fact]
     public async Task Save_UnresolvableRouteValue_IsRefusedAndWritesNothing()
     {
         await InitializeRepositoryAsync();
@@ -507,6 +553,43 @@ public sealed class PageSaveServiceTests : IDisposable
                 UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute |
                 UnixFileMode.GroupRead | UnixFileMode.GroupExecute |
                 UnixFileMode.OtherRead | UnixFileMode.OtherExecute);
+        }
+    }
+
+    /// <summary>
+    /// A <c>pre-commit</c> hook that touches <paramref name="startedMarkerPath"/> the instant it starts,
+    /// then sleeps for <paramref name="sleepSeconds"/> before exiting 0 -- a synchronization point for
+    /// tests that need to act while a save is provably deep inside its own <c>git commit</c> subprocess,
+    /// without depending on a guessed delay.
+    /// </summary>
+    private async Task InstallHookThatSignalsThenSleepsAsync(string startedMarkerPath, int sleepSeconds)
+    {
+        var hooksDirectory = Path.Combine(RepositoryRoot, ".git", "hooks");
+        Directory.CreateDirectory(hooksDirectory);
+        var hookPath = Path.Combine(hooksDirectory, "pre-commit");
+        await File.WriteAllTextAsync(hookPath, $"#!/bin/sh\ntouch '{startedMarkerPath}'\nsleep {sleepSeconds}\nexit 0\n");
+
+        if (!OperatingSystem.IsWindows())
+        {
+            File.SetUnixFileMode(
+                hookPath,
+                UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute |
+                UnixFileMode.GroupRead | UnixFileMode.GroupExecute |
+                UnixFileMode.OtherRead | UnixFileMode.OtherExecute);
+        }
+    }
+
+    private static async Task WaitForFileAsync(string path, TimeSpan? timeout = null)
+    {
+        var deadline = DateTime.UtcNow + (timeout ?? TimeSpan.FromSeconds(10));
+        while (!File.Exists(path))
+        {
+            if (DateTime.UtcNow > deadline)
+            {
+                throw new TimeoutException($"'{path}' never appeared.");
+            }
+
+            await Task.Delay(10);
         }
     }
 

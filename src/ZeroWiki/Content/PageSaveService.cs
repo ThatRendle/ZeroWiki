@@ -14,7 +14,12 @@ namespace ZeroWiki.Content;
 /// own body is commented against these same numbers:
 /// <list type="number">
 /// <item>Resolve the route to a working-tree path and reject a non-canonical request (S2).</item>
-/// <item>Acquire the write lock, bounded by <see cref="ContentStorageOptions.SaveWriteLockTimeout"/>.</item>
+/// <item>Acquire the write lock, bounded by <see cref="ContentStorageOptions.SaveWriteLockTimeout"/> —
+/// the only step in this method the caller's <see cref="CancellationToken"/> still governs (§6 block D2,
+/// Product Owner decision): once acquired, every step below runs to completion regardless of the
+/// request's own cancellation, because a killed <c>git commit</c> can strand <c>.git/index.lock</c> and
+/// nothing in this codebase clears one. <see cref="SaveAsync"/>'s own body names the seam explicitly as
+/// <c>lockHeldCancellation</c>.</item>
 /// <item>Re-read the base revision under the lock — D4's CAS is only a CAS because the re-read happens
 /// after acquiring exclusive access, not before.</item>
 /// <item>Compare against the declared base.</item>
@@ -116,10 +121,22 @@ public sealed class PageSaveService
 
         try
         {
+            // From here until the lock is released (the `finally` below), the request's own
+            // cancellation no longer applies -- Product Owner decision, §6 block D2. A `git commit`
+            // killed mid-flight can strand `.git/index.lock`, and nothing in this codebase clears
+            // one: measured by execution, a stranded lock fails `git add -A`/`git commit` with exit
+            // 128 while `git status --porcelain` and `git rev-parse HEAD` still read a clean tree at
+            // exit 0 -- it would fail D9's own startup reconciliation while reporting the tree
+            // healthy. `RepositoryWriteLock.AcquireAsync` above is the only cancellable step in this
+            // method (D17's "repository busy" path); everything below deliberately uses this token,
+            // never the caller's `cancellationToken`, so a reader can see exactly where cancellation
+            // stops applying rather than infer it from an argument that happens to be omitted.
+            var lockHeldCancellation = CancellationToken.None;
+
             // 3. Re-read the base revision under the lock -- this is what makes the compare in step 4 a
             // CAS rather than a check: read-then-write is not atomic across processes, and a base
             // revision read before the lock may already be stale by the time it is acted on.
-            var probe = await ProbeHeadPathAsync(repositoryRelativePath, cancellationToken);
+            var probe = await ProbeHeadPathAsync(repositoryRelativePath, lockHeldCancellation);
             if (probe.State == HeadPathState.Refuse)
             {
                 return SavePageResult.Refused;
@@ -149,12 +166,13 @@ public sealed class PageSaveService
             }
 
             // 5. Write.
-            await WriteFileAsync(absolutePath, content, cancellationToken);
+            await WriteFileAsync(absolutePath, content, lockHeldCancellation);
 
-            // 6-7. Stage, short-circuit on nothing-staged, commit. Any exception from this block (`add`
-            // throwing, or the caller's own CancellationToken firing mid-add/mid-commit) is handled by
-            // the single catch below exactly like an ordinary non-zero commit exit -- one rollback path,
-            // not two independently-written ones that can silently disagree on what "handled" means.
+            // 6-7. Stage, short-circuit on nothing-staged, commit. Any exception this block throws
+            // (`add` failing, or anything else -- the caller's own CancellationToken cannot fire here,
+            // it stopped applying above) is handled by the single catch below exactly like an ordinary
+            // non-zero commit exit -- one rollback path, not two independently-written ones that can
+            // silently disagree on what "handled" means.
             GitProcessResult commitResult;
             try
             {
@@ -164,7 +182,7 @@ public sealed class PageSaveService
                 await _git.RunOrThrowAsync(
                     _paths.RepositoryRoot,
                     ["add", "--", repositoryRelativePath],
-                    cancellationToken: cancellationToken);
+                    cancellationToken: lockHeldCancellation);
 
                 // Nothing staged -> success, no commit. Byte-identical content is not an error and must
                 // not fall into the rollback path; `git commit` would otherwise fail "nothing to commit"
@@ -172,7 +190,7 @@ public sealed class PageSaveService
                 var stagedDiff = await _git.RunAsync(
                     _paths.RepositoryRoot,
                     ["diff", "--cached", "--quiet", "--", repositoryRelativePath],
-                    cancellationToken: cancellationToken);
+                    cancellationToken: lockHeldCancellation);
                 if (stagedDiff.Succeeded)
                 {
                     return SavePageResult.Saved(commitSha: null);
@@ -183,7 +201,7 @@ public sealed class PageSaveService
                     _paths.RepositoryRoot,
                     ["commit", "-m", $"Save '{canonicalRoute}'"],
                     environmentVariables: author.ToEnvironmentVariables(),
-                    cancellationToken: cancellationToken);
+                    cancellationToken: lockHeldCancellation);
             }
             catch (Exception ex)
             {
@@ -196,7 +214,7 @@ public sealed class PageSaveService
                 var headSha = await _git.RunOrThrowAsync(
                     _paths.RepositoryRoot,
                     ["rev-parse", "HEAD"],
-                    cancellationToken: cancellationToken);
+                    cancellationToken: lockHeldCancellation);
                 return SavePageResult.Saved(headSha.StandardOutput.Trim());
             }
 
