@@ -570,6 +570,57 @@ only in the filename, so a single-directory scan is not sufficient either. D3 ow
 these and justifying the choice; D1 records that one of them must be chosen, because leaving the save
 path as the one surface D12 does not govern is not an option once a browser can reach it.
 
+**The mechanism, chosen in §6 block D3: a fresh working-tree enumeration under the write lock**, via
+`PageEnumerationService.EnumeratePages()`, asking whether the save's canonical route appears in the
+result's `AmbiguousRoutes`. It runs after the lock is acquired and before the CAS.
+
+*Why not the index snapshot.* D1's framing above — that consulting the index is barred by the
+lock-ordering objection — is **too strong, and the correction matters more than the conclusion**.
+`IPageIndex.Current` is a plain read of the installed snapshot and never touches `PageIndex`'s
+`_refreshGate`, so the lock-ordering argument does not reach it at all; that argument is about the save
+blocking on the *refresh*, which `Current` does not do. The snapshot is rejected for an entirely
+different and more decisive reason: **nothing refreshes it as a side effect of a save**, so it can be
+arbitrarily stale with respect to a push the app has not yet noticed — and a push the app has not yet
+noticed is *precisely* the in-flight case this refusal exists to catch. A mechanism whose blind spot is
+exactly its own motivating scenario is not a cheaper option, it is a non-answer.
+
+*Why not a git-side answer.* Re-deriving the collision rule against `HEAD`'s tree objects would
+duplicate `PageEnumerationService`'s own logic in a second place, and two implementations of D12's
+ambiguity rule is exactly the duplication that makes it possible for the two surfaces to disagree —
+which is the defect this decision exists to close. Outside a lock-held save the working tree equals
+`HEAD` by D9's invariant, so the git-side answer is not more authoritative either; it is the same answer
+computed twice.
+
+*Why a full walk rather than a scoped lookup.* A collision can arise in a **directory** segment, so
+there is no bounded neighbourhood to scan — the constraint D1 recorded, discharged rather than worked
+around.
+
+*The cost, measured rather than assumed:* `EnumeratePages()` is a **path-only** walk — it derives routes
+from filenames and reads no file contents and no frontmatter. So the per-save cost is directory
+traversal, not content I/O, and it notably does **not** read working-tree bytes, so it does not touch
+the hazard the rollback paragraph below is about. A full walk on the *normal* save path is nevertheless
+a deliberate trade, not an incidental one: D15's full rebuild is chosen for the *exceptional* rollback
+path, and this is a different bargain being struck for a different reason. It is accepted here because
+ZeroWiki is a wiki for a small trusted group over a mounted volume, and correctness of D12's invariant
+on the one surface that can silently violate it is worth a directory walk. If a deployment ever makes
+that walk material, the answer is to make enumeration incremental, not to narrow this check.
+
+**`LoadForEditAsync` probes `HEAD` *before* reading the file, and the order is load-bearing.** An editor
+load is not atomic: it produces a `(content, base revision)` pair from two separate reads, and which one
+happens first decides how a concurrent write can corrupt the pair.
+
+- **Probe first, then read** — a write landing between them means the content read is *newer* than the
+  declared base. The base falls behind the truth, the CAS sees a mismatch, and the save is refused as an
+  honest `Conflict`. The member is told to reload; nothing is lost.
+- **Read first, then probe** (rejected) — a write landing between them means the base is *newer* than
+  the content the member is editing. The base has caught up past what was actually read, so the CAS
+  compares clean and the save commits, **silently discarding a version the member never saw**. That is a
+  lost update produced by the very mechanism meant to prevent one.
+
+The asymmetry is the whole argument: one ordering can only ever manufacture a false conflict, the other
+can manufacture a false agreement. Where those are the two failure modes available, the correct choice
+is the one that fails toward refusing.
+
 **Every failure outcome stays distinguishable at the browser surface, and none of them discards what the
 member typed (Product Owner decision, §6 block D1).** There are **five**, not the four this section's
 DEVLOG has been counting since C2: conflict, repository-busy, refused, failed-and-rolled-back, and

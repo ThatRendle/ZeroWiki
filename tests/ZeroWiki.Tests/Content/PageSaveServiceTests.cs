@@ -367,6 +367,128 @@ public sealed class PageSaveServiceTests : IDisposable
     }
 
     [Fact]
+    public async Task Save_ThroughAnAmbiguousAddress_IsRefusedAndWritesNothing()
+    {
+        // The witness D1/D17 name: "Chapter_1.md" (literal '_' doubles) and "Chapter  1.md" (two spaces,
+        // each -> '_') both encode to the same route. Verified here, not merely asserted in a comment:
+        Assert.Equal(
+            PageRouteCodec.Encode("Chapter_1.md").Value,
+            PageRouteCodec.Encode("Chapter  1.md").Value);
+        Assert.Equal("Chapter__1", PageRouteCodec.Encode("Chapter_1.md").Value);
+
+        await InitializeRepositoryAsync();
+        await File.WriteAllTextAsync(Path.Combine(WorkingTree, "Chapter_1.md"), "underscore file");
+        await File.WriteAllTextAsync(Path.Combine(WorkingTree, "Chapter  1.md"), "two-space file");
+
+        var service = CreateService(out _);
+        var result = await service.SaveAsync(
+            new RouteValue("Chapter__1"),
+            "attempted save through the colliding address",
+            PageBaseRevision.AbsentAtHead,
+            Author(),
+            CancellationToken.None);
+
+        Assert.Equal(SaveOutcome.Refused, result.Outcome);
+        Assert.Equal("underscore file", await File.ReadAllTextAsync(Path.Combine(WorkingTree, "Chapter_1.md")));
+        Assert.Equal("two-space file", await File.ReadAllTextAsync(Path.Combine(WorkingTree, "Chapter  1.md")));
+    }
+
+    [Fact]
+    public async Task Save_AddressBecomesAmbiguousAfterTheContentWasLoaded_IsRefusedRatherThanApplied()
+    {
+        // The in-flight scenario (specs/content-editing/spec.md): a save was prepared against an address
+        // that identified exactly one file, and a second file claiming that same address arrives -- an
+        // Obsidian push landing "Chapter  1.md" -- before the save is applied. This must be reported
+        // Refused, not Conflict: the declared base revision is still exactly current, so a check that only
+        // re-compared base revisions would let this one through and silently write to "Chapter_1.md" while
+        // "Chapter  1.md" became unaddressable.
+        await InitializeRepositoryAsync();
+        var sha = await CommitPageDirectlyAsync("Chapter_1.md", "v1");
+
+        // The second claimant arrives by push, after the save's caller already loaded "Chapter_1.md" and
+        // captured its base revision above.
+        await File.WriteAllTextAsync(Path.Combine(WorkingTree, "Chapter  1.md"), "pushed by someone else");
+        await _git.RunOrThrowAsync(RepositoryRoot, ["add", "docs/Chapter  1.md"]);
+        await _git.RunOrThrowAsync(
+            RepositoryRoot,
+            ["commit", "-m", "pushed"],
+            new GitAuthor("Pusher", "pusher@zerowiki.example").ToEnvironmentVariables());
+
+        var service = CreateService(out _);
+        var result = await service.SaveAsync(
+            new RouteValue("Chapter__1"),
+            "an edit prepared before the collision arrived",
+            PageBaseRevision.ForBlob(sha),
+            Author(),
+            CancellationToken.None);
+
+        Assert.Equal(SaveOutcome.Refused, result.Outcome);
+        Assert.Equal("v1", await File.ReadAllTextAsync(Path.Combine(WorkingTree, "Chapter_1.md")));
+    }
+
+    [Fact]
+    public async Task LoadForEdit_ExistingPage_ReturnsItsContentAndTheBaseRevisionItCorrespondsTo()
+    {
+        await InitializeRepositoryAsync();
+        var sha = await CommitPageDirectlyAsync("page.md", "hello");
+
+        var service = CreateService(out _);
+        var result = await service.LoadForEditAsync(new RouteValue("page"), CancellationToken.None);
+
+        Assert.Equal(PageLoadForEditOutcome.Found, result.Outcome);
+        Assert.Equal("hello", result.Content);
+        Assert.Equal(sha, result.BaseRevision.BlobSha);
+    }
+
+    [Fact]
+    public async Task LoadForEdit_AddressWithNoPageYet_ReturnsNewDeclaringAbsentAtHead()
+    {
+        await InitializeRepositoryAsync();
+
+        var service = CreateService(out _);
+        var result = await service.LoadForEditAsync(new RouteValue("brandnew"), CancellationToken.None);
+
+        Assert.Equal(PageLoadForEditOutcome.New, result.Outcome);
+        Assert.Equal(string.Empty, result.Content);
+        Assert.Equal(PageBaseRevision.AbsentAtHead, result.BaseRevision);
+    }
+
+    [Fact]
+    public async Task LoadForEdit_AmbiguousAddress_IsRefusedRatherThanTreatedAsNoPageYet()
+    {
+        await InitializeRepositoryAsync();
+        await File.WriteAllTextAsync(Path.Combine(WorkingTree, "Chapter_1.md"), "underscore file");
+        await File.WriteAllTextAsync(Path.Combine(WorkingTree, "Chapter  1.md"), "two-space file");
+
+        var service = CreateService(out _);
+        var result = await service.LoadForEditAsync(new RouteValue("Chapter__1"), CancellationToken.None);
+
+        Assert.Equal(PageLoadForEditOutcome.Refused, result.Outcome);
+    }
+
+    [Fact]
+    public async Task LoadForEdit_NonCanonicalRouteValue_IsRefused()
+    {
+        await InitializeRepositoryAsync();
+
+        var service = CreateService(out _);
+        var result = await service.LoadForEditAsync(new RouteValue("a b"), CancellationToken.None);
+
+        Assert.Equal(PageLoadForEditOutcome.Refused, result.Outcome);
+    }
+
+    [Fact]
+    public async Task LoadForEdit_UnresolvableRouteValue_IsRefused()
+    {
+        await InitializeRepositoryAsync();
+
+        var service = CreateService(out _);
+        var result = await service.LoadForEditAsync(new RouteValue(string.Empty), CancellationToken.None);
+
+        Assert.Equal(PageLoadForEditOutcome.Refused, result.Outcome);
+    }
+
+    [Fact]
     public async Task Save_WhenTheCommitFailsAndTheRollbackAlsoFailsForAnExistingPage_ReportsRollbackFailedAndStillInvalidatesTheIndex()
     {
         // Reviewer blocker 1 (§6 block C2 remediation): a restore that itself fails must not leave the
@@ -663,6 +785,7 @@ public sealed class PageSaveServiceTests : IDisposable
     {
         var paths = Paths;
         var authorFactory = new AccountGitAuthorFactory(Options.Create(new ContentAuthorshipOptions()));
+        var enumerationService = new PageEnumerationService(paths, NullLogger<PageEnumerationService>.Instance);
 
         return new PageSaveService(
             paths,
@@ -670,6 +793,7 @@ public sealed class PageSaveServiceTests : IDisposable
             authorFactory,
             index,
             historyService,
+            enumerationService,
             NullLogger<PageSaveService>.Instance,
             Options.Create(new ContentStorageOptions
             {

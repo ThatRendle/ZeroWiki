@@ -20,6 +20,11 @@ namespace ZeroWiki.Content;
 /// request's own cancellation, because a killed <c>git commit</c> can strand <c>.git/index.lock</c> and
 /// nothing in this codebase clears one. <see cref="SaveAsync"/>'s own body names the seam explicitly as
 /// <c>lockHeldCancellation</c>.</item>
+/// <item>Refuse an address that does not identify exactly one file (D1's ambiguity refusal, §6 block D3)
+/// — re-checked here, under the lock just acquired, not read from any cached snapshot: a second file can
+/// start claiming this same route between this save being prepared and being applied (a push landing
+/// mid-edit), and a check made before the lock is a value that may already be stale by the time it is
+/// acted on.</item>
 /// <item>Re-read the base revision under the lock — D4's CAS is only a CAS because the re-read happens
 /// after acquiring exclusive access, not before.</item>
 /// <item>Compare against the declared base.</item>
@@ -45,6 +50,7 @@ public sealed class PageSaveService
     private readonly AccountGitAuthorFactory _authorFactory;
     private readonly IPageIndex _index;
     private readonly PageHistoryService _historyService;
+    private readonly PageEnumerationService _enumerationService;
     private readonly ILogger<PageSaveService> _logger;
     private readonly TimeSpan _saveWriteLockTimeout;
 
@@ -54,6 +60,7 @@ public sealed class PageSaveService
         AccountGitAuthorFactory authorFactory,
         IPageIndex index,
         PageHistoryService historyService,
+        PageEnumerationService enumerationService,
         ILogger<PageSaveService> logger,
         IOptions<ContentStorageOptions> options)
     {
@@ -62,6 +69,7 @@ public sealed class PageSaveService
         _authorFactory = authorFactory;
         _index = index;
         _historyService = historyService;
+        _enumerationService = enumerationService;
         _logger = logger;
         _saveWriteLockTimeout = options.Value.SaveWriteLockTimeout;
     }
@@ -133,7 +141,24 @@ public sealed class PageSaveService
             // stops applying rather than infer it from an argument that happens to be omitted.
             var lockHeldCancellation = CancellationToken.None;
 
-            // 3. Re-read the base revision under the lock -- this is what makes the compare in step 4 a
+            // 3. Refuse an address that does not identify exactly one file (D1's ambiguity refusal, §6
+            // block D3) -- checked fresh here, under the lock, rather than read from PageIndex's own
+            // snapshot: IPageIndex.Current is a plain read of whatever was last installed and is not kept
+            // fresh by anything this call does, so it can be arbitrarily stale relative to a push that
+            // landed without any reader having triggered a refresh since -- precisely the staleness the
+            // in-flight scenario (a second file starting to claim this route between this save being
+            // prepared and being applied) exists to catch. Enumerating the working tree instead is
+            // authoritative and race-free here: D16's single write lock, already held, excludes every
+            // other repository writer -- another browser save and a git receive hook alike -- for as long
+            // as this call holds it, and the working tree equals HEAD outside a lock-held save (D9), so
+            // nothing this save itself has done yet can have created the divergence D17 flags between
+            // "ambiguous by HEAD" and "ambiguous by the files enumeration sees".
+            if (IsAmbiguousRoute(canonicalRoute))
+            {
+                return SavePageResult.Refused;
+            }
+
+            // 4. Re-read the base revision under the lock -- this is what makes the compare in step 5 a
             // CAS rather than a check: read-then-write is not atomic across processes, and a base
             // revision read before the lock may already be stale by the time it is acted on.
             var probe = await ProbeHeadPathAsync(repositoryRelativePath, lockHeldCancellation);
@@ -142,7 +167,7 @@ public sealed class PageSaveService
                 return SavePageResult.Refused;
             }
 
-            // 4. Compare. Equal-including-both-null covers "declared absent, still absent" (a brand new
+            // 5. Compare. Equal-including-both-null covers "declared absent, still absent" (a brand new
             // page nobody else created meanwhile) and "declared a blob, that exact blob is still at
             // HEAD" identically; any other combination is a lost-update hazard (D4).
             if (!string.Equals(baseRevision.BlobSha, probe.BlobSha, StringComparison.Ordinal))
@@ -165,10 +190,10 @@ public sealed class PageSaveService
                 return SavePageResult.Refused;
             }
 
-            // 5. Write.
+            // 6. Write.
             await WriteFileAsync(absolutePath, content, lockHeldCancellation);
 
-            // 6-7. Stage, short-circuit on nothing-staged, commit. Any exception this block throws
+            // 7-8. Stage, short-circuit on nothing-staged, commit. Any exception this block throws
             // (`add` failing, or anything else -- the caller's own CancellationToken cannot fire here,
             // it stopped applying above) is handled by the single catch below exactly like an ordinary
             // non-zero commit exit -- one rollback path, not two independently-written ones that can
@@ -226,6 +251,115 @@ public sealed class PageSaveService
             writeLock.Dispose();
         }
     }
+
+    /// <summary>
+    /// Loads <paramref name="routeValue"/>'s current Markdown together with the <see cref="PageBaseRevision"/>
+    /// it corresponds to, for the browser editing surface (D17, §6 block D4) to declare back on a later
+    /// <see cref="SaveAsync"/> call. Applies the same route guards <see cref="SaveAsync"/> does — resolve,
+    /// the canonical-route refusal, and the ambiguity refusal — so an editor can never open on an address
+    /// a save would go on to refuse.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>Not run under the write lock, unlike <see cref="SaveAsync"/>'s own re-check of the same
+    /// conditions.</b> Opening an editor is a read; taking D16's single write lock here would serialize
+    /// every page-open behind every save and every push, which is D16's cost to pay for a writer, not a
+    /// reader. The consequence is that this method's own resolve/canonical/ambiguity check and its
+    /// base-revision probe are each a point-in-time read, not one atomic operation together, and content
+    /// can therefore be read a moment before or after either check — <see cref="SaveAsync"/>'s own CAS,
+    /// re-run under the lock at save time, is what actually protects a lost update; nothing this method
+    /// returns is trusted for that on its own.
+    /// </para>
+    /// <para>
+    /// <b>The probe runs before the content read, not after, and the order is deliberate.</b> If a write
+    /// lands between the two steps, this ordering can only ever produce a base revision that is already
+    /// stale by the time <see cref="SaveAsync"/> re-reads it under the lock — reported back as an ordinary
+    /// <see cref="SaveOutcome.Conflict"/>, nothing lost. Probing second instead could produce the opposite
+    /// and unsafe mistake: content read after a concurrent write paired with a base revision captured
+    /// before it, which is a value that can still equal a *later* revision if a second write is what
+    /// changed it back, letting a save whose CAS compares clean silently commit over content this method
+    /// never actually saw. Probe-then-read is therefore the order under which any divergence this method
+    /// cannot prevent is shown harmless rather than merely asserted to be.
+    /// </para>
+    /// <para>
+    /// A content read that fails after the probe found a committed blob (<see cref="IOException"/> or
+    /// <see cref="UnauthorizedAccessException"/> — the file vanished, moved, or became unreadable between
+    /// the two steps, the same race <c>WikiPage.razor</c>'s own read path already tolerates, neither
+    /// gated by the write lock for a reader, D15) is reported as <see cref="PageLoadForEditResult.New"/>
+    /// rather than propagated: safe for the same reason as the ordering above — a save that goes on to
+    /// declare <see cref="PageBaseRevision.AbsentAtHead"/> is re-checked under the lock by
+    /// <see cref="SaveAsync"/>'s own CAS, which refuses with <see cref="SaveOutcome.Conflict"/> if a blob
+    /// is still there rather than silently overwriting it.
+    /// </para>
+    /// </remarks>
+    public async Task<PageLoadForEditResult> LoadForEditAsync(RouteValue routeValue, CancellationToken cancellationToken)
+    {
+        if (!PageRouteCodec.TryResolveWorkingTreePathFromRouteValue(_paths, routeValue, out var absolutePath))
+        {
+            return PageLoadForEditResult.Refused;
+        }
+
+        var relativePath = Path.GetRelativePath(_paths.WorkingTree, absolutePath);
+        var canonicalRoute = PageRouteCodec.Encode(relativePath);
+        if (!PageRouteCodec.IsCanonicalRouteValue(routeValue, canonicalRoute))
+        {
+            return PageLoadForEditResult.Refused;
+        }
+
+        if (IsAmbiguousRoute(canonicalRoute))
+        {
+            return PageLoadForEditResult.Refused;
+        }
+
+        var repositoryRelativePath = _historyService.RepositoryRelativeWorkingTree + "/" +
+            relativePath.Replace(Path.DirectorySeparatorChar, '/');
+
+        var probe = await ProbeHeadPathAsync(repositoryRelativePath, cancellationToken);
+        if (probe.State == HeadPathState.Refuse)
+        {
+            return PageLoadForEditResult.Refused;
+        }
+
+        if (probe.State == HeadPathState.Absent)
+        {
+            return PageLoadForEditResult.New;
+        }
+
+        try
+        {
+            var content = await File.ReadAllTextAsync(absolutePath, cancellationToken);
+            return PageLoadForEditResult.ExistingPage(content, PageBaseRevision.ForBlob(probe.BlobSha!));
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            _logger.LogWarning(
+                ex,
+                "Editor load for '{RepositoryRelativePath}' found a committed blob at HEAD but the file " +
+                "could not be read (raced by a concurrent save or push); presenting it as not yet " +
+                "existing. A save that goes on to declare AbsentAtHead is still protected by SaveAsync's " +
+                "own CAS, re-checked under the write lock.",
+                repositoryRelativePath);
+            return PageLoadForEditResult.New;
+        }
+    }
+
+    /// <summary>
+    /// D1's ambiguity refusal (§6 block D3): whether <paramref name="canonicalRoute"/> currently has more
+    /// than one claimant, or a sole claimant whose own decode disagrees with it — <see cref="AmbiguousPageRoute"/>
+    /// already carries both cases, exactly as <c>WikiPage.razor</c>'s read path checks the same list off
+    /// <see cref="IPageIndex.Current"/>. This method never reads that cached snapshot — it re-walks the
+    /// working tree through <see cref="PageEnumerationService"/> every time it is called, which is what
+    /// makes the result authoritative as of the moment of the call rather than as of whenever the index
+    /// last refreshed. <see cref="PageEnumerationService.EnumeratePages"/> is a full tree walk, not a
+    /// lookup scoped to one route, because D12's collision can arise from a <em>directory</em> segment —
+    /// e.g. <c>a_b/</c> and <c>a  b/</c> (two spaces) both encode to <c>a__b/</c> — so a check confined to
+    /// <paramref name="canonicalRoute"/>'s own leaf directory would miss a collision introduced higher up
+    /// the path; a full walk needs no special case for that because it computes every file's route from
+    /// its whole relative path in one pass, the same way <see cref="PageEnumerationService"/> already does
+    /// for every other caller.
+    /// </summary>
+    private bool IsAmbiguousRoute(EncodedRoute canonicalRoute) =>
+        _enumerationService.EnumeratePages().AmbiguousRoutes.Any(candidate => candidate.Route == canonicalRoute);
 
     /// <summary>
     /// Writes <paramref name="content"/> via a temp-file-then-atomic-rename (<see cref="File.Move(string, string, bool)"/>
