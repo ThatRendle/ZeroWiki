@@ -13085,6 +13085,118 @@ half was about removing those.
 
 **Ticks nothing.** Obligations **7** and **19** are discharged; §6's task numbers all belong to C2 and D.
 
+**[architect]** **Re-carving the remaining work: the split is by *surface*, not by task number.** The
+original C2/D boundary (6.1–6.4, then 6.5–6.6) is wrong, and writing the brief is what exposed it. D17
+states the lock, the CAS and the rollback as **one mechanism**: the comparison is a compare-and-swap
+*because* it re-reads under the lock, and a commit that fails without a rollback leaves the tree dirty,
+which breaks the working-tree-clean invariant every push depends on. A C2 that shipped 6.1–6.4 alone
+would land a save path that is knowingly not atomic and knowingly leaves a dirty tree on failure, with a
+later block repairing it — the pattern this section has spent four blocks refusing.
+
+Splitting by surface instead gives two blocks that are each complete and each land green:
+
+- **C2 — the save service.** Base-revision read, CAS under the lock, write, stage, authored commit,
+  identical-content no-op, transactional rollback with index invalidation, and the "repository busy"
+  result. Complete and correct with no UI. **Ticks 6.2, 6.3, 6.5, 6.6.**
+- **D — the browser surface.** The `/wiki/{*Route}/edit` page and the save endpoint that wires the
+  service to HTTP, including how a conflict and a busy result reach the member. **Ticks 6.1, 6.4.**
+
+6.1 spans both by its wording ("save endpoint accepts content plus the declared base revision") — C2
+delivers the contract, D delivers the endpoint, and it ticks with D, where a member can actually reach it.
+
+**[architect]** Brief — block C2: **the save service**. → @worker
+
+Tasks **6.2, 6.3, 6.5, 6.6**. Spec: `specs/content-editing/spec.md` in full — every requirement there is
+yours except the save-point one — plus `specs/content-store/spec.md`'s two new index scenarios. Design:
+**D17** (the whole decision; it was written for this block), D3, D4, D9, D15, D16.
+
+Build it in two stages, in this order, because the second depends on the first and mixing them makes both
+harder to review.
+
+### Stage 1 — `PageIndex`'s generation, as a standalone tested unit
+
+D17's mechanism paragraph is the spec. Today `Replace` is an unconditional `Volatile.Write`, so a rebuild
+that already read a save's dirty bytes can land *after* a rollback's invalidation and silently undo it,
+with a `CommitSha` that still matches live `HEAD` because a rollback never advances it.
+
+- Hold the generation and the snapshot as **one immutable state object**, installed by
+  `Interlocked.CompareExchange` — the compare and the install must be one atomic operation, not a
+  capture-then-compare-then-write, which is a check-then-act that still loses the race.
+- `Invalidate()` installs a new state with the generation bumped and the snapshot `Empty`.
+- `GetCurrentAsync` captures the **whole state object** before the refresh begins its disk reads and
+  installs only if the current state is still that same object; otherwise it **discards** the refreshed
+  snapshot and **retries, bounded**. On exhausting the bound it serves the empty state and logs.
+  **The invariant is "never serve a discarded snapshot", not "always succeed"** — do not trade the bound
+  away for a nicer success rate.
+- Exactly **one** unconditional installer remains, used by the startup install, and named for that rather
+  than left as a general-purpose setter. `Invalidate()` is also an unconditional write and that is
+  correct — D17 explains why, and the reason is that `Empty` makes no claim about any page, so a losing
+  invalidation costs correctness while a losing refresh costs only a rebuild.
+- Gated by `specs/content-store/spec.md`'s *A rebuild already in flight cannot reinstate an abandoned
+  save's metadata*.
+
+### Stage 2 — the save service
+
+**Order of operations, and the order is the design:**
+
+1. Resolve the target with **`TryResolveWorkingTreePathFromRouteValue`** — C1 left it ready and typed.
+   Apply **`IsCanonicalRouteValue`** before trusting any match; S2 (block 3 remediation) exists because
+   `Encode` is not injective and a non-canonical request can otherwise resolve to a different file.
+2. **Acquire the write lock**, bounded by the **new save-side timeout** (see options below). On expiry,
+   return a **distinct "repository busy" result** — *not* D4's conflict. `spec.md`'s *Save's bounded wait
+   for the lock expires* requires the two be distinguishable, and requires that **nothing is written**.
+3. **Re-read the base revision under the lock** — `git ls-tree HEAD --format='%(objecttype) %(objectname)'
+   -- <repo-relative path>`. D17's table is normative: `blob <sha>` = present; empty output at exit 0 =
+   absent (the sentinel); `tree`/`commit`/any other output = refuse; non-zero exit = refuse. **Consult no
+   exit code to discriminate a state** — that is D17's posture and this instrument was chosen to honour it.
+4. **Compare** against the declared base. Mismatch → conflict result; write nothing.
+5. **Write**, then `git add <the one path>` — scoped, never `-A`.
+6. **Nothing staged → return success with no commit.** Byte-identical content is not an error and must
+   not fall into the rollback path. `--allow-empty` is rejected: an empty commit is history every Obsidian
+   vault then pulls in order to record that nothing happened.
+7. **Commit** with the author from C1's `AccountGitAuthorFactory`, passed as `GIT_AUTHOR_*`/`GIT_COMMITTER_*`.
+8. **On commit failure: restore the file first, *then* invalidate the index.** The reverse order leaves a
+   window where a refresh starts after the bump, reads still-dirty bytes, and installs with a generation
+   that legitimately matches.
+
+**Two hazards this block owns, both found by review rather than by me:**
+
+- **A symlink reads as an ordinary present blob.** Git models a symlink as a blob, so `%(objecttype)`
+  cannot distinguish one, and enumeration's reparse-point skip does not help because a save accepts a
+  route for a page that need not already be enumerated. A symlink arriving by push can therefore sit at a
+  save's resolved path. **The write step must not follow it out of `docs/`.**
+- **Apply D17's exit-code posture to every git call you add — do not invent a second one.** Block B
+  established it; you are extending it, not re-deciding it.
+
+### Options
+
+Split `WriteLockTimeout` per D17: it keeps its meaning and its 10s default for the **startup** acquisition,
+where expiry is a fatal refusal to start. Add a **second option** for the save's acquisition, defaulted
+**shorter** — a browser request budget, so a member meets a clear "busy, try again" rather than a hung tab.
+Document each in terms of *its own* failure cost, and correct `WriteLockTimeout`'s existing remarks, which
+currently say its only consumer is startup — that stops being true with this block.
+
+### Limits
+
+- **No UI.** No Razor page, no endpoint, no form — block D. If you are editing a `.razor` file you have
+  drifted. The deliverable is a service with a clean contract and its tests.
+- **Mutation: in scope, this is the section's core data-integrity path.** Capped at **3 runs**, scoped to
+  exactly three conditions: the **CAS comparison**, the **restore-then-invalidate ordering**, and the
+  **generation check on install**. Not the surrounding plumbing. Full **unfiltered** `dotnet test` — a
+  filtered figure is not the record. Checksum before *and* after; restore via `cp` from an out-of-repo
+  baseline inside a `trap`; **never** `git checkout --`/`git restore --`, which restore from `HEAD` and
+  would take this block's own uncommitted work with them. **New files have no git baseline — only the
+  checksum protects them.**
+- Gates: `dotnet build`, `dotnet test` **unfiltered** (baseline **719/719**; report the figure *and the
+  delta*, not just "green"), `dotnet format --verify-no-changes`, `openspec validate --strict`.
+- Post to the DEVLOG under `## 6.`, hand to @reviewer. **Do not commit; do not tick boxes** — I tick them
+  after review.
+
+**Carried from this section, because all five instances cost a review round:** the recurring defect here
+is a right mechanism with a wrong stated reason. Every justification you write is a claim about the code
+and will be traced. If you cannot reproduce it, do not write it — and **name what your checks cannot see**
+before calling anything done.
+
 ## NEXT
 
 **Resume point: §6 (Commit-on-save), first block. §5 is closed** — supervisor `Approve` on round two
