@@ -10,7 +10,7 @@ namespace ZeroWiki.Content;
 /// <see cref="PageHistoryService.GetAllLastEditsAsync"/> for last-edit metadata — one bulk <c>git log</c>
 /// pass, not one per page.
 /// </summary>
-public sealed class PageIndexBuilder
+public sealed class PageIndexBuilder : IPageIndexBuilder
 {
     private readonly ContentPaths _paths;
     private readonly GitProcessRunner _git;

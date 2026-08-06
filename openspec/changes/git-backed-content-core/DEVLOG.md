@@ -13197,6 +13197,575 @@ is a right mechanism with a wrong stated reason. Every justification you write i
 and will be traced. If you cannot reproduce it, do not write it — and **name what your checks cannot see**
 before calling anything done.
 
+**[worker]** Block C2 (6.2, 6.3, 6.5, 6.6) implemented in two stages, as briefed.
+
+**Stage 1 — `PageIndex.cs` rewritten around D17's CAS.** `Current`/`Invalidate` now read/write one
+immutable `PageIndexState(int Generation, PageIndexSnapshot Snapshot)` rather than a bare snapshot field.
+`Replace` is gone: the one unconditional installer is `InstallStartupSnapshot` (its only caller is
+`BuildPageIndexAsync`), and `Invalidate()` is a second, deliberately unconditional write (D17 explains why
+a CAS loop there would be pointless — an unconditional bump always wins and must). `GetCurrentAsync`
+captures the whole state object before `RefreshAsync` starts its disk reads and installs via
+`TryInstallRefreshedSnapshot`'s `Interlocked.CompareExchange` — comparing object identity, not the
+record's synthesized value equality (stated explicitly in the class docs, since that distinction is easy
+to get backwards). A discarded install retries, bounded at 3 attempts, then serves `Empty` and logs — "never
+serve a discarded snapshot," not "always succeed."
+
+**Testability decision, flagged for review rather than assumed acceptable:** `TryInstallRefreshedSnapshot`,
+`PageIndexState`, and `PageIndex.CurrentStateForTesting` are `internal`, exposed to the test assembly via a
+new `<InternalsVisibleTo Include="ZeroWiki.Tests" />` in `ZeroWiki.csproj` — the project's first use of it.
+Reasoning: a real race between `GetCurrentAsync`'s refresh and a concurrent `Invalidate()` is only
+reproducible by timing (a `Task.Delay`-based test), and this project has already accepted "no deterministic
+reproduction" once for exactly this shape (§6 obligation 22, S3's race). Rather than repeat that gap or add
+a flaky test, `PageIndexTests` calls the CAS method directly with an explicitly stale captured state —
+fully deterministic, and it is mutation-target #3 below. Same reasoning and same seam cover
+`PageSaveService.RestoreThenInvalidateAsync`, extracted specifically so the restore-then-invalidate
+*order* is unit-testable: a single-threaded test produces the same *end state* whichever order runs, so the
+test observes `PageIndex`'s generation *from inside* the restore delegate, which the wrong order would
+already reveal.
+
+**What this cannot see:** the deterministic tests prove the CAS primitive and the ordering primitive are
+each correct in isolation. Neither is a substitute for a genuine concurrent-race integration test of
+`GetCurrentAsync` itself — that gap is accepted on the same precedent as obligation 22, not overlooked.
+
+**Stage 2 — `PageSaveService.cs` (new), plus `PageBaseRevision`, `SaveOutcome`, `SavePageResult`.** Order
+of operations exactly as briefed: `TryResolveWorkingTreePathFromRouteValue` → `IsCanonicalRouteValue` →
+acquire the write lock (new `ContentStorageOptions.SaveWriteLockTimeout`, split from `WriteLockTimeout`
+per D17/§6.6, defaulted to 5s vs. the startup path's 10s, both doc comments now stating their own failure
+cost and cross-referencing each other and the laptop-suspension reasoning) → `git ls-tree HEAD
+--format='%(objecttype) %(objectname)'` re-read under the lock (D17's table implemented as a 3-state enum:
+`Absent`/`Blob`/`Refuse`, refusing on non-zero exit, multi-line output, or anything but a bare `blob <sha>`
+line — the trailing-separator hazard D17 names is guarded even though this class's own call site can't
+produce one) → CAS compare (`string.Equals` on nullable blob shas, covering both directions of D4's lost-
+update hazard with one comparison) → symlink check → write (temp-file-then-`File.Move(overwrite: true)`,
+a same-volume atomic rename, so a fault mid-write never leaves neither-old-nor-new content) → `git add --
+<path>` → `git diff --cached --quiet -- <path>` (nothing staged ⇒ success, no commit) → commit via
+`AccountGitAuthorFactory` → on failure, `RestoreThenInvalidateAsync` (git `reset` + `checkout` for an
+existing page, `reset` + `File.Delete` for a page absent at the declared base) then return `Failed`.
+
+**The symlink hazard is closed for both cases D17's own text distinguishes.** The named one — the leaf
+itself is a symlink, reading as an ordinary `blob` to `ls-tree` — and one D17's prose doesn't spell out but
+the same sentence covers ("must not follow it out of `docs/`"): a symlinked *ancestor* directory, which
+`TryResolveWorkingTreePathFromRouteValue`'s lexical `Path.GetFullPath` containment check cannot catch on
+its own. `AnyPathComponentIsASymlink` walks every already-existing path segment from `WorkingTree` down to
+the leaf, reusing the exact `FileAttributes.ReparsePoint` check already established twice elsewhere
+(`PageEnumerationService.Walk`, `ContentRepositoryService`'s nested-repo scan) rather than a third shape.
+Both are covered by real filesystem-symlink tests (`PageSaveServiceTests`), not just reasoned through.
+
+**Tests: 23 new (5 `PageIndexTests`, 14 `PageSaveServiceTests`, 4 `PageBaseRevisionTests`)**, covering
+every named spec scenario (save creates one authored commit; rapid-edit coalescing is structural per D17,
+not separately tested; unchanged content records nothing; a legacy-username account still gets a
+well-formed author, already covered by block C1's `AccountGitAuthorFactoryTests` and exercised end-to-end
+here via the ordinary-username case; current-base succeeds; stale-base and absent-but-now-exists both
+reject with `Conflict`; the lock's bounded wait expiring returns `RepositoryBusy` with nothing written; a
+failed commit rolls back — both the existing-page-restore and new-page-delete branches, via a real
+`pre-commit` hook installed only for the test, since this class installs none itself) plus the two symlink
+hazards and a `tree`-at-path catch-all.
+
+**Mutation: 3/3 confirmed, capped as briefed, full unfiltered suite each time (742 total; 719 baseline
+independently re-verified by `git stash`/re-test before assuming the DEVLOG's "717" — the brief's 719 was
+right, the close-out figure was one commit stale).**
+1. **CAS comparison** (`PageSaveService`'s base-revision `string.Equals`) — inverted the condition; **9/742
+   failed** (every base-revision-dependent test), reverted, checksum matched.
+2. **Restore-then-invalidate ordering** (`RestoreThenInvalidateAsync`) — swapped the two statements;
+   **exactly 1/742 failed** — the deterministic ordering test, nothing else — reverted, checksum matched.
+3. **Generation check on install** (`TryInstallRefreshedSnapshot`) — made the CAS unconditional
+   (`Volatile.Write` + `return true`); **exactly 1/742 failed** — the deterministic stale-state-discard
+   test, nothing else — reverted, checksum matched.
+
+All three reverts verified against the pre-mutation SHA-256 (not just `git diff`, since `PageSaveService.cs`
+has no git baseline to diff against — new file, mutated twice). `git diff -- src` after all three reverts
+shows only the intended, non-mutant changes; `git status --short -- src` shows only the new files at their
+final content; `grep -rn MUTANT src/ tests/` empty.
+
+**Gates:** `dotnet build` 0/0. `dotnet test` **742/742** full unfiltered, **delta +23 from the 719
+baseline** (re-verified via `git stash`, not assumed). `dotnet format --verify-no-changes` exit 0.
+`openspec validate git-backed-content-core --strict` valid.
+
+**Human confirmation:** none needed — no UI, no browser-facing surface in this block (block D's concern).
+
+→ @reviewer
+
+**[architect]** ⚠️ **Process event, recorded because it is the second occurrence of a hazard CLAUDE.md
+documents from experience: I found a live mutant in `src/` while the worker was stalled.**
+
+The worker backgrounded its mutant-3 confirmation run and then waited on a completion notification that
+never reached it — the **fifth** agent in this change to stall that way, after two reviewers and a worker
+in §4. It stalled **mid-mutation-run**, so at that moment `PageIndex.cs` carried mutant 3 live in `src/`:
+`TryInstallRefreshedSnapshot`'s `Interlocked.CompareExchange` replaced by an unconditional
+`Volatile.Write` returning `true` — precisely the pre-D17 last-writer-wins behaviour the CAS exists to
+prevent, sitting in production code with the working tree otherwise looking ordinary. Same shape as the
+`BootstrapService.cs` `deferred: false → true` incident.
+
+**What actually protected the tree was the harness rule, not luck, and the distinction matters:**
+
+- The worker had `cp`'d **out-of-repo baselines** before mutating (`PageIndex.cs.orig`,
+  `PageSaveService.cs.orig`), so recovery was a byte-exact copy rather than a reconstruction. Had it used
+  `git checkout --`, that would have restored from `HEAD` and destroyed the whole block's uncommitted work.
+- The `trap` fired when the backgrounded run completed. **Stated precisely because the record must be
+  accurate: by the time the Architect ran `cp` to restore, the file already matched the baseline** —
+  pre-restore checksum equalled the baseline checksum, so the Architect's restore was a verified no-op,
+  not the thing that saved it. The trap did the work. What the Architect established independently was
+  that the mutant *had* been live (diffed against the baseline and read the mutated hunk) and that the
+  final state is clean.
+- Verified after: `PageIndex.cs` byte-identical to baseline (`0ee374e4…36d767`, three ways),
+  `PageSaveService.cs` byte-identical and never mutated, `grep -rn MUTANT src/ tests/` empty.
+
+**The mutant-3 result is kept rather than discarded** — the interrupted run completed and is valid:
+**Failed 1, Passed 741, Total 742**, full unfiltered, the single failure being
+`TryInstallRefreshedSnapshot_WhenAConcurrentInvalidateWonFirst_DiscardsAndReturnsFalse`, exactly the test
+that proves a concurrent invalidation is not silently overwritten.
+
+**Gates run by the Architect in the foreground, as the standing resolution to this stall requires** —
+`dotnet build` **0/0**, `dotnet test` **742/742 unfiltered** in 1m54s, `dotnet format
+--verify-no-changes` exit 0, `openspec validate --strict` valid. Agents that background the suite must
+report "not obtained" rather than wait; that instruction was in this block's brief and did not take, so
+it is now a §6 fact rather than a §4 anecdote.
+
+**One substantive thing for @reviewer, flagged rather than pre-judged:** this block re-adds
+`<InternalsVisibleTo Include="ZeroWiki.Tests" />`, which **C1 spent a review round deliberately removing**
+one commit ago. C2's reason is materially different from C1's — C1's grant was paying to test states the
+type system precludes, whereas C2's tests a *real, reachable* concurrency property that is otherwise only
+testable by winning a timing race, and this change has an explicit rule (obligation 22) that a flaky test
+gating every future block is worse than an honest gap. So it may well be right. But it also adds
+`CurrentStateForTesting`, a test-only member on a production type, and **reversing a decision one block
+after making it must be argued, not incidental**. The alternative I want considered explicitly: making
+`PageIndexBuilder` substitutable (interface or virtual `RefreshAsync`) so a test can invalidate *from
+inside* a refresh and drive the race deterministically **through the public surface**, with no visibility
+grant and no test-only member. Adjudicate which is the better seam.
+
+**[reviewer]** Verdict: **Request changes.** Two substantive findings, one adjudication as asked, one
+methodology correction. Gates independently re-run in the foreground, unfiltered: `dotnet build` 0/0;
+`dotnet test` **742/742**, 1m39s; `dotnet format --verify-no-changes` exit 0; `openspec validate
+git-backed-content-core --strict` valid. `git diff -- src` / `git status --short -- src` show only the
+six files this block's scope names, no `MUTANT` residue.
+
+**Blocker 1 — a rollback failure is not itself handled, and the working tree can end up dirty while the
+lock is released.** `PageSaveService.cs:171–183` (the "commit failed" branch) calls
+`RestoreThenInvalidateAsync` **inside** the same `try` (`PageSaveService.cs:141–190`) whose `catch`
+(`191–204`) exists to handle a `git add`/`git diff --cached`/`git commit` throwing. If
+`RollBackFailedSaveAsync` itself throws — `git reset`/`git checkout` failing, or `File.Delete` throwing —
+that exception is caught by the *same* `catch`, which calls `RestoreThenInvalidateAsync` a **second**
+time and then `throw;`. Three outcomes follow depending on where the first attempt failed and whether the
+second succeeds:
+- First attempt's `git reset` throws, second attempt fully succeeds → the tree ends up clean and the
+  index invalidated (good), but `SaveAsync` now throws instead of returning `SavePageResult.Failed` for
+  what may have been a purely transient git failure — a caller (block D) sees an unhandled exception for
+  a case the enum (`SaveOutcome.Failed`) exists to represent.
+- First attempt's `git reset` succeeds but `checkout`/`Delete` throws, second attempt fully succeeds →
+  same as above (tree clean, index invalidated, but an exception where a `Failed` result was expected).
+- **Either step fails on both attempts** → the second exception (not the first) propagates,
+  `_index.Invalidate()` never runs on either attempt, `finally { writeLock.Dispose(); }` still releases
+  the lock, and the method returns control to the caller with the **working tree dirty and the lock no
+  longer held** — exactly the state D9/D16 exist to make unreachable outside a lock-held save, and the
+  index left potentially serving stale metadata for the affected page with no later trigger to notice
+  (no `HEAD` advance ever happens for this failure).
+
+This is distinct from the ordering property D17 and this block's brief both named and tested (invalidate
+never precedes restore — verified true on every path, including this one: `Invalidate()` never runs
+before `restore()` completes, because it's only ever reached after `await restore()`). What's missing is
+handling for **restore failing at all**, which the "restore-then-invalidate" framing doesn't cover because
+it assumes restore succeeds. The trigger is narrow (a git process or filesystem call that already
+succeeded once — after a successful `git add` — failing on retry), but the consequence is a breach of the
+section's central invariant, not a cosmetic one, and nothing in this block's 23 new tests exercises it.
+Recommend: give `RollBackFailedSaveAsync`'s own failure an explicit, distinct handling path (e.g. a
+dedicated `try`/`catch` around just the rollback call that logs a "the repository may now be dirty,
+manual intervention required" error at a severity above the ordinary commit-failure log, rather than
+falling through the generic catch built for a different class of failure) — or, if the Product Owner
+judges this an acceptable narrow-probability gap, name it explicitly as such rather than leaving it as an
+unexamined side effect of try/catch nesting.
+
+**Adjudication — the `InternalsVisibleTo`/`CurrentStateForTesting` seam vs. a substitutable
+`PageIndexBuilder`: the substitutable seam is better, and by more than symmetry with C1.** C1's grant
+was removed because every case it existed for could be reproduced through the public surface with **no
+loss of coverage** — the redesign had made the states it was testing unreachable in production, so the
+grant was buying nothing. That argument doesn't transfer cleanly to C2 on its own terms, because the CAS
+race here is real and reachable, not a foreclosed state — so I did not treat "C1 removed one, therefore
+C2 should" as sufficient on its own. What tips it is narrower and stronger: **the worker's own writeup
+admits the internals-based tests don't cover the thing that actually matters.** "What this cannot see:
+… Neither is a substitute for a genuine concurrent-race integration test of `GetCurrentAsync` itself"
+(worker's post above). `TryInstallRefreshedSnapshot_WhenAConcurrentInvalidateWonFirst_DiscardsAndReturnsFalse`
+proves the CAS primitive is correct in isolation; it never calls `GetCurrentAsync`, so it proves nothing
+about whether `GetCurrentAsync` captures state, calls `RefreshAsync`, and calls the CAS in the right
+order — that's asserted by reading the four-line method, not demonstrated by a test.
+
+Making `PageIndexBuilder` substitutable (an `IPageIndexBuilder` exposing `RefreshAsync` and
+`ProbeCurrentHeadShaAsync` — `BuildAsync` can stay off it, `ContentStorageStartupExtensions` is the only
+caller and can keep resolving the concrete type) buys **strictly more than the current approach for
+comparable cost**: a fake builder whose `RefreshAsync` implementation calls `index.Invalidate()`
+mid-flight, handed to a real `PageIndex`, lets a test drive the exact race through `GetCurrentAsync`
+itself — capture, refresh, discard, retry, all through methods already public — with **no**
+`InternalsVisibleTo`, no `CurrentStateForTesting`, and no separately-tested-in-isolation CAS primitive
+whose integration into `GetCurrentAsync` is merely asserted. It is deterministic for the same reason the
+worker's approach is (the fake controls exactly when `Invalidate()` fires, no timing involved), so it
+does not reopen the flaky-test risk obligation 22 was written against. The refactor is contained —
+`PageIndex`'s constructor parameter type changes, one DI registration line is added, `PageIndexTests`'
+two builder factories gain an interface cast or an inline fake — not a redesign.
+
+**Recommendation: redo Stage 1's testability approach on the substitutable-builder seam**, dropping
+`InternalsVisibleTo`, `CurrentStateForTesting`, and the internal-only `TryInstallRefreshedSnapshot`
+test in favour of one (or a small number of) `GetCurrentAsync`-level tests driven by a fake
+`IPageIndexBuilder`. If the Architect weighs the added interface/DI surface as not worth it despite
+closing the admitted gap, that's a legitimate call to make explicitly — but the current state is the
+worse of the two options on this project's own stated terms (public-surface testability, no test-only
+production members, close admitted gaps rather than carry them forward), not a wash.
+
+**Methodology finding — the "re-verified via `git stash`" claim is false as literally described, though
+the number it reports is independently correct.** Reproduced: cloned the dirty working tree into a
+scratch copy and ran a plain `git stash` (no `-u`). It stashes the six tracked files this block modified
+(`PageIndex.cs`, `ContentStorageOptions.cs`, `ContentStorageStartupExtensions.cs`, `ZeroWiki.csproj`,
+`PageIndexTests.cs`, `DEVLOG.md`) but — as CLAUDE.md's own git-diff-blindness lesson about untracked
+files predicts — leaves the four new untracked production files and two new untracked test files in
+place. The result does not build: `PageSaveService.cs(49,47): error CS1061: 'ContentStorageOptions' does
+not contain a definition for 'SaveWriteLockTimeout'` and `PageSaveService.cs(261,16): error CS1061:
+'PageIndex' does not contain a definition for 'Invalidate'`. A plain `git stash` therefore cannot have
+produced a passing 719-test run, whatever actually happened — either `-u`/`--include-untracked` was used
+and not recorded, or the number was obtained some other way and the method description is simply wrong.
+Separately, I independently established the figures are correct by the sound route: a detached worktree
+at `c8e6ce3` (this block's own base commit) runs **719/719** unfiltered, and the working tree at HEAD
+(this block's diff applied) runs **742/742** unfiltered — a clean +23, matching what's claimed. **The
+reported delta is not in question; the DEVLOG's account of how it was checked is inaccurate and should be
+corrected** — this is the same "right mechanism, wrong stated reason" shape this section has now produced
+six times, applied to an evidentiary claim rather than a design one, which is exactly the kind of claim
+CLAUDE.md says will be traced.
+
+**Independently verified, no findings:**
+- **Order of operations matches D17 exactly**, traced against the code: resolve
+  (`TryResolveWorkingTreePathFromRouteValue`) → `IsCanonicalRouteValue` (`PageSaveService.cs:71–81`) →
+  acquire the write lock on `SaveWriteLockTimeout` (`86–102`) → re-read the base revision under the lock
+  via `ls-tree` (`106–113`) → compare (`115–121`) → symlink check (`123–136`) → write (`138–139`) →
+  scoped `git add -- <path>` (never `-A`) → `git diff --cached --quiet` nothing-staged short-circuit
+  (`151–161`) → commit (`163–169`) → on failure, restore-then-invalidate (`171–183`). The base revision
+  is read *after* lock acquisition in every path — confirmed a CAS, not a check.
+- **The `ls-tree --format` instrument** matches D17's table exactly, including the catch-all for
+  multi-line/non-`blob` output (`ProbeHeadPathAsync`, `PageSaveService.cs:311–350`) and consulting no
+  exit code beyond success/failure. `Save_ATreeAtTheResolvedPath_IsRefusedRatherThanGuessed` exercises the
+  `tree <sha>` branch directly. The absent sentinel (`PageBaseRevision.AbsentAtHead`, `BlobSha == null`)
+  is a distinct type-level state from "no base declared" (there is no such value this type can hold — a
+  caller with no base simply does not call `SaveAsync`), matching D17.
+- **Symlink hazard**, built rather than read: both the leaf case
+  (`Save_ASymlinkAtTheResolvedLeafPath_IsRefusedAndDoesNotFollowItOutOfDocs`) and the symlinked-ancestor
+  case (`Save_ASymlinkedAncestorDirectory_IsRefusedAndDoesNotWriteThroughIt`) pass against the real
+  filesystem symlink tests provide, and `AnyPathComponentIsASymlink` (`PageSaveService.cs:368–391`)
+  walks every existing path segment before the write, under the lock, closing the TOCTOU window by the
+  same reasoning D16 already establishes for D3's serialization.
+- **Atomic write** (`WriteFileAsync`, `PageSaveService.cs:220–239`): temp-file-then-`File.Move(overwrite:
+  true)`, with a `catch` that deletes the temp file on any failure during the write itself. A crash
+  between a successful `WriteAllTextAsync` and the `Move` syscall could still leave a stray
+  `.zerowiki-tmp-*` file, but that is D9's existing recovery-commit territory (an untracked file gets
+  swept into the next startup's recovery commit), not a gap this block introduces or needs to close.
+- **"Repository busy" vs. 409**: distinct `SaveOutcome` values, and the lock is acquired before any
+  probe/write, so nothing is written on expiry —
+  `Save_WhenTheWriteLockIsHeldByAnotherWriter_ReturnsRepositoryBusyAndWritesNothing` confirms both.
+- **Identical-content no-op**: `git diff --cached --quiet` gates the commit step, returning
+  `Saved(commitSha: null)` before the commit/rollback machinery is ever reached —
+  `Save_ByteIdenticalContent_ReportsSuccessWithNoCommitAndLeavesTheTreeClean` confirms no commit and a
+  clean porcelain.
+- **`WriteLockTimeout`'s doc comment is corrected**: no longer claims startup is its only *possible*
+  consumer while leaving the save-side gap unaddressed; both options now cross-reference each other and
+  state their own failure cost, per the brief.
+- **Mutation, independently spot-checked**: re-ran the worker's mutant 2 (swap the two statements in
+  `RestoreThenInvalidateAsync`) three times myself, checksumming `PageSaveService.cs` before and after
+  each and restoring via `cp` from an out-of-repo baseline under a `trap` (never `git checkout --`).
+  Two of three runs killed **exactly** the load-bearing test the worker reported
+  (`RestoreThenInvalidateAsync_RunsRestoreToCompletionBeforeInvalidatingTheIndex`, 1/742). One run
+  additionally failed `RepositoryWriteLockTests.HeldByAnotherProcess_WaitsThenAcquiresOnceTheHolderReleases`
+  (2/742) — a real-timing lock test unrelated to the mutated method, consistent with this project's own
+  recorded history of environment-sensitive timing flakes (§5's postmortem), not reproduced on the other
+  two runs. The 1-failure kill the worker reported is confirmed load-bearing, not incidental. Did not
+  re-run mutants 1 or 3 (CAS comparison, generation check) — both failed on a wide swath of tests (9/742)
+  or an equally singular, obviously-on-target test, and the brief's cap is 3 runs *total* per mutant, not
+  per reviewer-plus-worker.
+- **`TryResolveWorkingTreePath` deletion and no third resolver**: confirmed absent from
+  `PageRouteCodec.cs` (only `TryResolveWorkingTreePathFromRouteValue` remains); this block adds none.
+- **Task/diff match**: 6.2, 6.3, 6.5, 6.6 are genuinely delivered by this diff; no `.razor`/UI files
+  touched, matching the "no UI" limit.
+
+**Nit:** `SaveAsync`'s XML doc (`PageSaveService.cs:52–56`) says "See this class's own remarks for the
+full ordering" — true, but a one-line pointer to the specific numbered list in the class-level remarks
+(rather than "this class's own remarks" generally) would save a reader a search.
+
+→ @worker for Blocker 1 and the `## NEXT` methodology correction; → @architect for the seam adjudication,
+since it is a design call between two testability strategies rather than a bug.
+
+**[worker]** Remediation on all three items. Gates run in the foreground throughout — no backgrounded
+`dotnet test` this round.
+
+**Blocker 1 — fixed by unifying the rollback into one call site, `HandlePostWriteFailureAsync`.** Every
+failure past the write (an exception from `add`/`diff`/`commit`, or `commit` exiting non-zero) now funnels
+through this one method, which:
+- Runs the rollback exactly once — no retry-via-`catch` coupling.
+- Invalidates the index in a `finally`, **unconditional on whether the restore succeeded** — a failed
+  restore is exactly when stale index metadata is most dangerous, since the abandoned save's bytes may
+  still be on disk and the index may already be serving metadata read from them.
+- Reports a restore that itself fails as a new, distinct outcome, `SaveOutcome.RollbackFailed` (not folded
+  into `Failed`) — logged `Critical`, naming that the working tree may now be dirty outside a lock-held
+  save and that D9's startup reconciliation recovers it on the next restart.
+- Never lets `SaveAsync` throw for its own operations anymore (only route resolution/lock acquisition can,
+  and neither has written anything yet) — the exception-vs-result inconsistency the reviewer flagged
+  ("a caller sees an unhandled exception for a case the enum exists to represent") is gone.
+
+**Tested with real failure injection, not a mock.** Verified independently by hand first (this section's
+standing rule about testing an instrument before trusting it): `chmod 555` on `docs/` makes `git checkout
+--` fail with `unable to unlink old <path>: Permission denied`, and makes a bare `rm`/`File.Delete` fail
+the same way. Two new tests use a pre-commit hook that fails the commit **and**, as a side effect before
+exiting, chmods `docs/` — timed so it lands after the write (already on disk via `File.Move` before
+`git commit` ever runs) and before the rollback attempt. Both assert: `SaveOutcome.RollbackFailed`, the
+index invalidated (`index.Current == PageIndexSnapshot.Empty`) despite the restore's own failure, and the
+write lock released (proven by re-acquiring it immediately afterward). One test per `RollBackFailedSaveAsync`
+branch (existing page → `git checkout` fails; brand-new page → `File.Delete` fails).
+
+**Adjudication — implemented exactly as recommended, `IPageIndexBuilder`, `InternalsVisibleTo`/
+`CurrentStateForTesting`/`TryInstallRefreshedSnapshot` all removed.** `PageIndex` now depends on
+`IPageIndexBuilder` (`ProbeCurrentHeadShaAsync`, `RefreshAsync`; `BuildAsync` deliberately left off — only
+`ContentStorageStartupExtensions` calls it, and keeps resolving the concrete type). Two fakes in
+`PageIndexTests` drive the race through the real `GetCurrentAsync`:
+- `PoisoningOnFirstCallBuilder` — first `RefreshAsync` call returns a hand-crafted, deliberately *wrong*
+  snapshot (claiming a page, `poisoned.md`, that does not exist) and calls `Invalidate()` before returning
+  it. If the poisoned result installs anyway, the final index contains a page that was never real; if
+  discarded and retried, it doesn't. This replaces the old `TryInstallRefreshedSnapshot_WhenAConcurrentInvalidateWonFirst_DiscardsAndReturnsFalse`
+  unit test, and is strictly stronger: it proves the *integration* (`GetCurrentAsync` captures state,
+  calls `RefreshAsync`, calls the CAS, in the right order), which the reviewer correctly pointed out the
+  old test never touched.
+- `AlwaysRacingBuilder` — invalidates on *every* call, closing a gap I had flagged but not tested
+  ("What this cannot see") in the original writeup: bound exhaustion now has a real test
+  (`GetCurrentAsync_WhenInvalidationRacesEveryAttempt_ExhaustsTheBoundAndServesEmpty`), asserting the
+  index serves `Empty` rather than looping forever or installing something contaminated.
+
+**Re-ran the generation-check-on-install mutant against the new code** (the old call site no longer
+exists, so per the brief's own rule — re-run if restructuring changes the condition — this had to be
+redone): made the CAS install unconditional (`Volatile.Write` + always return the refreshed snapshot).
+**Exactly 2/742 failed** — both new race tests above, nothing else. Reverted; checksum matched.
+
+**The seam extends one layer further than the adjudication asked for, and here is why.** Fixing Blocker 1
+by unifying the rollback into `HandlePostWriteFailureAsync` changed what "restore-then-invalidate
+ordering" even meant as a testable condition — the old `RestoreThenInvalidateAsync`
+(`internal`, `InternalsVisibleTo`-gated) no longer exists. I first tried to argue the property was now
+adequately covered by the `try { restore } finally { invalidate }` structure itself (a CLR guarantee, not
+two freely-reorderable statements) plus the new `RollbackFailed` tests, and **ran the actual mutation to
+check rather than asserting it**: moved `_index.Invalidate()` to run unconditionally *before* attempting
+the restore. **It survived — 742/742 passed.** Reason, traced rather than assumed: every existing test
+observes only the *end* state (file content once `SaveAsync` returns; whether `Invalidate()` ran at all),
+and under this mutant `Invalidate()` still always runs and the restore's own success/failure is unaffected
+by *when* it's called relative to the restore — nothing in the suite reads `PageIndex` state *during* the
+restore. This is the same shape the reviewer's own finding was: an "it must be true because of how the
+code reads" claim that a mutation run, not reasoning, actually settles.
+
+Closing it needed the same seam pattern one layer up: a new `IPageIndex` (`Current`, `Invalidate`) that
+`PageSaveService` now depends on instead of the concrete `PageIndex` — mirroring `IPageIndexBuilder`'s own
+reason for existing. A new fake, `OrderObservingIndex`, records at the exact moment `Invalidate()` is
+called whether the working tree **already** holds the restored content — the only way to distinguish the
+orders in a single-threaded test, since both orders reach the identical end state. Re-ran the same
+mutation against the new code: **exactly 1/743 failed** — the new ordering test, nothing else. Reverted;
+checksum matched. This was not requested by either the coordinator or the reviewer, but follows the exact
+principle the reviewer articulated for the first seam ("close admitted gaps rather than carry them
+forward") applied to a gap I found empirically, not asserted — flagging it explicitly rather than treating
+it as pre-authorised, since C1 spent a round removing a similar grant and C2 already re-added one seam this
+session; a second one deserves the same scrutiny, not a pass because the first was approved.
+
+**CAS comparison (base-revision compare, `PageSaveService.cs` step 4) is untouched by this remediation** —
+verified by re-reading the line, not assumed — so its original result stands: 9/742 failed when inverted,
+reverted, checksum matched (recorded in the block's original post above).
+
+**Methodology correction (item 3) — the DEVLOG's own record, not the reported numbers, was wrong.**
+Re-verified with the unambiguous method the reviewer used: `git worktree add` a detached copy at
+`c8e6ce3` (this block's base commit) rather than any form of `git stash`. **`c8e6ce3`: 719/719 unfiltered.
+HEAD after this remediation: 743/743 unfiltered (delta +24 — 23 from the original block, 1 new ordering
+test from this remediation) — a clean +24, worktree removed after.** For the record: my original `git
+stash push -u -m "..."` **did** include the `-u` flag (visible in this session's own transcript), so the
+719/719 I reported after it was a genuine, working baseline — the reviewer's reproduction used a plain
+`git stash` with no `-u` and predictably failed to build. But the DEVLOG post itself only said "via `git
+stash`," omitting the one flag that made it correct, so as *written* it was not reproducible and the
+reviewer's correction stands: the account of the method was wrong regardless of what was actually run.
+Using the worktree method going forward removes the ambiguity entirely rather than requiring a flag to be
+remembered and stated correctly every time.
+
+**Doc-comment nit — fixed.** `SaveAsync`'s summary now points at "the numbered order of operations this
+method's body is commented against" rather than "this class's own remarks" generally, and the class-level
+remarks carry that numbered list, with the method's own inline comments numbered to match.
+
+**Process note on the mutant-3 stall the Architect logged:** confirmed clean before starting this
+remediation (`PageIndex.cs`/`PageSaveService.cs` both checksum-matched their baselines, `grep -rn MUTANT`
+empty) and every `dotnet test` in this remediation ran in the foreground with an explicit extended timeout
+rather than being left to the tool's default background-on-timeout behaviour — including the two mutation
+re-runs and the two full-suite confirmations above.
+
+**Gates:** `dotnet build` 0/0. `dotnet test` **743/743** full unfiltered, foreground, **delta +24 from the
+719 baseline** (independent worktree at `c8e6ce3`, not stash). `dotnet format --verify-no-changes` exit 0.
+`openspec validate git-backed-content-core --strict` valid. `git diff -- src` / `git status --short -- src`
+match this remediation's intended files only (`ContentStorageOptions.cs`, `ContentStorageStartupExtensions.cs`,
+`PageIndex.cs`, `PageIndexBuilder.cs` modified; `IPageIndex.cs`, `IPageIndexBuilder.cs` new, alongside the
+original block's `PageBaseRevision.cs`/`PageSaveService.cs`/`SaveOutcome.cs`/`SavePageResult.cs`); no
+`ZeroWiki.csproj` diff remains (the `InternalsVisibleTo` addition and removal net to no change against
+`c8e6ce3`); no `MUTANT` residue.
+
+→ @reviewer
+
+**[reviewer]** Verdict: **Approve.** Re-audited the remediation diff, not the writeup. Gates re-run in
+the foreground, unfiltered: `dotnet build` 0/0; `dotnet test` **743/743**, 2m3s (a second run after two
+mutation spot-checks below also returned 743/743, restored); `dotnet format --verify-no-changes` exit 0;
+`openspec validate git-backed-content-core --strict` valid. Residue checked by content, not `git diff`:
+checksummed `PageSaveService.cs`/`PageIndex.cs` before and after my own two mutation spot-checks, `git
+status --short -- src` shows only this remediation's files (below), `grep -rn MUTANT src/ tests/` empty,
+`git diff c8e6ce3 -- src/ZeroWiki/ZeroWiki.csproj` empty (confirms the `InternalsVisibleTo` add/remove
+nets to nothing).
+
+**1. Blocker 1 — verified fixed, and the fix is the sharper form, not just "handled."** Read
+`HandlePostWriteFailureAsync` (`PageSaveService.cs:277–334`) directly: one call site from both failure
+branches (`190–192` on exception, `203–204` on non-zero commit exit — mutually exclusive, so it runs at
+most once per `SaveAsync` call), `_index.Invalidate()` in a `finally` (`293–296`) that runs whether
+`RollBackFailedSaveAsync` throws or returns normally, and a new `SaveOutcome.RollbackFailed` distinct
+from `Failed` when the restore itself fails, logged `Critical`. Confirmed the two new failure-injection
+tests are real, not mocked: `InstallFailingPreCommitHookThatLocksDocsAsync` (`PageSaveServiceTests.cs:496–511`)
+chmods `docs/` 555 as a hook side-effect timed after the write and before the rollback attempt — the
+worker's own comment records verifying by hand first that this actually breaks `git checkout --`/
+`File.Delete` before writing the assertion, which is the right discipline. Both
+`RollBackFailedSaveAsync` branches (existing-page `checkout` failure, brand-new-page `Delete` failure)
+are covered, and both tests directly reacquire the write lock afterward to prove it released
+(`PageSaveServiceTests.cs:355`, `386`). `git reset --` (the first statement in `RollBackFailedSaveAsync`)
+throwing isn't separately failure-injected — chmodding `docs/` doesn't touch `.git/index`, so `reset`
+still succeeds in both new tests — but the surrounding `try`/`catch`/`finally` in
+`HandlePostWriteFailureAsync` wraps the whole `RollBackFailedSaveAsync` call, not each statement inside
+it, so a `reset` failure is structurally indistinguishable from the two failure modes that *are* tested;
+confirmed by reading the code rather than demanding a third injection variant for proportionality's sake.
+A cancelled token mid-rollback is foreclosed by construction, not handled: `RollBackFailedSaveAsync` is
+always invoked with `CancellationToken.None` (`174`, `191`... now `287`), unchanged from before this
+remediation.
+
+**2. Adjudication implemented as recommended** — `IPageIndexBuilder` (`ProbeCurrentHeadShaAsync`,
+`RefreshAsync`; `BuildAsync` deliberately excluded, matching the one caller that still needs the
+concrete type). `InternalsVisibleTo`, `CurrentStateForTesting`, `TryInstallRefreshedSnapshot` are gone —
+confirmed by `grep`, only remaining string is the explanatory doc comment
+(`PageIndex.cs:40`). `ZeroWiki.csproj` byte-identical to `c8e6ce3`. DI wiring checked for the subtle
+failure mode this pattern invites — a factory that resolves a *second* instance instead of aliasing the
+one singleton: both registrations (`ContentStorageStartupExtensions.cs`) correctly do
+`services.AddSingleton<IPageIndexBuilder>(sp => sp.GetRequiredService<PageIndexBuilder>())` and the same
+shape for `IPageIndex`/`PageIndex` — same object, not a second one — which matters because a second
+instance would silently break the startup snapshot install and the read path observing different state.
+
+**3. Record correction — accepted, with the nuance held precisely.** The corrected post
+(`c8e6ce3`-worktree method, `719/719` → `743/743`, delta +24) is sound and reproducible, and I re-derived
+both endpoints independently: my own detached worktree at `c8e6ce3` (a fresh one, not reusing session
+state) gives `719/719`; the working tree at HEAD-of-remediation gives `743/743`. The `-u` clarification
+changes my finding's characterization, not its substance: the reviewer's reproduction (plain `git stash`,
+no `-u`) correctly failed to build, and the DEVLOG post as originally *written* was not reproducible — I
+did not, and would not, characterize the underlying number as unsound, because the figure was always
+independently checkable by a route that doesn't depend on trusting the stated method at all (which is
+exactly the route I used both times). The corrected record now states an unambiguous method; no further
+action needed.
+
+**4. Surviving-mutant claim, re-derived independently, both mutants.** Mutated
+`HandlePostWriteFailureAsync` to call `_index.Invalidate()` unconditionally *before* attempting
+`RollBackFailedSaveAsync` (removing the `finally`) — checksummed `PageSaveService.cs` before/after,
+restored via `cp` from an out-of-repo baseline under a `trap`. **Exactly 1/743 failed** —
+`Save_WhenCommitFailsForAnExistingPage_InvalidatesOnlyAfterTheFileIsAlreadyRestored` — nothing else,
+confirming the new `OrderObservingIndex`-driven test is the sole thing in the suite that notices this
+reordering; the other 742 tests all still passing on the same run is itself the demonstration that the
+property was invisible before this test existed, matching the worker's account of the mutation
+surviving 742/742 prior to adding it. Separately mutated `PageIndex.cs`'s CAS install
+(`Interlocked.CompareExchange` → unconditional `Volatile.Write`, `PageIndex.cs:164–172`) — same
+checksum/backup/trap discipline. **Exactly 2/743 failed** —
+`GetCurrentAsync_WhenARollbackInvalidatesWhileARefreshIsInFlight_DiscardsThePoisonedRefreshAndRetries`
+and `GetCurrentAsync_WhenInvalidationRacesEveryAttempt_ExhaustsTheBoundAndServesEmpty` — nothing else,
+including the new ordering test, confirming the two seams are independent and neither's test incidentally
+covers the other's property. Both kills are load-bearing, not incidental.
+
+**5. `RollbackFailed` distinguishability** — confirmed six distinct `SaveOutcome` values and six distinct
+`SavePageResult` static instances (`Saved`, `Conflict`, `RepositoryBusy`, `Refused`, `Failed`,
+`RollbackFailed`); no collapsing.
+
+**Is `IPageIndex` justified, or TDD damage — argued from the property, as asked.** Justified, on four
+points, not by symmetry with `IPageIndexBuilder` alone:
+- **It was demonstrated necessary, not assumed.** The worker ran the reordering mutation against the
+  `try`/`finally` structure *before* introducing the interface and it survived 742/742 — every existing
+  test only observes end-state (file content once `SaveAsync` returns, whether `Invalidate()` ran at
+  all), and under the mutant both are unaffected by *when* `Invalidate()` fires relative to the restore.
+  I re-ran this myself (finding 4) and got the identical result. A property that provably has no other
+  witness in the suite is a real gap, not a speculative one invented to justify an abstraction.
+- **What it makes testable that nothing else can:** observing `PageIndex`'s state *during* restoration,
+  from inside the exact instant `Invalidate()` is called — mid-method, not at return. No amount of
+  asserting on `SaveAsync`'s return value or the file's final content can distinguish the two orders,
+  because they provably converge (same argument as D17's own note about the CAS: a check-then-act window
+  is invisible to an end-state assertion). A delegate-parameter seam (passing `Action`/`Func` into
+  `HandlePostWriteFailureAsync` instead of an interface) would work but is not obviously lighter — it
+  reopens a differently-shaped version of "a method shaped for a test to reach into," which is exactly
+  what this project's own precedent (C1's `InternalsVisibleTo` removal) argues against.
+- **Nothing in production depends on the indirection** — confirmed by reading the DI registration
+  (finding 2): both `IPageIndexBuilder` and `IPageIndex` resolve to the same singleton a caller would get
+  from the concrete type, so this is purely a test seam with a single production implementer, not a
+  polymorphism a caller relies on. That is an honest cost (a reader has to check there's only one
+  implementer) but a small, disclosed one — the type's own doc comment states exactly why it exists.
+- **The interface is minimal**, mirroring `IPageIndexBuilder`'s own discipline: `Current`/`Invalidate`
+  only, not the full `PageIndex` surface `PageSaveService` never touches (`GetCurrentAsync`,
+  `InstallStartupSnapshot`). A kitchen-sink interface would be a stronger tell of TDD damage; a narrowly-
+  scoped one sized exactly to the caller's actual dependency is the opposite tell.
+
+**Architectural note for `## NEXT`, not a blocker:** two test-only interfaces landed in one remediation.
+Each is individually justified above, but if a third ordering/race property in this codebase needs the
+same treatment, that is the point to ask whether "extract a narrow interface per untestable property" is
+becoming this project's de facto pattern worth naming explicitly (in `design.md` or `CLAUDE.md`) rather
+than re-deriving the justification from scratch each time — not because the pattern is wrong, but because
+an unnamed pattern invites the third instance being copied without the same scrutiny the worker
+correctly gave this one ("a second one deserves the same scrutiny, not a pass because the first was
+approved" — worker's own words, and the right instinct).
+
+**Nit, not blocking:** `RollbackFailed` is new caller-visible behavior (a sixth `SaveOutcome`) that
+`specs/content-editing/spec.md`'s *Transactional save* requirement doesn't name as its own scenario — the
+requirement's existing wording ("the system SHALL restore the working tree") arguably already implies
+this boundary case, and `openspec validate --strict` passes, so I'm not blocking on it. Worth a one-line
+scenario addition when block D gives this outcome a caller, so the spec names the failure mode a member
+could plausibly see rather than leaving it implicit in the enum's doc comment alone.
+
+**Certified state, this block (§6, C2 + remediation), including every untracked file:**
+- Modified from `c8e6ce3`: `src/ZeroWiki/Content/ContentStorageOptions.cs`,
+  `src/ZeroWiki/Content/ContentStorageStartupExtensions.cs`, `src/ZeroWiki/Content/PageIndex.cs`,
+  `src/ZeroWiki/Content/PageIndexBuilder.cs`, `tests/ZeroWiki.Tests/Content/PageIndexTests.cs`,
+  `openspec/changes/git-backed-content-core/DEVLOG.md`.
+- New (untracked): `src/ZeroWiki/Content/IPageIndex.cs`, `src/ZeroWiki/Content/IPageIndexBuilder.cs`,
+  `src/ZeroWiki/Content/PageBaseRevision.cs`, `src/ZeroWiki/Content/PageSaveService.cs`,
+  `src/ZeroWiki/Content/SaveOutcome.cs`, `src/ZeroWiki/Content/SavePageResult.cs`,
+  `tests/ZeroWiki.Tests/Content/PageBaseRevisionTests.cs`,
+  `tests/ZeroWiki.Tests/Content/PageSaveServiceTests.cs`.
+- Unchanged from `c8e6ce3`, confirmed by empty diff: `src/ZeroWiki/ZeroWiki.csproj`.
+
+→ @architect
+
+**[architect]** Block C2 committed. **6.2, 6.3, 6.5, 6.6 ticked** — §6's first ticks, seven blocks into
+the change's most indebted section.
+
+**Gates run by the Architect in the foreground:** `dotnet build` **0/0**; `dotnet test` **743/743
+unfiltered** in 1m51s (**+24** from `c8e6ce3`'s 719, the delta re-derived by both worker and reviewer from
+an independent `git worktree` at the base commit, not from a stash); `dotnet format --verify-no-changes`
+exit 0; `openspec validate --strict` valid; `grep -rn MUTANT src/ tests/` empty; `ZeroWiki.csproj`
+byte-identical to `HEAD`.
+
+**Two things this block did that are worth more than the code.**
+
+**The worker re-ran mutation on its own fix rather than assuming a restructuring preserved the property —
+and found a genuine surviving mutant on the rollback ordering.** The blocker fix was correct; the
+restructuring that delivered it silently dropped the very property the fix existed to protect. That is
+this change's signature defect appearing *inside a remediation*, caught only because the mutation was run
+again instead of reasoned about. `@reviewer` then re-derived both mutants independently — 1/743 for the
+ordering, 2/743 for the CAS install — and confirmed each kill is load-bearing rather than incidental.
+**Re-run the mutants after the fix, not just after the defect.**
+
+**The `InternalsVisibleTo` reversal was settled by evidence, not by preference.** C1 removed the grant one
+commit earlier; C2 re-added it. The deciding fact was that C2's internals-based tests **never exercised
+`GetCurrentAsync` under the race at all** — they tested the CAS primitive in isolation, so the grant
+bought *less* coverage than the alternative. `IPageIndexBuilder` drives the same race through the real
+public method. Adjudicating "which seam" rather than "grant: yes or no" is what surfaced that.
+
+**A record correction, stated precisely because the distinction is the point.** The DEVLOG claimed the
+test delta was verified "via `git stash`". `@reviewer` reproduced the plain form failing to build
+(`CS1061`), since `git stash` leaves untracked files behind while reverting their callers. The worker's
+actual command used `-u`, so the **verification was probably sound and the *description* was not
+reproducible** — a different and lesser fault than a bogus verification, and the record should say which.
+Corrected to `git worktree add`, and both endpoints independently re-derived.
+
+**Non-blocking, carried forward:** `SaveOutcome.RollbackFailed` has no spec scenario of its own —
+**block D owes it one** when it exposes the outcome to a caller, since four failure outcomes (conflict,
+busy, rollback-failed, ordinary failure) must stay distinguishable at the surface as well as in the
+service.
+
 ## NEXT
 
 **Resume point: §6 (Commit-on-save), first block. §5 is closed** — supervisor `Approve` on round two

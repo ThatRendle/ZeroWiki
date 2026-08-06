@@ -39,11 +39,11 @@
 ## 6. Commit-on-save
 
 - [ ] 6.1 Save endpoint accepts content plus the declared base revision
-- [ ] 6.2 CAS check: reject with 409 when the file has advanced beyond the base revision
-- [ ] 6.3 On success, write file, `git add`, and create one commit authored as the logged-in user
+- [x] 6.2 CAS check: reject with 409 when the file has advanced beyond the base revision
+- [x] 6.3 On success, write file, `git add`, and create one commit authored as the logged-in user
 - [ ] 6.4 Coalesce rapid edits to a save-point (debounce/explicit save) — one commit per save-point
-- [ ] 6.5 Transactional save: on commit failure, restore the file so the tree stays clean
-- [ ] 6.6 Save acquires the write lock with a bounded wait, and on expiry fails with a distinct "repository busy" result — not D4's 409 (`specs/content-editing/spec.md:52-55`; added by §5's supervisor review, which found this SHALL clause owned by no task)
+- [x] 6.5 Transactional save: on commit failure, restore the file so the tree stays clean
+- [x] 6.6 Save acquires the write lock with a bounded wait, and on expiry fails with a distinct "repository busy" result — not D4's 409 (`specs/content-editing/spec.md:52-55`; added by §5's supervisor review, which found this SHALL clause owned by no task)
 
 ## 7. Smart HTTP git remote
 

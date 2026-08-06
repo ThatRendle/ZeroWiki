@@ -21,6 +21,9 @@ public static class ContentStorageStartupExtensions
             .Validate(
                 options => options.WriteLockTimeout > TimeSpan.Zero,
                 "ContentStorage:WriteLockTimeout must be greater than zero.")
+            .Validate(
+                options => options.SaveWriteLockTimeout > TimeSpan.Zero,
+                "ContentStorage:SaveWriteLockTimeout must be greater than zero.")
             .ValidateOnStart();
 
         services
@@ -53,11 +56,19 @@ public static class ContentStorageStartupExtensions
         // rather than duplicating any of them, and the process-memory singleton it fills at startup
         // (BuildPageIndexAsync, called after EnsureContentRepositoryAsync below).
         services.AddSingleton<PageIndexBuilder>();
+        // PageIndex depends on the interface, not the concrete type, so a test can substitute a fake
+        // (§6 block C2 remediation) — production resolves the same singleton either way.
+        services.AddSingleton<IPageIndexBuilder>(sp => sp.GetRequiredService<PageIndexBuilder>());
         services.AddSingleton<PageIndex>();
+        // Same pattern one layer up: PageSaveService depends on IPageIndex, not the concrete type, so a
+        // test can substitute a fake Invalidate() that observes ordering (§6 block C2 remediation).
+        services.AddSingleton<IPageIndex>(sp => sp.GetRequiredService<PageIndex>());
 
-        // §6 block C1: builds the synthetic author identity a save is committed under (D10, D17). No
-        // production caller yet — the save path itself is a later block in this section.
+        // §6 block C1: builds the synthetic author identity a save is committed under (D10, D17).
         services.AddSingleton<AccountGitAuthorFactory>();
+
+        // §6 block C2: the save path itself (D4, D9, D16, D17) — no UI caller yet, that is block D.
+        services.AddSingleton<PageSaveService>();
 
         return services;
     }
@@ -86,7 +97,7 @@ public static class ContentStorageStartupExtensions
         var builder = scope.ServiceProvider.GetRequiredService<PageIndexBuilder>();
         var index = scope.ServiceProvider.GetRequiredService<PageIndex>();
         var snapshot = await builder.BuildAsync(cancellationToken);
-        index.Replace(snapshot);
+        index.InstallStartupSnapshot(snapshot);
     }
 
     /// <summary>
