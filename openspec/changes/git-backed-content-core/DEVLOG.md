@@ -13768,23 +13768,75 @@ service.
 
 ## NEXT
 
-**Resume point: §6 (Commit-on-save), first block. §5 is closed** — supervisor `Approve` on round two
-over `c966651..HEAD`. §4 closed over `35dde44..HEAD` (round two); §3 closed over `60957e6..HEAD`
-(round two); §2 closed over `7b50e46..HEAD` (round four); §11 closed over `bb3cb2c..HEAD`.
+**Resume point: §6 (Commit-on-save), block D — the browser surface.** §6 is **in progress, not closed**:
+four blocks have landed and **no supervisor review has run yet**. §5 closed over `c966651..HEAD`
+(round two); §4 over `35dde44..HEAD` (round two); §3 over `60957e6..HEAD` (round two); §2 over
+`7b50e46..HEAD` (round four); §11 over `bb3cb2c..HEAD`.
 
-**§6 opens owing more than any section so far.** Obligations **7** (author line well-formed for accounts
-predating the username rules — gated by a scenario, not prose), **14** (`git add -A` exits 0 on an
-unreadable directory; likely a Product Owner call, and **27** attaches to its resolution as one question
-about what a git exit code may be trusted to mean), **19** (`PageRouteCodec` has two resolvers with no
-production caller — delete or wire, do not add a third), **25** (the index goes stale without `HEAD`
-moving, on the very path `spec.md:54` requires), **26** (mutation scope changes once a save resolves
-through the index), and **31** (settle whether `WriteLockTimeout` splits) are all §6's. **6.6 is new** —
-added by §5's supervisor review, which found the save-side bounded wait owned by no task.
+**§6's base commit is `97029e7`** — the supervisor's review scope when the section closes is
+`git diff 97029e7..HEAD`.
 
-**State: 21/41 tasks ticked** *(counted from `tasks.md` at close-out, not carried forward — 5.3 struck
-and 6.6/7.5 added since the last count)*. Branch `change/git-backed-content-core`. Gates at close-out:
-`dotnet build` 0/0, `dotnet test` **717/717** full unfiltered in **120.3s**,
-`dotnet format --verify-no-changes` exit 0, `openspec validate --strict` valid, no `MUTANT` residue.
+**State: 25/41 tasks ticked.** Branch `change/git-backed-content-core`. Gates at C2's close, run in the
+foreground by the Architect: `dotnet build` **0/0**, `dotnet test` **743/743** full unfiltered in 1m51s,
+`dotnet format --verify-no-changes` exit 0, `openspec validate --strict` valid, no `MUTANT` residue,
+`ZeroWiki.csproj` byte-identical to `HEAD`.
+
+### §6 progress — read this before the numbered obligations below
+
+| Block | Commit | Ticked | Delivered |
+|---|---|---|---|
+| A | `52ea5c6` | — | D17 + spec deltas (`content-store` ×3, `content-editing` ×2) |
+| B | `b3d0d44` | — | One posture on git exit codes; fixed a **live data-loss defect** |
+| C1 | `ae3d963` | — | Author identity total over accounts; codec distinct types |
+| C2 | `618e8fa` | 6.2, 6.3, 6.5, 6.6 | The save service |
+| D | *not started* | 6.1, 6.4 | `/wiki/{*Route}/edit` + the save endpoint |
+
+**Obligations 7, 14, 19, 25, 27 and 31 are DISCHARGED — do not act on their numbered entries below.**
+They are left unstruck only because striking six long entries by hand is itself an error surface; this
+table is authoritative over them. **This is the decay obligation 1 demonstrated** — it spent three
+sections asserting a Product Owner decision was owed after the decision had shipped, because `## NEXT`
+is append-mostly and unticked entries rot silently while the code moves. **Re-derive any forward
+obligation from the code before acting on it.**
+
+**Still open and owed by §6:**
+
+- **Obligation 8 — `GitProcessRunner` still does not kill its git subprocess on cancellation, and C2 made
+  it materially more live.** It was parked in §2 as inert, went live in §4 when the freshness check put
+  git on the request path, and C2 has now put a *write* path there too: a cancelled save can orphan
+  `ls-tree`, `add`, `commit` or `rev-parse`. **Nothing in §6 has fixed it.** Block D, or a §6 remediation,
+  should own it — or it must be explicitly re-homed, not carried silently for a third section.
+- **Obligation 26 — partially addressed.** C2 mutated the CAS install and the rollback ordering (both
+  killed, independently re-derived), but `ApplyIncrementalUpdateAsync`'s claimant reconstruction — the
+  specific condition 26 names — was **not** mutated. Confirm or close it at the section review.
+
+**Block D also owes a spec scenario for `SaveOutcome.RollbackFailed`** (C2's reviewer nit): four failure
+outcomes — stale-base conflict, repository busy, rollback failed, ordinary failure — must stay
+distinguishable at the browser surface as well as inside the service.
+
+**New in §6, for the section review and for §7/§8:** obligation **32** (a detached `HEAD` at a valid-
+looking but nonexistent object id exits 0 and bypasses block B's refusal — diagnosis-quality, not
+integrity; `git commit` itself refuses) is recorded at the end of the numbered list.
+
+### §6's transferable lessons so far — five review rounds' worth
+
+- **Every one of §6's findings has been a *right mechanism with a wrong stated reason*, not a wrong
+  mechanism** — six instances, and **two of them were the Architect's own reasoning**, not a worker's.
+  The most dangerous was a "property argument" that had the right form, cited the right precedent, and
+  rested on a premise about the code that was never traced. **A property argument is not self-certifying;
+  its premises are claims about the code and must be traced like any other.**
+- **Re-run the mutants after the *fix*, not just after the defect.** C2's blocker fix was correct and the
+  restructuring that delivered it silently dropped the property the fix existed to protect. Found only
+  because the worker re-ran the mutation instead of reasoning that a refactor was behaviour-preserving.
+- **A green total is not an answer to "did coverage change".** C1 hid a coverage drop behind an unrelated
+  increase **twice**; forcing an end-to-end reconciliation against the baseline found that one deleted
+  case was the only test exercising a live path-traversal branch.
+- **Adjudicate "which seam", not "this thing: yes or no".** The `InternalsVisibleTo` reversal was settled
+  by discovering the internals-based tests never exercised the race at all — the grant bought *less*
+  coverage than the alternative. Asking the binary question would have missed that.
+- **An interrupted mutation run left a live mutant in `src/` for the second time in this project.** Five
+  agents have now stalled on a backgrounded `dotnet test`. What protected the tree was the out-of-repo
+  `cp` baseline plus `trap` — `git checkout --` would have destroyed the block's whole uncommitted work.
+  **Agents must run the suite in the foreground or report "not obtained".**
 
 **§5 took two supervisor rounds and five commits, and its two blockers shared one shape: a principle
 applied to the case that prompted it and not to its siblings.** The section ruled — on a Product Owner
