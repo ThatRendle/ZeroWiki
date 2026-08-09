@@ -185,6 +185,79 @@ public sealed class PageSaveServiceTests : IDisposable
     }
 
     [Fact]
+    public async Task Save_WhenGitsIndexBlindsStagingViaAssumeUnchanged_RollsBackRatherThanReportingSavedForLostContent()
+    {
+        // §6 remediation round two, Fix A -- reproduced red first through this exact call, not raw git,
+        // before the fix existed: `git update-index --assume-unchanged` makes `git add`/`git status`
+        // both silently pretend the path is unmodified. Round one's safety net asked `git status
+        // --porcelain` -- the same index-backed bookkeeping -- and reported Saved off the empty result,
+        // permanently losing the write (D9's own reconciliation uses the same two commands, so nothing
+        // downstream ever noticed either). Confirmed independently by raw git before writing this test:
+        //   git update-index --assume-unchanged docs/page.md ; write "MEMBER TEXT"
+        //   git add -A                        -> stages nothing
+        //   git status --porcelain -- <path>  -> ''
+        //   HEAD blob: "Original body."   disk: "MEMBER TEXT"
+        // After the fix: the content-level check (git hash-object vs. HEAD's blob) catches the
+        // divergence and the save takes the existing rollback path instead of reporting Saved.
+        await InitializeRepositoryAsync();
+        var repositoryRelativePath = "docs/page.md";
+        var sha = await CommitPageDirectlyAsync("page.md", "Original body.");
+        await _git.RunOrThrowAsync(RepositoryRoot, ["update-index", "--assume-unchanged", repositoryRelativePath]);
+
+        var service = CreateService(out var index);
+        var result = await service.SaveAsync(
+            new RouteValue("page"),
+            "MEMBER TEXT",
+            PageBaseRevision.ForBlob(sha),
+            Author(),
+            CancellationToken.None);
+
+        Assert.Equal(SaveOutcome.Failed, result.Outcome);
+        Assert.Equal("Original body.", await File.ReadAllTextAsync(Path.Combine(WorkingTree, "page.md")));
+        Assert.Equal("Original body.", await ShowHeadBlobAsync(repositoryRelativePath));
+        Assert.Same(PageIndexSnapshot.Empty, index.Current);
+    }
+
+    [Fact]
+    public async Task Save_WhenAGitignoredBrandNewPageStagesNothing_RollsBackRatherThanReportingSaved()
+    {
+        // §6 remediation round two -- the other cause of "nothing staged" the brief named explicitly,
+        // checked by execution rather than assumed. Finding: given this class's own `git add --
+        // <single path>` (never `-A`), a genuinely new page a .gitignore rule matches never reaches
+        // Fix A's content check at all -- `git add -- <explicit ignored path>` refuses outright (exit
+        // 1, "The following paths are ignored...") the moment `add` runs, which the pre-existing
+        // generic `catch (Exception ex)` around add/status/commit already routes to the ordinary
+        // rollback-and-Failed path. `git add -A` (untested here; SaveAsync never calls it) is the
+        // invocation that stages an ignored path silently instead of refusing -- this class's explicit
+        // per-path `add` does not have that failure mode. Kept as a regression pinning the observed
+        // (correct) outcome for this specific cause, not as a test of the new content-hash branch --
+        // that branch's own coverage is the assume-unchanged test above, where "nothing staged" really
+        // does arrive with a zero exit code. There is still no HEAD blob for a page that was never
+        // committed, so IF a future git-invocation change ever made this scenario reach the content
+        // check silently, "nothing staged for an AbsentAtHead page" remains unconditionally a fault
+        // there too (probe.State != Blob skips the byte-identity branch entirely).
+        await InitializeRepositoryAsync();
+        await File.WriteAllTextAsync(Path.Combine(WorkingTree, ".gitignore"), "ignoredpage.md\n");
+        await _git.RunOrThrowAsync(RepositoryRoot, ["add", "docs/.gitignore"]);
+        await _git.RunOrThrowAsync(
+            RepositoryRoot,
+            ["commit", "-m", "seed gitignore"],
+            new GitAuthor("Seed", "seed@zerowiki.example").ToEnvironmentVariables());
+
+        var service = CreateService(out var index);
+        var result = await service.SaveAsync(
+            new RouteValue("ignoredpage"),
+            "content nobody will ever see committed",
+            PageBaseRevision.AbsentAtHead,
+            Author(),
+            CancellationToken.None);
+
+        Assert.Equal(SaveOutcome.Failed, result.Outcome);
+        Assert.False(File.Exists(Path.Combine(WorkingTree, "ignoredpage.md")));
+        Assert.Same(PageIndexSnapshot.Empty, index.Current);
+    }
+
+    [Fact]
     public async Task Save_WhenCommitFailsForAnExistingPage_RestoresTheCommittedContentAndInvalidatesTheIndex()
     {
         await InitializeRepositoryAsync();
@@ -471,6 +544,81 @@ public sealed class PageSaveServiceTests : IDisposable
     }
 
     [Fact]
+    public async Task Save_RouteCaseDisagreesWithAnExistingFilesCaseOnThisHostsFilesystem_BehavesCorrectlyForIt()
+    {
+        // §6 remediation round two, Fix B -- the original version of this test pinned
+        // `core.ignoreCase=true` via `git config`, but the guard it exercises
+        // (ResolvedPathMatchesOnDiskCaseExactly) is gated on File.Exists/Directory.GetFileSystemEntries,
+        // which answer from the *filesystem*, not from git's config: `core.ignoreCase` describes a
+        // filesystem's behaviour to git, it does not configure the filesystem itself. Confirmed by
+        // execution on a real case-sensitive volume (a scratch case-sensitive APFS volume, `hdiutil`)
+        // with the old config pin left in place: the save correctly SUCCEEDED there as a legitimate new
+        // page, proving the old hard-coded `Refused` assertion would fail on exactly this project's own
+        // case-sensitive Linux deployment target. This version probes the host's actual case-folding
+        // behaviour and asserts whichever outcome is correct for it, so it holds -- and actually
+        // exercises the guard -- on both kinds of host rather than being skipped on one.
+        await InitializeRepositoryAsync();
+        await CommitPageDirectlyAsync("Page.md", "Original body.");
+        var isCaseInsensitiveHost = IsWorkingTreeFileSystemCaseInsensitive();
+
+        var service = CreateService(out _);
+        var result = await service.SaveAsync(
+            new RouteValue("page"),
+            "NEW TEXT FROM MEMBER",
+            PageBaseRevision.AbsentAtHead,
+            Author(),
+            CancellationToken.None);
+
+        if (isCaseInsensitiveHost)
+        {
+            // D12's enumeration model computes a route strictly from each file's own literal name, so
+            // "Page" and "page" are different routes by that model even though a case-insensitive
+            // filesystem treats "Page.md" and "page.md" as the same physical file: enumeration
+            // publishes only "Page", so route "page" reads as "no page here yet" (AbsentAtHead) right
+            // up until an unguarded write would silently clobber the existing file. The guard refuses
+            // before that write happens.
+            Assert.Equal(SaveOutcome.Refused, result.Outcome);
+            Assert.Equal("Original body.", await File.ReadAllTextAsync(Path.Combine(WorkingTree, "Page.md")));
+            await AssertPorcelainIsEmptyAsync();
+        }
+        else
+        {
+            // On a case-sensitive filesystem "Page.md" and "page.md" genuinely coexist as two different,
+            // non-colliding pages under D12's model -- there is nothing for the guard to disagree with,
+            // and refusing here would be the false-refusal half of Blocker 1 the guard must not
+            // reintroduce.
+            Assert.Equal(SaveOutcome.Saved, result.Outcome);
+            Assert.Equal("Original body.", await File.ReadAllTextAsync(Path.Combine(WorkingTree, "Page.md")));
+            Assert.Equal("NEW TEXT FROM MEMBER", await File.ReadAllTextAsync(Path.Combine(WorkingTree, "page.md")));
+        }
+    }
+
+    [Fact]
+    public async Task LoadForEdit_RouteCaseDisagreesWithAnExistingFilesCaseOnThisHostsFilesystem_BehavesCorrectlyForIt()
+    {
+        // The same disagreement one surface earlier (§6 remediation Blocker 1, made portable by round
+        // two's Fix B -- see the Save_ sibling test's remarks for the full reasoning): before Blocker
+        // 1's fix, /wiki/page offered "Create this page" for an already-existing docs/Page.md on a
+        // case-insensitive filesystem, which is exactly what let a member's save believe it was
+        // creating something new.
+        await InitializeRepositoryAsync();
+        await CommitPageDirectlyAsync("Page.md", "Original body.");
+        var isCaseInsensitiveHost = IsWorkingTreeFileSystemCaseInsensitive();
+
+        var service = CreateService(out _);
+        var result = await service.LoadForEditAsync(new RouteValue("page"), CancellationToken.None);
+
+        if (isCaseInsensitiveHost)
+        {
+            Assert.Equal(PageLoadForEditOutcome.Refused, result.Outcome);
+        }
+        else
+        {
+            Assert.Equal(PageLoadForEditOutcome.New, result.Outcome);
+        }
+    }
+
+    [Fact]
     public async Task LoadForEdit_ExistingPage_ReturnsItsContentAndTheBaseRevisionItCorrespondsTo()
     {
         await InitializeRepositoryAsync();
@@ -664,10 +812,39 @@ public sealed class PageSaveServiceTests : IDisposable
         return result.StandardOutput.Trim();
     }
 
+    private async Task<string> ShowHeadBlobAsync(string repositoryRelativePath)
+    {
+        var result = await _git.RunOrThrowAsync(RepositoryRoot, ["show", $"HEAD:{repositoryRelativePath}"]);
+        return result.StandardOutput;
+    }
+
     private async Task<int> RevisionCountAsync()
     {
         var result = await _git.RunOrThrowAsync(RepositoryRoot, ["rev-list", "--count", "HEAD"]);
         return int.Parse(result.StandardOutput.Trim());
+    }
+
+    /// <summary>
+    /// §6 remediation round two, Fix B: probes <see cref="WorkingTree"/>'s actual case-folding
+    /// behaviour by execution, rather than pinning <c>core.ignoreCase</c> -- which describes a
+    /// filesystem's behaviour to git, it does not configure the filesystem itself. Must be called after
+    /// <see cref="InitializeRepositoryAsync"/> has created <see cref="WorkingTree"/>, and probes that
+    /// exact directory rather than <see cref="Path.GetTempPath"/> so the answer describes the volume
+    /// the save under test actually writes to.
+    /// </summary>
+    private bool IsWorkingTreeFileSystemCaseInsensitive()
+    {
+        var probeName = $"case-probe-{Guid.NewGuid():n}";
+        var probePath = Path.Combine(WorkingTree, probeName);
+        File.WriteAllText(probePath, string.Empty);
+        try
+        {
+            return File.Exists(Path.Combine(WorkingTree, probeName.ToUpperInvariant()));
+        }
+        finally
+        {
+            File.Delete(probePath);
+        }
     }
 
     private async Task AssertPorcelainIsEmptyAsync()

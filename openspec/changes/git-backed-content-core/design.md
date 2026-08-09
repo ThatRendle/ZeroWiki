@@ -762,6 +762,101 @@ another member's attribution; a fallback that a member could reproduce by choosi
 reopen that hole from the other side. The display name stays the raw username — git's name field
 constrains only `<`, `>` and newline — so a legacy member's history still reads as themselves.
 
+**A route's identity is a claim about a *name*; a filesystem's identity is a claim about a *file*, and a
+case-insensitive volume makes those two things disagree (a supervisor blocker on §6, the section's most
+serious defect).** D12 computes ambiguity over names: `Page` and `page` are different routes because
+`Page.md` and `page.md` are different names. On a case-insensitive filesystem — macOS by default, and
+Windows — they are **one file**. Enumeration walks the tree, sees `Page.md`, and publishes the route
+`Page`, so `/wiki/page` reads as "no page here yet" and offers to create it, while a write to
+`docs/page.md` lands on the existing `docs/Page.md`. Reproduced end to end:
+
+```
+core.ignoreCase = true            (git auto-detects it)
+HEAD:   docs/Page.md = "Original body."
+write:  docs/page.md = "NEW TEXT FROM MEMBER"   -> only Page.md exists; overwritten
+git add docs/page.md              -> stages NOTHING
+git status --porcelain            ->  M docs/Page.md
+```
+
+**Two guards, and they are not redundant — one is specific and one is general.**
+
+*Specific:* a save refuses when the route's resolved path does not match the on-disk entry **exactly and
+case-sensitively**, so route `page` can never write to `Page.md`. `LoadForEditAsync` applies the same
+refusal, so the editor stops offering to create a page that already exists under another casing. The
+check is gated on the filesystem's own answer rather than on comparing names, so a genuinely
+case-sensitive host — where `Page.md` and `page.md` really are two pages — is not falsely refused.
+
+*General:* **the save verifies the working-tree-clean invariant instead of inferring it.** The paragraph
+above on identical content reasons "identical ⇒ nothing staged ⇒ report success without a commit". That
+implication is true left to right and was being used right to left. **Nothing-staged has more than one
+cause and only one of them is benign**; the case-collapse above is one, and the whole point of the
+general guard is the ones nobody has thought of. So when nothing was staged, the save asks whether the
+file's content actually matches what `HEAD` holds for that path, and if it does not, rolls back and
+reports failure rather than success. This change's own standing rule — *when a guard's justification
+names a case, check the guard's branch* — applied to a justification that named the only case its author
+imagined.
+
+**The instrument is `git hash-object`, compared against the blob sha the `ls-tree` probe already read —
+and the first attempt at this guard used `git status --porcelain`, which was wrong in a way worth
+keeping on the record (a reviewer blocker at the section review's second round).** `git status` reads
+the **index**, and the index is precisely the bookkeeping the guard exists to distrust. A single
+`git update-index --assume-unchanged` blinds `git add`, `git status` **and** D9's startup reconciliation
+at once — verified by execution:
+
+```
+assume-unchanged, then write new bytes
+  git add -A                        -> stages nothing
+  git status --porcelain -- <path>  -> ''
+  git status --porcelain (tree)     -> ''
+  HEAD: Original.        disk: MEMBER TEXT
+```
+
+So the guard and the thing it guarded **shared an instrument**, and the resulting loss is worse than the
+case-collapse that motivated the guard: there, D9 eventually committed the member's bytes as a system
+recovery commit, so the edit landed unattributed; here **nothing ever notices at all**.
+
+*Why `hash-object` is the right instrument and not merely a different one.* It is a pure function of
+content plus attributes and **never consults the index**, so no index flag can blind it — while still
+agreeing with the blob git would actually store if a `.gitattributes` filter is in play. An in-process
+SHA over `blob <len>\0<bytes>` was rejected for that second reason: it touches no git at all, which
+sounds stronger, but it would diverge from the real blob the moment a filter exists and would then
+manufacture false faults on legitimate content.
+
+**The general rule this earns, which outlives the specific bug:** *you cannot verify a subsystem's
+bookkeeping by asking that subsystem.* This is the change's *audits sharing an instrument* rule (§0's
+`href=""` regex, §3's link-destination XSS, §11's service-model differential, §6 D4's body-only
+assertions) appearing for the first time in a **guard** rather than in an audit — and a guard is where it
+costs the most, because an audit that shares a blind spot fails to find a defect while a guard that
+shares one actively certifies its absence.
+
+*Two further causes of an empty staging result the content comparison also covers*, named because each
+was a distinct hole and none was reachable by the `status` instrument: a brand-new page
+(`AbsentAtHead`) that stages nothing — always a fault, since a new file must stage — and content sitting
+under a `.gitignore`, which stages nothing *and* is invisible to `status`.
+
+**What §6 block D4 shipped that this decision must also name, because four code sites cite D17 for it**
+(a supervisor blocker: `751cf95` changed `design.md` by six lines of block renumbering and no spec while
+shipping all of the following):
+
+- **The browser writes LF.** HTML form submission sends `textarea` content with CRLF; the save
+  normalises CRLF and lone `\r` to LF before writing. A repository that is the source of truth, read by
+  an Obsidian vault, should not accumulate line-ending noise from the one writer that emits it.
+- **`core.autocrlf=false` is pinned on the content repository**, before any `git add` runs on any
+  startup path. Without it an inherited host `core.autocrlf=input` makes `add -A` warn on stderr while
+  exiting 0, which block B's posture correctly refuses — so an ordinary browser save made the app refuse
+  to start, intermittently, only when git's index stat cache was cold. **The general lesson outlives the
+  setting: this app's correctness must not depend on configuration inherited from the operator's
+  `~/.gitconfig`.** `core.quotePath` was the same defect fixed as a one-off; the remaining inventory
+  (`commit.gpgsign` first) belongs to §7 as a class.
+- **The failure path is Post/Redirect/Get**, so a reload after a failed save never re-submits it. The
+  member's text is carried across the redirect by `EditDraftStore` — an in-memory, short-TTL store keyed
+  by an unguessable token, read only by the account that wrote it, capped per account so that one
+  member's flood can never evict another's draft.
+- **"Never discard what the member typed" outranks Post/Redirect/Get (Product Owner decision).** Where
+  the draft store cannot accept a draft at all, the surface re-renders **inline** rather than
+  redirecting: the member keeps every character and the resubmit prompt returns, in the one case that is
+  hardest to reach. The spec's SHALL stays absolute and acquires no exception.
+
 **Rollback must invalidate the index, because the rollback path is the one content-changing event that
 does not advance `HEAD`.** D15's freshness rests on the invariant that every content change moves
 `HEAD`; `specs/content-editing/spec.md:62-69` requires the path that breaks it.

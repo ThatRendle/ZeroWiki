@@ -402,14 +402,20 @@ public sealed class WikiPageEditorTests : IDisposable
     }
 
     [Fact]
-    public async Task A_globally_refused_draft_is_reported_distinctly_rather_than_looking_like_success()
+    public async Task A_globally_refused_draft_re_renders_inline_preserving_every_character_rather_than_discarding_it()
     {
         // The global backstop (D17, §6 block D4 continuation round two): reached honestly here by
         // EditDraftStore.MaxEntries distinct accounts each holding one live draft, stashed directly
         // through the app's own singleton rather than via hundreds of real sign-ins and failed HTTP
         // saves — EditDraftStoreTests owns proving the backstop's own refuse-not-steal behaviour in
-        // isolation; this test only needs ONE genuine failed save landing on an already-full store to
-        // prove the surface reports the resulting refusal rather than silently looking like success.
+        // isolation; this test only needs ONE genuine failed save landing on an already-full store.
+        //
+        // §6 remediation (Blocker 3, Product Owner decision): "never discard what the member typed"
+        // stays absolute with no carve-out, so Post/Redirect/Get yields here rather than the other way
+        // round -- there is nowhere left to stash the text for a follow-up GET to recover, so the ONLY
+        // way to keep every character is to re-render this same POST response in place. This replaces
+        // the previous version of this test, which asserted the discarding (redirect-to-a-bare-"Create
+        // page") behaviour as correct.
         await SeedAccountAsync("alice");
         var client = await SignInAsync("alice");
 
@@ -434,23 +440,19 @@ public sealed class WikiPageEditorTests : IDisposable
             ]));
         }
 
-        Assert.Equal(HttpStatusCode.Redirect, response.StatusCode);
-        var (path, query) = ParseRedirectLocation(response);
-        Assert.Equal("/wiki/brand-new", path);
-        Assert.Contains("draftRefused", query, StringComparison.Ordinal);
-        Assert.DoesNotContain("draft=", query, StringComparison.Ordinal);
+        // Not a redirect: there is no draft token to carry, and no follow-up GET could recover text
+        // that was never stashed anywhere.
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
 
-        var followUp = await client.GetAsync("/wiki/brand-new?edit&draftRefused");
-        var followUpBody = await followUp.Content.ReadAsStringAsync();
-
-        Assert.Equal(HttpStatusCode.OK, followUp.StatusCode);
-        Assert.Contains("could not be preserved", followUpBody, StringComparison.OrdinalIgnoreCase);
+        var body = await response.Content.ReadAsStringAsync();
+        Assert.Contains("Alices unsaved text.", body, StringComparison.Ordinal);
+        Assert.Contains("still shown below exactly as you typed it", body, StringComparison.OrdinalIgnoreCase);
         // Distinct from the ordinary expired-draft wording -- a member reading either must be able to
         // tell "never got a chance to be saved" from "was saved, then timed out."
-        Assert.DoesNotContain("draft expired", followUpBody, StringComparison.OrdinalIgnoreCase);
-        // Not a silent, unlabelled fresh editor: the fixture never wrote brand-new.md, so a bare empty
-        // "Create page" with no explanation would be indistinguishable from an ordinary first visit.
-        Assert.Contains("Create page", followUpBody, StringComparison.Ordinal);
+        Assert.DoesNotContain("draft expired", body, StringComparison.OrdinalIgnoreCase);
+        // The fixture never wrote brand-new.md, so this is still the create form -- but now with the
+        // member's own text in it, not a bare, unexplained empty one.
+        Assert.Contains("Create page", body, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -467,6 +469,31 @@ public sealed class WikiPageEditorTests : IDisposable
 
         var missing = await client.GetStringAsync("/wiki/does-not-exist");
         Assert.Contains("href=\"/wiki/does-not-exist?edit\"", missing, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("a#b", "a%23b")]
+    [InlineData("a?b", "a%3Fb")]
+    [InlineData("a%20b", "a%2520b")]
+    public async Task The_edit_link_is_built_from_the_canonical_encoded_route_not_the_decoded_request_path(
+        string fileNameWithoutExtension, string canonicalEncodedRoute)
+    {
+        // Blocker 2, §6 remediation: the previous version of WikiPage.razor built its edit href from
+        // context.Request.Path.Value, which ASP.NET Core has already percent-decoded once -- correct
+        // only when a route's encoded and decoded forms happen to be identical, which every one of the
+        // twelve pre-existing tests in this file is (page, brand-new, does-not-exist, Chapter__1, ...).
+        // These three routes are chosen because they are not: '#', '?' and a literal '%' are exactly
+        // what PageRouteCodec.EncodeSegment's second layer exists to escape (D12), and building the
+        // href from the decoded path would have produced "/wiki/a#b?edit", "/wiki/a?b?edit" and
+        // "/wiki/a%20b?edit" respectively -- three different, wrong addresses (verified in the DEVLOG's
+        // own reproduction table for this remediation).
+        await SeedAccountAsync("alice");
+        await WritePageAsync($"{fileNameWithoutExtension}.md", "Body.");
+        var client = await SignInAsync("alice");
+
+        var body = await client.GetStringAsync($"/wiki/{canonicalEncodedRoute}");
+
+        Assert.Contains($"href=\"/wiki/{canonicalEncodedRoute}?edit\"", body, StringComparison.Ordinal);
     }
 
     /// <summary>

@@ -189,8 +189,13 @@ else
 
         // The edit affordance for this address (D17, §6 block D4) — set once the request's own route
         // value is confirmed canonical, so a link this page renders is never built off a request form
-        // an editor load would itself go on to refuse.
-        _editHref = context.Request.Path.Value + "?edit";
+        // an editor load would itself go on to refuse. Built from PageRouteCodec.ResolveUrlForms, the
+        // one implementation this class and PageEditor.razor's own redirect both share (§6 remediation,
+        // Blocker 2) — never from context.Request.Path.Value, which is already percent-decoded and
+        // therefore wrong for exactly the characters Encode's second layer exists to escape (%, #, ?,
+        // control characters): a route containing one of those linked to a different page entirely.
+        var (editUrlSegment, _) = PageRouteCodec.ResolveUrlForms(routeValue);
+        _editHref = $"/wiki/{editUrlSegment}?edit";
 
         // D15/4.3: refreshes the snapshot first when its stamp no longer matches the repository's
         // current HEAD — the mechanism that keeps this correct for a writer that never notifies the app

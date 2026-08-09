@@ -376,4 +376,28 @@ public static class PageRouteCodec
         absolutePath = candidate;
         return true;
     }
+
+    /// <summary>
+    /// The route's canonical forms for a caller building a URL back into a page (§6 remediation, Blocker
+    /// 2) — the single implementation every such surface must share, closing the divergence where
+    /// <c>WikiPage.razor</c>'s edit link was built from the request's already-<i>decoded</i>
+    /// <c>Request.Path.Value</c> while <c>PageEditor.razor</c>'s own redirect built the same kind of URL
+    /// correctly, off this class's <see cref="Encode"/>. <see cref="UrlSegment"/> is still
+    /// percent/underscore-escaped — safe to place literally in a URL path segment — and
+    /// <see cref="ComparableRoute"/> is unescaped exactly once, for comparing against what ASP.NET Core
+    /// routing will hand back as a <see cref="RouteValue"/> after that same URL is requested. Falls back
+    /// to <paramref name="routeValue"/> verbatim in both forms when it cannot be decoded at all — a route
+    /// a caller's own load path would already have refused before ever offering a link or a form to post
+    /// from, kept here only so this method stays total rather than throwing on a hand-crafted request.
+    /// </summary>
+    public static (string UrlSegment, string ComparableRoute) ResolveUrlForms(RouteValue routeValue)
+    {
+        if (TryDecodeRouteValue(routeValue, out var relativePath))
+        {
+            var canonical = Encode(relativePath);
+            return (canonical.Value, Uri.UnescapeDataString(canonical.Value));
+        }
+
+        return (routeValue.Value, routeValue.Value);
+    }
 }

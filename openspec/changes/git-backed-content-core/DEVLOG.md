@@ -16859,20 +16859,929 @@ concurrency — and ask whether the absence is deliberate. A human in a real env
 formality after the gates; on this block they were the only instrument that asked three of the four
 questions that mattered.*
 
+---
+
+**[supervisor]** §6 section review — scope `git diff 97029e7..HEAD` (blocks A, B, C1, C2, D1, D2, D3, D4;
+HEAD `751cf95`). Everything below was reached by **running** something; where an instrument could not see
+a thing, I say so.
+
+## Verdict: **Request changes** — three blockers
+
+Two are cross-block: each of the eight blocks is defensible alone and the composition is not. The third
+is the record itself.
+
+---
+
+### Blocker 1 — a save can report **success**, create **no commit**, **destroy committed content**, and leave the **working tree dirty**. Blocks C2 + D4.
+
+Measured end to end against the real app on this machine (`core.ignoreCase=true`, git's own auto-detect
+on a case-insensitive volume):
+
+| step | observed |
+|---|---|
+| fixture | `docs/Page.md` committed, content `Original body.` |
+| `GET /wiki/page` | 200, *"Page not found"*, **offers "Create this page"** |
+| `GET /wiki/page?edit` | 200, **"Create page"** editor, `Input.BaseRevisionToken=""` (`AbsentAtHead`) |
+| POST | **302 → `/wiki/page`** — the `SaveOutcome.Saved` branch |
+| `git log --pretty=%s` | `write \| Initial commit` — **no new commit** |
+| `git show HEAD:docs/Page.md` | `Original body.` — unchanged in git |
+| `docs/Page.md` on disk | `Clobbered by the create path.` |
+| `git status --porcelain` | ` M docs/Page.md` — **dirty, outside any lock-held save** |
+
+The mechanism, and it is not about case:
+`PageSaveService.cs:215-222` infers success-with-no-commit from **`git diff --cached --quiet` exiting 0**.
+That is proof only that *nothing is staged* — a strictly weaker statement than *the content was
+byte-identical*. Here `git add -- docs/page.md` stages nothing (the index entry is `docs/Page.md`), the
+short-circuit fires, `Saved(commitSha: null)` is returned, the lock is released, and the dirty write is
+never rolled back and never invalidates the index.
+
+`specs/content-editing/spec.md:24` asks for exactly the property that is missing, in words:
+*"leaving the working tree exactly as clean as it already was, **by the same invariant every other save
+path relies on rather than by a check unique to this one**."* What shipped is a check unique to this one,
+and it is unsound.
+
+Consequences compose across sections, not just blocks: the dirty tree makes every subsequent
+`updateInstead` push non-fast-forward-rejected (D1/D9 — §7 and §9's Obsidian sync stop working), and D9's
+next startup reconciliation commits the clobbered bytes as a recovery commit ("never discard"), making the
+loss permanent.
+
+**What my instrument could not see, stated so it is not over-read:** I could not reach this on a
+case-sensitive filesystem. I tested the two other ways `git add` can stage nothing and **both fail
+honestly** — a `.gitignore`'d path (`add` exits non-zero → `Failed`, file rolled back, tree clean) and a
+`skip-worktree` path (`Failed` with a draft token). So the reachable trigger today is a
+**case-insensitive content volume** — which is `core.ignoreCase`, *on D4's own unverified list*, and which
+is the default for a Docker Desktop bind mount on macOS/Windows, i.e. squarely inside "point it at a
+folder and it Just Works".
+
+Three blocks each did something reasonable and nobody owned the seam: C2 wrote the inference, §3/§4's
+ordinal index lookup makes `/wiki/page` read as *not found*, and D4 added the affordance that turns that
+into a create form.
+
+**Why no block review could catch it:** C2's diff contains a correct comment about byte-identical
+content; D4's diff contains a correct "Create this page" link. The defect is only visible when the two
+are on the same request.
+
+---
+
+### Blocker 2 — the section's only way in builds the edit URL from the **decoded** request path, so it is wrong for exactly the characters `Encode` exists to escape. Block D4.
+
+`WikiPage.razor:193` — `_editHref = context.Request.Path.Value + "?edit"`. `PathString.Value` is the
+**decoded** path, so layer 2 of `PageRouteCodec.EncodeSegment` (`%`, `#`, `?`) is thrown away. Measured
+by rendering the real page and resolving the emitted `href` the way a browser does:
+
+| file | rendered `href` | where the member lands |
+|---|---|---|
+| `a#b.md` | `/wiki/a#b?edit` | `/wiki/a` + fragment `#b?edit` — **a different page** |
+| `a?b.md` | `/wiki/a?b?edit` | `/wiki/a`, query `b?edit`, no `edit` flag — **a different page's *view*** |
+| `a%20b.md` | `/wiki/a%20b?edit` | route value `a b` → non-canonical → **"This address cannot be edited"** |
+| `café.md` | `/wiki/caf&#xE9;?edit` | fine — HTML entity, decodes to `café` (my first pass mis-scored this: my resolver did not HTML-decode. Recorded because it is the same class of instrument error this section keeps finding.) |
+
+The canonical address works in every case (`GET /wiki/a%23b?edit` → editor opens), so the editor is
+correct and only the link into it is wrong. For `#` and `?` a member who clicks "Edit this page" and then
+saves has edited **the wrong page**, reachable from the only affordance §6 provides.
+
+This is the sibling divergence D3 closed one instance of: **two surfaces answering "what is this page's
+edit URL?"**, and only one of them right. `PageEditor.razor:249-256` builds the same URL correctly, off
+`PageRouteCodec.Encode`, and its own doc comment states the hazard verbatim — *"rather than
+re-interpolating the raw request value, which may contain characters (a space, '#') that are not safe to
+place directly into a URL"*. The same block wrote both.
+
+**What the suite could not see:** every route in `WikiPageEditorTests.cs` is `brand-new` / `page` /
+`a___b` / `Chapter__1` — routes whose encoded and decoded forms are *identical*. The twelve-test suite is
+structurally incapable of distinguishing the two constructions. `WikiPageEditorTests.cs:457-470` asserts
+the link and is blind for exactly this reason.
+
+---
+
+### Blocker 3 — D17 no longer describes the save path §6 shipped, and the code cites it for three mechanisms it never mentions. Blocks D1 + D4.
+
+D17 was corrected across A, D1 and D3 and is internally coherent for what those blocks built — I checked
+its cross-references and they survived the D3/D4 re-carve (`design.md:523-525` renumbers the surface
+obligation correctly; the D3 mechanism paragraphs at 575-608 and 610-624 match the code). **D4 is the
+problem: `751cf95` changed `design.md` by 6 lines, all of them that renumbering, and changed no spec file
+at all**, while shipping:
+
+- `EditDraftStore` — 253 lines of new server state with a TTL, a per-account cap, a global backstop and an
+  ownership check;
+- Post/Redirect/Get as the failure architecture for all five outcomes;
+- `NormalizeLineEndings` — a **content-transformation policy on the write path**, which silently rewrites
+  what the member submitted and is now the sole guarantor of LF-only storage;
+- the `core.autocrlf=false` pin on the content repository.
+
+`grep -n 'autocrlf|line ending|CRLF|EditDraftStore|draft' design.md` returns **one** hit in the whole
+file, and it is the word "draft" in the `zerowiki.invalid` paragraph. Yet
+`PageSaveService.cs:399-404`, `ContentRepositoryService.cs:554`, `EditDraftStore.cs:7` and
+`PageEditor.razor:76-88` all cite **D17** for these. Four false attributions, in the section whose own
+`## NEXT` records "four false literals shipped in prose in one block; two false attributions in another"
+as its standing lesson. This is that lesson recurring one level up — not in a comment's detail, but in
+which binding decision a mechanism claims to descend from.
+
+**And one of D17's claims is now false rather than merely absent.** `design.md:626-627`:
+*"Every failure outcome stays distinguishable at the browser surface, and **none of them discards what the
+member typed** (Product Owner decision, §6 block D1)"* — and `specs/content-editing/spec.md:61`:
+*"On any failure the surface SHALL re-present the content the member submitted rather than replacing or
+discarding it."* D4's `draftRefused` path **discards it**: `PageEditor.razor:157-163` falls through to a
+fresh `LoadForEditAsync`, and `WikiPageEditorTests.cs:453` *asserts* the result is a bare `Create page`
+editor. The commit message for `751cf95` repeats the false claim ("none discards submitted content").
+
+I am not relitigating the PO's four decisions — this is the opposite: the code does **not** honour the one
+D1 took. Reachability is low (500 live drafts across ≥63 accounts on an invite-only wiki), which is an
+argument for how to resolve it, not for leaving a spec SHALL and a binding decision contradicted by the
+shipped code and by a passing test.
+
+---
+
+## Suggested remediation shape — one fix block
+
+1. **`PageSaveService.SaveAsync` (`PageSaveService.cs:215-222`) must verify the invariant, not infer it.**
+   When nothing is staged, confirm the resolved path is actually clean against `HEAD` before returning
+   `Saved` — and if it is not, route through `HandlePostWriteFailureAsync` like any other post-write
+   failure. Regression test: the case-collision sequence above, asserting `git status --porcelain` empty
+   **and** the outcome not `Saved`. (Optional, and the Architect's call: also refuse at the address level
+   when the resolved path exists on disk under a different case than the route decodes to. The
+   invariant check is what closes the corruption; the address check only makes the message nicer.)
+2. **`WikiPage.razor:193` must build the href from the canonical `EncodedRoute`, not `Request.Path.Value`**
+   — reuse `PageEditor.razor`'s existing construction rather than growing a third. Regression test:
+   parameterise the existing link test over `a#b.md`, `a?b.md`, `a%20b.md`.
+3. **Reconcile the record with the code.** Either add the missing D17 paragraphs (draft store + PRG, LF
+   normalization, the `autocrlf` pin) so the citations become true, or re-cite them to a new decision;
+   and settle the `draftRefused` contradiction one way — the code honours the SHALL, or the spec and D17
+   record the bounded exception with the Product Owner's acceptance. Framing it open rather than as a
+   pick: `MaxDraftsPerAccount = 8` already bounds every account's footprint, so whether `MaxEntries`'s
+   refusal is buying anything the per-account cap does not is itself worth asking before choosing.
+
+Nothing in 1–3 needs new `N.M` numbers.
+
+---
+
+## Confirmed or closed, as asked
+
+- **Obligation 26 — CLOSE, trigger never fired.** Its condition was "once a save resolves through
+  `ApplyIncrementalUpdateAsync`". It does not: `_index` appears exactly once in the whole of
+  `PageSaveService` (`PageSaveService.cs:472`, `Invalidate()`), and the save's file choice comes from
+  `PageRouteCodec` plus a fresh `PageEnumerationService.EnumeratePages()` walk. The incremental path's
+  claimant reconstruction never decides which file a save writes, so it is still §4's derived-index
+  scoping and not a data-integrity path. *(`IPageIndex` exposes `Current` and no caller uses it — trim it
+  or leave it; `## NEXT`, not the fix block.)*
+- **`EnumeratePages()` on every save — sound, keep it.** It is consistent with D15 rather than in tension
+  with it: D15 accepts a full rebuild on the *exceptional* rollback path because being clever about one
+  entry is wrong there; D17 accepts a full *path-only* walk on the normal path because a collision can
+  arise in a directory segment and there is no bounded neighbourhood. I verified the case D1 said must
+  work: `a_b/one.md` + `a  b/one.md` → read path **409 ambiguous**, editor **refused**. Two oracles, one
+  rule, and they agree. For a small trusted group over a mounted volume this is the right bargain.
+- **The inherited-git-config class — §7 owning it is right, and `commit.gpgsign` does not need to block
+  §6.** Measured, not reasoned: with `commit.gpgsign=true` inherited and no usable gpg, a *fresh* repo
+  **refuses to start** (`EnsureInitialCommitAsync` throws — fail-fast, exactly the posture), and against
+  an *already-started* app every save fails **honestly** — PRG with a draft token, `git status`
+  **clean**, log unchanged, member's text preserved. No silent corruption in either direction. Contrast
+  Blocker 1, where `core.ignoreCase` — from the same list — *does* corrupt silently, which is the reason
+  that one is a blocker and this class is not.
+- **`EditDraftStore` scrutiny.** The mechanism holds up: the per-account cap makes the stated invariant
+  ("any eviction caused by account A falls only on A's drafts") true by construction, `TryGet` is
+  ownership-gated and uniform across missing/expired/foreign, and it is correctly a singleton. Two
+  things it is worth naming rather than discovering: it is **per-instance** state (fine today, a real
+  constraint on any future multi-instance deployment), and there is **no background sweeper** — expired
+  entries are only reclaimed inside `Save`, so a quiet store holds every expired draft's text in memory
+  until the next save failure. Neither blocks; both to `## NEXT`. The one *contract* problem is the
+  discard path, and that is inside Blocker 3.
+
+## Checked clean — recorded so it is not re-litigated
+
+- **All five `SaveOutcome` members are reachable, distinct at the surface, and spec-covered.** Nothing
+  re-collapsed them: five distinct messages in `PageEditor.razor:46-59`, five distinct tests
+  (`WikiPageEditorTests.cs:132/164/189/212/234`). The `_ => FailedMessage` arm is honest, not a collapse.
+- **One commit per save, LF-only storage, author *and* committer.** Measured: `rev-list --count` 1 → 2 for
+  one save; `Line one\r\nLine two\rLine three` stored as bytes with `10` and no `13` anywhere; author and
+  committer both `dave <dave@zerowiki.org>`; tree clean afterwards.
+- **The anonymous gate holds over the new surface.** `GET` and `POST` to `/wiki/page?edit` unauthenticated
+  both return the gate's uniform 848-byte response, no textarea, nothing written.
+- **Obligation 19 is discharged** — `TryResolveWorkingTreePath` (the callerless one) has no references
+  anywhere in `src` or `tests`; §6 added no third resolver.
+- **No mutation residue.** `git diff -- src` and `git status --short -- src` both empty at HEAD, and
+  every file §6 touched is tracked, so the untracked-file blind spot §7b hit does not apply here.
+- **HITL is recorded** — `751cf95`'s body carries "6.1 confirmed by the Product Owner in a real browser."
+  No task in §6 was ticked on an unconfirmed human-in-the-loop step.
+
+## For `## NEXT` (Architect, at close-out — not the fix block)
+
+- **`## NEXT` is stale by four blocks.** It still reads "Resume point: §6 … block D2", "five blocks have
+  landed", "**State: 25/41 tasks ticked**", and its progress table marks D2 and D3 *not started*. All of
+  D1–D4 have landed and 6.1–6.6 are ticked. Rewrite before opening §7.
+- Obligation 26 → closed, with the reason above. Obligation 19 → discharged.
+- `IPageIndex.Current` has no consumer.
+- `EditDraftStore`: per-instance state; no background expiry sweep.
+- §7/§9 will be the first real users of `updateInstead` against a tree §6 can now dirty — Blocker 1's fix
+  is what makes that safe, so re-derive the working-tree-clean invariant at §7's open rather than
+  assuming §6 established it.
+
+**@architect** — two rounds is the budget. Blockers 1 and 2 are small, local code fixes with obvious
+regression tests; Blocker 3 is prose plus one contract decision that is the Product Owner's, so brief it
+as a question, not as an edit.
+
+**[architect]** **All three blockers accepted. Blocker 1 re-derived by execution before accepting, and
+it is the most serious defect §6 has produced.** Independent reproduction in a scratch repository, macOS
+default filesystem:
+
+```
+core.ignoreCase = true            (auto-detected by git init)
+commit docs/Page.md = "Original body."
+write docs/page.md  = "NEW TEXT FROM MEMBER"   -> only Page.md exists; overwritten
+git add docs/page.md              -> staged: <NOTHING>
+git show HEAD:docs/Page.md        -> Original body.
+cat docs/Page.md                  -> NEW TEXT FROM MEMBER
+git status --porcelain            ->  M docs/Page.md
+```
+
+The save reports **`Saved`** off that empty staging result. No commit, `HEAD` stale, the member's bytes
+uncommitted on disk, and the **working-tree-clean invariant broken** — which blocks every
+`updateInstead` push, and which D9's next startup reconciliation resolves by committing the member's
+text as a *system* recovery commit: the edit lands eventually, unattributed, on restart.
+
+**The root cause is deeper than the short-circuit, and naming it correctly is what makes the fix
+general. D12's ambiguity model is computed over *names*; a case-insensitive filesystem collapses
+distinct names onto one *file*.** `Page` and `page` are different routes by D12 and the same file on
+disk. Enumeration sees `Page.md` and publishes route `Page`, so `/wiki/page` is "no page here yet" and
+offers Create — while the write lands on the existing file. **Two oracles, one file, opposite answers.**
+That is the same shape D3 fixed between the read and save paths, one level lower: there it was two
+*implementations* of one rule, here it is one rule against a filesystem that does not share its model of
+identity.
+
+**And the short-circuit is what converts it into silent wrong-success.** D17 reasoned "identical content
+⇒ nothing staged ⇒ report success without a commit." That implication is true left-to-right and is being
+used right-to-left. **Nothing-staged has more than one cause and only one of them is benign** — this
+change's own standing rule, *when a guard's justification names a case, check the guard's branch*, applied
+to a justification that named the only case its author imagined.
+
+Blockers 2 and 3 accepted as reported. Blocker 2 is another two-surfaces-one-question divergence
+(`WikiPage.razor` builds the edit URL from the decoded `Request.Path.Value`; `PageEditor.razor` builds
+it correctly and its own comment names the hazard) and the twelve D4 tests are structurally blind to it
+because every route they use has identical encoded and decoded forms. Blocker 3 is real: `751cf95`
+shipped `EditDraftStore`, PRG, `NormalizeLineEndings` and the `core.autocrlf` pin while changing
+`design.md` by six lines of block renumbering and no spec at all, yet four code sites cite D17 for them.
+
+**Carried-forward items accepted as resolved:** obligation 26 **closed** (its trigger never fires — the
+save's file choice never routes through `ApplyIncrementalUpdateAsync`); the per-save `EnumeratePages()`
+walk **sound, kept**; the inherited-config class **stays §7's**, with `commit.gpgsign` measured as
+failing loudly and honestly rather than silently — unlike `core.ignoreCase` from the same list, which is
+Blocker 1 and is therefore §6's.
+
+**[architect]** ❓ @product-owner — the spec/behaviour contradiction inside Blocker 3. **Answered.**
+
+`specs/content-editing/spec.md:61` requires the surface to re-present submitted content on **any**
+failure; the `draftRefused` path cannot, because that is precisely the case where the store had nowhere
+to put it — and `WikiPageEditorTests.cs:453` asserts the discarding behaviour as correct.
+
+→ **Decision: preserve the text; accept a resubmittable POST in the exhausted case only.** When the
+draft store refuses, the surface **re-renders inline** rather than redirecting: the member keeps every
+character, at the cost of the browser resubmit prompt in the one situation that is hardest to reach.
+"Never discard what the member typed" stays **absolute, with no asterisk**; Post/Redirect/Get yields to
+it rather than the other way round. Rejected: amending the spec to carve out the exception (the
+guarantee acquires an asterisk), and removing the refusal by growing past the cap (the memory bound
+stops being a bound).
+
+**[architect]** Brief — §6 remediation block (supervisor round one). **No new `N.M` numbers, ticks
+nothing** — every §6 box is already ticked; the findings and the fix are the record. Base `751cf95`.
+→ @worker
+
+**Fix 1 — the save must verify the invariant, never infer it. Two layers, both required.**
+
+- **The general safety net, which is the part that must not be skipped:** after `git add`, when nothing
+  was staged, **confirm the working tree actually matches `HEAD` for that path** before reporting
+  `Saved`. If it does not, the write reached disk and did not commit — roll back through the existing
+  transactional path and return a failure outcome. Never `Saved`. This must hold for *any* cause of an
+  empty staging result, not only the one below; that generality is the whole point.
+- **The specific, so the member gets an actionable answer:** refuse up front when the route's resolved
+  path does not match the on-disk entry **exactly, case-sensitively**. Route `page` must not write to a
+  file named `Page.md`. Enumeration already publishes only `Page`; the save must agree with it.
+  `SaveOutcome.Refused` is the fit — do not add a member.
+- **`LoadForEditAsync` must agree too.** Today `/wiki/page` offers "Create this page" for an existing
+  `docs/Page.md`. That is the same disagreement one surface earlier and it must not survive the fix.
+
+**Fix 2 —** build the edit URL in `WikiPage.razor` from the canonical **encoded** route, exactly as
+`PageEditor.razor` already does. Then **share one implementation** rather than two correct copies — this
+finding exists because there were two. Test with routes where encoded and decoded forms **differ**
+(`a#b.md`, `a?b.md`, `a%20b.md`); the existing twelve are blind by construction.
+
+**Fix 3 —** implement the Product Owner's decision above: on draft-store refusal, re-render inline
+preserving the member's content instead of redirecting. Update `WikiPageEditorTests.cs:453`, which
+currently asserts the discarding behaviour as correct. **The spec keeps its absolute SHALL** — no
+carve-out.
+
+**Fix 4 (docs, Architect-owned — do not write these; I will).** D17 must document `EditDraftStore`, PRG,
+`NormalizeLineEndings` and the `core.autocrlf` pin, and I will reconcile the four code sites citing it.
+
+**Method — non-negotiable, and the section's record is why:**
+
+- **Reproduce each blocker red before fixing it**, and say so. Fix 1's reproduction needs a
+  case-insensitive filesystem — macOS default, so it is reproducible here, but the test must **pin
+  `core.ignoreCase`** rather than depend on the host, exactly as D4's regression test pins
+  `GIT_CONFIG_GLOBAL`. A test that only passes on the developer's filesystem is not a regression test.
+- **Fix 1 is a data-integrity path: mutation testing is in scope, capped at 3.** Mutate the new
+  verification and confirm a test dies. `cp` outside the repo with a `trap`, checksum before and after,
+  never `git checkout --`.
+- **Explicit ≥10-minute timeout on every full-suite command.**
+- Every literal a machine parses gets executed and pasted back; no comment attributes a decision or
+  measurement to a party that did not produce it.
+
+Do not tick anything. Do not commit. Gates as always. → @reviewer when green.
+
+**[worker]** §6 remediation block implemented — no new task numbers, nothing ticked. All three blockers
+reproduced red first, independently, before any fix landed.
+
+**Fix 1 — `PageSaveService.cs`.** Two layers, both required, as briefed:
+
+- **Up-front, under the lock (new `ResolvedPathMatchesOnDiskCaseExactly`)** — refuses when the resolved
+  path's exact case does not match what is actually on disk, checked segment by segment from
+  `WorkingTree` down. Gated on the filesystem's own `File.Exists`/`Directory.Exists` for the exact-case
+  candidate, **not** on a name-only case-insensitive comparison: a name-only check would have wrongly
+  refused `page.md` merely because a differently-cased `Page.md` already exists, even on a
+  case-**sensitive** host where the two are legitimately different, non-colliding pages under D12's
+  model. Only when the filesystem's own existence check says the exact-case path is already there does
+  this method consult a directory listing to read back the real on-disk name. Re-checked under the lock
+  for the same race-safety reason as the ambiguity check it sits beside — a colliding-case file could
+  arrive by push mid-edit. Applied in both `SaveAsync` and `LoadForEditAsync`.
+- **General safety net (`git status --porcelain` scoped, replacing the `git diff --cached --quiet`
+  short-circuit)** — verifies the working tree's actual relationship to `HEAD` for the resolved path
+  before ever reporting `Saved` off "nothing staged", instead of inferring cleanliness from it. Scoping
+  to the resolved path is safe *because* the up-front check above has already confirmed its case matches
+  on-disk exactly. A non-clean status line throws, funnelled through the existing single rollback path
+  (`HandlePostWriteFailureAsync`) rather than a second one.
+- `SaveOutcome.Refused` used for the specific refusal, no new enum member.
+
+Reproduction (independent, in-suite): commit `Page.md`, pin `core.ignoreCase=true` via
+`git config` (not left to git's own auto-detect — same discipline as D4's `GIT_CONFIG_GLOBAL` test),
+`SaveAsync(route "page", AbsentAtHead, ...)`. **Red before the fix:** `Saved`, `Page.md` overwritten,
+`LoadForEditAsync` returned `New`. **Green after:** both `Refused`, `Page.md` untouched, porcelain empty.
+Verified by reverting each source file to `HEAD` (`git show HEAD:<path>`) and re-running the exact same
+tests before restoring — not reasoned about.
+
+**Mutation testing (capped at 3, used 2).** Both verified under the **full unfiltered `dotnet test`** in
+the foreground, `cp`+`trap` revert to an out-of-repo backup, checksummed before and after each mutation
+and after each revert:
+
+1. Inverted the case-mismatch branch (`return false` → `return true`) in
+   `ResolvedPathMatchesOnDiskCaseExactly`. **Died**: 2/796 failed (the two new tests above), exact
+   predicted failure mode, 2m01s.
+2. Inverted the general safety net's `isCleanlyStaged` condition to always `true` (bypassing it
+   entirely). **Survived**: 796/796 passed, 2m33s. Reported honestly, not suppressed: with mutant 1's
+   check in place, the one *known* reachable cause of "nothing staged but dirty" is refused before the
+   write ever happens, so no current test drives execution into the general net's unsafe branch. This is
+   the expected shape of defense-in-depth for an unenumerated future cause — the net still exists and is
+   reviewable, but nothing today exercises its failure arm. Not spending the third confirmation run on
+   this since the result was already unambiguous both times.
+
+`git diff -- src` and `git status --short -- src tests` checked after each revert — both matched exactly
+the six files this block intends to change, all tracked.
+
+**Fix 2 — `PageRouteCodec.ResolveUrlForms`.** New shared method (decode-then-`Encode`, returning the
+URL-safe segment and the once-unescaped comparable form). `WikiPage.razor`'s `_editHref` now builds off
+it instead of `context.Request.Path.Value`; `PageEditor.razor`'s own private `CanonicalRouteForms` is
+deleted and its two call sites now call the same shared method — one implementation, not two.
+Red-before-fix (reverted `WikiPage.razor` to `HEAD`): 3/3 new theory cases failed
+(`a#b.md`→`/wiki/a%23b?edit`, `a?b.md`→`/wiki/a%3Fb?edit`, `a%20b.md`→`/wiki/a%2520b?edit`), each looking
+for the exact wrong `href` the DEVLOG's own reproduction table predicted. Green after restoring.
+
+**Fix 3 — draft-store refusal re-renders inline.** On `EditDraftStore.Save` returning `null`,
+`PageEditor.razor.SubmitAsync` no longer redirects; it sets `_saveMessage` and returns, leaving `Input`
+untouched so the same POST response re-renders with every character the member typed still in the
+textarea. Removed the now-dead `DraftRefused` query parameter and its GET-side handling (no producer
+left). `WikiPageEditorTests.cs`'s renamed test now asserts 200 (not redirect) with the submitted text and
+the updated message present. Red-before-fix (reverted `PageEditor.razor` to `HEAD`): failed on `Found`
+(302) instead of `OK`. Green after restoring.
+
+**Gates:** `dotnet build` 0/0. `dotnet test` **796/796**, full unfiltered, foreground, 2m42s (explicit
+600000ms timeout on every full-suite command run in this block). `dotnet format --verify-no-changes`
+exit 0. `openspec validate git-backed-content-core --strict` valid.
+
+Files touched: `src/ZeroWiki/Content/PageSaveService.cs`, `src/ZeroWiki/Content/PageRouteCodec.cs`,
+`src/ZeroWiki/Components/Pages/WikiPage.razor`, `src/ZeroWiki/Components/Pages/PageEditor.razor`,
+`tests/ZeroWiki.Tests/Content/PageSaveServiceTests.cs`, `tests/ZeroWiki.Tests/Web/WikiPageEditorTests.cs`.
+`design.md` and the specs untouched, per the brief (Fix 4 is the Architect's).
+
+Not touched, per scope: obligation 8 (D2), obligation 26, and everything else already closed in the
+supervisor's "Confirmed or closed" section.
+
+→ @reviewer
+
+**[reviewer]** §6 supervisor remediation — **Request changes.** §6 does not close. Two blockers, both
+found by doing exactly what the coordinator's brief asked and going one execution further than the
+question as posed — the supervisor's own instrument ("could I construct another route to nothing-staged")
+and the coordinator's own instrument ("does the test pin the actual mechanism, not just a config knob")
+both turn out to have live findings underneath them, not merely reassurance.
+
+---
+
+### Blocker A — the surviving mutant is reachable, not defence-in-depth: `git update-index --assume-unchanged` defeats both guards, and even D9's own startup reconciliation, permanently.
+
+The brief asked whether `--assume-unchanged`/`--skip-worktree` could construct a route to "nothing
+stages but the tree is dirty" other than case-collapse. Built both against the real, shipped
+`PageSaveService.SaveAsync`, not raw git:
+
+**`--skip-worktree` is safe, and I traced why rather than just recording the outcome:** `git add --
+<path>` on a skip-worktree'd path exits **non-zero** (`RunOrThrowAsync` throws — modern git treats a
+skip-worktree path as outside the sparse-checkout and refuses `add` on it without `--sparse`), so the
+exception path runs and the result is `RollbackFailed` (not `Saved`). Never silent.
+
+**`--assume-unchanged` is not safe.** Committed `Page.md`... no — committed a page normally, set
+`git update-index --assume-unchanged` on its tracked path, then called `SaveAsync` with new content and
+the correct base revision:
+
+```
+Outcome: Saved, CommitSha: <null>
+On disk: 'MODIFIED content the member actually typed'
+HEAD content: 'original content'
+git status --porcelain (whole tree): ''
+```
+
+The up-front check doesn't apply (same case, same name — not a case-collapse). `git add -- <path>`
+**exits 0 and stages nothing**, silently. The general safety net's own instrument —
+`git status --porcelain -- <path>` — **also reports empty**, because `assume-unchanged` tells git's
+status/diff machinery to trust the cached stat without comparing content at all, scoped or not. The
+`isCleanlyStaged` branch never fires because the "genuinely clean" branch fires first, on a false
+premise. Full Blocker-1 bug, reproduced through the shipped fix, by a different door.
+
+**It gets worse: D9's own startup reconciliation — the supposed last line of defence — is blind to the
+same bit.** Left the dirty, assume-unchanged'd file exactly where `SaveAsync`'s bug leaves it, and ran a
+fresh `EnsureRepositoryAsync()` (a restart) over it:
+
+```
+Restart threw? False
+HEAD content after restart: 'original content'
+Porcelain after restart: ''
+Revision count after restart: 2
+```
+
+No refusal, no recovery commit, tree reports clean. For case-collapse, the supervisor's own finding was
+that the loss is *delayed, not permanent* — D9 eventually commits it as a system recovery commit. For
+`assume-unchanged`, **nothing ever recovers it**, because the same bit blinds `ReconcileWorkingTreeAsync`'s
+identical `git status`-based check too. This is a more severe failure mode than the one Blocker 1 named,
+sitting directly underneath the fix that was supposed to close the class.
+
+**Reachability, stated as carefully as the supervisor stated case-collapse's:** this bit is never set by
+any ZeroWiki code, and it is pure local index state — never transmitted by a push, so not remotely
+reachable. The route in is the same shape as `core.ignoreCase`/`core.autocrlf`/`commit.gpgsign` before
+it: an **adopted repository** (D1/D9's own explicit support for pointing ZeroWiki at a pre-existing git
+history) that already carried the bit before ZeroWiki ever wrote to it — plausible, not exotic, for
+content migrated from other git tooling that sets it as a performance optimisation. That is squarely
+"point it at a folder" territory, the standard this whole inherited-state class has been held to.
+
+**`design.md`'s own new paragraph is wrong about this, which is exactly the standing rule it names two
+lines earlier.** *"Recorded deliberately: the general guard's mutant survives... it guards the causes
+not yet known"* — the cause is now known, named, and demonstrated, and the general guard does not catch
+it. The general guard's own instrument (`git status --porcelain`) shares an assumption with the very
+signal it replaced (`git diff --cached --quiet`): both trust git's own change-detection, and both can be
+made to lie by index metadata orthogonal to content. A guard immune to this needs to compare **bytes**
+— the working-tree file's content against `git show HEAD:<path>` (or a blob hash comparison) — not any
+git status/diff signal, however scoped.
+
+Not asking for a fix to be designed here — naming the gap and its evidence is the review's job. Whether
+`## NEXT`/§7 or this block owns the byte-level check is the Architect's call.
+
+---
+
+### Blocker B — the Blocker-1 regression test pins the wrong layer: `core.ignoreCase=true` via `git config` does not reproduce the bug on a genuinely case-sensitive filesystem, and would very likely fail on the project's own Linux target.
+
+Built a real case-sensitive APFS volume (`hdiutil create -fs "Case-sensitive APFS"`) — not reasoned
+about, an actual second filesystem — and ran the worker's exact scenario on it: commit `Page.md`, pin
+`core.ignoreCase=true` via `git config` (exactly as the test does), save route `page`.
+
+```
+On a genuinely case-SENSITIVE filesystem, core.ignoreCase=true pinned via git config:
+  SaveAsync outcome: Saved
+  Page.md content (must be untouched if this is a false negative): 'Original body.'
+  page.md (lowercase) exists as a separate file? True
+  git status --porcelain: ''
+```
+
+`Saved`, not `Refused` — the worker's test asserts `Refused`. The reason is structural, not a fluke:
+`ResolvedPathMatchesOnDiskCaseExactly` is gated on `File.Exists`/`Directory.Exists`, which answer from
+the **real filesystem**, not from git's config — `core.ignoreCase` governs git's own pathspec matching,
+and has no effect on what `File.Exists("docs/page.md")` returns. On this volume the two files are
+genuinely different, `File.Exists` correctly says so, the guard correctly does not refuse, and the save
+correctly creates a second, legitimate page — exactly the behaviour Blocker 1's own "false-refusal" half
+is supposed to protect (confirmed separately, same volume: opening the editor and saving route `page`
+with `Page.md` present succeeds as a distinct new page, `Page.md` untouched — the up-front check's other
+half holds).
+
+But that means **the regression test's own precondition does not transfer**: pinning `core.ignoreCase`
+controls git's belief, not the filesystem's behaviour, and the bug needs the latter. This is the same
+class of defect the D4/D9 `GIT_CONFIG_GLOBAL` precedent was created to catch — a test that only reproduces
+its bug on the author's own filesystem — except here it's sharper: it isn't merely *unverified* on
+another platform, it's **executed proof that the assertion is false there**. Given the shipped image is
+Ubuntu 24.04 (case-sensitive ext4 by default, per this section's own earlier rounds), I judge this
+regression test would fail in this project's own CI/deployment-shape environment, not merely "some
+platform somewhere."
+
+The fix itself is not in question — the up-front check is correct and gated properly on the filesystem's
+own answer, confirmed on both a real case-insensitive volume (macOS default, matches the worker's claim)
+and a real case-sensitive one (this round, no false refusal). The problem is narrower and squarely a test
+problem: there is no `GIT_CONFIG_GLOBAL`-shaped lever for *filesystem* case sensitivity the way there was
+for git config, so reproducing this specific bug portably needs either a genuinely case-insensitive
+volume provisioned in CI (parallel to this round's own `hdiutil`), or the test's claim narrowed to what
+`core.ignoreCase` alone can honestly assert on whatever host runs it.
+
+---
+
+### Everything else audited and holding
+
+- **Blocker 2 — genuinely one shared implementation.** `PageRouteCodec.ResolveUrlForms` is the only
+  producer on both call sites; `PageEditor.razor`'s old private `CanonicalRouteForms` is deleted, not
+  left as a second copy. Re-derived the three literal encodings the new theory test depends on rather
+  than trusting them: `Encode("a#b.md")` = `a%23b`, `Encode("a?b.md")` = `a%3Fb`,
+  `Encode("a%20b.md")` = `a%2520b` — all three match exactly.
+- **Blocker 3 — the inline fallback preserves every character and doesn't touch the other outcomes.**
+  `SubmitAsync`'s `draftToken is null` branch sets `_saveMessage` and returns without calling
+  `NavigateTo`; `Input` is never reassigned on that path, so the same POST response re-renders with
+  exactly what was typed. The other five results (`Saved` plus the four ordinary failures with a token)
+  are byte-for-byte the pre-remediation PRG code path — confirmed by reading the diff, no logic moved
+  under them. The updated test asserts 200 (not redirect), the member's exact text, the new message, and
+  still a labelled "Create page" — not a bare unexplained one.
+- **`LoadForEditAsync`/`SaveAsync` agreement** — both call the identical `ResolvedPathMatchesOnDiskCaseExactly`;
+  confirmed on the real case-insensitive volume (`LoadForEditAsync` on route `page` with `Page.md`
+  present returns `Refused`, matching `SaveAsync`) and the real case-sensitive one (`New`, matching a
+  save that then succeeds).
+- **`design.md`'s Fix 4, everything except the surviving-mutant paragraph above.** The reproduction table
+  matches prior executed findings exactly. The `EditDraftStore` per-account-cap claim ("one member's
+  flood can never evict another's draft") is unchanged from what this review already confirmed by
+  adversarial execution in an earlier round and is not touched by this diff. The
+  inherited-git-config-class framing (`commit.gpgsign` first, owned by §7) is consistent with what was
+  independently measured then and not reopened here.
+
+`dotnet build` 0/0; `dotnet test` **796/796** (10-minute explicit timeout, re-run independently);
+`dotnet format --verify-no-changes` clean; `openspec validate --strict` valid. `git status --short --
+src tests` shows only this round's six files throughout — every throwaway probe (the assume-unchanged
+and skip-worktree tests, the startup-reconciliation blindness check, both case-sensitive-volume tests)
+was built inside `PageSaveServiceTests.cs`, run, and reverted with a checksum confirmed back to the
+pre-edit hash before moving to the next check; both scratch case-sensitive APFS volumes were detached
+and deleted. No new mutation testing run: the worker's own mutation (capped at 2, both unambiguous) is
+not in question — my job was to judge what the survival meant, and I judged it by constructing the
+adversary directly against the real class rather than by mutating further.
+
+**Verdict: Request changes.** Blocker A means the general safety net's own "defence in depth" claim is
+false as currently written and the class it was meant to close still has a live, if narrow, member with
+a worse failure mode (permanent, not delayed) than the one that motivated it. Blocker B means the
+regression test proving Blocker 1 fixed would very likely fail, not merely be silent, on this project's
+own deployment filesystem. Blockers 2 and 3 and the rest of Fix 4 hold. → @architect
+
+**[architect]** **Both blockers accepted. Blocker A re-derived independently before accepting, and it
+retracts a claim I wrote into `design.md` two hours ago.**
+
+```
+git update-index --assume-unchanged docs/a.md ; write new bytes
+git add -A                        -> stages nothing
+git status --porcelain -- <path>  -> ''      <-- the safety net's OWN instrument
+git status --porcelain (tree)     -> ''
+HEAD: Original.        disk: MEMBER TEXT
+```
+
+**The finding is architectural, not incidental, and it is this project's oldest lesson arriving one
+level lower than it has ever appeared.** The general safety net was added precisely because inferring
+the working-tree-clean invariant from "nothing staged" trusts one subsystem's bookkeeping. It then
+verifies that invariant by asking **`git status`** — the same subsystem, through a different door. So
+the guard and the thing it guards **share an instrument**, and `assume-unchanged` is a single flag that
+blinds both at once. D9's reconciliation uses the same two commands, so unlike case-collapse — where the
+member's text was eventually committed as a system recovery commit — here nothing ever notices. **The
+loss is permanent.**
+
+That is the *audits sharing an instrument* rule (§0's `href=""`, §3's link XSS, §11's differential,
+D4's body-only assertions) applied to a **guard** rather than to an audit. The generalisation worth
+keeping: **you cannot verify a subsystem's bookkeeping using that subsystem.** A content-level check —
+hashing the file and comparing it to `HEAD`'s blob — is immune to `assume-unchanged` because it never
+consults git's index at all. That is the shape a round-two fix would take; it is **not** being started
+here.
+
+**My `design.md` prose is now factually wrong and is retracted rather than quietly edited.** It says the
+mutant survives because the causes it guards "are not yet known". `@reviewer` demonstrated a known one.
+Left in place, annotated by this post, because the correct replacement text depends on which fix is
+chosen — and choosing is not mine right now (see below). **Nothing in the working tree is committed, so
+no false claim has shipped.**
+
+**Blocker B accepted too, and it is the sharper process finding.** The regression test pins
+`core.ignoreCase=true` via `git config`, but the guard is gated on `File.Exists` — which answers from
+the *filesystem*, not from git's config. `@reviewer` built a real case-sensitive APFS volume and showed
+the save correctly succeeds there as a legitimate new page, so **the test's assertion would fail on this
+project's own Linux deployment target.** The fix is right on both filesystem behaviours; only the test
+is not portable. Note what this is: the D4 `GIT_CONFIG_GLOBAL` precedent was followed *in form* — pin the
+hostile setting — and the wrong knob was pinned, because `core.ignoreCase` describes a filesystem rather
+than configuring one. **Pinning a setting is not the same as reproducing the condition the setting
+describes.**
+
+**⛔ Stopping here — this is CLAUDE.md §3c.4.** One remediation block has landed and the section still
+does not converge. The rule is two rounds, then put it to the Product Owner rather than carve a third,
+because a section that will not close in two rounds usually means the breakdown or the spec is wrong
+rather than the code. Blockers 2 and 3 and most of Fix 4 hold; what remains open is one guard whose
+verification strategy is wrong and one test that is not portable.
+
+**State left for the Product Owner:** the remediation is **uncommitted** in the working tree (six source
+files plus `design.md`), gates green at 796/796, no `MUTANT` residue, no leftover scratch volumes. §6 is
+**not closed** and no §7 work has begun.
+
+**[architect]** ❓ @product-owner — how to resolve §6 at the two-round stop. **Answered: take the
+content-hash fix as remediation round two.** The rule is satisfied by direction rather than bypassed;
+round two proceeds with the Product Owner's sanction, and if it does not converge the section comes back
+to them again rather than a third being carved.
+
+**[architect]** Brief — §6 remediation, round two. **No task numbers, ticks nothing.** Builds on the
+uncommitted round-one tree (do **not** revert it — Blockers 2 and 3 and most of Fix 4 were approved and
+must survive). → @worker
+
+**Fix A — replace the safety net's instrument. This is the whole point of the round.**
+
+The net currently asks `git status --porcelain`. `git status` reads the **index**, and the index is
+exactly the bookkeeping being doubted: `git update-index --assume-unchanged` blinds `add`, `status` and
+D9's reconciliation together, so a save reports `Saved` with stale `HEAD` and **nothing ever notices**.
+Re-derived by the Architect:
+
+```
+assume-unchanged + write
+  git add -A                        -> stages nothing
+  git status --porcelain -- <path>  -> ''
+  git status --porcelain (tree)     -> ''
+  HEAD: Original.   disk: MEMBER TEXT
+```
+
+**Replace it with a content-level comparison: when nothing was staged, compare the working-tree file's
+content hash against the blob `HEAD` holds for that path** (`ProbeHeadPathAsync` already returns that
+blob sha — reuse it, do not re-derive it). Equal ⇒ a genuine byte-identical no-op ⇒ `Saved`. Different
+⇒ the write did not reach `HEAD` ⇒ roll back through the existing transactional path and report failure.
+
+*Recommended instrument, but verify it rather than trusting this brief:* **`git hash-object`**. It is a
+pure function of content plus attributes and **does not consult the index**, so `assume-unchanged`
+cannot blind it — while still agreeing with what git would actually store if a `.gitattributes` filter
+is in play. **Execute both of those properties before relying on them:** that `hash-object` really is
+immune to `assume-unchanged`, and how it behaves when a `.gitattributes` filter would transform the
+content.
+
+*The alternative I considered and did not choose — say which you took and why.* Computing the SHA in
+process (`blob <len>\0<bytes>`) is maximally independent, touching no git at all, but it must replicate
+git's blob framing exactly **and** would diverge from the real blob the moment a `.gitattributes` filter
+exists, producing false faults on legitimate content. If you prefer it, justify that trade.
+
+**Cases to get right, each stated because each is a distinct cause of "nothing staged":**
+
+- **A brand-new page (`AbsentAtHead`) that stages nothing is always a fault** — a new file must stage.
+  There is no benign reading.
+- **`.gitignore` is another cause** and it is currently unhandled: ignored content stages nothing *and*
+  is invisible to `status`. The content comparison should catch it — confirm by execution that it does,
+  because it is the same blind-spot family and the fix is only worth having if it is general.
+- The genuine byte-identical no-op must still return `Saved` with no commit, exactly as today.
+
+**Fix B — make the Blocker-1 regression test portable.** It pins `core.ignoreCase=true` via `git config`,
+but the guard is gated on `File.Exists`, which answers from the **filesystem**. `core.ignoreCase`
+*describes* a filesystem; it does not *configure* one. On a real case-sensitive volume the save correctly
+succeeds as a new page, so the assertion would fail on the Linux deployment target.
+
+**The test must determine the host filesystem's actual case sensitivity by probing it, and assert the
+behaviour that is correct for that host** — `Refused` where the filesystem collapses case, `Saved` where
+it does not. Portable, and correct on both. Do not skip on either kind of host: skipping on Linux means
+the deployment target never exercises it.
+
+**Fix 4 stays mine.** `design.md`'s surviving-mutant paragraph is knowingly false and retracted; I will
+rewrite it **after** your mechanism lands, so the prose describes what shipped rather than what was
+planned. Do not touch `design.md` or the specs.
+
+**Evidence standard:**
+
+- **Reproduce red first, per blocker**, and say so. Fix A's reproduction is the `assume-unchanged`
+  sequence above, driven through the **real `SaveAsync`**, not raw git.
+- **Mutation is in scope for the new content check — cap 3.** Round one's net had a mutant survive
+  because nothing reached it; this one must have a test that kills it. If a mutant survives again, that
+  is a finding to report, not to engineer around.
+- `cp` outside the repo with a `trap`, checksum before and after, **never** `git checkout --` (the tree
+  carries uncommitted round-one work — restoring from `HEAD` would destroy it).
+- **Explicit ≥10-minute timeout on every full-suite command.**
+- Every parsed literal executed and pasted back; no comment attributing a decision or measurement to a
+  party that did not produce it.
+
+**Stop and ask** if the content comparison cannot be made correct without changing D17's ordering or the
+CAS, or if a `.gitattributes` filter makes a correct comparison impossible — the second would mean the
+guarantee itself needs re-scoping, which is a Product Owner call.
+
+Gates as always. Do not tick, do not commit. → @reviewer when green.
+
+**[architect]** ⚠️ **Fourth live mutant left in `src/`, and this one was found by the Architect's own
+gate run rather than by a hazard check — which is the part worth recording.**
+
+The worker landed round two's code and tests, then stalled mid-mutation. Its turn ended three times in a
+row, each time reporting it was "holding for the mutant-N test result", and each time a mutation was
+live in `src/`. **My first `dotnet test` measured mutated code and reported `Failed: 2, Passed: 796`** —
+which I nearly read as a regression in the fix. The `grep` for `MUTANT` and `false &&` that I ran *first*
+came back clean, because this mutation was neither: it was
+
+```
+752c752
+< return string.Equals(hashResult.StandardOutput.Trim(), headBlobSha, StringComparison.Ordinal);
+> return true;
+```
+
+**A marker grep is not a mutation check.** Three prior incidents all used a recognisable marker, so the
+habit formed around them; a mutation that is *ordinary-looking valid code* defeats it entirely. What
+found this one was **diffing the working file against the worker's own checksummed baseline** — the only
+check that does not depend on the mutation looking unusual.
+
+**Recovery, in order:** confirmed the worker's baseline existed with its recorded checksum
+(`2c3fd5af…`); diffed baseline against the working file to identify the mutation *before* touching
+anything; restored by `cp` — **never `git checkout --`**, which would have destroyed both remediation
+rounds' uncommitted work; verified the restored checksum matched the baseline exactly; **stopped the
+worker agent**, because it was cycling and would have applied a third mutation; killed a stale
+`dotnet test --no-build` still running against the mutated binary; and **rebuilt** before re-running,
+since `--no-build` meant the compiled DLL still carried the mutation.
+
+**Post-recovery gates, foreground, explicit 10-minute timeout:** `dotnet build` **0/0**; `dotnet test`
+**798/798 unfiltered** in 2m50s; `dotnet format --verify-no-changes` exit 0; `openspec validate
+--strict` valid; source checksum `2c3fd5af…` = baseline.
+
+**Mutation evidence for Fix A — obtained, and obtained rigorously, though by accident.** My pre-recovery
+run *was* a full unfiltered foreground suite over a real build of the mutated source, which is exactly
+the standard this project demands. Neutering the content comparison to `return true` killed **2 of 798**,
+including `Save_ByteIdenticalContent_ReportsSuccessWithNoCommitAndLeavesTheTreeClean`. **The new guard is
+covered** — which is precisely what round one's `status`-based net lacked, where the equivalent mutant
+survived because no test reached it. Mutant 2 was never completed and is **not** being pursued:
+CLAUDE.md caps confirmation runs and says to stop when the mutant at hand is resolved. It is resolved.
+
+**Standing rule, replacing the marker habit:** *verify a post-mutation tree by diffing against a
+checksummed out-of-repo baseline, never by grepping for a marker. A mutation that looks like ordinary
+code — an operator flipped, a condition replaced by a literal — is invisible to every marker search, and
+those are the mutations worth running.* Corollary: **a mutation harness that uses `--no-build` must
+rebuild before any result is trusted**, and an agent that backgrounds its suite must be assumed to end
+its turn with the mutation still applied.
+
+**[architect]** Fix 4 written — `design.md`'s retracted paragraph is replaced. It now records the
+`hash-object` instrument, the executed `assume-unchanged` evidence, why `status` was the wrong
+instrument (*you cannot verify a subsystem's bookkeeping by asking that subsystem* — the change's
+sharing-an-instrument rule appearing in a **guard** rather than an audit, where it costs more because a
+guard actively certifies absence), why an in-process SHA was rejected (it diverges under a
+`.gitattributes` filter), and the two further empty-staging causes the comparison covers
+(`AbsentAtHead`, `.gitignore`). → @reviewer
+
+**[reviewer]** **Approve.** Round two closes §6. Re-verified independently rather than taken on report —
+every claim below was re-derived by execution, not read off the DEVLOG.
+
+**Tree state, re-verified before touching anything else** (per the architect's own instruction not to
+trust a clean tree on their word after four incidents): checksum of `PageSaveService.cs` = `2c3fd5af…`,
+matches the reported baseline. `dotnet build` 0/0. `dotnet format --verify-no-changes` clean. `openspec
+validate --strict` clean. `dotnet test` (full, unfiltered, foreground, no `--no-build`) — **798/798**.
+All six matched the architect's report exactly before I read a line of the diff.
+
+**`hash-object`'s two claimed properties, both re-derived by execution, not read off the design.md prose:**
+- *Immune to `assume-unchanged`:* reproduced independently — `update-index --assume-unchanged`, rewrite
+  the file, `add -A` stages nothing, `status --porcelain` (path and whole-tree) both report clean, but
+  `git hash-object -- docs/page.md` still returns a SHA that disagrees with the `HEAD` blob. Confirmed:
+  it never consults the index, so no index flag can blind it.
+- *Agrees with the real stored blob under a `.gitattributes` filter:* built a real clean filter
+  (`tr a-z A-Z`) on `*.md`, committed a page through it, and compared `git hash-object`'s output (run
+  from the repo root against the repo-relative path, matching how `WorkingTreeFileMatchesHeadBlobAsync`
+  calls it) against `git ls-tree`'s recorded blob sha for that path — **identical**. An in-process SHA
+  over raw bytes would have hashed `"hello world\n"`, not `"HELLO WORLD"`, and would have manufactured a
+  false fault on every filtered save. The design.md rejection of that approach is correct and now
+  execution-backed, not merely argued.
+
+**The three empty-staging causes, each checked by execution or by reading the actual gating logic
+(`PageSaveService.cs:265-291`), not assumed from the test's own comment:**
+- `assume-unchanged` — the new `Save_WhenGitsIndexBlindsStagingViaAssumeUnchanged_…` test exercises this
+  exactly; passes.
+- `AbsentAtHead` staging nothing — read the code directly: line 274 gates the content-comparison branch
+  on `probe.State == HeadPathState.Blob`. A brand-new page has no `HEAD` blob, so it structurally cannot
+  take that branch and falls straight to the `InvalidOperationException` → rollback → `Failed`,
+  unconditionally, regardless of what `WorkingTreeFileMatchesHeadBlobAsync` would say. This is real
+  control flow, not a comment's claim.
+- `.gitignore`d content — reproduced directly: `git add -- docs/ignoredpage.md` against a path an
+  ignore rule matches exits **1** ("paths are ignored"), which `RunOrThrowAsync` turns into a
+  `GitProcessException`, caught by the surrounding `catch (Exception ex)` and routed to the ordinary
+  rollback path. The test's comment describing this mechanism is accurate.
+
+**Fix B's portability, re-derived on a real case-sensitive volume, not inferred from the test passing on
+this host:** created a genuine case-sensitive APFS volume (`hdiutil create -fs "Case-sensitive APFS"`),
+confirmed with `diskutil info` and by creating two distinctly-cased files that coexisted. Pointed
+`TMPDIR` at that volume and ran both new Fix B tests there with `--no-build` (binaries already fresh) —
+both passed, taking the case-sensitive (`Saved`/`New`) branch. Independently confirmed the probe method's
+own logic (`IsWorkingTreeFileSystemCaseInsensitive`) reports the correct answer on that volume by
+reproducing its exact write-then-check-uppercase behaviour at the shell. This host's default temp
+directory is case-insensitive, so between the ordinary run and the volume run both branches were
+genuinely exercised, not merely both textually present. Volume detached and `.dmg` deleted after.
+
+**Round one's approved work — confirmed byte-for-byte undisturbed**, diffed against what I approved
+last round: `PageRouteCodec.ResolveUrlForms`, `WikiPage.razor`'s `ResolveUrlForms`-built `_editHref`, and
+`PageEditor.razor`'s inline-preserve-on-refusal (`_saveMessage = DraftUnavailableMessage; return;`, no
+`draftRefused` query parameter) are identical to round one's diff. Round two touched only
+`PageSaveService.cs`, its test file, and `design.md`.
+
+**Mutation evidence — re-derived myself, and it disagrees with the incident's recorded figure; flagging
+the correction rather than the mutant, which is not in question.** Using `cp`-outside-repo + `trap` +
+checksum-before/after (never `git checkout --`, per the standing instruction — two rounds of uncommitted
+work are still sitting in this tree), I mutated the same line
+(`return string.Equals(hashResult.StandardOutput.Trim(), headBlobSha, StringComparison.Ordinal);` →
+`return true;`) and ran the full unfiltered suite in the foreground twice, independently, checksumming
+the restore each time:
+
+- Run 1: **1 of 798 failed** — `Save_WhenGitsIndexBlindsStagingViaAssumeUnchanged_…`, expected `Failed`,
+  got `Saved`. Restore verified byte-identical to baseline.
+- Run 2: same — **1 of 798**, same test, same failure. Restore verified again.
+
+Both clean, isolated runs agree, and the mechanism is fully understood — which is why I stopped at two
+rather than spending the third: `WorkingTreeFileMatchesHeadBlobAsync`'s only call site
+(`PageSaveService.cs:274-275`) is gated on `probe.State == HeadPathState.Blob`, and for
+`Save_ByteIdenticalContent_ReportsSuccessWithNoCommitAndLeavesTheTreeClean` the real answer is *also*
+`true` (the content genuinely is identical) — so hardcoding `true` cannot change that test's outcome by
+construction, no matter how many times it's run. The incident's recorded **"2 of 798, including
+`Save_ByteIdenticalContent_…`"** cannot be this mutation measured in isolation; it was captured mid
+gate-run over the worker's own stalled, multiply-mutated state (the incident post itself says the worker
+stalled mid-mutation three times), not a clean single-mutant confirmation. **The mutant is confirmed
+killed — that finding stands — but the durable record should read 1/798 (`…AssumeUnchanged…` only), not
+2/798, and should not name `Save_ByteIdenticalContent_…` as one of the deaths.** This is exactly the
+"name the wrong condition in the durable record" hazard this project already treats as blocking when it
+shows up in a filtered-vs-unfiltered figure; here it shows up as a figure captured amid noise rather than
+in isolation. Architect's call whether to correct the incident post or annotate it — I'm not asking for a
+third mutation run over it, the mutant's fate isn't in doubt.
+
+**design.md Fix 4, audited as a worker's submission — every executable claim checked, none taken on
+prose:**
+- The `assume-unchanged` repro block matches what I reproduced independently, including the specific
+  `git status --porcelain (tree)` line — I confirmed `ReconcileWorkingTreeAsync`
+  (`ContentRepositoryService.cs:792-806`) really does `add -A` followed by a whole-tree porcelain-based
+  clean assertion, so the claim that `assume-unchanged` also blinds D9's reconciliation is accurate, not
+  asserted for effect.
+- The in-process-SHA rejection is now backed by my own filter reproduction above, not just argued.
+- The two "further empty-staging causes" (`AbsentAtHead`, `.gitignore`) match the code and tests exactly.
+- No claim in the paragraph is unearned.
+
+**Cleanup confirmed:** `git diff -- src` shows only the expected six-file diff (no mutation residue).
+`git status --short -- src tests` matches exactly. Case-sensitive volume detached and deleted. All
+scratch probes removed. Checksum of `PageSaveService.cs` still `2c3fd5af…` at the time of this post.
+
+**Nits:** none worth blocking on.
+
+**Architectural note (not blocking):** the incident post's mutation figure (§ above) is the one piece of
+this round's evidence I could not reproduce as recorded — worth a one-line correction in that post for
+anyone reading the DEVLOG later as the record of what was actually measured.
+
+§6 is clear from this reviewer for supervisor re-review.
+
+**[architect]** ✏️ **Correcting my own incident post: the mutation figure I recorded was contaminated,
+and the correction is more useful than the number.** I wrote **2/798 killed, including
+`Save_ByteIdenticalContent_ReportsSuccessWithNoCommitAndLeavesTheTreeClean`**. `@reviewer` re-derived it
+twice cleanly and got **1/798**, and showed that named test **cannot die from this mutation by
+construction**. Verified myself rather than accepted:
+
+- The test saves the string `"unchanged content"` over content that is genuinely identical, so
+  `WorkingTreeFileMatchesHeadBlobAsync` returns `true` **legitimately**. Replacing its body with
+  `return true` changes nothing for that test — no possible outcome difference, so no possible kill.
+- It is additionally gated behind `probe.State == HeadPathState.Blob`
+  (`PageSaveService.cs:274`), so a brand-new page never reaches the comparison at all.
+
+**Where my number came from, stated plainly: I measured a state I did not control.** That run happened
+while the worker was mid-cycle across *multiple* mutations, and I attributed the result to the single
+mutation I later found by diff. The run itself was methodologically fine — full suite, unfiltered,
+foreground, real build — which is exactly what made the figure persuasive. **Every property I checked
+was a property of the *run*; none was a property of the *tree the run measured*.**
+
+**The conclusion survives; only the evidence for it was wrong.** The guard *is* covered — one test dies
+when the comparison is neutered, which is the thing round one's `status`-based net lacked entirely.
+Recording it as "2, including this named test" would have left a durable falsehood in the record that
+any later reader could have checked and found untrue.
+
+**Standing rule — the sharpest form of this change's oldest lesson, and the last one §6 produced:**
+*a measurement is only as trustworthy as your control over the state it measured. Before recording a
+figure, establish what the tree was at the moment of the run — by checksum, not by assumption. An
+impeccable method over an unknown state is not evidence; it is a number with a story attached.* This is
+the fifth §6 finding of the form *right conclusion, wrong stated reason*, and the third that was mine.
+
+The incident post above stands as written — the DEVLOG is append-only — and this is its correction.
+
 ## NEXT
 
-**Resume point: §6 (Commit-on-save), block D2 — obligation 8, the git subprocess cancellation kill.**
-§6 is **in progress, not closed**: five blocks have landed and **no supervisor review has run yet**. §5
-closed over `c966651..HEAD` (round two); §4 over `35dde44..HEAD` (round two); §3 over `60957e6..HEAD`
-(round two); §2 over `7b50e46..HEAD` (round four); §11 over `bb3cb2c..HEAD`.
+**Resume point: §6 is at CLAUDE.md §3c.4 — a Product Owner decision, not a next block.** All eight §6
+blocks have landed and all six tasks are ticked, the supervisor requested changes, **one** remediation
+block was built, and its review found two further blockers. The rule is two rounds then stop. **Do not
+carve a third remediation without the Product Owner's direction.**
 
-**§6's base commit is `97029e7`** — the supervisor's review scope when the section closes is
-`git diff 97029e7..HEAD`.
+**Working tree is DIRTY and deliberately so.** The remediation is uncommitted: `PageSaveService.cs`,
+`PageRouteCodec.cs`, `WikiPage.razor`, `PageEditor.razor`, `PageSaveServiceTests.cs`,
+`WikiPageEditorTests.cs`, `design.md`. Gates green at **796/796**, no `MUTANT` residue. **`design.md`
+carries one knowingly-false paragraph** (the surviving mutant's justification) — retracted in the
+`[architect]` post above, not yet rewritten, because the replacement depends on which fix is chosen.
 
-**State: 25/41 tasks ticked.** Branch `change/git-backed-content-core`. Gates at D1's close, run in the
-foreground by the Architect: `dotnet build` **0/0**, `dotnet test` **743/743** full unfiltered in 2m1s
-(unchanged — D1 is docs-only), `dotnet format --verify-no-changes` exit 0, `openspec validate --strict`
-valid, `src/` and `tests/` untouched by the block.
+**The two open blockers:**
+
+1. **The general safety net verifies `git status`, which is the same subsystem whose bookkeeping is the
+   thing being doubted.** `git update-index --assume-unchanged` blinds `add`, `status` *and* D9's
+   reconciliation simultaneously — so a save reports success, `HEAD` stays stale, and **nothing ever
+   notices**. Permanent loss, unlike case-collapse's delayed-and-attributed-to-the-system loss. A
+   content-level check (hash the file, compare to `HEAD`'s blob) never consults the index and is immune;
+   that is the likely shape of a fix, unstarted.
+2. **The Blocker-1 regression test is not portable.** It pins `core.ignoreCase=true` via `git config`,
+   but the guard is gated on `File.Exists`, which answers from the filesystem. On a real case-sensitive
+   volume the save correctly succeeds as a new page, so the assertion would **fail on the Linux
+   deployment target**. The fix is correct on both filesystems; only the test is wrong.
+
+**§6's base commit is `97029e7`** — the supervisor's scope is `git diff 97029e7..HEAD`, and the
+remediation must be committed before that range means anything.
+
+**State: 31/41 tasks ticked** (6.1–6.6 all done). Branch `change/git-backed-content-core`, HEAD
+`751cf95`. §7 has **not** begun.
+
+**Blocks landed in §6:** A `52ea5c6`, B `b3d0d44`, C1 `ae3d963`, C2 `618e8fa`, D1 `245bad2`,
+D2 `9aaf8da`, D3 `9099d72`, D4 `751cf95`.
 
 ### §6 progress — read this before the numbered obligations below
 

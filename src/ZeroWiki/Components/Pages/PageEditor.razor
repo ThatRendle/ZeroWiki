@@ -63,7 +63,8 @@ else
 
     private const string DraftUnavailableMessage =
         "Your save failed, and there was too much other activity right now to hold onto a copy of what " +
-        "you typed. Nothing was written, but your text could not be preserved either — please try again.";
+        "you typed. Nothing was written, but your text is still shown below exactly as you typed it — " +
+        "copy it out before reloading or navigating away.";
 
     /// <summary>The same route value <c>WikiPage.razor</c>'s own <c>Route</c> parameter carries.</summary>
     [Parameter, EditorRequired]
@@ -75,17 +76,6 @@ else
     /// </summary>
     [SupplyParameterFromQuery(Name = "draft")]
     private string? DraftToken { get; set; }
-
-    /// <summary>
-    /// Set on the PRG redirect in place of <see cref="DraftToken"/> when <see cref="EditDraftStore.Save"/>
-    /// refused to stash the failed save's text (D17, §6 block D4 continuation round two) — the store's
-    /// global backstop was reached with nothing expired to reclaim, and the fix for the eviction
-    /// vulnerability that motivated this parameter means that state is never resolved by evicting another
-    /// account's draft. Distinguished from <see cref="DraftToken"/> being merely absent or invalid so the
-    /// two cannot be confused with a same-shaped sentinel value.
-    /// </summary>
-    [SupplyParameterFromQuery(Name = "draftRefused")]
-    private string? DraftRefused { get; set; }
 
     [CascadingParameter]
     private HttpContext? HttpContext { get; set; }
@@ -154,14 +144,6 @@ else
 
             fallbackMessage = DraftExpiredMessage;
         }
-        else if (DraftRefused is not null)
-        {
-            // The save's own draft could not be stashed at all (EditDraftStore.Save returned null —
-            // D17, §6 block D4 continuation round two): there is no token to look up, only the fact
-            // that one was never issued. Distinct wording from DraftExpiredMessage: this text was never
-            // recoverable, not recoverable-and-then-lost.
-            fallbackMessage = DraftUnavailableMessage;
-        }
 
         var loaded = await PageSaveService.LoadForEditAsync(routeValue, context.RequestAborted);
 
@@ -198,7 +180,11 @@ else
         var routeValue = new RouteValue(Route ?? string.Empty);
         var result = await PageSaveService.SaveAsync(routeValue, Input.Content, baseRevision, account, context.RequestAborted);
 
-        var (urlRoute, comparableRoute) = CanonicalRouteForms(routeValue);
+        // PageRouteCodec.ResolveUrlForms is the one implementation this class and WikiPage.razor's edit
+        // link both share (§6 remediation, Blocker 2) — computing both forms from one call is what
+        // guarantees a redirect this method builds and the draft entry it stores always agree on the
+        // same route string, rather than risking two independent re-derivations drifting apart.
+        var (urlRoute, comparableRoute) = PageRouteCodec.ResolveUrlForms(routeValue);
 
         if (result.Outcome == SaveOutcome.Saved)
         {
@@ -230,38 +216,21 @@ else
         var draftToken = DraftStore.Save(
             account.Id, new RouteValue(comparableRoute), Input.Content, Input.BaseRevisionToken, message);
 
-        // EditDraftStore.Save returns null when its global backstop is reached with nothing expired to
-        // reclaim (D17, §6 block D4 continuation round two) — refusing rather than evicting a live
-        // entry belonging to an account other than this one. The redirect still carries the failure
-        // forward (never a silent success), just without a token there is no draft behind.
-        var redirectUrl = draftToken is not null
-            ? $"/wiki/{urlRoute}?edit&draft={Uri.EscapeDataString(draftToken)}"
-            : $"/wiki/{urlRoute}?edit&draftRefused";
-
-        Navigation.NavigateTo(redirectUrl, replace: true);
-    }
-
-    /// <summary>
-    /// The route's canonical form in the two shapes this class needs: still percent/underscore-escaped,
-    /// for embedding literally in a redirect URL's path segment (<c>ForUrl</c>); and unescaped exactly
-    /// once, for comparing against what ASP.NET Core routing will hand back as <see cref="Route"/> after
-    /// that same redirect is followed (<c>ForComparison</c>) — the same single-decode contract
-    /// <see cref="PageRouteCodec.TryDecodeRouteValue"/>'s own remarks establish. Computing both from one
-    /// call, here, is what guarantees a redirect this method builds and the draft entry it stores always
-    /// agree on the same route string, rather than risking two independent re-derivations drifting apart.
-    /// Falls back to the raw, undecodable route value verbatim for the one route
-    /// <see cref="SaveOutcome.Refused"/> can name that never reaches this far in the ordinary UI flow — a
-    /// hand-crafted post naming a route this component's own load path would have refused before ever
-    /// rendering a form to post from.
-    /// </summary>
-    private static (string ForUrl, string ForComparison) CanonicalRouteForms(RouteValue routeValue)
-    {
-        if (PageRouteCodec.TryDecodeRouteValue(routeValue, out var relativePath))
+        if (draftToken is null)
         {
-            var canonical = PageRouteCodec.Encode(relativePath);
-            return (canonical.Value, Uri.UnescapeDataString(canonical.Value));
+            // EditDraftStore.Save returns null when its global backstop is reached with nothing expired
+            // to reclaim (D17, §6 block D4 continuation round two) — refusing rather than evicting a
+            // live entry belonging to an account other than this one. There is nowhere left to stash
+            // this save's text for a follow-up GET to recover it from, and "never discard what the
+            // member typed" stays absolute with no carve-out (§6 remediation, Product Owner decision):
+            // Post/Redirect/Get yields here rather than the other way round. Re-rendering this same POST
+            // response in place, with Input untouched, keeps every character the member typed at the
+            // cost of the browser's resubmit-on-reload prompt — accepted deliberately, and only in this
+            // one, hardest-to-reach case.
+            _saveMessage = DraftUnavailableMessage;
+            return;
         }
 
-        return (routeValue.Value, routeValue.Value);
+        Navigation.NavigateTo($"/wiki/{urlRoute}?edit&draft={Uri.EscapeDataString(draftToken)}", replace: true);
     }
 }

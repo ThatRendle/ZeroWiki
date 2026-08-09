@@ -29,8 +29,10 @@ namespace ZeroWiki.Content;
 /// after acquiring exclusive access, not before.</item>
 /// <item>Compare against the declared base.</item>
 /// <item>Refuse to follow a symlink sitting at the resolved path, then write.</item>
-/// <item>Stage the one path (never <c>-A</c>); nothing staged means success with no commit — byte-
-/// identical content is not an error.</item>
+/// <item>Stage the one path (never <c>-A</c>); when nothing staged, verify byte-identity against
+/// <c>HEAD</c>'s own blob at the content level (<c>git hash-object</c>, §6 remediation round two Fix
+/// A) rather than trusting the empty index diff on its own — byte-identical content is not an error,
+/// but "nothing staged" alone is not proof of it.</item>
 /// <item>Commit, authored via <see cref="AccountGitAuthorFactory"/>.</item>
 /// <item>On any failure past the write — the commit exiting non-zero, or an exception from <c>add</c>/
 /// <c>diff</c>/<c>commit</c> — restore the working tree and invalidate the page index through one shared
@@ -158,6 +160,22 @@ public sealed class PageSaveService
                 return SavePageResult.Refused;
             }
 
+            // 3b. Refuse when the resolved path does not match the on-disk entry exactly, case-
+            // sensitively (§6 remediation Blocker 1) -- checked fresh here, under the lock, for the same
+            // race-safety reason as the ambiguity check just above: a colliding-case file could arrive by
+            // push between this save being prepared and being applied. See
+            // ResolvedPathMatchesOnDiskCaseExactly's own remarks for why this must run before the write,
+            // not merely after it.
+            if (!ResolvedPathMatchesOnDiskCaseExactly(_paths.WorkingTree, absolutePath))
+            {
+                _logger.LogWarning(
+                    "Refusing to save '{RepositoryRelativePath}': the resolved path does not match the " +
+                    "case of the file already on disk at this address (a case-insensitive filesystem " +
+                    "folds them onto the same physical file). Nothing was written.",
+                    repositoryRelativePath);
+                return SavePageResult.Refused;
+            }
+
             // 4. Re-read the base revision under the lock -- this is what makes the compare in step 5 a
             // CAS rather than a check: read-then-write is not atomic across processes, and a base
             // revision read before the lock may already be stale by the time it is acted on.
@@ -193,11 +211,11 @@ public sealed class PageSaveService
             // 6. Write.
             await WriteFileAsync(absolutePath, content, lockHeldCancellation);
 
-            // 7-8. Stage, short-circuit on nothing-staged, commit. Any exception this block throws
-            // (`add` failing, or anything else -- the caller's own CancellationToken cannot fire here,
-            // it stopped applying above) is handled by the single catch below exactly like an ordinary
-            // non-zero commit exit -- one rollback path, not two independently-written ones that can
-            // silently disagree on what "handled" means.
+            // 7-8. Stage, verify, commit. Any exception this block throws (`add` failing, the general
+            // safety net below throwing, or anything else -- the caller's own CancellationToken cannot
+            // fire here, it stopped applying above) is handled by the single catch below exactly like an
+            // ordinary non-zero commit exit -- one rollback path, not two independently-written ones that
+            // can silently disagree on what "handled" means.
             GitProcessResult commitResult;
             try
             {
@@ -209,16 +227,85 @@ public sealed class PageSaveService
                     ["add", "--", repositoryRelativePath],
                     cancellationToken: lockHeldCancellation);
 
-                // Nothing staged -> success, no commit. Byte-identical content is not an error and must
-                // not fall into the rollback path; `git commit` would otherwise fail "nothing to commit"
-                // and report a failure to a member who did nothing wrong.
-                var stagedDiff = await _git.RunAsync(
+                // §6 remediation Blocker 1 -- the general safety net, which must hold for ANY cause of
+                // an empty staging result, not only the case-fold one closed above: "nothing staged"
+                // is proof only that git found no diff to record, a strictly weaker statement than "the
+                // working tree is byte-identical to HEAD for this path". The previous version of this
+                // method treated `git diff --cached --quiet` succeeding as sufficient proof on its own
+                // and reported Saved off it -- unsound, because git's own pathspec matching for `add`
+                // and `diff --cached` does not case-fold a mismatched path the way `status`'s whole-tree
+                // scan does (measured by execution: with core.ignoreCase=true, `git add -- docs/page.md`
+                // against an on-disk "docs/Page.md" stages nothing at all, silently). `git status
+                // --porcelain` scoped to this exact path is the verification instead -- safe to scope
+                // this way because the case-check above has already confirmed repositoryRelativePath's
+                // case matches on-disk exactly (or the path did not exist at all), so the same case-fold
+                // blind spot that made `add`/`diff --cached` unsafe does not apply to this scoped read.
+                var status = await _git.RunOrThrowAsync(
                     _paths.RepositoryRoot,
-                    ["diff", "--cached", "--quiet", "--", repositoryRelativePath],
+                    ["status", "--porcelain", "--", repositoryRelativePath],
                     cancellationToken: lockHeldCancellation);
-                if (stagedDiff.Succeeded)
+                var statusLine = status.StandardOutput.TrimEnd('\n', '\r');
+
+                if (statusLine.Length == 0)
                 {
-                    return SavePageResult.Saved(commitSha: null);
+                    // §6 remediation round two, Fix A -- an empty status line is NOT, on its own, proof
+                    // of byte-identity: `git status`, like `git add` above, answers from the index, and
+                    // `git update-index --assume-unchanged` was found (by execution, reproduced through
+                    // this exact method before this fix existed) to blind `add`, this same `status`
+                    // call, AND D9's startup reconciliation simultaneously -- a write can land on disk,
+                    // stage nothing, report a clean status, and never be noticed again, permanently,
+                    // because nothing in this codebase ever advances HEAD to reveal the divergence. The
+                    // guard and the thing it guards must not share an instrument (this project's oldest
+                    // recurring lesson, one level lower than it has ever appeared): verify at the
+                    // content level instead, via `git hash-object`, which never consults the index and
+                    // so cannot be blinded the same way, while still agreeing with whatever bytes a real
+                    // `git add`/`commit` would store under a `.gitattributes` filter (confirmed by
+                    // execution against a real clean filter before this fix was written).
+                    //
+                    // probe.State == HeadPathState.Blob is the only case in which "byte-identical to
+                    // HEAD" is even a coherent claim: an AbsentAtHead page that staged nothing has no
+                    // HEAD blob to compare against, so it always falls through to the fault below. In
+                    // practice a genuinely new `.gitignore`d page never reaches this branch at all with
+                    // this class's own `git add -- <single path>` (checked by execution): git refuses
+                    // the explicit add outright (exit 1, "paths are ignored"), which the surrounding
+                    // `catch (Exception ex)` already routes to the same rollback. This branch stays as
+                    // the correct answer regardless -- unconditionally a fault -- should any future
+                    // change to how this class stages a path ever reach it with a zero exit code.
+                    if (probe.State == HeadPathState.Blob &&
+                        await WorkingTreeFileMatchesHeadBlobAsync(repositoryRelativePath, probe.BlobSha!, lockHeldCancellation))
+                    {
+                        // Genuinely clean, now verified at the content level rather than merely inferred
+                        // from an empty index diff: the write landed, but its content -- after any
+                        // `.gitattributes` filter -- is byte-identical to what HEAD already has.
+                        // Byte-identical content is not an error and must not fall into the rollback
+                        // path; `git commit` would otherwise fail "nothing to commit" and report a
+                        // failure to a member who did nothing wrong.
+                        return SavePageResult.Saved(commitSha: null);
+                    }
+
+                    throw new InvalidOperationException(
+                        $"'{repositoryRelativePath}' disagrees with HEAD after 'git add' staged nothing " +
+                        "usable for it, and its content does not match HEAD's own blob for this path " +
+                        $"either (git status --porcelain: '{statusLine}'). The write reached the " +
+                        "working tree but cannot be safely reported as either committed or " +
+                        "byte-identical.");
+                }
+
+                // Porcelain v1's "XY PATH" shape: X is the index (staged) status, Y is the worktree
+                // status relative to the index. Only X in {A, M, D, R, C, T} with Y == ' ' means "this
+                // path is staged, in full, with nothing left over in the working tree that the commit
+                // below would not also capture" -- anything else (X == ' ' or '?', or a non-blank Y) is
+                // the shape a write that reached disk but could not be safely staged produces, and must
+                // never be reported as a successful save.
+                var isCleanlyStaged = statusLine.Length >= 2 &&
+                    statusLine[0] is 'A' or 'M' or 'D' or 'R' or 'C' or 'T' &&
+                    statusLine[1] == ' ';
+                if (!isCleanlyStaged)
+                {
+                    throw new InvalidOperationException(
+                        $"'{repositoryRelativePath}' disagrees with HEAD after 'git add' staged nothing " +
+                        $"usable for it (git status --porcelain: '{statusLine}'). The write reached the " +
+                        "working tree but cannot be safely reported as either committed or byte-identical.");
                 }
 
                 var author = _authorFactory.CreateAuthor(account);
@@ -307,6 +394,15 @@ public sealed class PageSaveService
         }
 
         if (IsAmbiguousRoute(canonicalRoute))
+        {
+            return PageLoadForEditResult.Refused;
+        }
+
+        // §6 remediation Blocker 1: this surface must agree with SaveAsync's own refusal, or an editor
+        // opened here offers "Create this page" for a page that already exists under a different case on
+        // a case-insensitive filesystem -- the same disagreement one surface earlier that let the save
+        // path silently clobber it.
+        if (!ResolvedPathMatchesOnDiskCaseExactly(_paths.WorkingTree, absolutePath))
         {
             return PageLoadForEditResult.Refused;
         }
@@ -614,6 +710,48 @@ public sealed class PageSaveService
     /// (<see cref="PageEnumerationService"/>'s walk, <see cref="ContentRepositoryService"/>'s
     /// nested-repository scan) rather than a third, differently-shaped one.
     /// </remarks>
+    /// <summary>
+    /// §6 remediation round two, Fix A: whether the working-tree file at <paramref name="repositoryRelativePath"/>
+    /// is byte-identical, after any <c>.gitattributes</c> clean filter, to <paramref name="headBlobSha"/> —
+    /// the blob <c>HEAD</c> already holds for that path (from <see cref="ProbeHeadPathAsync"/>, never
+    /// re-derived).
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>Why not trust an empty <c>git status --porcelain</c> instead.</b> Round one's safety net did
+    /// exactly that, and both <c>git add</c> and <c>git status</c> answer from the index — the same
+    /// bookkeeping a lost update was already doubted for. Reproduced by execution through this exact
+    /// method's call site before this fix existed: <c>git update-index --assume-unchanged</c> on a
+    /// tracked path makes a subsequent <c>git add -- &lt;path&gt;</c> stage nothing, <c>git status
+    /// --porcelain -- &lt;path&gt;</c> report clean, <em>and</em> D9's own startup reconciliation (the
+    /// same two commands) see nothing wrong either — a stale write that never reached <c>HEAD</c> would
+    /// be reported <see cref="SaveOutcome.Saved"/> and never surfaced again by anything in this
+    /// codebase. A guard must not verify a subsystem's bookkeeping using that same subsystem.
+    /// </para>
+    /// <para>
+    /// <b>Why <c>git hash-object</c>, not an in-process hash.</b> <c>git hash-object -- &lt;path&gt;</c>
+    /// run with this method's <paramref name="repositoryRelativePath"/> is a pure function of the file's
+    /// bytes plus the repository's own <c>.gitattributes</c> rules for that exact path — it never reads
+    /// the index, so <c>assume-unchanged</c> cannot blind it, and it reproduces the sha a real
+    /// <c>git add</c>/<c>commit</c> would actually store (confirmed by execution against a real
+    /// <c>clean</c> filter: hashing the file at its real repository-relative path from the repository
+    /// root reproduces the committed blob's own sha exactly). An in-process <c>blob &lt;len&gt;\0&lt;bytes&gt;</c>
+    /// hash would touch no git at all, but would silently diverge from the real stored blob the moment a
+    /// <c>.gitattributes</c> filter is in play, producing a false fault on legitimate content — the
+    /// wrong trade for a guard that must not itself become a source of false refusals.
+    /// </para>
+    /// </remarks>
+    private async Task<bool> WorkingTreeFileMatchesHeadBlobAsync(
+        string repositoryRelativePath, string headBlobSha, CancellationToken cancellationToken)
+    {
+        var hashResult = await _git.RunOrThrowAsync(
+            _paths.RepositoryRoot,
+            ["hash-object", "--", repositoryRelativePath],
+            cancellationToken: cancellationToken);
+
+        return string.Equals(hashResult.StandardOutput.Trim(), headBlobSha, StringComparison.Ordinal);
+    }
+
     private static bool AnyPathComponentIsASymlink(string workingTree, string absolutePath)
     {
         var current = workingTree;
@@ -637,6 +775,100 @@ public sealed class PageSaveService
         }
 
         return false;
+    }
+
+    /// <summary>
+    /// Whether every path segment from <see cref="ContentPaths.WorkingTree"/> down to
+    /// <paramref name="absolutePath"/> exists on disk under exactly the case this route resolved to (§6
+    /// remediation, Blocker 1).
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>Why this must run before the write, not merely detect the damage after it.</b> D12's
+    /// enumeration model computes a route strictly from each file's own literal on-disk name, so
+    /// <c>Page.md</c> and <c>page.md</c> are different routes by that model; a case-insensitive
+    /// filesystem — the default for a Docker Desktop bind mount on macOS/Windows, and <c>core.ignoreCase</c>
+    /// is on D4's own unverified list — treats them as the <i>same</i> physical file. Left unchecked, a
+    /// save for route <c>page</c> resolves to the literal path <c>docs/page.md</c>, which such a
+    /// filesystem silently folds onto an already-committed <c>docs/Page.md</c>: the write clobbers
+    /// <c>Page.md</c> in place before this class ever asks git anything. Verified independently, by
+    /// execution, in a scratch repository before this method existed: with <c>core.ignoreCase=true</c>,
+    /// <c>git add -- docs/page.md</c> against that on-disk <c>Page.md</c> stages nothing at all — git's
+    /// own pathspec matching for <c>add</c>/<c>diff --cached</c> does not case-fold the way
+    /// <c>status</c>'s whole-tree scan does — and, worse, <c>git checkout -- docs/page.md</c> afterwards
+    /// (the exact command <see cref="RollBackFailedSaveAsync"/> would use to undo it) fails outright with
+    /// "pathspec ... did not match any file(s) known to git", because that literal path was never a real
+    /// tracked name. A purely post-hoc rollback cannot cleanly undo this clobber; refusing before the
+    /// write is what actually closes it, not merely reports it after the fact.
+    /// </para>
+    /// <para>
+    /// <b>Gated on the filesystem's own existence check, not on name comparison alone.</b> On a
+    /// case-sensitive filesystem, <c>Page.md</c> and <c>page.md</c> can legitimately coexist as two
+    /// different, non-colliding pages under D12's model — a name-only case-insensitive comparison would
+    /// wrongly refuse creating one merely because a differently-cased other page already exists.
+    /// <see cref="File.Exists(string)"/>/<see cref="Directory.Exists(string)"/> against the exact-case
+    /// candidate path is what actually distinguishes the two: it returns <see langword="false"/> for a
+    /// differently-cased sibling on a case-sensitive filesystem (nothing to disagree with — proceed), and
+    /// <see langword="true"/> only when the filesystem itself folds the exact-case candidate onto an
+    /// existing entry, which is the condition this method exists to catch. Only then is a directory
+    /// listing consulted, to read back the entry's real, literal on-disk name for the case comparison.
+    /// </para>
+    /// </remarks>
+    /// <returns>
+    /// <see langword="false"/> only when some segment's exact-case candidate path exists (per the
+    /// filesystem's own case-folding behaviour) under a different literal case than
+    /// <paramref name="absolutePath"/> names. <see langword="true"/> when every segment matches exactly,
+    /// or when the filesystem does not consider the exact-case candidate to exist at all — an ordinary
+    /// new page (or a differently-cased, non-colliding sibling on a case-sensitive filesystem) has
+    /// nothing to disagree with.
+    /// </returns>
+    private static bool ResolvedPathMatchesOnDiskCaseExactly(string workingTree, string absolutePath)
+    {
+        var current = workingTree;
+        var relativeToWorkingTree = Path.GetRelativePath(workingTree, absolutePath);
+
+        foreach (var segment in relativeToWorkingTree.Split(Path.DirectorySeparatorChar))
+        {
+            var candidate = Path.Combine(current, segment);
+
+            if (!File.Exists(candidate) && !Directory.Exists(candidate))
+            {
+                // The filesystem itself does not consider this exact-case path to exist -- either
+                // genuinely nothing here yet, or (on a case-sensitive filesystem) a differently-cased
+                // sibling that is simply a different, non-colliding file. Nothing to disagree with, and
+                // nothing deeper to check either.
+                return true;
+            }
+
+            string[] entries;
+            try
+            {
+                entries = Directory.GetFileSystemEntries(current);
+            }
+            catch (Exception ex) when (ex is DirectoryNotFoundException or UnauthorizedAccessException)
+            {
+                // Nothing readable here -- treated the same as "nothing here yet" rather than a case
+                // mismatch. A genuine fault (an unreadable ancestor directory, a vanished one) is not
+                // this method's concern to report; the ordinary filesystem calls later in SaveAsync
+                // (the write itself) or LoadForEditAsync's own read are what surface a real fault.
+                return true;
+            }
+
+            // The filesystem's own existence check above says this exact-case path exists -- read back
+            // the real, literal on-disk name to see whether that is because it genuinely matches, or
+            // because the filesystem folded it onto a differently-cased entry.
+            var actualName = Array.Find(
+                entries, entry => string.Equals(Path.GetFileName(entry), segment, StringComparison.OrdinalIgnoreCase));
+
+            if (actualName is not null && !string.Equals(Path.GetFileName(actualName), segment, StringComparison.Ordinal))
+            {
+                return false;
+            }
+
+            current = candidate;
+        }
+
+        return true;
     }
 
     private enum HeadPathState { Absent, Blob, Refuse }
