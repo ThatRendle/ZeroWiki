@@ -362,8 +362,9 @@ public sealed class PageSaveService
         _enumerationService.EnumeratePages().AmbiguousRoutes.Any(candidate => candidate.Route == canonicalRoute);
 
     /// <summary>
-    /// Writes <paramref name="content"/> via a temp-file-then-atomic-rename (<see cref="File.Move(string, string, bool)"/>
-    /// performs a same-volume POSIX <c>rename(2)</c>), so a fault partway through writing never leaves
+    /// Writes <paramref name="content"/> — after <see cref="NormalizeLineEndings"/> — via a
+    /// temp-file-then-atomic-rename (<see cref="File.Move(string, string, bool)"/> performs a
+    /// same-volume POSIX <c>rename(2)</c>), so a fault partway through writing never leaves
     /// <paramref name="absolutePath"/> holding neither its old content nor its new content — a plain
     /// truncate-and-overwrite would risk exactly that if it failed mid-write. The temp file's name never
     /// ends in <c>.md</c>, so a concurrent read (enumeration, or a page render — neither is gated by the
@@ -373,10 +374,12 @@ public sealed class PageSaveService
     {
         Directory.CreateDirectory(Path.GetDirectoryName(absolutePath)!);
 
+        var normalizedContent = NormalizeLineEndings(content);
+
         var tempPath = $"{absolutePath}.zerowiki-tmp-{Guid.NewGuid():N}";
         try
         {
-            await File.WriteAllTextAsync(tempPath, content, cancellationToken);
+            await File.WriteAllTextAsync(tempPath, normalizedContent, cancellationToken);
             File.Move(tempPath, absolutePath, overwrite: true);
         }
         catch
@@ -389,6 +392,28 @@ public sealed class PageSaveService
             throw;
         }
     }
+
+    /// <summary>
+    /// Normalizes every line ending in <paramref name="content"/> to a bare LF before it is ever
+    /// written to disk (D17, §6 block D4 continuation round three). An HTML <c>&lt;textarea&gt;</c>'s
+    /// submitted value always uses CRLF, regardless of what the member actually typed or which OS their
+    /// browser runs on — this save path is therefore the one and only writer of browser-originated
+    /// content, and it is the only place left that can guarantee LF-only storage now that
+    /// <c>core.autocrlf</c> is pinned to <c>false</c> on the content repository
+    /// (<see cref="ContentRepositoryService"/>'s own remarks): git itself no longer performs — or even
+    /// inspects for — any line-ending conversion once that pin is in effect.
+    /// </summary>
+    /// <remarks>
+    /// A lone <c>\r</c> (old Mac-style) is normalized too, not only <c>\r\n</c> — the goal is "every
+    /// line ending this repository ever stores is LF", not merely "reproduce whatever
+    /// <c>core.autocrlf=input</c> used to do". That setting never touched a lone <c>\r</c> either, and
+    /// leaving one on disk would be exactly the kind of mixed-line-ending content a source-of-truth
+    /// repository should not tolerate — invisible to git under <c>autocrlf=false</c> (which stops
+    /// inspecting line endings at all) and just as unwelcome to an Obsidian vault, which expects LF.
+    /// <c>\r\n</c> is replaced first so a two-byte CRLF sequence collapses to one LF rather than two.
+    /// </remarks>
+    private static string NormalizeLineEndings(string content) =>
+        content.Replace("\r\n", "\n", StringComparison.Ordinal).Replace('\r', '\n');
 
     /// <summary>
     /// The single path every failure past the write funnels through — an exception from <c>add</c>/

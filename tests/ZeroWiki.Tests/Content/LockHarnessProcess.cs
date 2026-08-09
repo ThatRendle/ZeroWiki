@@ -61,7 +61,9 @@ internal sealed class LockHarnessProcess : IAsyncDisposable
         _process.Dispose();
     }
 
-    private static string ResolveHarnessAssemblyPath()
+    /// <summary>Internal so <see cref="ReconcileHarnessProcess"/> can reuse this path resolution
+    /// rather than duplicating it for a second harness mode.</summary>
+    internal static string ResolveHarnessAssemblyPath()
     {
         // AppContext.BaseDirectory: .../tests/ZeroWiki.Tests/bin/<Config>/<TFM>/ — reuse the actual
         // Config/TFM folder names found on disk rather than guessing Debug vs Release.

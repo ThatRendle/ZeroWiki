@@ -55,6 +55,50 @@ public sealed class PageSaveServiceTests : IDisposable
     }
 
     [Fact]
+    public async Task Save_ContentWithCrlfLineEndings_IsWrittenAsLfOnDisk()
+    {
+        // D17, §6 block D4 continuation round three: an HTML <textarea> submits CRLF regardless of
+        // what the member typed, and this is the one place left that can guarantee LF-only storage now
+        // that core.autocrlf is pinned to false on the content repository (ContentRepositoryService).
+        await InitializeRepositoryAsync();
+        var service = CreateService(out _);
+
+        var result = await service.SaveAsync(
+            new RouteValue("crlf-page"),
+            "line one\r\nline two\r\nline three",
+            PageBaseRevision.AbsentAtHead,
+            Author(),
+            CancellationToken.None);
+
+        Assert.Equal(SaveOutcome.Saved, result.Outcome);
+        var written = await File.ReadAllTextAsync(Path.Combine(WorkingTree, "crlf-page.md"));
+        Assert.Equal("line one\nline two\nline three", written);
+        Assert.DoesNotContain('\r', written);
+    }
+
+    [Fact]
+    public async Task Save_ContentWithALoneCarriageReturn_IsAlsoNormalizedToLf()
+    {
+        // A lone \r (old Mac-style) is normalized too, not only \r\n -- the goal is "every line ending
+        // this repository ever stores is LF", not merely "reproduce what core.autocrlf=input used to
+        // do" (which never touched a lone \r either). See PageSaveService.NormalizeLineEndings's own
+        // remarks for the full reasoning.
+        await InitializeRepositoryAsync();
+        var service = CreateService(out _);
+
+        var result = await service.SaveAsync(
+            new RouteValue("cr-page"),
+            "old mac style\rline two",
+            PageBaseRevision.AbsentAtHead,
+            Author(),
+            CancellationToken.None);
+
+        Assert.Equal(SaveOutcome.Saved, result.Outcome);
+        var written = await File.ReadAllTextAsync(Path.Combine(WorkingTree, "cr-page.md"));
+        Assert.Equal("old mac style\nline two", written);
+    }
+
+    [Fact]
     public async Task Save_ExistingPageOnCurrentBase_UpdatesTheFileAndCommits()
     {
         await InitializeRepositoryAsync();

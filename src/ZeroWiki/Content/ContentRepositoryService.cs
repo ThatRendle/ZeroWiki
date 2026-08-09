@@ -198,6 +198,13 @@ public sealed class ContentRepositoryService
         // reporting that damage after it already happened.
         await AssertGitResolvesRepositoryRootAsync(repositoryRoot, cancellationToken);
 
+        // D17, §6 block D4 continuation round three: must run before any `add` below, on every call to
+        // this method — not deferred to ConfigureRepositoryAsync, which runs only once this whole
+        // method returns and would therefore leave every startup's own ReconcileWorkingTreeAsync (which
+        // runs unconditionally, not only on first init) still exposed to the exact warning this exists
+        // to prevent. See ApplyContentSafetyConfigurationAsync's own remarks for why.
+        await ApplyContentSafetyConfigurationAsync(repositoryRoot, cancellationToken);
+
         // The docs/ probe below needs only the already-computed repositoryHasNoCommitsYet value, and
         // the gitlink probe (inside ReconcileWorkingTreeAsync) is intrinsically a staging-and-diff
         // operation — both can and must run before this repository is ever configured or has hooks
@@ -279,17 +286,33 @@ public sealed class ContentRepositoryService
             "empty) and restart the application.");
 
     /// <summary>
-    /// D17: reconciliation's <c>git add -A</c> reported, on stderr, that it could not read part of the
-    /// working tree at <paramref name="repositoryRoot"/> — even though the process exited
-    /// successfully. Refusing here (rather than committing whatever was staged and reporting success)
-    /// is what keeps D9's "never discard" holding for the subtree git could not see at all.
+    /// D17: reconciliation's <c>git add -A</c> printed something on stderr this app does not recognise
+    /// as safe to ignore, even though the process exited successfully. Refusing here (rather than
+    /// committing whatever was staged and reporting success) is what keeps D9's "never discard" holding
+    /// for whatever that stderr describes.
     /// </summary>
-    private static InvalidOperationException UnreadableWorkingTreeException(string repositoryRoot, string standardError) =>
+    /// <remarks>
+    /// The message deliberately does not guess <em>what</em> went wrong beyond what git itself said
+    /// (D17, §6 block D4 continuation round three, a Product Owner-reported production defect). An
+    /// earlier version of this exception assumed every such stderr meant an unreadable directory and
+    /// told the operator to fix permissions — correct for that one cause, but this app has since learned
+    /// of another (a benign CRLF line-ending warning under an inherited <c>core.autocrlf</c> setting,
+    /// now removed at the source by <see cref="ApplyContentSafetyConfigurationAsync"/>) that stderr
+    /// alone cannot be told apart from at this call site without pattern-matching git's own,
+    /// locale-dependent message text. A refusal that misdiagnoses its cause and prescribes the wrong fix
+    /// is worse than one that honestly says "something unexpected happened, here is exactly what git
+    /// reported" and lets the operator judge it themselves — the verbatim <paramref name="standardError"/>
+    /// is what makes that judgement possible.
+    /// </remarks>
+    private static InvalidOperationException UnexpectedReconciliationStderrException(string repositoryRoot, string standardError) =>
         new(
-            $"Startup reconciliation of the content repository at '{repositoryRoot}' could not read " +
-            $"part of the working tree: {standardError.Trim()} Content behind an unreadable directory " +
-            "would be silently unstaged and left out of the recovery commit while every later check " +
-            "still reports a clean tree. Refusing to start; fix the reported permissions and restart.");
+            $"Startup reconciliation of the content repository at '{repositoryRoot}' saw 'git add -A' " +
+            "report something on stderr that this app does not recognise as safe to ignore, even though " +
+            "the command itself exited successfully. Refusing to start rather than assume it is " +
+            "harmless: content behind whatever it describes could be silently left out of the recovery " +
+            $"commit while every later check still reports a clean tree.\n\nWhat git reported:\n{standardError.Trim()}\n\n" +
+            "This is not necessarily a permissions problem — read the message above for what git " +
+            "actually said, resolve it, and restart the application.");
 
     /// <summary>
     /// Whether <paramref name="repositoryRoot"/> has a <c>.git</c> entry of its own — a directory for
@@ -528,6 +551,53 @@ public sealed class ContentRepositoryService
     }
 
     /// <summary>
+    /// Pins <c>core.autocrlf=false</c> on the content repository (D17, §6 block D4 continuation round
+    /// three) — a Product Owner decision forced by an availability defect found in production, every
+    /// link of it executed rather than reasoned about: an HTML <c>&lt;textarea&gt;</c> submits CRLF
+    /// regardless of what the member typed; <c>git add -A</c> then warns on stderr about the conversion
+    /// it would perform "the next time git touches" that file, whenever the <em>host's</em> inherited
+    /// git configuration sets <c>core.autocrlf=input</c> (or <c>true</c>) and git's own index stat cache
+    /// happens to be cold for that path — which a fresh clone, a container restart, or a remounted
+    /// volume all produce; and <see cref="ReconcileWorkingTreeAsync"/>'s own guard refuses to start on
+    /// <em>any</em> such stderr (Product Owner decision, reaffirmed rather than weakened when this exact
+    /// defect surfaced: no silent content loss, ever). An inherited setting this app never chose, and
+    /// cannot see from its own configuration, could therefore brick startup on perfectly ordinary
+    /// content — "point it at a folder and it Just Works" cannot depend on the operator's own
+    /// <c>~/.gitconfig</c>.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// This removes the class rather than teaching the guard to forgive one instance of it: with no
+    /// conversion attempted, <c>add -A</c> produces no stderr for a CRLF-bearing file at all — verified
+    /// by execution in a scratch repository (inherited <c>autocrlf=input</c>: warns; the same file with
+    /// <c>autocrlf=false</c> set on the repository: no stderr whatsoever, because there is nothing left
+    /// to warn about). Bytes are then stored exactly as <see cref="PageSaveService.NormalizeLineEndings"/>
+    /// already writes them (LF-only) — the honest posture for a repository this app calls the source of
+    /// truth: git should not silently rewrite a member's bytes on top of what the save path already
+    /// normalized, and a push arriving with CRLF from an editor that does not normalize is stored
+    /// exactly as sent rather than mutated on the way in.
+    /// </para>
+    /// <para>
+    /// Deliberately <em>not</em> folded into <see cref="ApplyRepositoryConfigurationAsync"/> alongside
+    /// <c>receive.denyCurrentBranch</c>/<c>http.receivepack</c>, even though that is the more obviously
+    /// parallel location for "repository configuration this app pins": that method runs from
+    /// <see cref="ConfigureRepositoryAsync"/>, which <see cref="EnsureRepositoryAsync"/> calls only
+    /// <em>after</em> <see cref="AcceptRepositoryAsync"/> has already returned. Setting this pin there
+    /// would leave every startup's own <see cref="ReconcileWorkingTreeAsync"/> call — which runs
+    /// unconditionally inside <see cref="AcceptRepositoryAsync"/>, on every single start, not only the
+    /// first — still exposed to the exact warning this pin exists to prevent, since the pin would not
+    /// yet be in effect when that call runs. This method is called from <see cref="AcceptRepositoryAsync"/>
+    /// itself instead, immediately after <see cref="AssertGitResolvesRepositoryRootAsync"/> confirms
+    /// <c>.git</c> is resolvable and before any <c>add</c> in this class runs.
+    /// </para>
+    /// </remarks>
+    private async Task ApplyContentSafetyConfigurationAsync(string repositoryRoot, CancellationToken cancellationToken) =>
+        await _git.RunOrThrowAsync(
+            repositoryRoot,
+            ["config", "core.autocrlf", "false"],
+            cancellationToken: cancellationToken);
+
+    /// <summary>
     /// Whether <paramref name="repositoryRoot"/>'s <c>HEAD</c> is unborn: <c>.git</c> exists, but no
     /// commit has ever been made in this repository — for example a process that died between
     /// <c>git init</c> and the initial commit that should have followed it. Only ever called once
@@ -702,17 +772,23 @@ public sealed class ContentRepositoryService
         // `add -u`) would leave that content uncommitted — the tree still dirty, and every push
         // bouncing — while every existing check up to this point still looks like it succeeded.
         //
-        // D17: `add -A` exits 0 even when it could not read a directory — it warns on stderr and
-        // stages whatever it *could* read, so an unreadable subtree is silently unstaged while every
-        // later check (this method's own diff below, and AssertWorkingTreeIsCleanAsync) still reports
-        // success. `RunOrThrowAsync` only inspects the exit code, so it cannot catch this; called via
-        // `RunAsync` here instead, with stderr inspected explicitly below, deliberately local to this
-        // call site rather than a change to `RunOrThrowAsync` itself — tightening stderr handling
-        // globally would silently re-gate every other caller (PageHistoryService's `git log`, the
-        // index builder's probes) with faults this design never intended to catch there. Reproduced on
-        // git 2.55.0 (macOS, dev) and 2.43.0 (Ubuntu 24.04, the shipped image): both exit 0 with
-        // `warning: could not open directory '<path>/': Permission denied` on stderr for an unreadable
-        // directory, and both produce empty stderr for `add -A` on a healthy tree.
+        // D17: `add -A` exits 0 even when it has something to warn about — an unreadable directory is
+        // one cause (it stages whatever it *could* read and warns about the rest, so an unreadable
+        // subtree would be silently unstaged while every later check, this method's own diff below and
+        // AssertWorkingTreeIsCleanAsync, still reports success), and a CRLF line-ending conversion under
+        // an inherited core.autocrlf setting is another, found in production (§6 block D4 continuation
+        // round three) — this app cannot enumerate every message git might ever put on this stderr, so
+        // the posture is "any stderr refuses", not "known-bad stderr refuses" (Product Owner decision:
+        // no silent content loss, ever). `RunOrThrowAsync` only inspects the exit code, so it cannot
+        // catch this; called via `RunAsync` here instead, with stderr inspected explicitly below,
+        // deliberately local to this call site rather than a change to `RunOrThrowAsync` itself —
+        // tightening stderr handling globally would silently re-gate every other caller
+        // (PageHistoryService's `git log`, the index builder's probes) with faults this design never
+        // intended to catch there. Reproduced on git 2.55.0 (macOS, dev) and 2.43.0 (Ubuntu 24.04, the
+        // shipped image): both exit 0 with `warning: could not open directory '<path>/': Permission
+        // denied` on stderr for an unreadable directory, and both produce empty stderr for `add -A` on a
+        // healthy tree — `ApplyContentSafetyConfigurationAsync`'s own remarks cover the CRLF case, which
+        // this app now removes at the source rather than trying to also recognise here.
         var addArguments = new[] { "add", "-A" };
         var addResult = await _git.RunAsync(repositoryRoot, addArguments, cancellationToken: cancellationToken);
         if (!addResult.Succeeded)
@@ -756,7 +832,7 @@ public sealed class ContentRepositoryService
 
         if (!string.IsNullOrWhiteSpace(addResult.StandardError))
         {
-            throw UnreadableWorkingTreeException(repositoryRoot, addResult.StandardError);
+            throw UnexpectedReconciliationStderrException(repositoryRoot, addResult.StandardError);
         }
 
         var stagedDiff = await _git.RunAsync(

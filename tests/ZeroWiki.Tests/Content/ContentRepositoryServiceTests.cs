@@ -843,6 +843,14 @@ public sealed class ContentRepositoryServiceTests : IDisposable
             Assert.Contains("could not open directory", exception.Message, StringComparison.Ordinal);
             Assert.Contains("locked", exception.Message, StringComparison.Ordinal);
 
+            // D17, §6 block D4 continuation round three: the refusal must still fire and still name
+            // what git said for a genuine unreadable directory — this is the case the message existed
+            // for in the first place — but must no longer claim, unconditionally, that every such
+            // stderr means a permissions problem (an earlier version of this exception did, and was
+            // wrong for the CRLF-warning case this round fixed at the source instead).
+            Assert.DoesNotContain("fix the reported permissions", exception.Message, StringComparison.Ordinal);
+            Assert.Contains("not necessarily a permissions problem", exception.Message, StringComparison.Ordinal);
+
             // The whole point of this fixture: no recovery commit was made over the readable subset.
             // `git status --porcelain` itself reports clean here (nothing readable changed, and it
             // does not surface the unreadable directory on stdout either) — exactly the "every later
@@ -857,6 +865,50 @@ public sealed class ContentRepositoryServiceTests : IDisposable
                 lockedDirectory,
                 UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
         }
+    }
+
+    [Fact]
+    public async Task RestartingOverACommittedCrlfFileUnderInheritedAutocrlfInput_StartsSuccessfully()
+    {
+        // The Product Owner's own reported production defect, every link reproduced rather than
+        // reasoned about (D17, §6 block D4 continuation round three): an HTML <textarea> submits CRLF
+        // regardless of what the member typed; `git add -A` then warns on stderr about the conversion
+        // it would perform "the next time git touches" that file whenever the *host's* inherited git
+        // configuration sets core.autocrlf=input (or true) and git's own index stat cache happens to be
+        // cold for that path — which a fresh clone, a container restart, or a remounted volume all
+        // produce; and ReconcileWorkingTreeAsync's own guard refuses to start on any such stderr. This
+        // is the regression test for exactly that chain, run via a genuine second OS process
+        // (ReconcileHarnessProcess) so the hostile GIT_CONFIG_GLOBAL this test pins never touches this
+        // test host's own process-wide environment (see ReconcileHarnessProcess's own remarks for why
+        // that matters under xUnit's default parallelism).
+        var service = CreateService();
+        await service.EnsureRepositoryAsync();
+
+        var repositoryRoot = RepositoryRoot;
+        var crlfFilePath = Path.Combine(repositoryRoot, "docs", "scratch.md");
+        await File.WriteAllTextAsync(crlfFilePath, "editing it \r\n\r\n user A edit");
+        await _git.RunOrThrowAsync(repositoryRoot, ["add", "docs/scratch.md"]);
+        await _git.RunOrThrowAsync(
+            repositoryRoot,
+            ["commit", "-m", "add a CRLF-bearing file"],
+            new Dictionary<string, string>
+            {
+                ["GIT_AUTHOR_NAME"] = "Test",
+                ["GIT_AUTHOR_EMAIL"] = "test@zerowiki.example",
+                ["GIT_COMMITTER_NAME"] = "Test",
+                ["GIT_COMMITTER_EMAIL"] = "test@zerowiki.example",
+            });
+
+        var hostileGlobalConfigPath = Path.Combine(_dataRoot, "hostile-gitconfig-for-test");
+        await File.WriteAllTextAsync(hostileGlobalConfigPath, "[core]\n\tautocrlf = input\n");
+
+        // Simulates the container restart / cold-stat-cache condition without depending on actually
+        // getting git's stat cache cold: a fresh, second EnsureRepositoryAsync call is what the harness
+        // process performs, in its own process, over the same data root.
+        var (succeeded, output) = await ReconcileHarnessProcess.RunAsync(_dataRoot, hostileGlobalConfigPath);
+
+        Assert.True(succeeded, $"Restart under inherited core.autocrlf=input should succeed; harness reported: {output}");
+        Assert.Equal("RECONCILED", output);
     }
 
     private static bool CanEnumerate(string directory)
@@ -1253,6 +1305,13 @@ public sealed class ContentRepositoryServiceTests : IDisposable
         Assert.Equal(
             "true",
             (await _git.RunOrThrowAsync(repositoryRoot, ["config", "http.receivepack"])).StandardOutput.Trim());
+
+        // D17, §6 block D4 continuation round three: pinned alongside the two settings above so a
+        // CRLF-bearing file can no longer make `add -A` warn regardless of what the host's own
+        // ~/.gitconfig sets.
+        Assert.Equal(
+            "false",
+            (await _git.RunOrThrowAsync(repositoryRoot, ["config", "core.autocrlf"])).StandardOutput.Trim());
     }
 
     private async Task AssertPorcelainIsEmptyAsync(string repositoryRoot)

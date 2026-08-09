@@ -519,8 +519,10 @@ looks.
 *The consequence, named rather than discovered:* view and edit share one component and one route, so
 the component branches on the flag, and the flag's **presence** is what selects the mode. A valueless
 `?edit` is a real binding hazard — the bound value is empty, not "true" — so the exact parameter form
-and its binding is something block D3 must **run**, not assume; this change's standing rule about
-tracing a premise applies to the correction as much as to what it corrected.
+and its binding is something the surface block must **run**, not assume; this change's standing rule
+about tracing a premise applies to the correction as much as to what it corrected. (That block was D3
+when this paragraph was written and is **D4** after §6's D3/D4 re-carve — the obligation followed the
+surface, not the number.)
 
 **The edit surface creates as well as edits (Product Owner decision, §6 block D1).** A route that
 resolves to no existing page opens an empty form declaring `PageBaseRevision.AbsentAtHead`, and saving

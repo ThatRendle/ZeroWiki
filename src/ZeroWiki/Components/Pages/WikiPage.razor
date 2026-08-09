@@ -13,7 +13,15 @@
 
 <PageTitle>@PageDisplayTitle</PageTitle>
 
-@if (_renderedBody is { } body)
+@* Editing is a mode of this page, not a second address for it (D17, §6 block D4): the `edit` query
+   flag selects PageEditor in place of everything below, rather than a sibling `@page` route (a
+   catch-all may only occupy the last route segment, and a sibling `/edit` route would collide with
+   content whose own path happens to start with "edit/" — see D17). *@
+@if (Edit is not null)
+{
+    <PageEditor Route="@Route" />
+}
+else if (_renderedBody is { } body)
 {
     <h1>@PageDisplayTitle</h1>
 
@@ -33,6 +41,11 @@
                 <li>@tag</li>
             }
         </ul>
+    }
+
+    @if (_editHref is { } editHref)
+    {
+        <p><a href="@editHref">Edit this page</a></p>
     }
 
     <div class="page-body">
@@ -58,11 +71,28 @@ else
 {
     <h1>Page not found</h1>
     <p>There is no page at this address.</p>
+
+    @if (_editHref is { } editHref)
+    {
+        <p><a href="@editHref">Create this page</a></p>
+    }
 }
 
 @code {
     [Parameter]
     public string? Route { get; set; }
+
+    /// <summary>
+    /// The `edit` mode flag (D17, §6 block D4) — presence, not value, selects edit mode. A valueless
+    /// `?edit` binds this <see cref="string"/> parameter to the empty string, not <see langword="null"/>
+    /// — verified by execution, not assumed. A nullable <see cref="bool"/> parameter was tried too and
+    /// is <b>not</b> the 400 an earlier draft of this block's brief claimed: it silently binds to
+    /// <see langword="null"/> for both a valueless flag and an explicit empty value, indistinguishable
+    /// from the flag being entirely absent, and only faults (500, not 400) on a non-empty value it
+    /// cannot parse. See the DEVLOG post for this block for the exact responses observed.
+    /// </summary>
+    [SupplyParameterFromQuery(Name = "edit")]
+    private string? Edit { get; set; }
 
     [CascadingParameter]
     private HttpContext? HttpContext { get; set; }
@@ -70,6 +100,7 @@ else
     private PageIndexEntry? _page;
     private AmbiguousPageRoute? _ambiguousRoute;
     private MarkupString? _renderedBody;
+    private string? _editHref;
 
     private string PageDisplayTitle =>
         _page?.Title is { Length: > 0 } title ? title : _page?.RelativePath ?? "ZeroWiki";
@@ -122,6 +153,13 @@ else
     /// </remarks>
     protected override async Task OnInitializedAsync()
     {
+        if (Edit is not null)
+        {
+            // Edit mode delegates entirely to PageEditor (D17, §6 block D4) — none of the read path
+            // below (the index lookup, the rendered body) applies to this request at all.
+            return;
+        }
+
         var context = HttpContext
             ?? throw new InvalidOperationException("Rendering a wiki page requires the static server-rendered HttpContext.");
 
@@ -148,6 +186,11 @@ else
         {
             return;
         }
+
+        // The edit affordance for this address (D17, §6 block D4) — set once the request's own route
+        // value is confirmed canonical, so a link this page renders is never built off a request form
+        // an editor load would itself go on to refuse.
+        _editHref = context.Request.Path.Value + "?edit";
 
         // D15/4.3: refreshes the snapshot first when its stamp no longer matches the repository's
         // current HEAD — the mechanism that keeps this correct for a writer that never notifies the app

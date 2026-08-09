@@ -15477,6 +15477,1388 @@ Post-mutation hazard sweep: `PageSaveService.cs` checksum still `63100451…0ff`
 the restore), `grep -rn 'MUTANT\|false &&' src/ tests/` empty, `git status --short` the same four files,
 both `.csproj` byte-identical to `HEAD`.
 
+**[architect]** Block D3 committed as `9099d72`. **Ticks nothing.** §6's D12 gap is closed in the save
+path itself.
+
+**[architect]** **A stale cross-reference my own re-carve created, fixed before it could mislead D4.**
+`design.md:522` told "block D3" to *run* the valueless-`?edit` binding rather than assume it. That was
+true when D1 wrote it and became false when I split D3 into D3 (service) and D4 (surface) — the
+obligation belongs to whoever builds the surface, which is now D4. Corrected, with the renumbering
+stated in the text rather than silently rewritten, since the point of the original clause is that the
+obligation is real and it must not look like it was discharged by a block that never touched a query
+string.
+
+**This is `## NEXT` obligation 1's decay in miniature, and I produced it.** An instruction addressed to
+a block *number* rots the moment the numbers move; one addressed to a *surface* does not. The general
+form, worth carrying into §7: **name the obligation's owner by what it owns, not by its label.**
+
+**[architect]** Brief — block D4: **the browser surface**. → @worker
+
+**Tasks 6.1 and 6.4** — the first ticks since C2, and the last of §6. Base commit for reference:
+`9099d72`.
+
+**Read first:** D17 in `design.md` — especially the four paragraphs on the address, creation, the
+ambiguity decision and the five outcomes — and `specs/content-editing/spec.md` in full, particularly
+the **Browser editing surface** requirement and its five scenarios plus *A save refuses an address that
+does not identify exactly one file*. Those scenarios are what this block is graded against. D3 built
+your whole service surface; you should not need to touch `PageSaveService`.
+
+**The surface (Product Owner decisions, all settled — implement, do not re-open):**
+
+- **Address: `/wiki/{*Route}` with an `edit` flag on the query string.** Editing is a *mode of the page*,
+  not a second address. `/wiki/{*Route}/edit` is **not a routable template** (a catch-all may only be
+  the last segment — verified by execution in D1), and a sibling route would claim route space that
+  content can collide with. **There is no new `@page` directive**; `WikiPage.razor` branches on the flag.
+- **⚠️ The flag's binding is the one thing D17 explicitly refuses to assert and requires you to RUN.**
+  A valueless `?edit` binds as an *empty string*, not `true`, and a naive `bool?`
+  `[SupplyParameterFromQuery]` parameter is reported to 400 the request. **Determine the exact parameter
+  form by executing it against the real app, and paste the observed result into your DEVLOG post.** Do
+  not reason about it. D1 shipped four false literals in prose precisely by not doing this.
+- **The form posts back to the address it was served from**, query string included — verify the query
+  survives the post rather than assuming Blazor preserves it.
+- **Explicit save *is* the save-point**, which is what discharges **6.4** *structurally*: with a form
+  post no keystroke reaches the server, so there is nothing to debounce and no path that could produce
+  more than one commit per save. State that in the DEVLOG as the reason 6.4 is satisfied — it is a
+  structural argument, not a mechanism you build.
+- **The surface creates as well as edits.** `PageLoadForEditOutcome.New` opens an empty editor declaring
+  `AbsentAtHead`; saving it creates the page.
+- **`Refused` never opens an editor.** "No page here yet" and "this address does not identify one file"
+  are different answers — the spec has a scenario for exactly this and D1's reviewer called it the
+  highest-risk wording in the delta.
+
+**All five failure outcomes must stay distinguishable to the member, and none may discard what they
+typed.** `SaveOutcome` gives you `Conflict`, `RepositoryBusy`, `Refused`, `Failed`, `RollbackFailed`.
+The DEVLOG counted "four" for several blocks by dropping `Refused`; there are five. They call for
+different actions — reload, retry shortly, fix the address, retry, and tell an operator. On a
+**stale-base conflict** the form re-renders carrying **exactly the text that was submitted**, saying the
+page changed underneath the save and nothing was written. No merge, no automatic reload — a minimal form
+that replaced a member's text with someone else's would lose the edit the CAS exists to protect.
+
+**Wiring:** `PageSaveService.LoadForEditAsync(RouteValue, ct)` → `PageLoadForEditResult`
+(`Found`/`New`/`Refused`, with `Content` and `BaseRevision`); `SaveAsync(routeValue, content,
+baseRevision, account, ct)` → `SavePageResult`. The declared base revision round-trips through a hidden
+field. The logged-in account comes from the existing accessor the other pages use — do not invent a
+second path to identity.
+
+**Follow this project's Static SSR idiom**, as `Login.razor`/`Bootstrap.razor` do: `EditForm` +
+`[SupplyParameterFromForm]` + a separate `*Input.cs` model beside the component. Keep `[Authorize]`.
+`WikiPage.razor` is already dense with load-bearing remarks — **do not degrade its view path**; if the
+edit branch makes the component unwieldy, a child component sharing the one route is the expected shape.
+
+**Give the surface a way in.** An edit affordance on the view page — otherwise 6.1 is unreachable in a
+browser and the Product Owner cannot verify it.
+
+**Do not weaken what §3 established on this component:** the canonical-route refusal (S2), the
+ambiguous-route 409 naming claimants, the `IStatusCodePagesFeature` opt-out, and the 404-vs-200
+reasoning in its remarks. All of it is there for reasons the remarks record; read them before editing.
+
+**Tests.** Cover each of the five outcomes reaching the member distinguishably, `New` vs `Refused`,
+conflict preserving submitted content, and the create path end to end. Prefer the real Blazor Static SSR
+render the existing `WikiPageTests` use over a minimal-API stand-in — §3 recorded that a simplified
+probe does **not** reproduce this pipeline's behaviour.
+
+**Mutation testing is NOT in scope for this block** unless you find a genuine concurrency or
+data-integrity path, which the surface should not contain — the integrity work landed in C2 and D3.
+CLAUDE.md scopes mutation to auth, concurrency and data integrity, **not** ordinary UI or CRUD. If you
+believe you have found such a path, post to the DEVLOG and ask before mutating anything.
+
+**⚠️ Suite timeout — new rule, from an incident in D3.** The full suite now runs ~2m5s and the default
+command timeout is 2m00s, so it **will** be auto-backgrounded unless you set an explicit timeout. **Set
+at least 10 minutes on every full-suite command.** Seven agents have now stalled on a backgrounded run
+and two left a live mutant in `src/`. "Run it in the foreground" is not achievable by intent alone.
+
+**Two standing rules, applying to your writeup as much as your code:** any literal a machine parses —
+a route, a query parameter, a form name — must be **fed to that machine and the output pasted back**
+before it appears in a comment or a post; and **no comment may attribute a decision or a measurement to
+a party or role that did not produce it** (D2 shipped two such, one of them mine).
+
+**Human-in-the-loop, and this is a hard stop.** 6.1 cannot be ticked on automated gates alone. When the
+code is green, **stop and hand the Architect a precise, copy-pasteable browser recipe** — exact command
+to start the app, the URL, what to click, what should appear for a successful save, a conflict, and a
+create. The Product Owner verifies in a real browser and the box is not ticked until they confirm. The
+local environment is port **5171** with the Product Owner's existing admin account; do not invent a
+different setup.
+
+**Stop and ask the Architect (post to the DEVLOG; do not improvise) if:** the flag binding cannot be
+made to work without a second route or a new `@page`; the form post cannot carry the query string; or
+satisfying a spec scenario would require changing `PageSaveService`. Any of those means the surface
+decision needs revisiting, which is not yours to do silently.
+
+Gates: `dotnet build`, full unfiltered `dotnet test` **with an explicit ≥10-minute timeout**, `dotnet
+format --verify-no-changes`, `openspec validate git-backed-content-core --strict`. Leave WIP
+uncommitted. Post to the DEVLOG under `## 6.` as `**[worker]**`, then → @reviewer.
+
+**[worker]** Block D4 done — 6.1 (needs human confirmation) and 6.4 (discharged structurally).
+
+**The `?edit` binding — run, not reasoned about, and the brief's own prose about it was also wrong.**
+Built `WikiPage.razor` with `[SupplyParameterFromQuery(Name = "edit")] private string? Edit` and, in a
+throwaway experiment page-side property, a `bool?` twin, then hit both forms for real
+(`/wiki/does-not-exist?edit`, `?edit=`, `?editBoolExperiment`, `?editBoolExperiment=`,
+`?editBoolExperiment=true`, `?editBoolExperiment=notabool`) through `ZeroWikiAppFactory`. Observed,
+verbatim:
+
+```
+?edit                          -> status=OK Edit="" EditBool=(null)
+?editBoolExperiment            -> status=OK Edit=(null) EditBool=(null)
+?edit=                         -> status=OK Edit="" EditBool=(null)
+?editBoolExperiment=           -> status=OK Edit=(null) EditBool=(null)
+?editBoolExperiment=true       -> status=OK Edit=(null) EditBool=True
+?editBoolExperiment=notabool   -> status=InternalServerError Edit=<missing> EditBool=<missing>
+```
+
+Two things settled: a `string?` binds a valueless `?edit` to `""` (matches D17's prose, confirmed
+rather than assumed) — that is the form shipped, tested on presence (`Edit is not null`), not on value.
+And **the brief's claim that a naive `bool?` "400s" a valueless flag is itself false** — the real
+failure mode is worse: `bool?` silently binds to `null` for both `?flag` and `?flag=`, indistinguishable
+from the flag being absent at all, and only a non-empty *unparseable* value (`?flag=notabool`) faults —
+as a 500, not a 400. This is exactly D17's own point about not trusting prose that wasn't run: the
+brief itself carried a fifth false literal of the kind D1 shipped four of. Experiment code and test
+deleted after the observation was captured; nothing of it ships.
+
+**Address and mode.** No new `@page` route — `WikiPage.razor` branches on `Edit is not null` and
+early-returns before any of its existing index/render logic when set, rendering `<PageEditor
+Route="@Route" />` instead. `PageEditor.razor` (new, same folder, no `@page` of its own) owns the whole
+edit surface: `EditForm` + `FormName="pageEditor"` + `PageEditorInput` (new, no DataAnnotations — an
+empty file is a legitimate save) with `Content` via `InputTextArea` and `BaseRevisionToken` via a
+hand-written `<input type="hidden" name="Input.BaseRevisionToken">` (no built-in `InputHidden`).
+
+**Form-post query preservation — also run, not assumed.** Dumped the rendered `<form>` for
+`/wiki/brand-new?edit`: Blazor's `EditForm` emits an explicit
+`action="/wiki/brand-new?edit"` unprompted — nothing in `PageEditor.razor` sets `Action`. Asserted
+verbatim in `WikiPageEditorTests.The_rendered_form_posts_back_to_the_address_it_was_served_from_query_string_included`.
+
+**Load vs. save.** `OnInitializedAsync` calls `PageSaveService.LoadForEditAsync` only when
+`PostedInput is null` (a fresh GET) — on the save's own POST, `Input` already carries exactly what was
+submitted, and `SubmitAsync` (via `OnValidSubmit`) calls `SaveAsync` directly without reloading, so the
+only route/base-revision check on the write path is `SaveAsync`'s own, under the lock. `Refused` at
+load time renders "This address cannot be edited" and never reaches the `<EditForm>` — `New` renders an
+empty form declaring the `AbsentAtHead` sentinel (`BaseRevisionToken = ""`, a real blob sha is never
+empty).
+
+**All five failure outcomes, plus the create path, tested against the real Blazor pipeline**
+(`WikiPageEditorTests.cs`, 12 tests, not a minimal-API stand-in): `New` vs `Refused` at load;
+create-then-view round trip; update-on-current-base; **Conflict** (stale base, member's own text
+preserved, the newer committed content never shown, and the view route confirms nothing of the stale
+save landed); **Refused at save time** — the sharpest one — load a single-claimant route, land a second
+claimant via direct git *after* the load but *before* the post, and the save is refused distinctly from
+a conflict ("no longer identifies a single file" vs "changed underneath your save"), proving D17's
+point that the refusal lives in `SaveAsync`, not the surface, since the surface's own load-time gate
+had already passed; **RepositoryBusy** (external `RepositoryWriteLock` held during the POST, submitted
+content preserved, nothing written); **Failed** and **RollbackFailed** (the same failing-pre-commit-hook
+and chmod-555-`docs/` techniques `PageSaveServiceTests` already established, now proven to reach
+distinct, correctly-worded messages at the HTTP surface); an edit/create-link affordance on both the
+found and not-found view branches (6.1's "way in").
+
+**6.4 discharged structurally, not by a mechanism** — per the brief and D17: the surface is one
+`EditForm` with one `OnValidSubmit`, posted once per click; no keystroke reaches the server, so there is
+no debounce to build and no path that could produce more than one commit per explicit save.
+
+**`WikiPage.razor`'s existing read-path remarks (S2, D12, the 409/`IStatusCodePagesFeature` opt-out, the
+404-vs-200 reasoning) are untouched** — the only changes to that method are the `Edit is not null` early
+return, one `_editHref` assignment placed right after the existing canonical-route check, and two
+`<a href>` affordances in markup. Diff: `git diff -- src/ZeroWiki/Components/Pages/WikiPage.razor`.
+
+**Gates:** `dotnet build` clean (0 warnings); full unfiltered `dotnet test` (10-minute timeout given) —
+**770/770 passed, 2 m 20 s**; `dotnet format --verify-no-changes` clean; `openspec validate
+git-backed-content-core --strict` valid.
+
+**Mutation testing:** none run — this block is the UI surface; the concurrency/data-integrity mechanism
+it calls into was already mutation-tested in C2/D3. No new correctness-critical path was found here.
+
+**6.1 needs human confirmation — browser recipe below.** Start: `dotnet run --project src/ZeroWiki`
+(port 5171, per the local environment). Sign in with the Product Owner's existing admin account.
+
+- *Create:* visit `http://localhost:5171/wiki/scratch?edit` (a route with no existing page) — expect
+  "Create page" and an empty textarea. Type something, click **Save** — expect a redirect to
+  `http://localhost:5171/wiki/scratch` showing the typed content rendered as Markdown.
+- *Edit:* from that page, click **Edit this page** — expect "Edit page" with the existing content
+  pre-filled. Change the text, click **Save** — expect redirect back to the view showing the new text.
+- *Conflict:* open `http://localhost:5171/wiki/scratch?edit` in two browser tabs. In tab A, change the
+  text and Save (succeeds, redirects). In tab B (still holding the original, now-stale base revision),
+  change the text differently and Save — expect **no redirect**: the same edit form reappears with tab
+  B's own typed text still in the textarea, plus a message that the page changed underneath the save and
+  nothing was written. Reload tab B's edit URL to confirm it now shows tab A's saved content.
+
+→ @reviewer. Please look hardest at: the load-vs-save branching in `PageEditor.razor` (`PostedInput is
+null` as the "fresh GET" test — is there a request shape where that's wrong?); whether the five outcome
+messages are actually distinguishable to a member reading them, not just to an assertion matching
+substrings; and whether `WikiPage.razor`'s read-path remarks are genuinely undisturbed.
+
+**[architect]** ❗ **The false `bool?`-400 claim was mine, and its route into the brief is the finding.**
+Good catch, and it is the **sixth** instance of this change's signature defect — but the **first where a
+brief was the vector**, which is why it is worth more than the correction.
+
+**Provenance, traced rather than guessed:** the claim originates in `@reviewer`'s D1 round-one post,
+which reported the binding hazard as *"confirmed real — a bare `?edit` binds as an empty string and 400s
+a naive `bool?` parameter"*. The empty-string half is true and was executed. **The 400 half rode along
+inside a sentence whose first half had been verified**, and I lifted the whole sentence into D4's brief
+as established fact without executing it. `@worker` then executed both halves and found `bool?` binds
+silently to `null` — indistinguishable from the flag being absent — and faults as a **500**, not a 400,
+and only on a non-empty unparseable value.
+
+**Three things this teaches that the existing rules did not cover:**
+
+1. **A brief binds a worker exactly as `design.md` binds a section**, so the execute-the-literal rule
+   applies to briefs with full force. I have been applying it to design prose and treating briefs as
+   correspondence. They are not — a worker implements against them.
+2. **Verification does not distribute across a conjunction.** "Confirmed real" attached to a sentence
+   containing two claims certified the one that had been run and silently carried the one that had not.
+   **When a report bundles a verified claim with an unverified one, the bundle inherits the verified
+   claim's authority.** That is a new failure mode in this change, and it is a *review-artifact* fault
+   rather than a code one.
+3. **The consequence was worse than a wrong number, and only luck made it harmless here.** A `bool?`
+   that binds `null` for both `?edit` and no flag at all is not a loud failure an implementer would
+   notice — it is a *silently unreachable edit mode*. The claimed 400 would at least have announced
+   itself. Had `@worker` reasoned from the brief instead of executing, the surface could have shipped
+   with the flag inert.
+
+**Credit where it belongs:** `@worker` also found and removed a stale copy of the wrong claim it had
+already written into its own doc comment before finalising. The surviving comment in
+`WikiPage.razor:89-91` records the correction *with its provenance* ("an earlier draft of this block's
+brief claimed") — which is the right way to write it, and correctly attributes it to the brief rather
+than to a person, per the rule D2 earned.
+
+**Standing rule added:** *a brief is a binding artifact — every literal in it is subject to the
+execute-it-first rule, and a claim lifted from a review post must be re-executed before it is passed on
+as fact, however confidently the post asserted it.*
+
+**[reviewer]** Block D4 (the browser surface) — **Approve.** 6.1 and 6.4 are tick-worthy pending the
+Product Owner's own browser confirmation of 6.1, which this review clears the way for. Owning my own
+method first, then the audit.
+
+**On my own report, since it's a live question about my method, not just the brief's.** Checked my
+actual DEVLOG post rather than the paraphrase of it: at the time (`DEVLOG.md:13901-13906`), I wrote "a
+naive `bool?` **minimal-API** parameter bound to it returns 400" — the qualifier was there, and that
+sentence is true of what I ran. The paraphrase that entered D4's brief without it
+("*confirmed real — ... 400s a naive `bool?` parameter*") does not appear anywhere in my own post; it is
+a compression that dropped the one word doing the scoping work, and I did not write it. That is a real
+mitigating fact, but it does not clear my method, and I want to be precise about why: **I built the
+`TestServer` probe against a minimal-API `MapGet` lambda, not a Razor component with
+`[SupplyParameterFromQuery]`**, because I already had the minimal-API harness standing from the route-
+precedence check moments earlier in that same round, and I treated "a query string binding to `bool?`"
+as one question when ASP.NET Core actually has two different binders answering it. I never flagged that
+risk, which is the part that's mine regardless of how the sentence was later compressed.
+
+Re-ran it properly this time — a real Blazor Static SSR component, `[SupplyParameterFromQuery]` on both
+`string?` and `bool?`, hosted for real (`Microsoft.AspNetCore.Sdk.Web` + `AddRazorComponents` +
+`UseAntiforgery`, the antiforgery middleware being itself a first find — omit it and every request 500s
+before the component ever runs):
+
+```
+?edit                 -> status=200  edit=[""]      editBool=[<null>]
+?editBool              -> status=200  edit=[<null>]  editBool=[<null>]
+?edit=                 -> status=200  edit=[""]      editBool=[<null>]
+?editBool=             -> status=200  edit=[<null>]  editBool=[<null>]
+?editBool=true         -> status=200  edit=[<null>]  editBool=[True]
+?editBool=notabool     -> status=500  (fault)
+```
+
+Exact match to `@worker`'s six-row table, against the real mechanism this time. The lesson I'm taking
+from this, stated plainly: **verifying a claim about mechanism X by executing mechanism Y is not
+verification, even when Y is a close relative and even when the caveat naming Y survives into the
+record** — the caveat protects a reader who reads the whole sentence closely; it does not protect the
+next claim built on top, which is exactly what happened here.
+
+**`PostedInput is null` as the "fresh GET" signal — this is where I spent the most effort, and it
+holds.** Built a throwaway probe (`ZeroWikiAppFactory`, deleted before finishing, `git status` clean
+throughout — same discipline as the worker's own deleted experiment) and threw four adversarial POST
+shapes at the real edit surface: a completely bare POST with no hidden fields, the real fields with the
+antiforgery token's *value* corrupted, the real fields with the antiforgery *field* removed entirely, and
+the real fields with `_handler` removed. All four: **400, empty body, before `PageEditor` ever renders.**
+ASP.NET Core's antiforgery middleware and the named-form handler reject a malformed or unauthenticated
+form post at the framework level, upstream of `OnInitializedAsync` entirely. There is no request shape I
+could construct where a real POST reaches the component with `PostedInput` null — the only way to reach
+that state is a genuine GET, where `[SupplyParameterFromForm]` never attempts to bind at all. I did not
+test browser-side enhanced navigation specifically (it changes the transport the client uses, not the
+server contract `[SupplyParameterFromForm]` sees, so I don't think it can diverge here, but that's
+reasoning, not execution, and I'm flagging the difference rather than blurring it) or the
+validation-failure branch (there is no `<DataAnnotationsValidator />` in the form and `PageEditorInput`
+carries no `DataAnnotations`, so `EditContext.Validate()` has nothing to fail against and `OnValidSubmit`
+fires unconditionally on a well-formed post — stable, well-documented Blazor behaviour, not the kind of
+obscure binder quirk this round's other finding came from, so I did not spend an execution on it).
+
+**The five outcome messages are genuinely distinguishable, not just five different substrings.** Read all
+five for tone and prescribed action, not just content: Conflict implies reconciling with someone else's
+edit ("copy your text out, reload"); RepositoryBusy implies pure waiting ("try again in a moment");
+Refused implies the address itself is broken, a different class of problem from either; Failed implies an
+ordinary, safely-retryable hiccup; RollbackFailed escalates explicitly ("an administrator needs to
+check"). One nit, not blocking: `FailedMessage` and `RollbackFailedMessage` share the opening clause "The
+save failed," which could read alike on a fast skim before the second sentence (which is where the actual
+divergence — retry vs. escalate — lives) arrives. Worth a wording pass, not a re-open.
+
+**Every one of the five failures preserves submitted content — confirmed by direct code trace, not
+inference from the happy path.** `SubmitAsync`'s failure branch (`_saveMessage = result.Outcome switch`)
+never touches `Input`/`PostedInput`; nothing in the method reassigns it after the POST-time binding.
+`WikiPageEditorTests.cs` has one dedicated test per failure outcome, each asserting the exact submitted
+string is still present in the re-rendered body — real coverage, not merely claimed.
+
+**`WikiPage.razor`'s read path — verified by behaviour.** The diff is exactly what it claims to be: one
+early return, one `_editHref` assignment placed after the canonical-route check (never before it, so a
+rendered edit link is never built off a request `LoadForEditAsync` would itself refuse), and two markup
+additions. Behaviourally: all 18 pre-existing `WikiPageTests` — the 409 naming claimants, the S2
+canonical refusal, the 404-vs-200 `IStatusCodePagesFeature` handling, the hostile-route refusal — passed
+in the same run as the new tests, not a subset excluded or skipped.
+
+**The form action preserving the query string — re-derived with a different instrument than the
+worker's, deliberately.** The existing test asserts a substring; I dumped the raw `<form>` tag by regex
+against three shapes (a plain route, a D12-escaped route, and a nested path) rather than reusing the same
+substring check, precisely because a shared instrument is not corroboration (§0's `href=""` lesson):
+
+```
+<form method="post" action="/wiki/brand-new?edit">
+<form method="post" action="/wiki/Chapter__1?edit">
+<form method="post" action="/wiki/Sub/Nested?edit">
+```
+
+Correctly quoted, non-empty, the escaped route's doubled underscore intact, the nested route's `/`
+un-mangled. Two independent checks, genuinely different instruments, agreeing.
+
+**`New` vs `Refused` — confirmed distinct**, both in code (`_refused` never lets `<EditForm>` render;
+`New` populates an empty `Input` declaring the `AbsentAtHead` sentinel) and in the existing test asserting
+no `<textarea` and no claimant content leaks into the refused render.
+
+**Authorization and antiforgery — confirmed live, not inferred from `[Authorize]` being present in the
+diff.** Built a second throwaway probe (also deleted, `git status` clean after): an anonymous client
+against both the GET and the POST to `/wiki/anon-probe?edit`. Both returned **200 with the uniform
+anonymous landing page** — containing "Login," not "Create page" — matching AD21's no-enumeration posture
+exactly (a distinguishing 401/302 would itself leak whether the route exists). The POST reflected none of
+the submitted text and wrote nothing to disk. `PageEditor` has no `@page` of its own, so it has no entry
+point independent of `WikiPage`'s own `[Authorize]`-gated route — confirmed rather than assumed, since
+that structural argument is exactly the kind of claim this section has gotten right in prose and wrong in
+fact before.
+
+**Standing rules — no new violations in this block's own diff.** The corrected `WikiPage.razor:89-91`
+comment attributes the retraction to "an earlier draft of this block's brief," not to a person — right
+shape, per the rule D2 earned. No other attributed claim appears in the new files that I haven't already
+traced to its own execution above.
+
+**Gates, all re-run independently, not taken from the worker's report:** `dotnet build` 0/0; `dotnet
+test` **770/770** (10-minute explicit timeout, as the new rule requires); `dotnet format
+--verify-no-changes` clean; `openspec validate --strict` valid. `git status --short -- src tests` shows
+only this block's four files — every throwaway probe I built for this round was deleted and verified gone
+before moving to the next check. No mutation testing run, per the brief — this is a UI surface with no
+new concurrency or data-integrity path, and I agree with that scoping.
+
+**Verdict: Approve.** No blockers. One non-blocking wording nit (Failed/RollbackFailed's shared opening
+clause). 6.1 is ready for the Product Owner's browser confirmation using the recipe already posted; 6.4's
+structural argument (one `EditForm`, one `OnValidSubmit`, no keystroke reaches the server) holds. → @architect
+
+**[architect]** ✏️ **Correcting my own post above — my account of how the false claim travelled was
+itself wrong, and the truth is worse for me.** I wrote that the 400 claim *"rode along inside a sentence
+whose first half had been verified"*, implying `@reviewer` had bundled an unrun claim with a run one.
+Checked against the actual text rather than my memory of it:
+
+- **`@reviewer`, D1 round one (line 13904):** *"a naive `bool?` **minimal-API** parameter bound to it
+  returns 400"*.
+- **My D4 brief (line 15514):** *"a naive `bool?` **`[SupplyParameterFromQuery]`** parameter is reported
+  to 400 the request"*.
+
+**I did not drop a qualifier. I substituted a different one** — silently moving a measurement from
+ASP.NET Core's minimal-API binder onto Blazor's `[SupplyParameterFromQuery]` binder, a different
+subsystem. The reviewer's sentence was **true as written**. Mine was false, and it was false *because I
+changed the noun the measurement was about* while keeping the number that had been measured against the
+other one.
+
+**So the "verification does not distribute across a conjunction" lesson I drew above is wrong as an
+account of this incident** — there was no conjunction. It stands as a general caution, but it is not
+what happened here, and leaving it as the diagnosis would let the real mechanism escape. **The real
+mechanism is transplantation: a measurement is a claim about a *specific instrument*, and re-stating it
+against a different instrument is fabrication even when every word around it is accurate and the number
+is copied faithfully.** This change's standing rule already says *produce every counterfactual on the
+engine that ships* (§11, `new Regex` vs `[GeneratedRegex]`, which disagreed by ~80x). I restated a
+figure across engines in a brief — the same rule, broken from the other direction.
+
+**`@reviewer`'s own fault here is real but distinct, and it should not be collapsed into mine:** it
+measured the minimal-API binder when the question in front of it was about a Blazor component, and did
+not flag the two as potentially divergent. Labelling the instrument correctly is what made my
+substitution *detectable*; not questioning whether it was the *right* instrument is what left a
+mislabelled-by-me figure plausible enough to survive into a brief. It has since rebuilt the correct
+instrument — a real hosted Razor component — and reproduced `@worker`'s six-row table exactly.
+
+**Standing rule, corrected and sharpened:** *a measured figure is inseparable from the instrument that
+produced it. Carrying it to a different instrument — a different binder, engine, framework or
+subsystem — is a new claim requiring a new measurement, no matter how faithfully the number is copied.
+Name the instrument every time the figure is restated; a figure whose instrument is not named cannot be
+audited, and one whose instrument has been swapped cannot be trusted.*
+
+The post above stands as written — the DEVLOG is append-only — and this is its correction.
+
+**[architect]** ❗ **The Product Owner found a defect in D4 during browser verification that twelve tests,
+a worker and a reviewer all missed — and *how* it hid is the finding.**
+
+**The defect:** `PageEditor.razor` redirects on **success** (`NavigateTo`, line 135) but on **failure**
+merely sets `_saveMessage` and re-renders. So the error page **is the POST response**, and reloading it
+raises the browser's "Resubmit the form?" prompt. The failure path is not Post/Redirect/Get.
+
+**Why every instrument on this block was blind to it.** `WikiPageEditorTests.cs` has twelve tests over
+this surface and **every one asserts on rendered body content** — does the body contain the conflict
+message, is the submitted text still present. **Not one asserts on the response *shape*** — status code,
+`Location` header, whether the response is a redirect at all. The worker built that instrument, the
+reviewer re-derived findings *through* it, and I set the brief that scoped it. Three independent checks,
+one shared question — *"what does the body say"* — and the defect lives entirely in the question none of
+them asked: *"what kind of response is this?"*
+
+This is the **fourth** instance of this project's most expensive pattern (§0's `href=""` anchor regex,
+§3's link-destination XSS, §11's service-model differential), and the first found by the Product Owner
+rather than by an agent. **A browser asks questions a test suite does not know it is not asking.** The
+standing rule says *before trusting a clean audit, name what its question cannot see* — and this block's
+audit was clean precisely because nobody named it.
+
+**[architect]** ❓ @product-owner — where a failed save's draft lives across the redirect. **Answered.**
+
+PRG means the POST's response carries no body, so the member's typed text must survive a redirect, and
+the Product Owner's own standing decision is that a failed save never discards it.
+
+→ **Decision: a short-TTL in-memory draft store, keyed by an unguessable token carried in the redirect
+URL.** No schema, no cookies, no JavaScript. Accepted cost, stated at decision time: drafts do not
+survive a restart or deploy, and it is per-instance server state.
+
+**The token earns its place on the merits, not merely as a mechanism.** Keying drafts by
+`(account, route)` alone would be simpler *and wrong for the very case this fixes*: the conflict scenario
+**is** a two-tab scenario, and two tabs editing one page would clobber each other's drafts in a single
+slot. The token keeps concurrent drafts of the same page distinct.
+
+Persisting drafts in SQLite was rejected as wider scope than §6 has taken; a cookie-carried draft was
+rejected outright — the ~4KB limit means the guarantee would silently stop holding exactly when a member
+has written the most.
+
+**[architect]** Brief — block D4 continuation (still D4; nothing is committed, so this is not a
+remediation of a landed block). → @worker
+
+**Deliver Post/Redirect/Get on the failure path, for all five outcomes** — `Conflict`,
+`RepositoryBusy`, `Refused`, `Failed`, `RollbackFailed`. Not conflict alone. The success path already
+redirects; confirm it still does and do not change its shape.
+
+**The draft store — constraints, with the reasoning so you can choose specifics:**
+
+- **In-memory, short TTL** (minutes, not hours — a draft exists to survive a redirect, not a lunch
+  break). An internal constant with its reason stated, not a configuration option.
+- **The token must be unguessable.** The project already has `ISecretTokenGenerator`; use it rather than
+  inventing a second source of randomness.
+- **Possession of the token must not be sufficient — check ownership.** A draft belongs to an account,
+  and a retrieval by any other account must fail as though the draft did not exist. A token in a URL
+  leaks through logs, referrers and shoulder-surfing; the ownership check is what makes that leak
+  non-exploitable rather than merely unlikely.
+- **The store must be bounded.** A member can produce failing saves in a loop, and an unbounded
+  dictionary of page-sized strings is a memory-exhaustion path reachable by any authenticated member.
+  Cap it — entries, bytes, or both — and decide what eviction does. Say what you chose and why.
+- **Do not consume the draft on read.** Reloading the error page must keep showing the member's text;
+  consume-on-read would make a reload silently lose it, which is the defect one level down.
+- **A missing, expired or foreign token must degrade *honestly*.** Load the editor fresh and say the
+  draft expired. It must **never** silently render the committed content as though nothing was lost —
+  that would discard the member's work while looking like success, which is worse than the bug being
+  fixed.
+
+**Tests — and this is the part that matters most, because it is where the block actually failed:**
+
+- **Assert on the response shape, not only the body.** Every failure outcome must be shown to produce a
+  redirect: assert the **status code** and the **`Location` header**. A test that only checks the
+  rendered body cannot distinguish a redirect from a re-render, which is exactly why twelve passing
+  tests certified a broken surface.
+- **Assert the follow-up GET** renders the member's text and the right message — the redirect is only
+  half the behaviour.
+- **Cover the degradation paths**: expired token, absent token, and a token belonging to another
+  account.
+- **Cover two concurrent drafts of the same page** (the two-tab case the token exists for).
+- Keep the existing twelve tests passing; do not weaken them to fit the new shape.
+
+**Reproduce the original defect first, and say so in your writeup.** Write the response-shape assertion
+against the **current** code, watch it fail, then fix. A test that has only ever been seen passing
+cannot tell you it would have caught this — this change's standing rule from §3, and this block is the
+proof of it.
+
+**⚠️ Set an explicit ≥10-minute timeout on every full-suite command** (the suite runs ~2m12s against a
+2m00s default; this is what left a live mutant in `src/` during D3). **No mutation testing** — still a
+UI surface; ask before mutating if you think otherwise.
+
+**Standing rules:** every literal a machine parses must be executed and the output pasted back; no
+comment may attribute a decision or a measurement to a party or role that did not produce it; and a
+measured figure is inseparable from the instrument that produced it.
+
+Do not tick 6.1 or 6.4 and do not commit. When green, hand back a **revised browser recipe** — the
+Product Owner re-verifies, including that a reload after a failed save no longer prompts to resubmit.
+Gates as before. → @reviewer when done.
+
+**[worker]** D4 continuation done — PRG on all five failure outcomes, an `EditDraftStore` behind it.
+
+**Reproduced first, as instructed.** Added the response-shape assertion to a throwaway test against
+the *pre-fix* `PageEditor.razor`: POST a stale-base save, assert `HttpStatusCode.Redirect`. Observed
+`Expected: Found / Actual: OK` — the defect reproduced exactly as described, on the first try, before
+any fix landed. Deleted the throwaway once confirmed; the real assertions now live permanently in
+`WikiPageEditorTests.cs`.
+
+**`EditDraftStore.cs` (new, `ZeroWiki.Content`, singleton).** `Save(accountId, route, content,
+baseRevisionToken, message)` → token (via `ISecretTokenGenerator.Generate().Plaintext` — no second
+randomness source); `TryGet(accountId, token)` → `EditDraft?`.
+
+- **Ownership, not possession:** `TryGet` refuses a token whose stored `AccountId` doesn't match the
+  caller, returning the identical `null` a missing or expired token returns — no "found, but not
+  yours" branch to leak an existence oracle to whoever holds a leaked token.
+- **No consume-on-read:** `TryGet` never removes on a hit; only an expired entry is pruned, and only
+  because it's already gone by definition, not as a policy choice.
+- **Bounded:** `MaxEntries = 500` (public, so a test drives the real constant rather than a duplicate
+  magic number). At capacity, `Save` evicts the single soonest-to-expire entry — cheaper than a full
+  LRU for a bound expected to be hit rarely, and the evicted entry was already nearest the end of its
+  life. A member looping failed saves degrades their own oldest drafts, never an error.
+- **TTL = 5 minutes** (`public static readonly Ttl`, same reasoning — a redirect and an immediate
+  reaction, not a lunch break).
+- Unit-tested directly (`EditDraftStoreTests.cs`, 8 tests, `FakeTimeProvider`) rather than only through
+  HTTP: ownership, no-consume, the TTL boundary (survives at `Ttl - 1s`, gone at `Ttl + 1s`), the
+  eviction-at-capacity behavior exercising the real `MaxEntries`, and two same-route drafts staying
+  distinct by token.
+
+**`PageEditor.razor` — PRG on every failure outcome, not conflict alone.** `SubmitAsync` now: on
+`Saved`, redirects exactly as before (unchanged shape — confirmed by
+`The_successful_save_redirect_carries_no_draft_token`); on any of the five failures, maps the outcome
+to its message (same five strings as before), stashes `(content, baseRevisionToken, message)` in
+`EditDraftStore` keyed by the signed-in account, and redirects to
+`/wiki/{route}?edit&draft={token}` — never re-renders the POST response.
+
+`OnInitializedAsync`'s fresh-GET branch now checks a `DraftToken` query parameter first: a hit
+populates the form from the draft and shows its message; a miss (absent, expired, or wrong account)
+falls through to the **ordinary fresh load** from `PageSaveService.LoadForEditAsync`, with
+`DraftExpiredMessage` ("Your draft expired, so this is a fresh copy of the page rather than what you
+were working on.") appended — **never** silently presenting committed content as an unlabeled success.
+
+**Route consistency, not just the token, is what the draft is keyed to on the read side.** A new
+`CanonicalRouteForms(routeValue)` helper computes both the still-escaped form for the redirect's URL
+segment and the once-unescaped form for the draft's stored `Route` — from one call, so the redirect a
+save builds and the entry it stores can never independently drift apart. `TryGet`'s caller additionally
+checks `draft.Route == routeValue` before accepting a hit, closing a narrow but real correctness gap:
+without it, a member who reused an old draft URL against a *different* page could have that page's
+editor silently populated with stale text from an unrelated address. (`SaveAsync`'s own base-revision
+CAS would catch most such mix-ups as an honest `Conflict` anyway, since the mismatched blob sha would
+almost never match — but "almost never" isn't a guarantee, and the route check is free.)
+
+**Tests — the shape assertion is now load-bearing, not incidental.** `WikiPageEditorTests.cs`: all five
+originally-body-only failure tests (`Conflict`, save-time `Refused`, `RepositoryBusy`, `Failed`,
+`RollbackFailed`) now route through a new `AssertPrgRedirectAndFollowAsync` helper that asserts
+`HttpStatusCode.Redirect` and the `Location` header's path **before** following it and checking the
+body — exactly the two-part check ("what kind of response, then what does it say") the finding named.
+Plus: the success path's redirect carries no draft token; an absent token degrades honestly; an
+expired-in-effect token (never saved into this run's store — `EditDraftStoreTests` owns the literal TTL
+boundary) degrades the same way; a foreign-account token degrades identically **and** the true owner
+can still recover it afterward (proves the degradation is the ownership check, not consumption); two
+concurrent failed saves of the same page keep independently recoverable drafts (the two-tab case named
+in the decision). 17 tests total in this file (12 kept, 5 new), 8 in `EditDraftStoreTests.cs` — none of
+the original twelve weakened; each just gained a shape assertion in front of its existing body check.
+
+**One assertion bug caught and fixed along the way, worth naming since it's the same shape as the
+finding this round is about:** two new tests initially failed asserting on literal apostrophes
+("Alice's…", "Tab A's…") because Razor HTML-encodes `'` as `&#x27;` inside a rendered `<textarea>` —
+the assertions were checking the wrong representation of the response, not the mechanism, which was
+already correct (confirmed by temporarily printing the actual body). Fixed by using apostrophe-free
+literals; also fixed a `DoesNotContain` on the same raw apostrophe string that had been passing
+*vacuously* for the same reason. Recorded rather than quietly folded in, since "the assertion checks
+the wrong thing while the mechanism is right" is this section's whole theme this round.
+
+**Gates:** `dotnet build` clean (0 warnings); full unfiltered `dotnet test` (10-minute timeout given) —
+**783/783 passed, 2 m 11 s**; `dotnet format --verify-no-changes` clean; `openspec validate
+git-backed-content-core --strict` valid. No mutation testing (still a UI/state-carrier surface, not
+auth/concurrency/data-integrity — `EditDraftStore`'s locking is a plain mutex around a `Dictionary`,
+not a distributed or cross-process concern).
+
+**Revised browser recipe — please re-verify, especially the reload.** Start: `dotnet run --project
+src/ZeroWiki` (port 5171). Sign in with the existing admin account.
+
+- *Create/edit*, unchanged from before: `http://localhost:5171/wiki/scratch?edit` → type → Save →
+  redirects to the view showing the rendered content. Edit again via the "Edit this page" link → change
+  → Save → redirects back showing the new text.
+- *Conflict, now via PRG:* open `http://localhost:5171/wiki/scratch?edit` in two tabs. In tab A, change
+  the text and Save (redirects to the view, succeeds). In tab B, change the text differently and Save —
+  expect a redirect (the address bar changes to end in `?edit&draft=…`) landing on the edit form again,
+  tab B's own typed text still in the textarea, and the message that the page changed underneath the
+  save. **Reload this page now** — this is the fix: it must reload cleanly showing the same text and
+  message, with **no "resubmit this form?" browser prompt**. Navigate away and back to
+  `http://localhost:5171/wiki/scratch?edit` (no draft token this time) — expect a fresh editor showing
+  tab A's saved content, not tab B's lost draft.
+- *Expired/foreign draft (optional, not required to confirm 6.1):* visit
+  `http://localhost:5171/wiki/scratch?edit&draft=not-a-real-token` — expect a fresh editor with "Your
+  draft expired…" rather than an error.
+
+→ @reviewer. Please look hardest at: whether `CanonicalRouteForms` genuinely keeps the redirect URL and
+the stored draft route in agreement for every outcome (not just the ones tested); whether
+`EditDraftStore`'s single `lock (_gate)` around a plain `Dictionary` is adequate given this is a
+Blazor Static SSR app with concurrent requests, or whether it needs a concurrency-focused look despite
+not being on the auth/data-integrity list; and whether the message shown after a recovered draft vs. an
+expired one is actually distinguishable to a member reading them side by side.
+
+**[reviewer]** Block D4 continuation (PRG + `EditDraftStore`) — **Request changes.** One confirmed
+blocker, found by doing what this round's whole point was: executing the check my prior instrument
+couldn't run, not re-running the same one harder.
+
+**Naming the blind spot before using any instrument, per the standing rule this round earned.** Last
+round's question was "what does the body say" and it could not see "what kind of response is this" —
+that's now fixed and I re-derived it (below). This round's new instrument is "is it a redirect with the
+right `Location`, and does the follow-up body say the right thing" — a two-part question, not one. Before
+trusting it I asked what *it* still can't see: (a) whether `EditDraftStore`'s lock is provably correct
+under real concurrent access, or merely correct by inspection — I had reasoned through the code and
+concluded it was fine, which is exactly the "read it, don't run it" shape this project keeps
+re-discovering the hard way; (b) whether the eviction/DoS question I was asked to check was answerable by
+tracing the loop, or needed an actual attacker-shaped sequence run against the real class. Both of those
+are analysis I would otherwise have reported as reasoning. I ran both instead — the second is where the
+blocker is.
+
+**Confirmed blocker, executed rather than reasoned about: an authenticated member can evict a specific
+other member's draft using only their own failing saves — a targeted denial-of-service against unsaved
+work, exactly the risk named as worse than a plain memory cap.** `EvictSoonestToExpireLocked`
+(`EditDraftStore.cs:162-180`) scans the *entire* store for the globally soonest-to-expire entry with no
+account scoping at all. Since every entry gets the identical `Ttl`, "soonest to expire" is simply
+"oldest," store-wide — an attacker's own freshly-created entries are, by construction, never the oldest
+until the attacker stops attacking, so a sustained flood of the attacker's own failing saves
+systematically evicts *everyone else's* older drafts first, never the attacker's own. Built the exact
+attacker sequence against the real class (`FakeTimeProvider`, no HTTP needed) rather than trusting the
+trace:
+
+```
+Before overflow: victim's draft recoverable? True
+After overflow (one more attacker save): victim's draft survived? False
+After overflow: attacker's own brand-new draft survived? True
+CONCLUSION: attacker evicted the victim's draft using only their own failing saves = True
+```
+
+Victim saves one draft (now the store's oldest entry). Attacker submits 499 of their own failing saves,
+then one more to tip the store past `MaxEntries`. The victim's draft — created first, by an account the
+attacker never touched — is the one evicted; the attacker's own newest entry survives. This requires
+roughly 500 requests and no privilege beyond being signed in (a `RepositoryBusy` or an ordinary `Refused`
+is trivial and harmless to trigger repeatedly), and `EditDraftStoreTests.cs`'s own eviction test
+(`When_the_store_is_full_the_soonest_to_expire_entry_is_evicted_to_make_room`) only ever saves from one
+account, so it cannot see this — the gap is real, not merely untested by coincidence. A member who
+manages to fill the store is not just capping memory, as the doc comment frames it (*"a member looping
+failed saves degrades their own oldest drafts"* — `EditDraftStore.cs:39-40` — this claim is false; they
+degrade whichever account's draft is globally oldest, which is systematically never their own while they
+keep attacking); they can reliably grief a specific colleague's unsaved edit. Scoping eviction to prefer
+the caller's own oldest entry before reaching into the global pool is the shape of fix that suggests
+itself, but the choice is the worker's, not mine to prescribe.
+
+**Concurrency — re-checked by running real threads against the real store, not by re-reading the lock.**
+50 real `Task.Run` writers × 20 saves each (1000 operations, `TimeProvider.System`, no fake clock) against
+one shared `EditDraftStore`, each writer immediately reading back its own just-written token and throwing
+on any mismatch. Zero corruption, zero lost writes, zero exceptions across all 1000 operations (the store
+correctly evicted down to its 500-entry cap along the way, which is the *expected* mechanism, not a
+failure). The single `lock (_gate)` wraps every access point to `_entries` with no lock-free path and no
+call to anything reentrant while held — sound, and now backed by execution rather than inspection alone.
+
+**Foreign/missing/expired token — confirmed no oracle, via the existing passing tests plus a direct code
+trace, not reasoning alone.** `TryGet` returns bare `null` from three distinct internal reasons (unknown
+token, expired entry, wrong `AccountId`) with no branch anywhere that reports which — `PageEditor`'s own
+`OnInitializedAsync` treats every `null` identically (falls through to `DraftExpiredMessage` on the
+ordinary fresh load). `An_absent_draft_token_degrades_to_a_fresh_editor_with_an_expiry_notice`,
+`An_expired_draft_token_degrades_to_a_fresh_editor_rather_than_reviving_stale_text`, and
+`A_token_belonging_to_another_account_degrades_the_same_way_rather_than_leaking_their_draft` all assert
+the identical shape (200, "draft expired", the same committed content) — re-ran the full suite and
+confirmed all three pass. No message, status, or `Location` difference exists between the three cases.
+(Timing aside, as scoped — a nanosecond-scale dictionary-operation difference buried inside a full signed-in
+HTTP round trip is not a channel worth this review's budget, and I'm naming that I set it aside rather
+than silently not checking it.)
+
+**`CanonicalRouteForms` — holds structurally for every outcome, not only the tested ones, because it
+cannot see the outcome at all.** It is called once, unconditionally, before `result.Outcome` is even
+inspected (`PageEditor.razor:178`), so there is no per-outcome branch that could make it diverge — the
+same computation feeds the success redirect and all five failure redirects alike. The fallback branch
+(undecodable route, echoed verbatim) is dead in the ordinary UI flow: reaching `SubmitAsync` at all
+requires having passed `OnInitializedAsync`'s own resolve/canonical gate first, and an ambiguity arising
+later doesn't affect decodability. `A_route_that_becomes_ambiguous_between_load_and_save_is_refused_distinctly_from_a_conflict`
+already exercises the primary branch against a D12-escaped route (`Chapter__1`) *with* a failure outcome
+and PRG together, which is the sharpest combination available; re-ran it, passes.
+
+**Message distinguishability — holds, and survives the round trip.** The five failure messages are
+unchanged from the pre-PRG round and were already assessed distinguishable in tone and prescribed action
+(one non-blocking nit stands: `FailedMessage`/`RollbackFailedMessage` share an opening clause). Confirmed
+via the passing test suite that all five still read out correctly after `EditDraftStore` round-trips
+them. `DraftExpiredMessage` ("Your draft expired…") is unambiguously distinct from all five — it answers
+a different question (can the draft be recovered at all) than the five outcome messages do (why did the
+save fail).
+
+**No sibling of the apostrophe/encoding bug.** Grepped both new test files for a literal `'` inside a
+body-comparison assertion: none remain in `WikiPageEditorTests.cs` (HTTP body, HTML-encoded); the two
+hits in `EditDraftStoreTests.cs` (`"Tab A's text."`) compare against the store's own in-memory `Content`
+property directly, never through Razor rendering, so the encoding mismatch this class of bug depends on
+cannot occur there — different representation layer, not a near-miss. No other markup-significant
+character (`<`, `>`, `&`, `"`) appears in any asserted content literal either.
+
+**DI resolves.** `EditDraftStore`'s two dependencies (`ISecretTokenGenerator`, `TimeProvider`) are both
+already-registered singletons in `Program.cs`; built the real `AddContentStorage` registration under
+`ValidateOnBuild: true` and resolved it directly, including a live `Save`/`TryGet` round trip.
+
+**Standing rules.** No comment attributes a decision or measurement to a party that didn't produce it in
+this diff. One inaccurate claim found and reported above (the eviction doc comment's "degrades their own
+oldest drafts," which the executed attacker sequence shows is false) — flagged as part of the blocker
+above rather than separately, since it's the same defect described twice.
+
+`dotnet build` 0/0; `dotnet test` **783/783** (10-minute explicit timeout); `dotnet format
+--verify-no-changes` clean; `openspec validate --strict` valid — all re-run independently on the clean
+tree. Mutation: `EditDraftStore`'s ownership check (`entry.AccountId != accountId`, line 124) neutered to
+`if (false)` — died clean on the first run, two tests failing for exactly the expected reason (Bob reads
+Alice's draft), `cp`-outside-repo + `trap` restore, checksum verified before (`20f25d0…`) and after
+(matches) — one run was unambiguous, cap of 2 not needed. `git status --short -- src tests` shows only
+this block's five files throughout; every throwaway probe (the eviction/concurrency probe, the DI check)
+was deleted and reconfirmed gone before moving on. `grep -rn MUTANT` — no hits.
+
+**Verdict: Request changes** — the eviction policy must not let one account's activity preferentially
+evict another account's older drafts; everything else in this round's audit, including the two claims I
+converted from reasoning into execution (the lock, the no-oracle property), holds. → @architect
+
+**[architect]** **Blocker accepted — executed, not inferred, and it is a genuine vulnerability rather
+than a resource nit.** `EvictSoonestToExpireLocked` scans store-wide for the oldest entry, and since
+every entry shares one TTL, "oldest" means "belonging to whoever has been idle longest" — never the
+flooder's own fresh entries. So ~500 of an attacker's failing saves deterministically destroys a chosen
+colleague's unsaved work while leaving the attacker's own drafts intact. **A cap intended to bound
+memory became a targeted denial-of-service against another member's content.**
+
+**The doc comment asserting the opposite is the more instructive half.** It claimed a looping member
+"degrades their own oldest drafts" — the reassuring reading, written by reasoning about the policy's
+*intent* rather than running it. The same execution that found the defect falsified the comment. This
+is the change's signature failure in a new place: not a wrong literal, but **a security argument that
+was never run**. A resource bound's safety claim is a claim about an adversary, and an adversary is
+something you simulate, not something you reason about.
+
+**Also worth recording: I flagged this in the brief as a question and it was answered by prose, not by a
+probe.** Asking the right question is not the same as getting it verified — the question survived into
+the audit only because `@reviewer` chose to convert its own reasoning into execution when I told it to
+name what its instrument could not see. Had it audited the same way it audited the round before, this
+would have shipped.
+
+**[architect]** Brief — block D4 continuation, round two (still D4; nothing committed, ticks nothing).
+→ @worker
+
+**One deliverable: an account's draft pressure must never be paid for by another account.** State it as
+the invariant and build to it — *any eviction caused by account A must fall on account A's own drafts.*
+
+Shape, with the reasoning; the mechanism is yours to choose and justify:
+
+- **A per-account cap is the natural carrier** — when A adds a draft and A is at its own limit, evict
+  A's oldest. Cross-account eviction then cannot arise from ordinary operation at all.
+- **Keep a global backstop, but never let it evict across accounts.** If a global bound is reached,
+  reclaim **expired** entries first; if there is nothing expired to reclaim, **refuse the new draft**
+  rather than taking someone else's. That confines the cost of a flood to the flooder. Refusing a draft
+  does mean the flooder's own text is not preserved on that one save — acceptable, because they caused
+  it, and the alternative is destroying an innocent member's work.
+- **Choose the per-account number deliberately** and state the reason in code. A member legitimately
+  has a handful of tabs open, not hundreds.
+- **The TTL and the no-consume-on-read behaviour stay as they are.** Do not change what is already
+  approved.
+
+**Tests — the same discipline as last round, and it is the reason the round succeeded:**
+
+- **Reproduce the attack first and watch it fail against the current code.** `@reviewer` has the exact
+  sequence in its post above (victim's draft recoverable before overflow, gone after, attacker's own
+  fresh draft surviving). Encode that as a test, see it red, then fix. Say so in your writeup.
+- Assert the invariant directly: **after any amount of account A activity, account B's drafts are
+  untouched.**
+- Cover the global-backstop path you choose, including what a refused draft does at the surface — it
+  must not silently look like success.
+- Keep all 783 passing; do not weaken the existing eviction or TTL tests to fit the new policy.
+
+**Fix the false doc comment** in the same edit, and state what the policy actually guarantees rather
+than what it was hoped to guarantee.
+
+**Mutation testing: in scope for the new eviction guard, capped at 2 runs**, same rules as the ownership
+check — full unfiltered suite, explicit ≥10-minute timeout, `cp` outside the repo with a `trap`,
+checksum before and after. The ownership-check mutant already died clean; do not re-run it.
+
+Do not tick, do not commit. When green, hand back the revised browser recipe. → @reviewer.
+
+**[worker]** D4 continuation, round two done — per-account eviction cap, global backstop refuses rather
+than steals, false doc comment replaced.
+
+**Reproduced the reviewer's attacker sequence first, against the actual pre-fix class, before touching
+it.** Since the fix changes `Save`'s signature (`string` → `string?`) and adds a new public constant the
+old class doesn't have, the permanent test file can't compile against the vulnerable version, so the
+reproduction ran as an isolated throwaway (`CrossAccountEvictionReproductionExperiment.cs`, using only
+members both versions share) with the real `EditDraftStoreTests.cs` moved aside for the duration. Swapped
+in a byte-for-byte copy of last round's shipped `EditDraftStore.cs`, ran it, watched it fail exactly as
+predicted:
+
+```
+Victim's draft must survive a flood of the attacker's own saves. -- FAILED
+```
+
+Restored both files via a `trap`, confirmed by checksum (`b67b53a7…` before, matches after), then
+implemented the fix and reran the same sequence — now permanent as
+`A_flooding_account_can_never_evict_a_different_accounts_draft_the_reviewers_attacker_sequence` in
+`EditDraftStoreTests.cs` — green.
+
+**The fix: a per-account cap that pays for its own pressure, plus a global backstop that refuses rather
+than steals.** `EditDraftStore.Save` now:
+
+1. Reclaims already-expired entries first (harmless to any account — they're gone regardless).
+2. Runs `EvictAccountOldestIfAtCapLocked(accountId)` **unconditionally**, not only when the store is
+   globally full: once an account holds `MaxDraftsPerAccount` (8 — "a handful of tabs, not hundreds",
+   stated in code) entries, adding one more evicts that *same* account's own oldest first. This is the
+   whole mechanism — an account's footprint in the store can never exceed 8 regardless of how many
+   failing saves it produces, so it can never need another account's entry to make room for its own.
+3. `MaxEntries` (500, unchanged) is now purely a whole-store backstop for *many distinct* accounts being
+   active at once. If it's still reached after steps 1–2, every remaining entry belongs to some other,
+   unexpired account's within-cap draft — `Save` returns `null` rather than evicting one.
+
+**`Save` returning `null` is a new, real outcome the surface had to handle, not just the store.**
+`PageEditor.razor`'s `SubmitAsync`: if `DraftStore.Save` returns `null`, the PRG redirect carries a new
+valueless `draftRefused` query flag instead of `draft={token}` (same presence-not-value pattern as `edit`
+itself, from block D4's first round). `OnInitializedAsync` checks `DraftToken` first, then
+`DraftRefused`, and shows a new, distinctly-worded `DraftUnavailableMessage` ("...there was too much
+other activity right now to hold onto a copy of what you typed... please try again") on top of an
+ordinary fresh load — never a silent, unlabelled "Create page" that would look like nothing went wrong.
+
+**The false doc comment is rewritten to state what's actually guaranteed, not what was hoped.** The
+class's remarks now narrate the defect, the reviewer's execution that found it, and the corrected
+invariant in the same place the wrong claim used to live, rather than deleting the history.
+
+**Tests — 10 new (4 in `EditDraftStoreTests.cs` net of one rename, plus 1 in `WikiPageEditorTests.cs`,
+totaling 788 from 783):**
+
+- The reviewer's exact attacker sequence, permanent, as above.
+- `No_amount_of_one_accounts_activity_can_touch_another_accounts_earlier_draft` — the invariant stated
+  directly, driven to `MaxEntries * 2` from a single account.
+- `When_many_distinct_accounts_fill_the_global_backstop_a_new_draft_is_refused_not_stolen` — the global
+  path reached honestly (`MaxEntries` *distinct* accounts, one draft each), refusal confirmed, and the
+  earliest account's own draft confirmed untouched.
+- `The_global_backstop_reclaims_expired_entries_before_refusing` — the reclaim-before-refuse ordering.
+- Renamed the pre-existing single-account eviction test to
+  `When_a_single_accounts_saves_exceed_its_own_cap_its_own_oldest_entry_is_evicted` and re-scoped its loop
+  from `MaxEntries` to `MaxDraftsPerAccount` — it now drives the constant actually responsible; its
+  assertions are unchanged, not weakened, and it still passes.
+- `WikiPageEditorTests.A_globally_refused_draft_is_reported_distinctly_rather_than_looking_like_success`
+  — fills the global backstop with `MaxEntries` distinct accounts stashed directly through the app's own
+  `EditDraftStore` singleton (not 500 real sign-ins), then drives **one genuine failed HTTP save** on top
+  of it and asserts the PRG redirect carries `draftRefused` (not `draft=`), and the follow-up GET shows
+  the distinct message, is *not* confused with `DraftExpiredMessage`'s wording, and still reads as a
+  labelled "Create page" rather than a bare, unexplained one.
+- All 8 originally-passing `EditDraftStoreTests` and all 17 `WikiPageEditorTests` from prior rounds still
+  pass unmodified in substance (one rename, above).
+
+**Mutation — one run, died clean, cap of 2 not needed.** Mutated the new guard's own per-account
+scoping filter (`EditDraftStore.cs`, `EvictAccountOldestIfAtCapLocked`: `if (entry.AccountId !=
+accountId)` → `if (false)`, dropping the filter that makes eviction account-scoped in the first place —
+the direct undo of this round's fix, not the ownership check the reviewer already mutated). `cp`'d a
+known-good copy outside the repo first; checksum before (`b67b53a7…`) and after (`f8d9316e…`, confirms a
+real change, not a no-op); mutation, checksum, and the full unfiltered suite all ran inside one shell
+invocation with a `trap` restoring the file on exit, so no separate step could leave it mutated — a
+lesson from this file's own hazard notes about a mutant surviving between tool calls. Four tests failed,
+all for the expected reason (cross-account eviction reopened): the three new unit invariants plus the
+one new HTTP surface test — 784/788 (Failed: 4). Restored, checksum confirmed back to `b67b53a7…`, full
+suite reconfirmed green on the clean tree (788/788) as a separate run afterward. `git status --short --
+src tests` throughout shows only this block's five files; `grep -c MUTANT` on the restored file is 0.
+
+**Gates, on the final clean tree:** `dotnet build` 0 warnings/0 errors; full unfiltered `dotnet test`
+(10-minute timeout given) — **788/788, 1 m 43 s**; `dotnet format --verify-no-changes` clean; `openspec
+validate git-backed-content-core --strict` valid.
+
+**Revised browser recipe.** Start: `dotnet run --project src/ZeroWiki` (port 5171). Sign in with the
+existing admin account.
+
+- *Create/edit/conflict*, unchanged from the previous round's recipe — still the primary path to verify
+  6.1, including the reload-after-failed-save check.
+- *New this round, optional (not required for 6.1):* the per-account cap and global backstop are not
+  practically reachable by hand in a browser (8 and 500 respectively require scripted requests), so
+  there is nothing new to click through — this round's fix is covered by the automated tests above,
+  not by a manual step.
+
+→ @reviewer. Please look hardest at: whether `EvictAccountOldestIfAtCapLocked` running unconditionally
+(not gated on the store being globally full) has any cost or side effect worth naming; whether
+`draftRefused` and `draft` as two separate query flags can ever both be supplied by a crafted request in
+a way that produces a confusing render; and whether `DraftUnavailableMessage` is actually distinguishable
+from `DraftExpiredMessage` to a member who has never seen either before.
+
+**[reviewer]** Block D4 continuation, round two (per-account cap, refuse-not-steal backstop) —
+**Approve.** Every priority item executed, not read; no blocker found.
+
+**The invariant, re-derived by adversary, not by reading the guard.** Re-ran the reviewer's own original
+attacker sequence's shape against the *fixed* class (a victim saves first, an attacker floods with its
+own failing saves) via the permanent test and independently confirmed the compound case the brief called
+out specifically — one account already at its own `MaxDraftsPerAccount` cap *at the same moment* the
+global `MaxEntries` backstop is also at its bound:
+
+```
+Global count is now exactly MaxEntries (500)? (492 filler + 8 Eve = 500)
+Eve (already at her own cap) saves one more while global is also at cap -> token issued? True
+Eve's own oldest evicted to pay for it? True
+Brand-new account (0 of her own) saves while global is at cap -> refused (null)? True
+```
+
+An account already at its own cap can always self-fund a replacement entry — its own eviction frees
+exactly the slot its own new entry needs, regardless of global fullness — while a brand-new account with
+nothing of its own to evict is correctly refused rather than granted a slot by taking someone else's.
+Traced why this generalizes rather than trusting the one case: `EvictAccountOldestIfAtCapLocked` filters
+strictly to `entry.AccountId == accountId` (`EditDraftStore.cs:223`), so no `_entries.Remove` call in
+`Save` can ever reach a token belonging to a different account except via `EvictExpiredLocked`, which
+only removes entries already dead by definition. The invariant holds structurally, and now also by
+execution in the sharpest interaction the two caps can produce together.
+
+**`Save` returning `null` — traced end to end, and it never looks like success or a silent discard.**
+`SubmitAsync` builds `?edit&draftRefused` (no token) when `Save` returns `null`; the follow-up GET's
+`OnInitializedAsync` takes the `else if (DraftRefused is not null)` branch, sets
+`DraftUnavailableMessage`, then still calls `LoadForEditAsync` for an honest fresh copy and renders the
+message *above* the form. The message itself states both halves plainly: "Your save failed... Nothing was
+written, but your text could not be preserved either — please try again." No path renders a bare,
+unlabelled "Create page" or "Edit page" with the failure unstated.
+
+**Is the refusal path reachable against an innocent member, not just an attacker? Established
+concretely, not asserted.** Reaching the global backstop honestly (not via one account's own cap, which
+self-funds) requires roughly 500/8 ≈ 63 *distinct* accounts each independently near their own limit
+within one 5-minute TTL window — confirmed by tracing the arithmetic against the actual constants, not
+guessed. For "a wiki for a small trusted group" (this project's own stated scale), that many
+simultaneously struggling editors in one 5-minute window is not a plausible ordinary-use scenario, and
+even in the worst case the failure is *refusing to stash one new draft* — never touching any of the other
+62 accounts' already-stashed work. This is qualitatively milder than the original defect (a targeted,
+100%-reliable destruction of a chosen victim's existing draft) and is now an honestly-reported,
+disclosed, low-likelihood degradation rather than a vulnerability. Confirmed the existing
+`When_many_distinct_accounts_fill_the_global_backstop_a_new_draft_is_refused_not_stolen` test reaches this
+path the honest way (distinct accounts, none at their own cap) rather than via a shortcut that would miss
+the point.
+
+**`draft` and `draftRefused` supplied together — traced, then executed against the real pipeline rather
+than left as a hand-crafted request nobody would actually construct.** The `if`/`else if` gives `draft`
+priority. Built the exact adversarial URL (`?edit&draft={realToken}&draftRefused` together) against a
+real, valid, owned token: the real draft's own content and message won outright; neither fallback message
+appeared. Safe by construction — `TryGet`'s ownership check still gates the `draft` branch regardless of
+what else rides along in the query string, and there is no code path where the two flags combine to leak,
+crash, or bypass anything.
+
+**Valueless `?draftRefused` binding — already executed against the real pipeline, not merely assumed
+identical to `?edit`.** `A_globally_refused_draft_is_reported_distinctly_rather_than_looking_like_success`
+hits `/wiki/brand-new?edit&draftRefused` bare (no `=`) through the real app and asserts the refusal
+message renders — re-ran it as part of the full suite rather than duplicating a fresh probe for a binder
+I'd already exercised on the identical `string?`/`[SupplyParameterFromQuery]` shape earlier this block.
+
+**Message distinguishability, checked side by side for a first-time reader.** `DraftExpiredMessage`
+("Your draft expired, so this is a fresh copy of the page...") implies something existed and its *window*
+passed. `DraftUnavailableMessage` ("Your save failed, and there was too much other activity right now to
+hold onto a copy...") implies the save itself failed and *capacity*, not time, is why nothing could be
+kept. Different cause, different vocabulary, and both explicitly state the text is gone rather than
+leaving it to be inferred — satisfies the bar the original PRG defect failed to clear.
+
+**The doc comment's claims — reproduced, not read, since that is the entire point of this round.** Checked
+every factual assertion in the rewritten remarks against either my own execution or a passing test:
+the old policy's mechanism and failure mode (matches my original findings and the worker's own reproduction
+against the byte-for-byte vulnerable copy), the corrected invariant (matches my adversarial and compound
+runs above), and the backstop's refuse-not-steal behavior (matches the existing distinct-accounts test).
+Nothing in the new comment is asserted beyond what's been run.
+
+**Unconditional per-account scan — no meaningful cost.** `EvictAccountOldestIfAtCapLocked` adds one more
+O(≤500) in-memory scan per `Save` call, alongside `EvictExpiredLocked`'s own existing O(≤500) scan —
+`Save` was already linear in store size before this round; this doubles a constant already too small to
+matter at this project's stated scale, not a new complexity class.
+
+**Nothing weakened.** All 8 originally-approved `EditDraftStoreTests` assertions are intact (one rename,
+re-scoped to drive `MaxDraftsPerAccount` instead of `MaxEntries`, which is a strictly *more* precise
+target, not a weaker one) and all pre-existing `WikiPageEditorTests` pass unmodified in substance.
+
+**Mutation — relied on the worker's already-clean run rather than repeating it.** The worker mutated the
+new per-account scoping filter itself (the direct undo of this round's fix) and got a clean 4-test kill on
+one run, checksummed and `trap`-protected. I did not re-run that specific mutation: my own adversarial and
+compound executions above independently prove the *property* holds against the current code, which is a
+stronger form of evidence than confirming a specific future regression would be caught, and the brief said
+mutate "only if you need it to verify" — I didn't need to.
+
+`dotnet build` 0/0; `dotnet test` **788/788** (10-minute explicit timeout, re-run independently); `dotnet
+format --verify-no-changes` clean; `openspec validate --strict` valid. `git status --short -- src tests`
+shows only this block's five files throughout — the compound-cap probe and the both-flags probe were each
+deleted and reconfirmed gone before moving to the next check. `grep -rn MUTANT` — no hits.
+
+**Verdict: Approve.** The invariant holds under adversarial and compound execution, the new `null`
+outcome is honestly surfaced at the surface, the milder residual backstop-refusal path is concretely
+bounded and disclosed rather than merely asserted safe, and the doc comment's claims all reproduce. Ready
+for the Product Owner's browser re-verification of 6.1. → @architect
+
+**[architect]** ❗ **The Product Owner's second browser session found a worse defect than the first: a
+browser save can make the wiki refuse to start.** Not a UX fault — an availability one, discovered on the
+Product Owner's own machine on the first real content ever saved through this surface.
+
+**The chain, every link executed rather than reasoned:**
+
+1. **HTML form submission sends `textarea` content with CRLF.** `docs/scratch.md` on the Product Owner's
+   volume: `od -c` shows `...editing it \r \n \r \n user A edit`. D4 wrote those bytes verbatim.
+2. **`git add -A` then warns on stderr and exits 0**, leaving the tree clean:
+   `warning: in the working copy of 'docs/scratch.md', CRLF will be replaced by LF the next time Git
+   touches it`. **Nothing is lost or unstaged** — `git status --porcelain` is empty afterwards.
+3. **Block B's guard refuses to start on any `add -A` stderr**, so the app dies — with a message that
+   says *"could not read part of the working tree … fix the reported permissions"* when there is no
+   permission problem and nothing unreadable.
+4. **It is intermittent**, which is worse than deterministic: the warning only fires when git's index
+   stat cache is cold for that path. Reproduced by `touch`ing the file — clean `add -A` before, warning
+   after. A fresh clone, a container restart, or a remounted volume all produce a cold cache, so a
+   Docker deployment over a mounted volume is exactly where this bites.
+
+**The root cause is not the guard — it is inherited configuration the app does not control.** The
+warning exists only because the *host's* `~/.gitconfig` sets `core.autocrlf=input`. Verified by
+execution in a scratch repository: with the inherited `input`, `add -A` warns; with
+`core.autocrlf=false` set **on the repository**, the same CRLF file produces **no stderr at all**,
+because no conversion is attempted so there is nothing to warn about.
+
+**That is a zero-config defect in its own right, and it generalises past CRLF.** "Point it at a folder
+and it Just Works" cannot depend on the operator's `~/.gitconfig`. ZeroWiki already pins
+`receive.denyCurrentBranch` and `http.receivepack` on the content repository; every git setting the
+app's *correctness* depends on belongs in that same list. `core.quotePath` already bit this change once
+(D17 records it) — that was the same defect and it was fixed as a one-off rather than as a class.
+
+**[architect]** ❓ @product-owner — whether block B's stderr posture should change, given its accepted
+cost has now materialised on ordinary content. **Answered: keep refusing on any stderr.** No silent
+content loss, ever; the decision stands exactly as taken at §6's open.
+
+Recorded because the reasoning matters for §7: the alternatives were *classify stderr* (keeps the
+safety property but requires judging git's message set, and git localises its messages, so it would also
+force pinning the subprocess locale) and *refuse only on recognised danger* (no future git release could
+brick a startup, but it fails **open** on an unanticipated dangerous warning — reopening the exact hole
+block B was created to close). The Product Owner chose the option that cannot lose content silently.
+**The fix therefore has to stop the benign warning being *emitted*, not teach the guard to forgive it** —
+which is the stronger fix anyway, and the one that removes the class instead of the instance.
+
+**[architect]** Brief — block D4 continuation, round three (still D4; nothing committed, ticks nothing).
+→ @worker
+
+Three items. All three are required; the first alone would not have prevented this.
+
+1. **The save path must write LF.** A browser is the one writer that emits CRLF, and git-as-source-of-
+   truth plus an Obsidian vault both want LF. Normalise CRLF to LF on the way in, at the save. Decide
+   and state whether a lone `\r` is also normalised, and why.
+2. **Pin `core.autocrlf=false` on the content repository**, alongside the existing
+   `receive.denyCurrentBranch` and `http.receivepack` in `ApplyRepositoryConfigurationAsync`. This is
+   what removes the class: content arriving with CRLF from Obsidian or an operator can no longer make
+   `add -A` warn, so the strict guard stays strict and stops firing on a non-problem. Bytes are then
+   stored verbatim, which is also the honest posture for a repository the app calls the source of truth
+   — the app should not silently rewrite a member's bytes.
+3. **Fix the error message.** It currently diagnoses *every* stderr as an unreadable directory and tells
+   the operator to fix permissions. Keep refusing — that is the Product Owner's decision — but say what
+   actually happened: git reported something this app does not recognise as safe, here is the verbatim
+   stderr, and here is what to do about it. An operator who hits this must not be sent hunting a
+   permissions problem that does not exist.
+
+**Tests — and the instrument is the point, because the whole suite missed this.** Every existing test
+builds a fresh repository under whatever configuration the test host happens to have. This defect
+requires *hostile inherited configuration* to reproduce, so a test must **pin it deliberately**:
+`GIT_CONFIG_GLOBAL` pointing at a temp config with `core.autocrlf=input` is the lever. Cover:
+
+- a save of CRLF-bearing content writes **LF** to the working tree;
+- a repository containing a CRLF file, under inherited `core.autocrlf=input`, **starts successfully**
+  (this is the regression test for the Product Owner's exact failure — write it first and watch it fail
+  against the current code, then fix);
+- the refusal message for a genuine unreadable directory still refuses and still reads correctly.
+
+**Reproduce before fixing, and say so in your writeup.** This is the third consecutive round where that
+discipline is what made the fix trustworthy.
+
+**Also record, do not fix:** which *other* inherited git settings could change this app's behaviour.
+`core.quotePath` is already known. Do **not** widen the change to chase them — list what you find in the
+DEVLOG so §7 can own it as a class.
+
+**⚠️ Explicit ≥10-minute timeout on every full-suite command.** No mutation testing unless you find a
+genuine integrity path; ask first. Do not tick, do not commit. When green, hand back the browser recipe
+— the Product Owner's environment is currently **unstartable** and the recipe must include how they
+recover it. → @reviewer.
+
+**[worker]** D4 continuation, round three done — LF normalization, `core.autocrlf=false` pinned (at the
+point that actually matters, not merely "alongside" the other two settings — see below), and the
+refusal message rewritten.
+
+**Reproduced the regression first, against the actual pre-fix `ContentRepositoryService.cs`, before
+touching it.** Since nothing this round is committed, the pre-fix version is `git show
+HEAD:src/ZeroWiki/Content/ContentRepositoryService.cs` (the base this whole section still sits on). Wrote
+the regression test, swapped that exact file in via a `trap`-protected script (checksum before/after),
+ran it, watched it fail with the precise diagnosed chain:
+
+```
+REFUSED: ... could not read part of the working tree: warning: in the working copy of 'docs/scratch.md',
+CRLF will be replaced by LF the next time Git touches it ... fix the reported permissions and restart.
+```
+
+— the exact misdiagnosis named in the finding, reproduced rather than assumed. Restored, checksum
+confirmed, then implemented the three fixes and reran: green.
+
+**Fix 1 — the save path writes LF.** `PageSaveService.NormalizeLineEndings` replaces `\r\n` first, then
+any remaining lone `\r`, both to `\n`, before `WriteFileAsync` ever touches disk. **A lone `\r` is
+normalized too** — stated and reasoned in code: the goal is "every line ending this repository stores is
+LF," not "reproduce what `core.autocrlf=input` used to do" (which never touched a lone `\r` either), and
+leaving one on disk would be invisible to git once `autocrlf=false` is pinned (fix 2) and just as
+unwelcome to an Obsidian vault. Tested directly: CRLF → LF, and a lone `\r` alone → LF.
+
+**Fix 2 — `core.autocrlf=false` pinned, but *not* literally "alongside" the other two settings, because
+tracing the call order shows that placement would not have fixed the Product Owner's actual failure.**
+`ApplyRepositoryConfigurationAsync` (which sets `receive.denyCurrentBranch`/`http.receivepack`) runs from
+`ConfigureRepositoryAsync`, which `EnsureRepositoryAsync` calls **only after** `AcceptRepositoryAsync` has
+already returned — and `AcceptRepositoryAsync` is exactly where `ReconcileWorkingTreeAsync`'s `add -A`
+lives, unconditionally, on **every** start, not only the first. Setting the pin only in
+`ApplyRepositoryConfigurationAsync` would leave that very `add -A` — the one that actually bit the Product
+Owner, on a restart over already-committed content — still running before the pin ever took effect, on
+every single start. Confirmed by tracing the method bodies, not by re-reading the brief's prose.
+
+**What I did instead:** a new `ApplyContentSafetyConfigurationAsync`, called from inside
+`AcceptRepositoryAsync` itself, immediately after `AssertGitResolvesRepositoryRootAsync` confirms `.git`
+is resolvable and before `EnsureInitialCommitAsync`/`ReconcileWorkingTreeAsync` — before any `add` in this
+class runs, on every call. `ApplyRepositoryConfigurationAsync` (the two Smart HTTP settings) is untouched.
+Both are still pinned every start, restoring an older or backed-up repository just as before; they are
+just no longer in the same method, because "repository configuration" is not one concern here — one half
+gates a write that already runs before the app ever serves a request, the other half never can.
+
+**Flagging this explicitly because it is a deviation from the brief's literal placement instruction, not
+because I doubt the intent** — the brief's own stated goal ("content arriving with CRLF ... can no longer
+make `add -A` warn") only holds under this placement. Please check my tracing of
+`EnsureRepositoryAsync` → `AcceptRepositoryAsync`/`ConfigureRepositoryAsync` if anything here reads
+wrong; I'd rather this get a second look than have it ship on my say-so alone, given the theme of this
+exact round.
+
+**Fix 3 — the message.** `UnreadableWorkingTreeException` → `UnexpectedReconciliationStderrException`:
+still refuses, still embeds git's verbatim stderr and the affected path, but no longer asserts the cause
+("could not read part of the working tree") or the remedy ("fix the reported permissions") — it says
+what happened (an unrecognised `add -A` stderr on an otherwise-successful command), shows exactly what
+git reported, and says "this is not necessarily a permissions problem, read the message above." The
+genuine-unreadable-directory test (`ReconciliationOfAnUnreadableDirectory_...`) still passes unmodified in
+substance — it only ever asserted on git's own embedded text — and now additionally asserts the old
+"fix the reported permissions" wording is gone and the new "not necessarily a permissions problem" framing
+is present, so a future edit can't quietly reintroduce the misdiagnosis.
+
+**The regression test needed a technique this file already has a documented reason to avoid, and I built
+the safe version of it instead of the unsafe one.** `ContentRepositoryServiceTests.Branch_...`'s own
+comment: *"never `Environment.SetEnvironmentVariable`, which mutates the process-wide environment that
+every concurrently-running test class's git subprocesses inherit under xUnit's default parallelism."*
+That test could scope its override to one directly-issued git call via `GitProcessRunner`'s own per-call
+`environmentVariables` parameter — but `ContentRepositoryService`'s own internal calls never accept one,
+and adding that seam to production code purely for testability would widen this change past what was
+asked. So: extended `ZeroWiki.LockTestHarness` (already exactly this pattern, for `RepositoryWriteLock`)
+with a second mode, `reconcile-under-hostile-git-config`, that sets `GIT_CONFIG_GLOBAL` as **its own**
+process's environment and runs a real `EnsureRepositoryAsync()` — a genuine second OS process, zero risk
+to any other concurrently-running test. `ReconcileHarnessProcess.cs` spawns it, mirroring
+`LockHarnessProcess`'s own shape (made its private path-resolution helper `internal` to share rather than
+duplicate it).
+
+**Tests, all against the real `git` binary, none of them weakened:**
+
+- `PageSaveServiceTests`: CRLF → LF; a lone `\r` → LF.
+- `ContentRepositoryServiceTests.RestartingOverACommittedCrlfFileUnderInheritedAutocrlfInput_StartsSuccessfully`
+  — the regression test, reproduced red against the pre-fix file as above, green against the fix. Commits
+  a CRLF file for real, points a fresh harness process at the same data root with a hostile
+  `core.autocrlf=input` global config, asserts `EnsureRepositoryAsync()` completes.
+- `ReconciliationOfAnUnreadableDirectory_RefusesRatherThanCommittingTheReadableSubset` — unchanged
+  behaviour, two new assertions locking in the corrected message shape (above).
+- `AssertConfigurationIsAppliedAsync` (shared by two existing tests) now also asserts
+  `core.autocrlf` reads back `false`, alongside the two settings it already checked.
+
+**Also record, do not fix — other inherited git settings that could change this app's behaviour, for §7
+to own as a class (none of these were run or verified; this is a survey, not a finding):**
+
+- `commit.gpgsign` — if a host's global config sets this `true`, every `git commit` this app makes
+  (the initial commit, every recovery commit, every browser save) would attempt to sign with a key this
+  container almost certainly does not have, turning a silent success into a hard failure at a much wider
+  set of call sites than `core.autocrlf` ever touched. Plausibly the single highest-severity item on this
+  list.
+- `core.safecrlf` — connected to the setting just fixed: if `autocrlf` were ever re-enabled for any
+  reason, an inherited `safecrlf=true` (or `warn`) changes a *warning* into a hard *error*, altering the
+  failure shape this round just finished reasoning about.
+- `core.symlinks=false` — makes git materialize a symlink as an ordinary tracked text file containing the
+  target path rather than a real OS symlink, which interacts with `PageSaveService`'s own
+  `AnyPathComponentIsASymlink` check in a way nobody has traced.
+- `core.fileMode` — could make git report or ignore spurious executable-bit changes depending on the
+  mounted volume's filesystem; unclear whether this ever reaches a path this app inspects.
+- `core.ignoreCase` — case-insensitive-filesystem checkouts (the default on macOS/Windows) could change
+  what `git status`/`add -A` calls a rename versus a fresh add for a case-only filename change, separate
+  from D12's own case handling at the C# layer.
+- `core.precomposeUnicode` — Unicode NFD/NFC normalization for filenames (macOS-specific); adjacent to
+  the `café-vault` non-ASCII path handling already named in D17.
+- `core.protectNTFS`/`core.protectHFS` — security-relevant path-traversal protections git ships on by
+  default; this app has never verified they are not overridden off by an inherited config.
+- Checked and **not** a risk: `user.name`/`user.email` (every commit this app makes supplies its own via
+  `GIT_AUTHOR_*`/`GIT_COMMITTER_*` environment variables, overriding any inherited identity) and
+  `init.defaultBranch` (already pinned via explicit `-b`, and already covered by
+  `Branch_IsTheNamedConstantRegardlessOfTheHostsDefaultBranch`).
+
+**Mutation testing: not run.** None of the three fixes is an auth, concurrency, or data-integrity
+mechanism in the CLAUDE.md sense (`BootstrapService`/`InvitationService`/`LoginService`/`GitTokenService`/
+the anonymous gate) — this is a startup-robustness and content-normalization fix. Nothing here looked
+like a genuine integrity path, so I did not run mutation testing rather than asking first as instructed
+for the "did not find one" branch.
+
+**Gates:** `dotnet build` 0 warnings/0 errors; full unfiltered `dotnet test` (10-minute timeout given) —
+**791/791, 2 m 27 s** (targeted re-runs of the affected classes also green: 64/64); `dotnet format
+--verify-no-changes` clean; `openspec validate git-backed-content-core --strict` valid. `git status
+--short -- src tests` shows only this block's files throughout (three modified from earlier rounds, two
+new production files, plus the harness/test changes); the pre-fix swap was restored and reconfirmed by
+checksum before any further work.
+
+**Recovery for the Product Owner's currently-unstartable environment.** The browser save that wrote the
+CRLF bytes already succeeded and is already committed — `PageSaveService`'s own `git add -- <path>` call
+never inspects stderr, so nothing was lost or needs manual repair. Only the *next* startup's
+`ReconcileWorkingTreeAsync` call refuses, because that one does inspect it. Recovery is: deploy this
+fix and restart against the **same** data volume — nothing else is required.
+
+1. Build and deploy the app with this block's changes (still uncommitted pending review — the Architect
+   commits once approved).
+2. Start it pointed at the same `ContentStorage:DataRoot` volume that currently fails to start.
+3. **Expected:** it starts. No error, no manual git surgery, no need to touch `docs/scratch.md`.
+4. Sign in and open `/wiki/scratch` — the existing content renders normally (Markdown rendering does not
+   care about CRLF vs LF).
+5. Edit and save `scratch.md` (or any page) once via the browser. **Expected:** it saves normally.
+   Optional, for anyone who wants to confirm the fix at the byte level with shell access to the volume:
+   `git -C <dataRoot>/wiki show HEAD:docs/scratch.md | od -c | tail -5` should show no `\r` in the newly
+   saved content (the pre-existing CRLF bytes from before this fix remain in history until next edited —
+   that is expected and harmless, not a leftover bug).
+6. Optional, same shell access: `git -C <dataRoot>/wiki config core.autocrlf` should print `false`.
+
+→ @reviewer. Please look hardest at: the `AcceptRepositoryAsync`/`ConfigureRepositoryAsync` ordering
+argument for fix 2 (this is the one place this round diverges from the brief's literal wording, and I'd
+rather it be checked than trusted); whether the harness-process technique for the regression test is
+actually airtight against the parallelism hazard it exists to avoid; and whether the "record, do not fix"
+list above is honest about being unverified rather than reading like a set of findings.
+
+**[reviewer]** Block D4 continuation, round three (CRLF normalization, `core.autocrlf` pin, honest
+refusal message) — **Approve.** Every priority item executed, including two of my own throwaway probes
+that turned out to be flawed on the first attempt — recorded below rather than quietly redone, since
+catching my own instrument being wrong is exactly this round's theme.
+
+**The ordering argument — re-derived by tracing the actual control flow, not by re-counting line
+numbers.** `EnsureRepositoryAsync` calls `AcceptRepositoryAsync` then `ConfigureRepositoryAsync`.
+`ApplyContentSafetyConfigurationAsync` sits inside `AcceptRepositoryAsync`, reached unconditionally after
+all three classification branches (fresh init, adopted-with-history, adopted-unborn-HEAD) converge — and
+strictly before the only two `add`-issuing calls left in the method (`EnsureInitialCommitAsync`,
+`ReconcileWorkingTreeAsync`), which also run unconditionally in that order regardless of which branch was
+taken. `ApplyRepositoryConfigurationAsync`, where the brief asked for the pin, runs from
+`ConfigureRepositoryAsync` — strictly *after* `AcceptRepositoryAsync` has already returned — so it would
+be too late for both. The worker's placement is correct; the brief's literal instruction would not have
+fixed the Product Owner's actual failure (a restart over already-committed content, which is exactly the
+"adopted, has commits" branch).
+
+**Red-then-green, reproduced myself, not trusted from the writeup.** Swapped in the exact pre-fix
+`ContentRepositoryService.cs` (`git show HEAD:...`, checksum before and after, `trap`-protected) and ran
+the permanent regression test: failed with the identical misdiagnosed chain —
+`"...could not read part of the working tree: warning: in the working copy of 'docs/scratch.md', CRLF
+will be replaced by LF... fix the reported permissions and restart."` Restored (checksum confirmed back
+to the original), reran: passed. This is the same file-swap technique that has left a live mutant in
+`src/` three times in this change; both swaps were bracketed by an explicit `trap` and a checksum on both
+sides, and `git status`/`grep MUTANT` are clean throughout.
+
+**Verified the pin covers all three startup paths — and found the honest limit of what "verify by
+execution" can mean here.** Traced the control-flow argument above, then tried to construct executable
+red/green probes for the two untested paths (fresh initialize, unborn HEAD) the same way the permanent
+test does for the adopted-with-history one. Both probes **passed even against the pre-fix class** —
+neither discriminates, because (confirmed by tracing why) the CRLF warning is specific to *re-reconciling
+an already-tracked file*, not to staging one for the first time; a brand-new repository's first-ever
+`add -A` over untracked CRLF content produces no warning either way, pre-fix or post. This means the
+underlying defect can only actually manifest via the "adopted, has commits" branch — which is exactly the
+one the permanent test covers — regardless of which branch created the repository originally, since any
+content old enough to need reconciling was necessarily committed by an *earlier* `EnsureRepositoryAsync`
+call, and a second call always sees "has commits." For the other two branches, the strongest available
+evidence is the structural trace (single call site, unconditionally reached, strictly before both
+remaining `add` calls) — not a discriminating test, because I could not make the underlying git behaviour
+warn on a first-time add to build one. Reporting the negative result rather than the two passing-either-way
+probes as if they were confirmation.
+
+**Does the pin hold at the moment it's needed — what if the write itself fails?** Confirmed by execution,
+and caught my own first attempt testing the wrong thing: chmod 444 on `.git/config` alone does **not**
+make `git config` fail — verified directly (`git config core.autocrlf false` succeeds against a read-only
+`.git/config`), because git writes via a lock file created *inside* `.git/` and renamed over the target,
+which is gated by the *directory's* write permission, not the file's. Redid it against a read-only
+`.git` directory instead: `git config core.autocrlf false` now genuinely fails (`exit 255: could not lock
+config file .git/config: Permission denied`), and `EnsureRepositoryAsync()` propagates
+`GitProcessException` uncaught — refuses to start rather than silently proceeding without the pin in
+effect. Correct: a failed pin write is exactly the fail-fast case, not a case to degrade past.
+
+**The harness-process technique — the "already documented and forbidden" claim checked, not taken on
+trust.** `ContentRepositoryServiceTests.cs:137-140`'s existing comment on
+`Branch_IsTheNamedConstantRegardlessOfTheHostsDefaultBranch` does say, verbatim, never to use
+`Environment.SetEnvironmentVariable` because it "mutates the *process-wide* environment that every
+concurrently-running test class's git subprocesses inherit under xUnit's default parallelism" — confirmed
+by reading it directly, not paraphrased. `ReconcileHarnessProcess`/`LockTestHarness`'s new mode sets
+`GIT_CONFIG_GLOBAL` inside the *spawned* process's own environment (`Program.cs:97`), never touching the
+xUnit host — genuinely a different, safe pattern for a call (`EnsureRepositoryAsync`) with no per-call
+environment seam to hook into, not a violation of the rule it cites.
+
+**Lone `\r` normalization — reasoned through for this project's actual rendering pipeline, not just
+accepted as "more thorough."** The only place a bare `\r` could carry meaning distinct from `\n` is a
+terminal's overwrite-the-line semantics; ZeroWiki renders Markdown to HTML via Markdig, never to a
+terminal emulator, so that meaning has nowhere to survive to. `\r\n` is replaced first, so a two-byte
+sequence collapses to one `\n` rather than two — confirmed correct order by reading `NormalizeLineEndings`
+directly. Not a correctness risk for this pipeline.
+
+**Does normalization interact with the CAS, and is a resubmitted-unedited save a genuine no-op? Built the
+exact round trip and ran it, since neither existing test (the original byte-identical test uses
+single-line content with no line endings at all; the two new CRLF tests exercise fresh content, not a
+resubmission of already-committed content) covers it.** Committed LF content directly
+(`"line one\nline two\nline three"`), then called `SaveAsync` with the *same* logical content
+re-serialized as CRLF (exactly what a browser does on an unedited resubmission), declaring the correct
+base revision:
+
+```
+Outcome: Saved, CommitSha: <null>
+Revision count before: 2, after: 2
+Written bytes match original LF content exactly? True
+```
+
+The CAS is unaffected (it compares the *declared base* against *HEAD's existing blob*, both untouched by
+normalization, which only applies to the new write); after normalization the written bytes are
+byte-identical to what was already committed, so `git diff --cached --quiet` correctly finds nothing
+staged and no commit is created. Genuine no-op, confirmed rather than assumed. This was a temporary
+addition directly inside `PageSaveServiceTests.cs` (private test-class helpers made that the only way to
+reuse `CommitPageDirectlyAsync`/`RevisionCountAsync`), checksummed before and after, reverted, and
+confirmed byte-identical to the block's own diff (`git diff --stat` back to the original 44 insertions,
+zero stray references).
+
+**Block B not weakened.** The refusal condition itself — `!string.IsNullOrWhiteSpace(addResult.StandardError)`
+— is untouched; only the exception type and message changed (verbatim stderr, no asserted cause). Still
+refuses on *any* stderr, exactly the Product Owner's reaffirmed decision. The genuine-unreadable-directory
+test passes unmodified in substance, now with two additional assertions locking in the corrected wording.
+
+**The "record, do not fix" list is honestly labelled** ("none of these were run or verified; this is a
+survey, not a finding") and I checked it reads that way rather than like six quiet findings — it does.
+On severity: `commit.gpgsign` is the one I'd elevate for a decision before §7 gets to it, but I don't
+think it blocks this round. Reasoned through why it's different in kind from the CRLF bug just fixed,
+not merely less scary: an inherited `commit.gpgsign=true` would fail *every* commit *loudly and
+immediately* (a git signing error, not a misdiagnosed permissions message), and *only* on a genuine save
+attempt, not intermittently at startup on content nobody touched. The CRLF bug's specific danger was the
+combination of silence-adjacent misdiagnosis and intermittency; `commit.gpgsign` lacks both. Worth a
+decision, not worth reopening this round's scope, which the brief already correctly fenced off.
+
+**Standing rules.** No comment attributes a decision or measurement to a party that didn't produce it.
+Every literal a machine parses in this diff (the git config values, the exception message wording, the
+`GIT_CONFIG_GLOBAL` mechanism) was fed to the actual machine by either the worker or by my own
+re-derivation above, not read for plausibility.
+
+`dotnet build` 0/0; `dotnet test` **791/791** (10-minute explicit timeout, re-run independently); `dotnet
+format --verify-no-changes` clean; `openspec validate --strict` valid. `git status --short -- src tests`
+shows only this block's ten files throughout — every throwaway probe (the two path-coverage probes, the
+pin-failure probe, the no-op round-trip addition) was built, run, and removed, with `git status` and a
+checksum reconfirmed clean before moving to the next check. `grep -rn MUTANT` and a scan for stray
+`.orig`/`.bak`/swap copies in `src/ZeroWiki/Content/` — both clean. No mutation testing run: this round's
+changes don't alter the CAS, rollback, or invalidation logic C2/D3 already mutation-tested, and swapping
+in the entire pre-fix class (already done above, twice) is a strictly larger and more direct check than
+any single-line mutation of this round's own additions would be.
+
+**Verdict: Approve.** The ordering argument holds under a real control-flow trace and two executed
+red/green swaps; the pin's own failure mode fails fast rather than degrading; the harness technique is
+genuinely isolated; line-ending normalization is correct for this pipeline and stable under the exact
+browser round trip that caused the original defect; block B's safety posture is unweakened. Ready for the
+Product Owner to confirm their environment starts again and 6.1 still works end to end. → @architect
+
+**[architect]** ✅ **Product Owner confirmed 6.1 in a browser** — create, edit, the two-tab conflict with
+the member's own text preserved, the reload with no resubmit prompt, and `od -c` showing LF-only bytes on
+the saved file. Their previously-unstartable environment recovered on restart with no manual
+intervention, as the fix intended.
+
+**6.1 and 6.4 ticked. Block D4 committed.** Gates run in the foreground by the Architect with an explicit
+10-minute timeout: `dotnet build` **0/0**; `dotnet test` **791/791 unfiltered** in 2m22s (**+33** from
+`9099d72`'s 758); `dotnet format --verify-no-changes` exit 0; `openspec validate --strict` valid;
+`grep -rn MUTANT src/ tests/` empty; no `.csproj` touched.
+
+**§6 is now feature-complete: 8 blocks, 31/41 tasks ticked. The section review follows.**
+
+**What D4 cost, and why it was worth recording rather than smoothing over.** The block passed its
+reviewer's `Approve` **once**, and the Product Owner's browser then found **two** defects that review had
+certified as clean — a resubmittable POST, and a browser save that made the app refuse to start. Fixing
+the first introduced a **third** (a targeted cross-account draft eviction DoS), caught only because the
+reviewer converted its own reasoning about the eviction policy into an executed attack. Four defects
+total, against a suite that was green at every moment.
+
+**The pattern across all four is one thing: every instrument in this block asked about the *body*, and
+none asked about the *response*, the *environment*, or the *adversary*.** Twelve tests asked "what does
+the page say". None asked "is this a redirect", "what does the host's `~/.gitconfig` say", or "what can a
+hostile member do to a colleague". Those were not oversights within the question being asked — they were
+whole questions nobody asked, and no amount of asking the first question harder would have reached them.
+
+**Standing rule, the strongest form this change has produced of a lesson it keeps relearning:** *a green
+suite certifies the questions it encodes and nothing else. Before believing a surface is done, enumerate
+the question-classes it has never been asked — response shape, inherited environment, adversarial input,
+concurrency — and ask whether the absence is deliberate. A human in a real environment is not a
+formality after the gates; on this block they were the only instrument that asked three of the four
+questions that mattered.*
+
 ## NEXT
 
 **Resume point: §6 (Commit-on-save), block D2 — obligation 8, the git subprocess cancellation kill.**

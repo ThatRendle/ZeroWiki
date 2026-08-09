@@ -70,6 +70,11 @@ public static class ContentStorageStartupExtensions
         // §6 block C2: the save path itself (D4, D9, D16, D17) — no UI caller yet, that is block D.
         services.AddSingleton<PageSaveService>();
 
+        // §6 block D4 continuation: the Post/Redirect/Get draft carrier for a failed save. Depends on
+        // the already-singleton ISecretTokenGenerator and TimeProvider rather than either being
+        // re-resolved per request.
+        services.AddSingleton<EditDraftStore>();
+
         return services;
     }
 
