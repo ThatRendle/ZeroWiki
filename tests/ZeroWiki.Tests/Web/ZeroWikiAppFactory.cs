@@ -26,6 +26,7 @@ public sealed class ZeroWikiAppFactory : WebApplicationFactory<Program>
     private readonly string _databasePath;
     private readonly string _dataRoot;
     private readonly string _connectionString;
+    private readonly bool _useRealServer;
 
     /// <summary>Everything this application logged, so a test can sweep it for a secret.</summary>
     public CapturingLoggerProvider Logs { get; } = new();
@@ -46,11 +47,20 @@ public sealed class ZeroWikiAppFactory : WebApplicationFactory<Program>
     {
     }
 
-    private ZeroWikiAppFactory(string databasePath, string dataRoot)
+    private ZeroWikiAppFactory(string databasePath, string dataRoot, bool useRealServer = false)
     {
         _databasePath = databasePath;
         _dataRoot = dataRoot;
         _connectionString = TestDatabase.ConnectionStringFor(_databasePath);
+        _useRealServer = useRealServer;
+
+        if (_useRealServer)
+        {
+            // Must be called before this instance is first started (Services/CreateClient/etc.) --
+            // WebApplicationFactory throws InvalidOperationException otherwise. Port 0: dynamic
+            // selection, read back afterward via RealServerAddress.
+            UseKestrel(port: 0);
+        }
     }
 
     /// <summary>
@@ -63,6 +73,49 @@ public sealed class ZeroWikiAppFactory : WebApplicationFactory<Program>
     /// </summary>
     public static ZeroWikiAppFactory RestartedFrom(ZeroWikiAppFactory previous) =>
         new(previous.DatabasePath, previous.DataRoot);
+
+    /// <summary>
+    /// Task 7.3/7.4: boots the real application on a real listening Kestrel socket rather than the
+    /// in-memory <c>TestServer</c> every other test uses — the one property a real <c>git</c> client
+    /// needs, since it is a separate OS process that must dial an actual port to clone, fetch or
+    /// push. See <see cref="RealServerAddress"/> for the address it bound to.
+    /// </summary>
+    /// <param name="dataRoot">
+    /// When supplied, this instance's <c>ContentStorage:DataRoot</c> — pre-populate it with an
+    /// existing git repository (e.g. on a branch other than <c>main</c>) before constructing this
+    /// factory to exercise startup's adopted-repository path rather than first-ever <c>git init</c>.
+    /// Left <see langword="null"/> for a fresh, empty root exactly like the parameterless
+    /// constructor's.
+    /// </param>
+    public static ZeroWikiAppFactory WithRealServer(string? dataRoot = null) =>
+        new(
+            Path.Combine(Path.GetTempPath(), $"zerowiki-web-{Guid.NewGuid():n}.db"),
+            dataRoot ?? Path.Combine(Path.GetTempPath(), $"zerowiki-web-data-{Guid.NewGuid():n}"),
+            useRealServer: true);
+
+    /// <summary>
+    /// The real address Kestrel bound to — only meaningful when constructed via
+    /// <see cref="WithRealServer"/>. Accessing this triggers server startup (mirrors
+    /// <see cref="Services"/>'s own behaviour), so no separate "start" call is needed first.
+    /// </summary>
+    public Uri RealServerAddress
+    {
+        get
+        {
+            if (!_useRealServer)
+            {
+                throw new InvalidOperationException(
+                    $"{nameof(RealServerAddress)} is only meaningful on an instance constructed via " +
+                    $"{nameof(WithRealServer)}.");
+            }
+
+            // Services touches StartServer() the same way the base class's own Server property
+            // does, which is what makes ClientOptions.BaseAddress reflect the port Kestrel actually
+            // bound rather than the pre-startup placeholder.
+            _ = Services;
+            return ClientOptions.BaseAddress;
+        }
+    }
 
     /// <summary>A client that surfaces redirects instead of following them.</summary>
     /// <remarks>

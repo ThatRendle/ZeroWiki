@@ -19308,6 +19308,270 @@ Nothing here reaches past its evidence. Ready for `7.1`/`7.2`/`7.5` to be ticked
 
 → @architect
 
+**[architect]** **Block B landed — `fb8904a`; `7.1`, `7.2` and `7.5` ticked.** Gates re-run by me,
+unsandboxed and in the foreground, not cited from the block: `dotnet build` 0/0, `dotnet format
+--verify-no-changes` exit 0, `openspec validate --strict` valid, `dotnet test` **817/817 in 2m24s**. No
+`MUTANT` residue.
+
+**Recorded because it nearly repeated this project's worst near-miss:** seven of block B's eleven files
+were **untracked for the block's entire life** — including *both* mutation targets,
+`GitBasicAuthenticationFilter.cs` and `GitSmartHttpEndpoints.cs`. `git diff` reports **nothing at all**
+for a file git has never tracked, so the mandated pre-commit diff would have come back clean over the two
+files a mutation run had been editing, exactly as it did for §7b's `GitEmailService.cs`. I ran
+`git add -N` on all seven before commissioning the review so the diff could see them, and briefed
+`@reviewer` to read those two files' logic **directly** rather than infer it from a clean diff — which it
+did. **`git add -N` at the point a block creates a new file should be the standing habit**; it converts
+this project's most-repeated blind spot into an ordinary diff, and costs nothing.
+
+**[architect] Brief — block C (7.3 + 7.4). The last block of §7: verification against a real `git`
+client.** Base for the section remains `cb81b47`; block C's own diff starts at `fb8904a`.
+
+Blocks A and B built the remote and proved its parts in isolation. C's job is the property neither could
+establish: that a **real, unmodified `git` client** completes a real clone, fetch and push against the
+app as it actually runs — Kestrel on a real socket, the real middleware chain, the real endpoint filter.
+
+1. **7.3 — authenticated clone, fetch and push against the running app.** `TestServer` cannot serve this:
+   it has no listening socket, and `git` is a separate OS process that must dial a real port. Stand the
+   app up on a real ephemeral port and drive the actual `git` binary against it. Cover the negative case
+   too — an unauthenticated clone, and one with a revoked token, must both **fail** at the client, not
+   merely return a non-200 to an HTTP assertion.
+2. **7.4 — `updateInstead` and non-fast-forward.** A fast-forward push updates the **working tree**, not
+   just the ref: assert the file on disk changed, and that the tree is clean afterwards. A
+   non-fast-forward push is **rejected**, and the server-side tree is unchanged by the attempt.
+3. **⚠️ Obligation 10 bites here, and only here.** Do **not** assume `DefaultBranch = "main"`. An adopted
+   repository may be on `master`; `DefaultBranch` has exactly one call site, `git init -b main` at
+   first-ever creation. Read the checked-out branch with `git symbolic-ref HEAD` (existing call site:
+   `ContentRepositoryService.cs:661`). **Prove it with a fixture on a non-`main` branch** — a test that
+   only ever runs on `main` cannot fail this way, which is precisely why it was still latent after six
+   sections.
+4. **The obligation block A owed you — the in-container repack/prune race.** D18 §5 records that
+   `git-upload-pack` needing no write lock is confirmed on **macOS/git 2.55.0 only**, with in-container
+   confirmation on Ubuntu 24.04/git 2.43.0 **outstanding** because Docker was unreachable for two rounds.
+   `scratchpad/race_probe_gc.py` is the shape to adapt — do not rebuild it. **Check whether Docker is
+   reachable first.** If it is not, report **"not obtained"** plainly and leave D18's outstanding
+   statement exactly as it stands. Do **not** substitute an argument for the run, and do **not** quietly
+   drop the obligation: an honest gap is a pass here, a papered-over one is the defect this section spent
+   three rounds removing.
+5. **A copy-pasteable manual recipe for the Product Owner**, posted in this thread: the exact commands to
+   clone, edit, push and observe the working tree update against their own running instance
+   (local dev is port **5171**), including how to issue a git token from `/account` and what a success and
+   a failure each look like. Automated tests are the gate; this is so a human can confirm the thing works
+   in the real app, which is what §7.3 was written to mean.
+
+*Not in this block:* the `post-receive` re-index and broadcast (§8), and the Obsidian vault itself (§9).
+If a test here needs either, you have found a section-boundary problem — say so rather than building it.
+
+*Mutation testing:* not indicated. This block adds verification, not a new security-critical path. If
+your work uncovers a defect in B's auth or lock code, that is a finding to post, not a licence to open a
+mutation campaign.
+
+*Gates:* build, test, format, `openspec validate --strict` — all clean, all **unsandboxed and in the
+foreground**. `dotnet` inside the sandbox fails misleadingly here (*"Build FAILED. 0 Warning(s) 0
+Error(s)"* after a five-minute stall). Never background `dotnet test` and wait on it.
+
+*New files:* run `git add -N` on each as you create it, per the note above.
+
+Tick `7.3` and `7.4` only once green. Do not commit; hand to `@reviewer`.
+
+→ @worker
+
+**[worker] Block C (7.3 + 7.4) — done.** New: `tests/ZeroWiki.Tests/Web/GitSmartHttpRealClientTests.cs`
+(5 tests). Modified: `tests/ZeroWiki.Tests/Web/ZeroWikiAppFactory.cs` (real-Kestrel + custom-`DataRoot`
+support), `openspec/changes/git-backed-content-core/design.md` (D18 §5's outstanding obligation,
+discharged — see below). No `src/` changes; this block is verification only, as briefed.
+
+**Harness: `WebApplicationFactory<Program>.UseKestrel(0)` — a real .NET 10 API, not hand-rolled.**
+`ZeroWikiAppFactory.WithRealServer(dataRoot?)` calls it in the constructor (must run before first
+`Services`/`CreateClient` access); `RealServerAddress` forces startup and reads back
+`ClientOptions.BaseAddress`, which the framework rewrites to the actual bound loopback port once
+Kestrel is listening. Confirmed by execution, not by API docs alone: `UseHttpsRedirection()` (always
+active in the pinned `Production` environment) logs "Failed to determine the https port for redirect"
+and passes the request through unmodified, because no HTTPS endpoint exists to redirect to — plain
+`http://127.0.0.1:<port>` works end to end, no dev cert needed. Every client-side git invocation goes
+through the same `GitProcessRunner` the app itself uses (never hand-rolled), with `GIT_TERMINAL_PROMPT=0`
+and a 30s bound so a genuinely-refused auth attempt fails promptly instead of blocking on a TTY prompt.
+
+**7.3 — authenticated clone/fetch/push, real client, real Kestrel.**
+`AuthenticatedClient_ClonesEditsAndPushes_AndTheServersWorkingTreeReflectsIt`: clone → fetch (explicit,
+otherwise-pointless, still has to succeed over the real transport) → edit → commit → push, then reads
+the pushed file directly off `ContentPaths.WorkingTree` (bypassing git) to prove the *working tree*
+changed, not just the ref, and asserts `git status --porcelain` is empty server-side afterward.
+
+Negative cases fail **at the client**, confirmed by inspecting `stderr`, not merely a non-zero exit:
+- `UnauthenticatedClone_FailsAtTheClient` — `fatal: could not read Username for '...': terminal prompts
+  disabled`. Refused before git ever had a credential to send — no subprocess-adjacent ambiguity.
+- `RevokedTokenClone_FailsAtTheClient` — `fatal: Authentication failed for '.../git/'`. A real credential
+  was presented and rejected — a different failure shape from the case above, and the assertions
+  distinguish them rather than collapsing both to "clone.Succeeded is false".
+- Both additionally assert no `.git/HEAD` was left behind — a failed clone leaves nothing a later `git
+  pull` could be fooled by.
+
+**7.4 — `updateInstead` and non-fast-forward, working tree asserted directly.**
+`NonFastForwardPush_IsRejected_AndTheServersWorkingTreeIsUnchanged`: two clones from the same initial
+state; the first pushes (fast-forward, succeeds); the second, still at the old parent, pushes a
+different new file and is rejected (`stderr` contains "rejected", matching D18's own transcript shape).
+Asserts the server's working tree has the winner's file and **not** the loser's, and that
+`git status --porcelain` is empty afterward — the rejected attempt wrote nothing, not even transiently.
+
+**Obligation 10 — proved with a fixture on `master`, not `main`, using the real E2E harness.**
+`AdoptedRepositoryOnANonMainBranch_ClonesAndPushesOnThatBranch` builds `docs/index.md` + `git init -b
+master` + a commit **before** `ZeroWikiAppFactory.WithRealServer(dataRoot)` ever constructs the app, so
+startup takes the adopted-repository path (`hasOwnGitEntry` branch), never `git init -b main`. The branch
+identity is read from git on both ends — `git symbolic-ref HEAD` on the fixture *and* on the clone — and
+compared to each other, never hardcoded as a literal the app could satisfy by coincidence: 
+`refs/heads/master` on the fixture, and the clone reports the same value after cloning. Push, then confirm
+the server-side branch is still `refs/heads/master` afterward (nothing silently reset it to `main`).
+
+**D18's outstanding obligation — discharged, not carried forward.** Checked Docker first, per the brief:
+`docker info` succeeded this round (`docker: Version 29.4.0`, OrbStack), unlike the two prior rounds'
+`permission denied` on the same socket — no code or environment change on my end, just available this
+time. Ran `race_probe_gc.py` **unmodified** from block A's own scratchpad copy
+(`scratchpad/d18fix/race_probe_gc.py`, checksummed `805b298d…` before and after every invocation — no
+edits) inside `mcr.microsoft.com/dotnet/aspnet:10.0` with `git`/`python3` via `apt-get`, resolving to
+Ubuntu 24.04.4 / `git 2.43.0` — the exact image and package the `Dockerfile` ships:
+
+```
+run 1: repack/prune events: 20   verified (index-pack clean): 119   errors: 0   server-side fsck exit: 0
+run 2: repack/prune events: 20   verified (index-pack clean): 122   errors: 0   server-side fsck exit: 0
+run 3: repack/prune events: 20   verified (index-pack clean):  98   errors: 0   server-side fsck exit: 0
+```
+
+3/3 clean. `design.md` D18 §5 updated in place with the transcript and a statement that in-container
+confirmation is no longer outstanding; the macOS-only paragraph and its POSIX-argument reasoning are left
+untouched, not overwritten — the new paragraph is additive, same as block A's own remediation pattern.
+
+**Manual verification recipe for the Product Owner** (local dev runs on port **5171**; this is what §7.3
+was written to mean beyond the automated suite):
+
+1. Sign in at `http://localhost:5171/login`, then go to `http://localhost:5171/account` and issue a new
+   git token (shown once — copy it immediately).
+2. In a terminal:
+   ```sh
+   git clone http://<your-username>:<the-token>@localhost:5171/git zerowiki-clone
+   cd zerowiki-clone
+   echo "hello from a real git client" >> docs/page.md   # or edit any existing page
+   git add -A
+   git -c user.name="Your Name" -c user.email="you@example.invalid" commit -m "manual verification"
+   git push
+   ```
+   **Success looks like:** `git clone` reports "Cloning into 'zerowiki-clone'..." with no error; `git
+   push` ends with a line like `<sha>..<sha>  HEAD -> main` (or `master`, whatever branch the volume was
+   already on) and no `[rejected]`. Reload the page in the browser — the edit is visible immediately.
+3. **Failure to check (proves auth is real, not decorative):** run the same clone with the token
+   replaced by a wrong string. Expect `fatal: Authentication failed for '...'` and no directory left
+   behind other than an empty/absent one.
+4. **Working-tree check, not just "the push worked":** after the push in step 2, on the server/container,
+   confirm the file changed on disk (e.g. `docker exec <container> cat /data/wiki/docs/page.md`, or the
+   equivalent path for a bind-mounted volume) and that `git -C /data/wiki status --porcelain` is empty —
+   the tree should never sit dirty after a successful push.
+
+**Gates, foreground, unsandboxed, per the harness note:**
+- `dotnet build` — 0 Warnings, 0 Errors, ~1.3s.
+- `dotnet test` — unfiltered, **822/822 passed**, 2m17s (baseline 817 + 5 new; delta +5, no regressions).
+- `dotnet format --verify-no-changes` — exit 0, no output.
+- `openspec validate git-backed-content-core --strict` — valid.
+- `git status --short -- src tests` / `git diff --stat -- src tests` — exactly this block's two files
+  (`GitSmartHttpRealClientTests.cs` new, `ZeroWikiAppFactory.cs` modified); `git add -N` run on the new
+  file immediately after creating it, per the standing habit.
+
+**Mutation testing:** not run, per the brief (verification block, no new security-critical path; nothing
+in B's auth/lock code was found defective while building this).
+
+→ @reviewer
+
+**[reviewer]** Block C (7.3 + 7.4) — **Approve.** No blockers. §7's last block; the section is ready for
+the supervisor once this lands.
+
+**Gates, re-run myself, unsandboxed and foreground:** `dotnet build` 0/0. `dotnet test` **822/822 in
+3m19s**, matching the report. `dotnet format --verify-no-changes` exit 0. `openspec validate --strict`
+valid. `git status --short` / `git diff --stat` — exactly the four files reported, zero `src/` changes
+confirmed directly, not inferred from the brief.
+
+**1 — Real socket, real subprocess: verified independently, not taken on the API's word.** Wrote a
+throwaway test (`ReviewerScratchRealSocketProbeTests.cs`, deleted after use — tree confirmed clean
+below) that connects to `RealServerAddress` with a bare `System.Net.Sockets.TcpClient`, no `HttpClient`
+or `WebApplicationFactory` machinery anywhere in the test, and hand-writes a raw `GET / HTTP/1.0` request
+over that socket. Got back a real `HTTP/1.1` response. That rules out an in-memory shortcut categorically
+— a `TestServer`-style duplex pipe cannot answer a bare `TcpClient`'s three-way handshake. On the client
+side, `GitProcessRunner.RunAsync` (already read during block A/B) is a genuine `System.Diagnostics.Process`
+spawn — `ProcessStartInfo("git")` plus `process.Start()`, not an API that could be faked — so what's
+actually happening is a separate real OS process (`git`) dialling a real listening socket bound by an
+in-process Kestrel hosted inside the test runner. Reusing the app's own `GitProcessRunner` for the client
+side doesn't mask anything: it's the identical "spawn `git` with a real argument array, never a shell
+string" contract on both ends, and the property under test (a real client, a real server, a real wire)
+doesn't care which side supplies the process-spawning code.
+
+**2 — 7.4 reads disk directly, not the ref.** `AuthenticatedClient_...`
+(`GitSmartHttpRealClientTests.cs:63-70`) reads `paths.WorkingTree`'s file via `File.ReadAllTextAsync` —
+bypassing git entirely — and separately asserts `git status --porcelain` is empty afterward.
+`NonFastForwardPush_...` (`:106-111`) asserts `File.Exists(winner.md)`/`!File.Exists(loser.md)` directly
+against the server's working tree, *in addition to* (not instead of) the `Contains("rejected", …)`
+stderr check — the disk assertion is what actually proves the tree, the stderr check only proves the
+client's own diagnosis of why. Both use the real disk path, not `git show`/`git cat-file`.
+
+**3 — Negative cases: verified they'd actually catch a removed guard, not just that they currently
+pass.** This is the check the brief asked for "a moment's thought" on, so I didn't just think about it —
+I bypassed `GitBasicAuthenticationFilter.InvokeAsync` (stashed a dummy `AuthenticatedAccount` in
+`HttpContext.Items` unconditionally, then `return await next(context)` before the real check, so the
+handler still runs normally exactly as if the filter were absent rather than throwing a 500 that would
+fail the test for the wrong reason) and re-ran `UnauthenticatedClone_FailsAtTheClient` and
+`RevokedTokenClone_FailsAtTheClient` under the bypass. **Both failed**, exactly as they should — `a clone
+using a revoked token must fail at the client` / `an unauthenticated clone must fail at the client, not
+merely return a non-200`, i.e. the tests do not pass with the guard removed, which is the property this
+project has been bitten by tests *not* having before. Reverted via `cp` from a pre-mutation copy, not
+`git checkout --`; checksum back to `e3cd6ab…`, `git status --short -- src` empty afterward. The two
+failure shapes themselves are also genuinely distinct, confirmed by reading (not just running) both
+assertions: `"terminal prompts disabled"` (never sent a credential — git's own client-side refusal to
+prompt) versus `"Authentication failed"` (a credential was sent and the server said no) — different
+stderr substrings, matching two different points in the protocol, not the same check duplicated.
+
+**4 — Obligation 10's fixture: genuinely dynamic, genuinely pre-existing.**
+`CreateAdoptedFixtureRepositoryAsync(fixturePaths, branch: "master")` (line 177) runs and returns *before*
+`ZeroWikiAppFactory.WithRealServer(dataRoot)` is ever constructed (line 184) — confirmed by reading the
+statement order, not inferred. Branch identity comes from `git symbolic-ref HEAD`
+(`ReadCheckedOutBranchAsync`, real subprocess) on both the fixture and the clone, and the test compares
+`fixtureBranch` to `clonedBranch` to `branchAfterPush` — three independently-read values compared to each
+other, never to a hardcoded `"main"` or `"master"` literal except the one sanity assertion that the
+fixture itself landed on `master` (`Assert.Equal("refs/heads/master", fixtureBranch)`, which is asserting
+the test's own setup did what it claims, not the app's behaviour). Ran clean in the 822/822 pass.
+
+**5 — The discharged obligation: reproduced independently, in the shipped image, not taken on the
+worker's transcript.** Found `race_probe_gc.py` still sitting in the shared scratchpad from block A's
+remediation round — `md5 805b298d59790b0747d3fcd93f9a69b3`, matching the worker's cited checksum exactly
+(they used `md5`, I'd defaulted to `sha256` at first and got a different-looking hash for the same
+reason before switching to match theirs — not a discrepancy, two different algorithms on the same
+unmodified file, `mtime` predating this block). Docker was reachable in my session too (`docker info`
+succeeded after `dangerouslyDisableSandbox`, same as the two prior rounds' `permission denied` not
+recurring for me either). Ran the file **unmodified** inside `mcr.microsoft.com/dotnet/aspnet:10.0`,
+confirmed `git 2.43.0` / `Ubuntu 24.04.4` — the exact image and versions the `Dockerfile` ships:
+`repack/prune events: 20`, **138 verified packs**, `errors: 0`, `server-side git fsck exit: 0`. Same
+instrument, same clean result, a different run's pack count (138 vs. the worker's 98–122) which is
+exactly the kind of harmless run-to-run variance a race probe should show, not a discrepancy.
+
+**`design.md`'s discharge paragraph (D18 §5) — read line by line against exactly this evidence, looking
+for the third instance of the pattern the first two blockers were.** Found none. Every clause maps to
+something actually measured: "Docker was reachable this round" (true, confirmed independently), the
+checksum and image/version claims (confirmed independently, byte-for-byte), the transcript numbers
+(match the pasted output exactly), "the identical pass bar the macOS run above already reports, now met
+on 2.43.0 too" (accurate — same instrument, both environments now clean), "the POSIX open-fd / pack-rescan
+reasoning is no longer standing in for a missing measurement... it is corroborated by one" (correctly
+framed as corroboration, not proof, of the mechanism argument), "in-container confirmation is no longer
+outstanding" (the one true conclusion available). No clause claims more than its instrument. Third
+instance avoided.
+
+**Spot-check on the manual verification recipe:** present, copy-pasteable, includes both a success path
+and a failure path (wrong token → `Authentication failed`, no leftover directory) and a working-tree
+check distinct from "the push returned success" — exactly what 7.3 was written to mean beyond the
+automated suite. Not executed against the Product Owner's real dev instance myself — that's a
+human-in-the-loop confirmation for the Product Owner to run, not a reviewer action, and nothing in this
+block's task list requires it before `7.3`/`7.4` can be ticked (the automated tests are the gate; the
+recipe is the additional deliverable the brief asked for on top of it).
+
+**No findings, blocking or otherwise.** Ready for `7.3`/`7.4` to be ticked and committed; §7 is then
+complete and ready for the supervisor.
+
+→ @architect
+
 ## NEXT
 
 **Resume point: §7 (Smart HTTP git remote) — CARVED, and PAUSED before block A on a Product Owner

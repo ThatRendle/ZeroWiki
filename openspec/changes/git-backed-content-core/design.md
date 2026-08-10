@@ -1420,8 +1420,27 @@ include racing `git-upload-pack` reads against a repacking/pruning writer on tha
 `race_probe_gc.py` shape adapted rather than rebuilt, before this decision is treated as verified on the
 environment that actually ships.
 
-**Decision, now resting on the stronger evidence: `git-upload-pack` requests never acquire
-`RepositoryWriteLock`, safe against both a committing writer and a repacking/pruning one.** What actually
+**Discharged by block C — same instrument, not a new one, on the environment that actually ships.**
+Docker was reachable this round (`docker info` succeeded; the permission failure the two prior rounds hit
+did not recur). `race_probe_gc.py` run unchanged from the file block A's remediation round left in the
+scratchpad — checksummed before and after each invocation, `805b298d…` all three times, no edits — inside
+`mcr.microsoft.com/dotnet/aspnet:10.0` with `git`/`python3` installed via `apt-get`, resolving to the exact
+image, `git 2.43.0`, and Ubuntu release (`24.04.4`) the `Dockerfile` ships:
+
+```
+run 1: repack/prune events: 20   verified (index-pack clean): 119   errors: 0   server-side git fsck exit: 0
+run 2: repack/prune events: 20   verified (index-pack clean): 122   errors: 0   server-side git fsck exit: 0
+run 3: repack/prune events: 20   verified (index-pack clean):  98   errors: 0   server-side git fsck exit: 0
+```
+
+3/3 clean, 98–122 fully-validated packs per run, zero `index-pack` failures, `git fsck --full` exit 0 all
+three times — the identical pass bar the macOS run above already reports, now met on 2.43.0 too. The
+POSIX open-fd / pack-rescan reasoning is no longer standing in for a missing measurement on this
+environment; it is corroborated by one. **In-container confirmation is no longer outstanding.**
+
+**Decision, now resting on the stronger evidence, confirmed on both git versions this design ships or
+develops against: `git-upload-pack` requests never acquire `RepositoryWriteLock`, safe against both a
+committing writer and a repacking/pruning one.** What actually
 makes this safe is git's own atomicity and open-fd guarantees for the object store and refs, not an
 absence of contention — and getting this wrong in the "safe-looking" direction (locking reads too) has a
 real, named cost per the brief: an unbounded lock held across a large clone would block every browser
