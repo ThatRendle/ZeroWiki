@@ -18461,9 +18461,39 @@ recoverable by an instrument that shares the blind spot. §6 fixed its **own** g
 and did not fix D9. Fixing it touches a guarantee `specs/content-store/spec.md`'s *Working-tree-clean
 invariant* names, which is why it is not §7's to absorb quietly.
 
-**Status: a proposal is being written for it as a separate change. The Product Owner will decide, after
-reading that proposal, whether it applies before or after §7** — §7 stays paused at this carve until that
-order is settled. Neither §7's blocks nor its base commit may open before then.
+**Status: PROPOSED and QUEUED as a follow-on change — `openspec/changes/fix-reconciliation-index-blindness`,
+all four artifacts complete, `openspec validate --strict` valid.** It is committed on **this** branch and
+is therefore deliberately in this change's diff while being **out of §7's scope**; that is the Product
+Owner's call, recorded here so the section review is not surprised by it. §7 resumes now.
+
+**Why it could not be applied first, which is a constraint rather than a preference.** The code it
+repairs (`ContentRepositoryService.cs`) and the requirement it amends (`content-store`) exist **only** on
+`change/git-backed-content-core` — 47 commits ahead of `main`, unmerged.
+`git cat-file -e main:src/ZeroWiki/Content/ContentRepositoryService.cs` fails, and `openspec/specs/` holds
+only `authentication`, `invitations`, `request-lifecycle`, `user-accounts`. A change branched from the
+default branch per CLAUDE.md §2.4 would find nothing to fix. It applies after this change archives.
+
+**⚠️ Correction to carry-forward 1 above — it overstated the severity, and the correction came from
+running it.** Four measurements on git 2.55.0, in a repository shaped like ZeroWiki's:
+
+- **Untracked content is NOT blinded** — `?? docs/newpage.md` is still reported with `--assume-unchanged`
+  set on a sibling. D9's load-bearing case, a folder of Markdown copied onto the volume, is unaffected.
+  The blind spot is **tracked divergence only**, which no previous statement of this said.
+- **`updateInstead` does NOT share the blind spot, so this is not data loss.** A fast-forward push against
+  a blinded-dirty tree was **refused** — `error: Entry 'docs/page.md' not uptodate. Cannot merge.` /
+  `! [remote rejected] main -> main` — and the uncommitted local edit survived byte-for-byte. The real
+  cost is an availability and diagnosis failure: the app reports its invariant healthy while every push
+  from every vault is rejected forever, naming a file the health check simultaneously calls clean.
+- **A fourth instrument is blinded that nobody had named: `git diff --quiet HEAD` exits 0.** It is the
+  natural "just compare the tree to `HEAD`" reflex and it reads as index-free. Anyone fixing this by
+  reaching for it would ship a patch that passes review and changes nothing.
+- **`git ls-files -v` is the instrument that sees the bits**, tagging `h` for assume-unchanged and `S`
+  for skip-worktree against `H` for a normal entry — with the trap that lowercase-or-`S` is the correct
+  rule and `!= "H"` is not, since `M`/`R`/`C`/`K`/`?` are non-`H` states that are not suppressions.
+
+This is the same standing rule paying out again: **a claim about a mechanism is not evidence until it is
+executed.** The carry-forward was written by reading §6's finding rather than reproducing it, and three
+of these four facts contradict or sharpen what it said.
 
 **Working tree CLEAN. State: 31/41 tasks ticked** (§6's 6.1–6.6 all done). Branch
 `change/git-backed-content-core`, HEAD **`da6ed4f`**. Gates at §6's close, run in the foreground by the
