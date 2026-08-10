@@ -314,7 +314,13 @@ public sealed class WikiPageTests : IDisposable
         var response = await (await SignInAsync("alice")).GetAsync("/wiki/page");
 
         Assert.True(response.Headers.TryGetValues("Content-Security-Policy", out var values));
-        var csp = Assert.Single(values);
+
+        // §8 block B: enabling InteractiveServer app-wide (D7, D19 §3) makes the framework append its
+        // own defensive `frame-ancestors 'self'` header for circuit protection alongside this app's own
+        // policy -- both are present rather than one replacing the other (a browser intersects two
+        // same-named CSP headers, so this can only narrow what is allowed, never widen it). Asserts the
+        // app's own policy specifically, not merely "a" Content-Security-Policy header.
+        var csp = Assert.Single(values, value => value.StartsWith("default-src 'self';", StringComparison.Ordinal));
         Assert.Contains("script-src 'self'", csp, StringComparison.Ordinal);
         Assert.DoesNotContain("unsafe-inline", csp, StringComparison.Ordinal);
     }

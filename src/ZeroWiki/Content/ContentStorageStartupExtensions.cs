@@ -79,6 +79,14 @@ public static class ContentStorageStartupExtensions
         // re-resolved per request.
         services.AddSingleton<EditDraftStore>();
 
+        // §8 block B (D19): the "changed on disk" pub/sub layer riding on D7's InteractiveServer
+        // circuit, and the reaction that drives it after a received push. Same interface-over-concrete
+        // pattern as IPageIndex/IPageIndexBuilder above, for the same reason -- a test can substitute a
+        // fake IPageChangeNotifier that records what it was called with.
+        services.AddSingleton<PageChangeNotifier>();
+        services.AddSingleton<IPageChangeNotifier>(sp => sp.GetRequiredService<PageChangeNotifier>());
+        services.AddSingleton<PushReactionService>();
+
         return services;
     }
 

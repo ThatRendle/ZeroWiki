@@ -309,7 +309,8 @@ public sealed partial class LoginPageTests : IDisposable
     /// Blanks the antiforgery token, which is regenerated per response and would otherwise make
     /// two identical pages compare unequal.
     /// </summary>
-    private static string Normalise(string html) => AntiforgeryToken().Replace(html, "TOKEN");
+    private static string Normalise(string html) =>
+        HttpAssertions.StripPersistedComponentState(AntiforgeryToken().Replace(html, "TOKEN"));
 
     /// <summary>Extracts just the <c>name=value</c> pair, stripping attributes like <c>Secure</c>.</summary>
     private static string AuthenticationCookiePair(HttpResponseMessage response) =>

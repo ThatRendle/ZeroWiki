@@ -1,0 +1,53 @@
+@* D7/D19 §3, §8 block B: the first InteractiveServer island in the app -- everything else stays Static
+   SSR (D7). Mounted only inside WikiPage.razor's rendered-body branch, so it never exists for an
+   ambiguous, refused, or not-found route -- exactly the routes IPageChangeNotifier could never
+   meaningfully address anyway (PushReactionService's own remarks). *@
+@* Self-declared here, not `@rendermode="InteractiveServer"` at WikiPage.razor's usage site --
+   this component's whole purpose is a live circuit, so its render mode is intrinsic to what it is
+   rather than a caller's choice, and self-declaring is what StaticSsrRenderModeTests' own reflection
+   tripwire (RenderModeAttribute on the component's class) actually detects. *@
+@rendermode InteractiveServer
+@implements IDisposable
+@using ZeroWiki.Content
+@inject IPageChangeNotifier Notifier
+
+@if (_changedOnDisk)
+{
+    <p class="page-changed-on-disk" role="status">
+        This page has changed on disk since it was loaded.
+        <a href="@_pageHref">Reload</a> to see the latest version.
+    </p>
+}
+
+@code {
+    /// <summary>The page's own canonical route (D12) -- the exact key <see cref="PushReactionService"/>
+    /// notifies under, so this component only ever hears about the page it is mounted on.</summary>
+    [Parameter, EditorRequired]
+    public EncodedRoute Route { get; set; }
+
+    private IDisposable? _subscription;
+    private bool _changedOnDisk;
+    private string _pageHref = string.Empty;
+
+    protected override void OnInitialized()
+    {
+        _pageHref = $"/wiki/{Route.Value}";
+
+        // Guards against subscribing during the static-SSR prerender pass, which this component also
+        // runs through once before its real InteractiveServer circuit starts (D7's render-mode split):
+        // a prerendered instance is discarded immediately, and a subscription registered on it would
+        // never be disposed (its circuit never ends -- it never had one).
+        if (RendererInfo.IsInteractive)
+        {
+            _subscription = Notifier.Subscribe(Route, OnPageChangedAsync);
+        }
+    }
+
+    private Task OnPageChangedAsync()
+    {
+        _changedOnDisk = true;
+        return InvokeAsync(StateHasChanged);
+    }
+
+    public void Dispose() => _subscription?.Dispose();
+}

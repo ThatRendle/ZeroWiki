@@ -25,6 +25,15 @@ else if (_renderedBody is { } body)
 {
     <h1>@PageDisplayTitle</h1>
 
+    @if (_page is { } notifiedPage)
+    {
+        @* D19 §3, §8 block B: the one InteractiveServer island on this page (D7) -- everything else
+           above and below renders Static SSR. Keyed by this page's own canonical route, so it only
+           ever hears about a push that touched this exact page. Render mode is declared inside the
+           component itself, not here (see its own remarks). *@
+        <ChangedOnDiskIndicator Route="@notifiedPage.Route" />
+    }
+
     @if (_page?.LastEdit is { } lastEdit)
     {
         <p class="page-last-edit">

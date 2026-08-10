@@ -11,7 +11,14 @@ using ZeroWiki.Web;
 var builder = WebApplication.CreateBuilder(args);
 
 // Add services to the container.
-builder.Services.AddRazorComponents();
+//
+// D7: Static SSR stays the default render mode for the app as a whole; AddInteractiveServerComponents
+// only makes the InteractiveServer opt-in available to the specific components that ask for it
+// (@rendermode InteractiveServer) -- it does not, by itself, put every page on a SignalR circuit. §8
+// block B (D19 §3) is the first component to opt in: ChangedOnDiskIndicator, mounted inside
+// WikiPage.razor. MapRazorComponents<App>() below is what actually maps the /_blazor hub this rides.
+builder.Services.AddRazorComponents()
+    .AddInteractiveServerComponents();
 builder.Services.AddIdentityDb(builder.Configuration);
 builder.Services.AddContentStorage(builder.Configuration);
 builder.Services.AddSingleton(TimeProvider.System);
@@ -175,7 +182,8 @@ app.UseAntiforgery();
 // Anonymous by necessity: the login page has to be able to load its stylesheet, and swallowing the
 // assets would leave it unstyled for precisely the visitors who need it.
 app.MapStaticAssets().AllowAnonymous();
-app.MapRazorComponents<App>();
+app.MapRazorComponents<App>()
+    .AddInteractiveServerRenderMode();
 
 // §7: the Smart HTTP git remote (D18). AllowAnonymous() on the whole group -- applied inside
 // MapGitSmartHttp itself -- opts these three routes out of AnonymousGate and the fallback policy

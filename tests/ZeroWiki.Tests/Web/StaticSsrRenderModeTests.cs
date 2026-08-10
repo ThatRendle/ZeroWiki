@@ -9,15 +9,22 @@ using ZeroWiki.Security;
 namespace ZeroWiki.Tests.Web;
 
 /// <summary>
-/// Task 6.3 — the authentication surface renders as Static SSR and holds no circuit.
+/// Task 6.3 / §8 block B — the authentication surface renders as Static SSR and holds no circuit;
+/// <c>ChangedOnDiskIndicator</c> is the one deliberate exception (D7, D19 §3), not an opening for
+/// anything else.
 /// </summary>
 /// <remarks>
-/// This is already true of the application as written, which is exactly why it needs pinning: the
-/// day somebody adds <c>@rendermode InteractiveServer</c> to a page, every existing test still
-/// passes and a login form silently starts holding a SignalR circuit open per anonymous visitor.
-/// The two tests below are the condition and the outcome, and both are needed — the first names the
-/// mistake at the point it is made, the second still fails if a render mode arrives by some route
-/// the first does not model.
+/// Originally pinned "no component anywhere declares an interactive render mode" — true only until
+/// §8 block B wired D7's own planned exception in. Narrowing the pin to name that one component
+/// exactly, rather than deleting it, keeps the tripwire's real point intact: the day some other
+/// component (especially one on the authentication surface below) gains
+/// <c>@rendermode InteractiveServer</c>, this still fails and names the offender, the same as before
+/// §8. <see cref="ZeroWiki.Components.Pages.ChangedOnDiskIndicator"/> only ever mounts inside
+/// <c>WikiPage.razor</c>'s rendered-body branch (never on an anonymous, login, or invitation
+/// surface), so the second test below still holds unchanged: a signed-in member's own authenticated
+/// pages other than a wiki page in view still establish no circuit, and the endpoint is asserted
+/// mapped now rather than absent, since D19 §3 rides the framework's own hub rather than a bespoke
+/// one.
 /// </remarks>
 public sealed class StaticSsrRenderModeTests : IDisposable
 {
@@ -29,31 +36,32 @@ public sealed class StaticSsrRenderModeTests : IDisposable
     public void Dispose() => _app.Dispose();
 
     [Fact]
-    public void No_component_declares_an_interactive_render_mode()
+    public void Only_the_changed_on_disk_indicator_declares_an_interactive_render_mode()
     {
-        // The condition. `@rendermode X` on a component compiles to a RenderModeAttribute on its
-        // class, so this catches the declaration itself rather than one of its symptoms, and names
-        // the offending component when it fails.
+        // `@rendermode X` on a component compiles to a RenderModeAttribute on its class, so this
+        // catches the declaration itself rather than one of its symptoms, and names every offending
+        // component (not just whether one exists) when it fails.
         var interactive = typeof(Program).Assembly.GetTypes()
             .Where(type => typeof(IComponent).IsAssignableFrom(type))
             .Where(type => type.GetCustomAttribute<RenderModeAttribute>(inherit: false) is not null)
             .Select(type => type.FullName)
             .ToList();
 
-        Assert.Empty(interactive);
+        Assert.Equal([typeof(ZeroWiki.Components.Pages.ChangedOnDiskIndicator).FullName], interactive);
     }
 
     [Fact]
-    public async Task The_interactive_blazor_endpoint_is_not_mapped()
+    public async Task The_interactive_blazor_endpoint_is_mapped_for_the_one_component_that_needs_it()
     {
-        // The outcome. Without an interactive render mode registered there is no /_blazor hub, so
-        // no page can hold a circuit however it is annotated. Asked as a signed-in member because
-        // an anonymous request to any unmapped URL is answered by the landing page (AD21), which
-        // would make the status assertion pass whether the hub existed or not.
+        // §8 block B (D19 §3): D7's plan was always for a component to eventually need this, and now
+        // one does, so the hub is legitimately mapped app-wide -- there is no way to scope a single
+        // SignalR hub to only the pages that use it. Asked as a signed-in member because an
+        // anonymous request to any unmapped URL is answered by the landing page (AD21), which would
+        // make a bare status assertion pass whether the hub existed or not.
         await SeedAccountAsync();
         var client = await SignInAsync();
 
-        Assert.Equal(HttpStatusCode.NotFound, (await client.GetAsync("/_blazor")).StatusCode);
+        Assert.NotEqual(HttpStatusCode.NotFound, (await client.GetAsync("/_blazor")).StatusCode);
 
         var routes = _app.Services.GetRequiredService<EndpointDataSource>().Endpoints
             .OfType<RouteEndpoint>()
@@ -62,7 +70,7 @@ public sealed class StaticSsrRenderModeTests : IDisposable
             .Where(pattern => pattern.Contains("_blazor", StringComparison.OrdinalIgnoreCase))
             .ToList();
 
-        Assert.Empty(routes);
+        Assert.NotEmpty(routes);
     }
 
     private async Task SeedAccountAsync() =>

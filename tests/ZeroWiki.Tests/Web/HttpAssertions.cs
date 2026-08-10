@@ -1,10 +1,27 @@
 using System.Net;
+using System.Text.RegularExpressions;
 using ZeroWiki.Web;
 
 namespace ZeroWiki.Tests.Web;
 
-public static class HttpAssertions
+public static partial class HttpAssertions
 {
+    /// <summary>
+    /// Strips the Blazor Server persisted-component-state marker
+    /// (<c>&lt;!--Blazor-Server-Component-State:...--&gt;</c>) that every Razor Components response now
+    /// carries once §8 block B wires <c>InteractiveServer</c> into the app (D7, D19 §3) — appended after
+    /// <c>&lt;/html&gt;</c> regardless of whether the specific page renders any interactive component,
+    /// since the render mode is an app-wide capability rather than a per-page one. It is DataProtection-
+    /// encrypted, so it differs between any two responses even when their visible content is otherwise
+    /// identical. A test comparing two responses for a uniform-response property (AD17, AD21) must
+    /// normalise this away first, exactly as an antiforgery token already needs normalising.
+    /// </summary>
+    public static string StripPersistedComponentState(string html) =>
+        PersistedComponentStateMarker().Replace(html, string.Empty);
+
+    [GeneratedRegex("<!--Blazor-Server-Component-State:[^>]*-->")]
+    private static partial Regex PersistedComponentStateMarker();
+
     /// <summary>
     /// Asserts the response is the one page every unauthenticated request gets (AD21) — which is
     /// also the only shape an anonymous denial takes, since nothing redirects a stranger to login.

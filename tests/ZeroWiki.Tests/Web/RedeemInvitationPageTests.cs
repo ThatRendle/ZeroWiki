@@ -131,7 +131,13 @@ public sealed partial class RedeemInvitationPageTests : IDisposable
         var unknown = await client.GetStringAsync($"{InvitationPolicy.RedemptionPath}/{NewToken()}");
         var malformed = await client.GetStringAsync($"{InvitationPolicy.RedemptionPath}/not-a-token");
 
-        Assert.Equal(unknown, malformed);
+        // §8 block B: the persisted-component-state marker every Razor Components response now
+        // carries is DataProtection-encrypted and differs per response even when the visible page is
+        // identical -- normalised away first, the same way an antiforgery token already needs to be
+        // (see HttpAssertions.StripPersistedComponentState's own remarks).
+        Assert.Equal(
+            HttpAssertions.StripPersistedComponentState(unknown),
+            HttpAssertions.StripPersistedComponentState(malformed));
     }
 
     [Fact]
@@ -154,8 +160,8 @@ public sealed partial class RedeemInvitationPageTests : IDisposable
 
         Assert.Equal(HttpStatusCode.OK, existing.StatusCode);
         Assert.Equal(
-            await unknown.Content.ReadAsStringAsync(),
-            await existing.Content.ReadAsStringAsync());
+            HttpAssertions.StripPersistedComponentState(await unknown.Content.ReadAsStringAsync()),
+            HttpAssertions.StripPersistedComponentState(await existing.Content.ReadAsStringAsync()));
 
         await AssertOnlyTheIssuerExistsAsync();
     }

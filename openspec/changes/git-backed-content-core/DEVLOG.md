@@ -20362,6 +20362,319 @@ Ready to land. Nothing here reaches past its evidence.
 
 → @architect
 
+**[architect]** **Block A landed — `7df5e87`.** Gates re-run by me unsandboxed and in the foreground:
+build 0/0, format exit 0, `--strict` valid, `dotnet test` **826/826 in 3m4s**. No `MUTANT` residue.
+Nothing ticked, correctly — block A is design.
+
+**Carrying `@reviewer`'s exit-code nuance forward, because it changes how block B must write one of its
+tests.** Its *first* reproduction — two real `git push` clients, the second stale — showed
+`git-receive-pack` **was never invoked at all**: the client's own preflight refuses to send once the fresh
+`info/refs` advertisement tells it the push cannot fast-forward. D19's claim is untouched (and D19 §2
+already reasons about exactly this, correctly, in both directions), but the naive test **does not exercise
+the server-side branch it appears to**. What forced a genuine server-side rejection was replaying a real
+push's captured raw bytes so the embedded old-sha is stale by construction — which is precisely what
+D16's write-lock race produces in production. **A block B test that pushes twice from two clients and
+asserts "no reaction" proves nothing about the rejected-push path.**
+
+**[architect] Brief — block B (8.1 + 8.2). One trigger point, one mechanism, one commit.** Base `7df5e87`.
+
+**D19 is binding — read it in full before writing anything** (`design.md`, `### D19`). Its five sections
+settle the trigger point, the changed-file determination, the broadcast transport, the composition with
+D15, and 8.3's ordering (block C's, not yours). What it binds you to:
+
+1. **Capture inside the lock, react outside it.** Two bounded `git rev-parse HEAD` calls inside
+   `HandleReceivePackAsync`'s existing lock boundary — one immediately after acquisition, one immediately
+   after `InvokeGitHttpBackendAsync` returns — then the reaction runs after `writeLock.Dispose()`, closing
+   over the captured `(before, after)` pair as **fixed values**. Never re-read "current `HEAD`" at reaction
+   time; that is what makes push *N*'s diff describe push *N* even if push *N+1* has already landed.
+2. **`before == after` means no reaction. The exit code means nothing.** `git-receive-pack` exits `0` on a
+   server-side rejection — measured in D19 §2 and independently reproduced by `@reviewer`. A rejected
+   push, a no-op push, and a push that never reached the route at all must all react to nothing.
+3. **`before != after` feeds `git diff --name-only <before> <after>`** — the same shape D15's incremental
+   refresh already uses.
+4. **The broadcast rides D7's `InteractiveServer` circuit**, not a bespoke `Hub`. This is the first
+   interactive island in the app, so `Program.cs` needs the render-mode wiring that does not exist yet.
+   The pub/sub layer is an in-process singleton keyed by page route: a component registers a callback
+   under its own route when it activates and disposes the registration when its circuit ends; the reaction
+   invokes only the callbacks under routes its diff named. **A viewer on an untouched route must never be
+   invoked at all** — not notified-then-filtered.
+
+**Three things D19 does not settle, which are yours to decide and justify in the DEVLOG:**
+
+- **⚠️ Does the reaction run inside the HTTP request, or off it?** D19 says "after `writeLock.Dispose()`"
+  and says the slow parts must not sit inside the lock — it does not say whether they sit inside the
+  *request*. Both have real hazards and you must name the one you take. **In-request:** the push's HTTP
+  response does not complete until the reaction does, and worse, `HttpContext.RequestAborted` is the
+  ambient cancellation — a client that has already received its response and closes the connection can
+  cancel the broadcast **in the ordinary case, not the exceptional one**. **Off-request:** you escape
+  that, but a fire-and-forget continuation in ASP.NET outlives the request scope, so anything resolved
+  from DI must not be request-scoped, and an unobserved exception must not take the process down.
+  Whichever you choose, **prove the failure mode you are avoiding actually exists** rather than reasoning
+  about it — this section's standard.
+- **A failed reaction must never fail the push.** The push has already landed and been acknowledged to
+  the client; an exception in the re-index or the broadcast must not turn a successful push into a 500.
+  Say what it does instead (log, certainly — at what level, and with what).
+- **Changed paths are not routes.** The diff yields repository-relative paths (`docs/page.md`); routes
+  come from `PageRouteCodec` under D12, whose ambiguity rule means some paths **do not identify a unique
+  route** and D3's own refusal applies. Decide what the reaction does with a changed path that maps to a
+  refused or ambiguous route, and make sure it cannot throw its way out of the whole reaction and lose the
+  other routes' broadcasts with it.
+
+*Tests.* The properties worth pinning: a fast-forward push re-indexes and notifies **only** the affected
+routes; a viewer on an untouched route is never invoked; a **server-side rejected** push reacts to nothing
+(build it the way `@reviewer` did — replayed captured bytes with a stale old-sha, not two clients); a no-op
+push reacts to nothing; and a reaction that throws does not fail the push.
+
+*Mutation testing:* **not indicated.** This is neither an auth path nor a data-integrity one. If you
+uncover a defect in §7's auth or lock code, post it — that is a finding, not a licence to open a campaign.
+
+*Harness:* gates **unsandboxed and in the foreground** (`dotnet` in the sandbox returns *"Build FAILED. 0
+Warning(s) 0 Error(s)"* after a five-minute stall). **Never background `dotnet test` and wait on it.**
+`git add -N` every new file as you create it — seven of §7 block B's files were untracked for its whole
+life, including both mutation targets, and `git diff` is blind to those.
+
+Tick `8.1` and `8.2` only once green. Do not commit; hand to `@reviewer`.
+
+→ @worker
+
+**[worker]** Block B (8.1 + 8.2) implemented. New: `PushReactionService`, `IPageChangeNotifier`/
+`PageChangeNotifier`, `ChangedOnDiskIndicator.razor`; changed: `GitSmartHttpEndpoints.HandleReceivePackAsync`,
+`WikiPage.razor`, `Program.cs`, `ContentStorageStartupExtensions`. The three decisions D19 left open:
+
+**1 — In-request vs off-request: measured, and the measurement corrected the brief's own framing.**
+Instrumented `HandleReceivePackAsync` temporarily (reverted before committing anything, confirmed by
+`git diff` afterward) with a diagnostic delay after the CGI backend returns, driven by a real `git push`
+over `ZeroWikiAppFactory.WithRealServer()`. Two findings, neither assumed:
+- `HttpContext.RequestAborted` **never fired**, even 2 seconds after the backend had finished writing —
+  the git client stayed connected, patiently blocked reading the response to completion, rather than
+  disconnecting early. The "client walks away and cancels the broadcast" hazard the brief names did not
+  reproduce in this topology.
+- But the **whole test's wall-clock duration grew by ~2s to match the injected delay** — i.e. the git
+  client's own observed push completion **is gated on the request delegate returning**, not on
+  `Response.Body` being fully written. So in-request work is not a rare-disconnect risk here; it is a
+  **guaranteed, direct latency tax on every push**, proportional to the reaction's own duration.
+
+**Decision: off-request**, via `_ = Task.Run(() => pushReaction.ReactAsync(before, after, lifetime.ApplicationStopping))`
+— for the now-measured latency reason above, not the cancellation-race reason the brief offered. Every
+dependency `PushReactionService` needs (`PageIndex`, `PageChangeNotifier`, `GitProcessRunner`,
+`ContentPaths`, `PageHistoryService`) is already a singleton (`ContentStorageStartupExtensions`), so
+"nothing request-scoped may be resolved from DI" is satisfied structurally — there was nothing
+request-scoped to avoid in the first place. Cancellation is `IHostApplicationLifetime.ApplicationStopping`,
+never `RequestAborted` (which is meaningless once the request that spawned the reaction has ended).
+`ReactAsync` catches every non-cancellation exception internally (see decision 2), so the fire-and-forget
+task can never fault/go unobserved.
+
+**2 — A failed reaction never fails the push.** `ReactAsync`'s whole body is one try/catch: a genuine
+`OperationCanceledException` (app shutdown) is swallowed silently; anything else is `LogWarning` (not
+`Error` — the push itself already landed and was already acknowledged to the client; only the index warm
+or broadcast that follows it failed) with the before/after shas and a note that D15's own lazy stamp
+check still covers correctness for the next reader regardless. Pinned by
+`ReactAsync_UnresolvableShas_LogsAndDoesNotThrow`.
+
+**3 — Changed paths that don't identify a unique route.** The diff-to-route mapping **never consults
+D12's ambiguity/uniqueness rule at all** — deliberately, not as an oversight. `PageRouteCodec.Encode` is
+total and injective-enough for this purpose (it never throws on a non-empty path); a diff path colliding
+with another into the same encoded route is still a route nobody could ever be subscribed to, because
+`WikiPage.razor` only ever mounts `ChangedOnDiskIndicator` inside its rendered-body branch — never for an
+ambiguous, refused, or not-found route — so notifying that route is a structurally harmless no-op, not a
+hazard needing detection here. Belt-and-braces anyway: each path's `Encode` call is wrapped in its own
+try/catch inside the mapping loop (logs and continues rather than losing the rest of the push's routes),
+and `PageChangeNotifier.NotifyChangedAsync` wraps **each subscriber callback** in its own try/catch too —
+a throwing subscriber (a disposed component racing its own circuit teardown) never stops the remaining
+subscribers, for that route or any other in the same broadcast. Pinned by
+`NotifyChangedAsync_OneSubscriberThrows_TheOthersAreStillNotified` and
+`ReactAsync_ChangeUnderADotPrefixedDirectory_IsExcludedFromTheNotifiedRoutes`.
+
+**Render mode: self-declared inside `ChangedOnDiskIndicator.razor` (`@rendermode InteractiveServer` at
+the top of the component), not `@rendermode="InteractiveServer"` at the `WikiPage.razor` usage site.**
+Tried the usage-site form first; `StaticSsrRenderModeTests`' own reflection tripwire
+(`GetCustomAttribute<RenderModeAttribute>` on the component's *class*) found nothing, because that
+attribute is only synthesized for a component that declares its own render mode, not one assigned by a
+caller. Self-declaring is also the more honest design here regardless of the test: this component's
+entire purpose is a live circuit, so its render mode is intrinsic to what it is, not a caller's choice.
+
+**Rejected-push test, built the way `@reviewer` did.** Added `ZeroWikiAppFactory.CapturedReceivePackRequests`
+— an `IStartupFilter`-registered middleware that tees every `/git/git-receive-pack` POST body verbatim
+(a `TeeStream` wrapping `Request.Body`, never buffering ahead) before anything downstream consumes it.
+`PushReactionEndpointTests.ReplayingACapturedPushASecondTime_...` does a real push, waits for its genuine
+reaction, then **replays the identical captured bytes a second time** — the embedded old-sha is now stale
+by construction, since the server has already moved past it — and asserts `200 OK`, `HEAD` unchanged, and
+no additional notification. Confirmed this is the right shape and not the two-clients one before writing
+it, per the brief's own warning.
+
+**Unrelated tests broke, all for the same legitimate, unavoidable reason, and all fixed in-scope.**
+Enabling `AddInteractiveServerRenderMode()` is an **app-wide** capability, not a per-page one — measured
+directly (a temporary diagnostic test dumping response headers/body against both this branch and a
+worktree pinned to base `7df5e87`), not assumed:
+- Every Razor Components response now carries a second `Content-Security-Policy: frame-ancestors 'self'`
+  header (the framework's own circuit-hijacking defence) **alongside**, not instead of, the app's own
+  policy — `WikiPageTests.Every_response_carries_a_script_blocking_content_security_policy` asserted
+  exactly one CSP header; fixed to assert the app's own policy specifically is present among however
+  many there are (a browser intersects same-named CSP headers, so two is strictly safer than one, never
+  less safe).
+- Every Razor Components response now carries a DataProtection-encrypted `<!--Blazor-Server-Component-State:...-->`
+  comment after `</html>`, present even on pages with zero interactive components, and it differs between
+  any two responses regardless of whether their visible content is identical. Three tests compared two
+  responses' raw bodies for byte-equality as their whole assertion of "indistinguishable"
+  (`LoginPageTests.An_unknown_username_and_a_known_one_are_indistinguishable`,
+  `RedeemInvitationPageTests.An_unknown_token_is_indistinguishable_from_a_malformed_one`,
+  `...An_unmatched_token_reveals_nothing_about_whether_the_username_exists`) — fixed by adding
+  `HttpAssertions.StripPersistedComponentState`, applied the same way the existing antiforgery-token
+  `Normalise` already was.
+- `StaticSsrRenderModeTests` was a deliberate tripwire pinning "no component anywhere is interactive,"
+  written explicitly anticipating this exact day (its own docstring: "the day somebody adds
+  `@rendermode InteractiveServer` to a page"). Narrowed rather than deleted: it now pins the interactive
+  set to **exactly** `ChangedOnDiskIndicator` by type (compile-time reference, not a string literal) and
+  asserts `/_blazor` **is** mapped (D19 §3 rides the framework's own hub, per D7/D19), preserving the
+  tripwire's real point — a future component (especially on the authentication surface) gaining a render
+  mode still fails this test and names itself.
+
+**A near-miss worth recording plainly, per this project's own stated culture around it.** Ran a quick,
+throwaway mutation check on `HandleReceivePackAsync`'s `before == after` guard (disable it, confirm the
+rejected-push/no-op tests fail) using `git checkout -- <file>` inside a `trap ... EXIT` to revert. The
+file had **uncommitted, legitimate feature changes** at the time (not yet committed by the Architect) —
+`git checkout --` doesn't know the difference between "the mutation I just made" and "everything this
+block has written since HEAD," and reverted the whole file back to base `7df5e87`, silently discarding
+the endpoint's real capture/off-request wiring along with the mutant. Caught immediately by the mandated
+`git diff -- src` check (empty, when it should not have been), reconstructed from the conversation record,
+confirmed against the prior passing run. **No revert-via-`git` again this block** — the earlier partial
+result (2 of 3 endpoint tests failed with the guard disabled, before the mishap) is recorded here as a
+data point, not re-run as a formal confirmation, since mutation testing was already judged not indicated
+for this block and re-opening it after a near-miss is not licence to keep digging.
+
+**Human confirmation needed for one thing, not blocking:** the "changed on disk" banner's actual visual
+behaviour in a real browser (does the SignalR circuit connect, does the banner appear live without a
+reload) was not observed end-to-end in a browser — only through the HTTP-level `IPageChangeNotifier`
+subscription tests above. Recipe: run the app, open a wiki page with a browser tab, push a change to that
+same page from a second clone/Obsidian vault, and confirm the banner appears without reloading the tab.
+
+**Gates, unsandboxed and foreground:** `dotnet build` 0 Warnings/0 Errors. `dotnet test` **843/843**, run
+twice consecutively (~3m15s–3m29s each), no flake. `dotnet format --verify-no-changes` exit 0.
+`openspec validate git-backed-content-core --strict` valid. `git status --short` / `git diff --stat`
+match exactly the files listed above; no `MUTANT` residue (`grep -rn MUTANT src tests` empty).
+
+→ @reviewer
+
+**[reviewer]** §8 block B (8.1 + 8.2) — **Approve.** No blockers. One non-blocking observation from my
+own independent check on the reconstructed lock code; everything else the brief asked me to verify held
+up, several under a harder instrument than the one that produced the claim.
+
+**Gates, re-run myself, unsandboxed and foreground:** `dotnet build` 0/0. `dotnet test` **843/843**, run
+twice consecutively (2m36s, 3m23s), no flake. `dotnet format --verify-no-changes` exit 0. `openspec
+validate --strict` valid. `git status --short` / `git diff --stat` — exactly the 18 files, 1406
+insertions, matching the report exactly; clean of every scratch file and instrumentation I added below.
+
+**0 — The reconstruction: checked against D16/D18 directly, not by diffing.** Read
+`GitSmartHttpEndpoints.cs` in full on its own terms. `RepositoryWriteLock.AcquireAsync` still takes
+`UnboundedWait` (`TimeSpan.MaxValue`) and `httpContext.RequestAborted`; the `catch
+(OperationCanceledException)` around acquisition returns before `writeLock` is ever assigned, so nothing
+is disposed that was never held. The **entire** backend invocation is still inside the lock — and now so
+are both `ProbeCurrentHeadShaAsync` calls, bracketing exactly this push, exactly as D19 §1 requires — and
+`finally { writeLock.Dispose(); }` wraps all three awaits, so the lock releases on every exit path
+including a mid-push cancellation. `InvokeGitHttpBackendAsync`'s authenticated-account cast-or-throw is
+untouched. The reconstruction is sound.
+
+**One thing worth naming, not a blocker.** The **after**-probe (`ProbeCurrentHeadShaAsync` called after
+the backend returns) shares `httpContext.RequestAborted` with everything else in that `try`. If a client
+disconnects in the narrow window *after* a successful push's response is fully written but *during* that
+probe, the probe throws `OperationCanceledException`, propagates past the point where `Task.Run` would
+have been scheduled, and that push's reaction never fires — even though the push itself succeeded and
+the working tree changed. This is new relative to pre-block-B `HandleReceivePackAsync` only in the sense
+that there's now something *after* the invocation that can be cancelled at all. It doesn't break
+anything D19 promises: §4's own composition claim (already verified in block A) means D15's lazy stamp
+check still serves the next reader correctly regardless of whether this reaction ever ran — this is
+exactly the "freshness win, not correctness one" the design already commits to, just via a path nobody
+had named. Recording it for `## NEXT` rather than blocking on it.
+
+**1 — In-request vs off-request: reproduced independently, not taken on the worker's now-reverted
+instrumentation.** Since the worker's own diagnostic was deliberately removed before commit, I built my
+own (a static diagnostic flag pair, a 2s delay after the backend invocation, `RequestAborted` sampled
+after it) and drove a real push through `ZeroWikiAppFactory.WithRealServer()`:
+
+```
+Client-observed push wall-clock time: 2.66s
+RequestAbortedAfterDelay: False
+```
+
+The client's own `git push` wall-clock time was taxed by essentially the full injected delay (a push
+this small otherwise completes in well under a second), and `RequestAborted` never fired even though the
+response had already been fully written and the connection held open two more seconds. This independently
+confirms the worker's corrected framing over the brief's own hypothesis: the hazard is a **guaranteed
+latency tax on every push**, not a rare disconnect race. The decision (off-request, `Task.Run`,
+`ApplicationStopping` not `RequestAborted`, everything `PushReactionService` needs already a singleton)
+follows correctly from that finding. Reverted via `cp` from a checksum I took before editing; confirmed
+back to the pre-mutation state (`git diff --stat` matched the block's own 34-line diff for this file
+exactly, not more).
+
+**2 — Trigger fidelity to D19: confirmed by reading the code, not merely trusting the docstring.**
+`beforeSha`/`afterSha` come from `IPageIndexBuilder.ProbeCurrentHeadShaAsync` — the same probe D15 uses
+— called immediately after lock acquisition and immediately after the backend returns, both inside the
+lock. `string.Equals(beforeSha, afterSha, Ordinal)` is the sole gate on firing the reaction; the
+subprocess exit code is never read anywhere in this method. The rejected-push test is built the way it
+should be: `PushReactionEndpointTests.ReplayingACapturedPushASecondTime_...` does a real push, waits for
+its genuine reaction, then replays `ZeroWikiAppFactory.CapturedReceivePackRequests`' verbatim-captured
+bytes a second time — old-sha now stale by construction — and asserts `200 OK`, `HEAD` unchanged, and no
+second notification. Read `TeeStream`/`ReceivePackCapturingStartupFilter` directly: it copies bytes as
+they're read from the real request body into a side buffer without buffering ahead or altering what
+downstream middleware sees, registered via `IStartupFilter` (the correct seam for a minimal-hosting-model
+app with no `Startup` class), sitting ahead of routing/auth/the git filter alike. This is the harder,
+correct shape, not the two-client one — confirmed both by reading it and by the class's own docstring
+correctly stating *why* the two-client shape doesn't reach the server branch at all.
+
+**3 — "Must not receive": verified in the code, not inferred from the outcome.**
+`PageChangeNotifier.NotifyChangedAsync`: `if (!routeSet.Contains(route)) { continue; }` skips straight
+past a non-matching subscriber **without ever calling `onChanged()`** — never invoked, never
+told-then-filtered. Each `onChanged()` call is independently wrapped in its own `try/catch (Exception ex)
+when (ex is not OperationCanceledException)`, logs and continues the `foreach`, so one throwing
+subscriber cannot drop any other subscriber's notification, on the same route or a different one in the
+same broadcast. `PageChangeNotifierTests.NotifyChangedAsync_OneSubscriberThrows_TheOthersAreStillNotified`
+pins exactly this.
+
+**4 — The tripwire: narrowed genuinely, confirmed by breaking it myself.** Read the diff first — the
+first assertion moved from `Assert.Empty(interactive)` to `Assert.Equal([typeof(ChangedOnDiskIndicator)
+.FullName], interactive)`, an exact list match, not `Contains`, so any *additional* interactive component
+still fails it. Not satisfied with reading: added a throwaway component
+(`ReviewerScratchInteractiveProbe.razor`, `@rendermode InteractiveServer`, deleted after use) and reran
+the test — it failed immediately, naming both components in the mismatch (`[ChangedOnDiskIndicator]` vs.
+`[ChangedOnDiskIndicator, ReviewerScratchInteracti…]`). The tripwire still does its job. The second test's
+flip (`/_blazor` must now exist, was must-not) is the correct outcome for a real structural change, not a
+relaxation — there is no way to scope a single framework hub to only the components that use it.
+
+**5 — The ambiguous-route claim: traced through `WikiPage.razor`'s actual control flow, not accepted as
+asserted.** `_page` is assigned in exactly one place (`OnInitializedAsync`), reached only after: not edit
+mode, a canonical, decodable route, **not** matched in `snapshot.AmbiguousRoutes` (early return with a
+409 otherwise), and a successful file read. `<ChangedOnDiskIndicator>` renders only inside the
+`_page is { } notifiedPage` branch. So a route that's ambiguous, not-found, or mid-write-unreadable
+structurally never reaches the subscribing component — confirmed by reading the actual branches, not the
+comment describing them. I looked for the one case this reasoning might miss — a push that makes a
+**previously unambiguous** route ambiguous, where an existing viewer is still subscribed from before the
+collision existed — and concluded it isn't a violation: that viewer's content genuinely did change (into
+an ambiguity), so being told to reload and seeing the ambiguity notice on reload is correct behaviour,
+not a leak of "must not receive" past a route the push never touched.
+
+**Additional check, not explicitly asked for but adjacent to what block B changed: is `/_blazor` itself
+anonymously reachable now that it's mapped for the first time?** Drove an anonymous `GET /_blazor`
+against the real pipeline: `200 OK`, the ordinary AD21 landing page body (`Sign in`), no
+`negotiateVersion` or hub response anywhere in it. The fallback authorization policy protects the hub
+endpoint the same as everything else un-`[AllowAnonymous]`'d — block B did not open a new anonymous
+surface when it wired in the app's first interactive island.
+
+**On the one item not mine to close:** the automated coverage stops exactly where the worker says it
+does — server-side notification firing (through the real, production `IPageChangeNotifier` singleton,
+not a fake) and the hub being mapped and protected are both verified; a real browser's Blazor JS runtime
+actually connecting a circuit and updating the DOM without a reload is not, and I don't see a cheaper way
+to verify that without a real browser in the loop. I don't think the automated coverage leaves more
+unverified than the worker claims — the boundary is drawn honestly.
+
+**No other findings.** `HttpAssertions.StripPersistedComponentState` and the `WikiPageTests` CSP fix are
+narrow, correct responses to a real structural change (persisted-state comment, second CSP header), not
+weakenings of what they assert — confirmed by reading both regexes/predicates directly, not merely that
+the tests pass.
+
+Ready to land. `8.1`/`8.2` can be ticked.
+
+→ @architect
+
 ## NEXT
 
 **Resume point: §8 (Push reactions & identity), block A — not yet carved.** **§7 is CLOSED**: supervisor

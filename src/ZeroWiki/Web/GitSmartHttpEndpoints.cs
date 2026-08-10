@@ -57,7 +57,24 @@ public static class GitSmartHttpEndpoints
     /// <see cref="HttpContext.RequestAborted"/> firing, so its wait is genuinely unbounded, exactly as
     /// the scenario requires.
     /// </remarks>
-    private static async Task HandleReceivePackAsync(HttpContext httpContext, GitHttpBackendHost host, ContentPaths paths)
+    /// <remarks>
+    /// D19 §1 (§8 block B): <c>HEAD</c> is captured twice inside the lock — once before the backend
+    /// runs, once after it returns, still inside the same <c>try</c> — bracketing exactly this push's own
+    /// invocation and no one else's. Both captures are cheap and bounded (a single <c>git rev-parse</c>
+    /// each, via <see cref="IPageIndexBuilder.ProbeCurrentHeadShaAsync"/>, the same probe D15's own
+    /// freshness check uses), so neither lengthens the lock's own hold time meaningfully. The reaction
+    /// itself — unbounded, and structurally decoupled from both the lock and the request (see
+    /// <see cref="PushReactionService"/>'s own remarks for why it runs off-request) — is fired only once
+    /// the lock is released and only when the two shas actually differ; a rejected, no-op, or never-
+    /// invoked push (D19 §2: the exit code proves nothing here) leaves them equal and triggers nothing.
+    /// </remarks>
+    private static async Task HandleReceivePackAsync(
+        HttpContext httpContext,
+        GitHttpBackendHost host,
+        ContentPaths paths,
+        IPageIndexBuilder pageIndexBuilder,
+        PushReactionService pushReaction,
+        IHostApplicationLifetime lifetime)
     {
         RepositoryWriteLock writeLock;
         try
@@ -72,14 +89,29 @@ public static class GitSmartHttpEndpoints
             return;
         }
 
+        string? beforeSha;
+        string? afterSha;
         try
         {
+            beforeSha = await pageIndexBuilder.ProbeCurrentHeadShaAsync(httpContext.RequestAborted);
             await InvokeGitHttpBackendAsync(httpContext, host, "/git-receive-pack");
+            afterSha = await pageIndexBuilder.ProbeCurrentHeadShaAsync(httpContext.RequestAborted);
         }
         finally
         {
             writeLock.Dispose();
         }
+
+        if (string.Equals(beforeSha, afterSha, StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        // D19 decision 1: off-request, on its own thread-pool work item -- structurally decoupled from
+        // this method's own call stack rather than merely finishing before anything would notice. The
+        // request completes as soon as this method returns; PushReactionService.ReactAsync never lets an
+        // exception escape it (see its own remarks), so this fire-and-forget task can never fault.
+        _ = Task.Run(() => pushReaction.ReactAsync(beforeSha, afterSha, lifetime.ApplicationStopping));
     }
 
     /// <summary>Not <see cref="Timeout.InfiniteTimeSpan"/> (a negative duration <see cref="RepositoryWriteLock.AcquireAsync"/>
