@@ -57,7 +57,7 @@
 
 - [x] 8.1 On a received push, the app re-indexes the changed files in-process (D19; no `post-receive` hook — the app is already the parent of the push, see §7.5/D16)
 - [x] 8.2 On a received push, the app broadcasts a "changed on disk" signal to connected viewers of affected pages (SignalR via D7's `InteractiveServer` circuit, D19 §3)
-- [ ] 8.3 Implement git-email → account mapping; attribute push-originated edits, falling back to raw identity for unknown emails
+- [x] 8.3 Implement git-email → account mapping; attribute push-originated edits, falling back to raw identity for unknown emails
 
 ## 9. Obsidian sync verification
 

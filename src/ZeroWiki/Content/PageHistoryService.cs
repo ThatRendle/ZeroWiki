@@ -9,8 +9,9 @@ namespace ZeroWiki.Content;
 public sealed class PageHistoryService
 {
     /// <summary>
-    /// ASCII Unit Separator: never appears in an author's display name or an ISO-8601 date, so it is a
-    /// safe delimiter between the two <c>%an</c>/<c>%aI</c> fields in a single <c>--format</c> line.
+    /// ASCII Unit Separator: never appears in an author's display name, email, or an ISO-8601 date, so
+    /// it is a safe delimiter between the <c>%an</c>/<c>%ae</c>/<c>%aI</c> fields in a single
+    /// <c>--format</c> line.
     /// </summary>
     private const char FieldSeparator = '\x1f';
 
@@ -84,7 +85,7 @@ public sealed class PageHistoryService
         {
             result = await _git.RunOrThrowAsync(
                 _paths.RepositoryRoot,
-                ["log", "-1", $"--format=%an{FieldSeparator}%aI", "--", repositoryRelativePath],
+                ["log", "-1", $"--format=%an{FieldSeparator}%ae{FieldSeparator}%aI", "--", repositoryRelativePath],
                 cancellationToken: cancellationToken);
         }
         catch (GitProcessException ex)
@@ -105,9 +106,9 @@ public sealed class PageHistoryService
         }
 
         var fields = output.Split(FieldSeparator);
-        if (fields.Length != 2
+        if (fields.Length != 3
             || !DateTimeOffset.TryParse(
-                fields[1],
+                fields[2],
                 CultureInfo.InvariantCulture,
                 DateTimeStyles.RoundtripKind,
                 out var editedAt))
@@ -120,7 +121,7 @@ public sealed class PageHistoryService
             return null;
         }
 
-        return new PageLastEdit(fields[0], editedAt);
+        return new PageLastEdit(fields[0], editedAt, fields[1]);
     }
 
     /// <summary>
@@ -180,7 +181,7 @@ public sealed class PageHistoryService
                 "--no-renames",
                 "--name-status",
                 "-z",
-                $"--format={HistoryHeaderMarker}%an{FieldSeparator}%aI",
+                $"--format={HistoryHeaderMarker}%an{FieldSeparator}%ae{FieldSeparator}%aI",
                 "--",
                 _repositoryRelativeWorkingTree,
             ],
@@ -190,6 +191,7 @@ public sealed class PageHistoryService
         var repositoryPathPrefix = _repositoryRelativeWorkingTree + "/";
 
         string? currentAuthor = null;
+        string? currentAuthorEmail = null;
         DateTimeOffset? currentEditedAt = null;
 
         var tokens = result.StandardOutput.Split('\x00');
@@ -212,14 +214,15 @@ public sealed class PageHistoryService
             if (token[0] == HistoryHeaderMarker)
             {
                 var fields = token[1..].Split(FieldSeparator);
-                if (fields.Length == 2
+                if (fields.Length == 3
                     && DateTimeOffset.TryParse(
-                        fields[1],
+                        fields[2],
                         CultureInfo.InvariantCulture,
                         DateTimeStyles.RoundtripKind,
                         out var editedAt))
                 {
                     currentAuthor = fields[0];
+                    currentAuthorEmail = fields[1];
                     currentEditedAt = editedAt;
                 }
                 else
@@ -227,6 +230,7 @@ public sealed class PageHistoryService
                     // An unparseable header (should not happen against a real git log, but D14's total-
                     // failure posture applies here too): stop attributing until the next valid header.
                     currentAuthor = null;
+                    currentAuthorEmail = null;
                     currentEditedAt = null;
                 }
 
@@ -255,7 +259,9 @@ public sealed class PageHistoryService
             var workingTreeRelativePath = repositoryRelativePath[repositoryPathPrefix.Length..]
                 .Replace('/', Path.DirectorySeparatorChar);
 
-            lastEdits.TryAdd(workingTreeRelativePath, new PageLastEdit(currentAuthor, currentEditedAt.Value));
+            lastEdits.TryAdd(
+                workingTreeRelativePath,
+                new PageLastEdit(currentAuthor, currentEditedAt.Value, currentAuthorEmail));
         }
 
         return lastEdits;

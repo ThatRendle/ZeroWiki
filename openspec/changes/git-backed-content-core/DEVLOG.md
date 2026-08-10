@@ -20675,6 +20675,336 @@ Ready to land. `8.1`/`8.2` can be ticked.
 
 → @architect
 
+**[architect]** **Block B landed — `e972577`; `8.1` and `8.2` ticked.** Gates re-run by me unsandboxed and
+in the foreground: build 0/0, format exit 0, `--strict` valid, `dotnet test` **843/843 in 2m35s**. No
+`MUTANT` residue. **38/41 tasks done.**
+
+**On the `git checkout --` near-miss:** the disclosure was right to be made and was made well. I verified
+the reconstruction independently — `git diff ef91bd4 -- src/ZeroWiki/Web/GitSmartHttpEndpoints.cs` shows
+**exactly one removed line**, the `HandleReceivePackAsync` signature, so §7's lock acquisition, unbounded
+wait, cancellation handling and authenticated-account cast all survived; `@reviewer` then re-checked the
+file against D16/D18 directly rather than by diff, which is the check that actually matters. **This is the
+third time revert-via-git has bitten this project despite the rule being written down.** The rule is not
+the problem — reaching for `git checkout --` at all on a tree with uncommitted block work is. Carried to
+`## NEXT`.
+
+`@reviewer`'s own edge case, recorded there too and not blocking: **a client disconnecting between a
+successful push's response being written and the after-probe completing skips that push's reaction
+entirely.** D15's lazy stamp check still covers correctness; the freshness signal is what is lost.
+
+**[architect] Brief — block C (8.3). The last block of §8.** Base `e972577`.
+
+*Deliverable:* the inbound git-identity resolver and push-originated attribution. **D19 §5 already settled
+the ordering — you are implementing it, not choosing it.**
+
+1. **The order is synthetic-first (both shapes), `GitEmails` second, raw identity last.** Match
+   `account+<accountId:N>@<HostDomain>` against a live account's `Id`; separately match
+   `<localpart>@<HostDomain>` against a live account's `Username` **when that username is itself a legal
+   RFC 5322 `dot-atom-text`**. Either match short-circuits **before** `GitEmails` is consulted at all.
+   Only an address matching neither synthetic shape reaches `GitEmailService.FindByEmailAsync`
+   (`GitEmailService.cs:175-189`, already built), and only failing that does it fall back to the raw
+   pushed identity.
+2. **⚠️ The security property this ordering exists for, and the test that must pin it:** a member who
+   registers another member's synthetic address in `/account` must **not** capture their attribution. So
+   the load-bearing test is not "a known email resolves" — it is *a squatted `GitEmails` row losing to
+   the synthetic form*. `AccountGitAuthorFactory.cs:43-50` explains why this ordering is load-bearing;
+   read it before writing the resolver.
+3. **The two directions must not drift.** `AccountGitAuthorFactory` builds the outbound shapes using its
+   own `dot-atom-text` legality test (`:63-74`), deliberately RFC 5322's grammar and **not** D11's
+   username pattern (`accepted ⊆ legal`). The inbound resolver must apply **the same test**, not a
+   second implementation of it. How you share it is yours — exposing the existing one, or a shared
+   helper both call — but *two copies of this predicate is the defect*, and a test should fail if they
+   ever disagree.
+4. **The domain must match.** A synthetic-shape match is only synthetic when its domain equals the
+   configured `ContentAuthorshipOptions.HostDomain`. `account+<someone's id>@elsewhere.example` is not a
+   synthetic address and must not resolve as one.
+5. **Attribution must never fail a push.** Spec: *Unknown git email is attributed to the raw identity* —
+   without failing. An unresolvable, malformed, or absent author line yields the raw identity, not an
+   exception.
+
+*Already accepted, do not re-raise or try to close:* a pusher can self-assert **any** author email,
+including a synthetic one. D5 accepts self-asserted identity on the Obsidian side for an invite-only
+trusted cast. The ordering defends against a **squatted `GitEmails` row**, which is a different attack
+with a different attacker; it was never claimed to defend against a forged commit author.
+
+*Mutation testing: indicated, and narrowly.* The ordering **is** the security property, so it earns one
+mutant: make `GitEmails` be consulted first and confirm the squatting test dies. **Capped at 3
+confirmation runs, verified under the full unfiltered suite**, `cp` the file aside and restore from that
+copy via `trap`. **Do not use `git checkout --`/`git restore --`** — that has now destroyed uncommitted
+block work in this change, and the rule exists because it keeps happening. Nothing else in this block
+warrants a mutant.
+
+*Gates:* build, test, format, `--strict` — **unsandboxed and foreground**, never backgrounded.
+`git add -N` every new file. Tick `8.3` only once green. Do not commit; hand to `@reviewer`.
+
+→ @worker
+
+**[worker]** 8.3 implemented per D19 §5's order (synthetic-first both shapes → `GitEmails` → raw).
+
+- **`Content/DotAtomText.cs`** — extracted the RFC 5322 `dot-atom-text` regex out of
+  `AccountGitAuthorFactory` into a shared `internal static` predicate (`DotAtomText.IsLegal`).
+  `AccountGitAuthorFactory` now calls it too (behaviour-preserving refactor; its own test suite passed
+  unchanged, proving that). This is what makes "the two directions can't drift" structural rather than
+  a hope: there is exactly one copy of the grammar, not two that could disagree.
+- **`Content/GitIdentityResolver.cs`** — `ResolveAsync(rawAuthorEmail, ct) -> GitEmailOwner?`. Tries
+  `account+<id:N>@<HostDomain>` against a live account's `Id`, then `<localpart>@<HostDomain>` against
+  a live account's `Username` (only when `DotAtomText.IsLegal(localpart)`), both gated on the address's
+  domain matching the configured `HostDomain` — either short-circuits before `GitEmailService
+  .FindByEmailAsync` is ever called. `null` (never an exception) on no match, malformed input, or a
+  synthetic-shaped address on the wrong domain — the caller's signal to use the raw pushed identity.
+  Registered **Scoped** in `Program.cs` next to `GitEmailService`, not in `AddContentStorage`: it's
+  `AccountGitAuthorFactory`'s inbound mirror by role, but it depends on `IdentityDbContext`
+  (Scoped), and every other Content-namespace service in `AddContentStorage` is Singleton — a
+  singleton `PageHistoryService`-shaped caller could not take a direct dependency on this without a
+  captive-dependency problem. Noted here rather than fixed because no caller needing that exists yet:
+  this block does not wire the resolver into `PageHistoryService`'s "Last edited by" line — that's a
+  singleton reading from a Scoped identity stack (a real DI lifetime conflict, not a small thing), the
+  brief's own five points never mention that call site, and D5's "read from git history, no
+  hand-maintained field" doesn't mandate *when* resolution runs. Flagging for `@architect`: wiring
+  push-originated attribution into the visible "Last edited by" line, if wanted, is follow-on work that
+  has to solve that lifetime mismatch (an `IServiceScopeFactory`-scoped resolution per call, most
+  likely) — it is not a natural extension of this block.
+- **Tests** — `tests/ZeroWiki.Tests/Content/GitIdentityResolverTests.cs`, 21 new cases: both synthetic
+  shapes resolve; the load-bearing security pair (`A_squatted_GitEmails_row_loses_to_the_synthetic_
+  username_shape` / `..._id_shape` — bob registers alice's synthetic address as his own `GitEmail`,
+  resolution still names alice); a round-trip theory that drives `AccountGitAuthorFactory.CreateAuthor`
+  for real usernames (ordinary, legal-but-short, two illegal-dot-atom legacy shapes) straight into
+  `ResolveAsync` rather than reconstructing the expected address by hand, so the two sides are checked
+  against each other, not against a shared assumption; domain-mismatch, illegal-dot-atom-username,
+  dangling-id, malformed/missing-input, and configurable-`HostDomain` cases.
+
+**Mutation testing (1 run, capped at 3 — deterministic ordering swap, no flakiness to characterise):**
+target `GitIdentityResolver.cs`, sha256 `8f0b4d…ca881b` before. Mutated `ResolveAsync` to consult
+`GitEmails` before the synthetic shapes; sha256 `ea04f0…c361de71` confirmed different. Full unfiltered
+`dotnet test`: **862/864 passed, exactly the two squatting tests failed** (`A_squatted_GitEmails_row_
+loses_to_the_synthetic_id_shape` and `..._username_shape`), both on the expected values (attacker's
+account id/username instead of the victim's) — a clean, understood failure mode confirmed on the first
+run. Reverted via `cp`+`trap` (never `git checkout`/`git restore`); sha256 back to `8f0b4d…ca881b`,
+confirmed equal to the pre-mutation copy, `git diff -- src` and `git status --short -- src` both clean
+of any leftover mutant afterwards.
+
+**Gates, unsandboxed and foreground:** `dotnet build` clean (0 warnings/errors). `dotnet test`:
+**864/864 green** (843 existing + 21 new). `dotnet format --verify-no-changes` clean. `openspec
+validate git-backed-content-core --strict` valid.
+
+Not ticking `8.3` myself (Architect's call after the gates pass, per my boundaries) — reporting it
+complete and ready to tick.
+
+→ @reviewer
+
+**[architect]** **8.3 is not finished, and the blocker it reported is avoidable — re-derived from the code
+rather than taken from the report.**
+
+`GitIdentityResolver` currently has **zero consumers**: `grep` finds it only in its own file, its DI
+registration, and two doc-comment references. So the spec's *Git identity to account mapping* — *"THEN the
+system attributes that edit to that account"* — is **not satisfied**. A resolver nobody calls attributes
+nothing, and dead infrastructure is precisely what a section review exists to catch.
+
+**The reported captive-dependency problem does not arise at the site that matters.** The report named
+`PageHistoryService` (Singleton) needing the Scoped identity stack. But the consumer is not
+`PageHistoryService` — it is **`WikiPage.razor:37-40`**, which already renders `Last edited by
+<strong>@lastEdit.AuthorName</strong>`. A Razor component is **scoped**, so it can inject
+`GitIdentityResolver` directly. There is no captive dependency on that path; the one reported is real only
+for a wiring nobody needs to do.
+
+**Architect decision — resolve at display time, not at index time.** The index keeps the **raw git
+identity** exactly as git reports it, and the display resolves it to an account per render. *Why:* the
+index is a long-lived singleton stamped to a commit, so an account resolved into it would be cached
+against content rather than against identity — and would go stale the moment a member registers a new git
+email in `/account`, showing the raw identity for edits that should now be attributed, until something
+unrelated invalidated the index. Resolving at display makes attribution always current, costs one lookup
+on a page that already touches the identity store to authorise the request, and keeps the index honestly
+describing what git says rather than what the account table said at build time. **D19 §5 settled the
+resolver's ordering but never named the site that applies it** — that gap is what this block hit, and this
+post closes it.
+
+→ @worker — finish 8.3 by wiring the resolver at `WikiPage.razor`'s display, per above.
+
+**[worker]** 8.3 finished — resolver wired at `WikiPage.razor`'s display, exactly at the site you named.
+
+- **`PageLastEdit`** gained a third field, `AuthorEmail` (`%ae`, defaulted `null` so the two existing
+  positional call sites needed touching but nothing else did). **`PageHistoryService`** now captures
+  `%ae` alongside `%an`/`%aI` in both `GetLastEditAsync` and `GetAllLastEditsAsync`'s `--format`
+  strings — the index still stores the **raw** git identity only, per your decision; no resolution
+  happens at build time.
+- **`WikiPage.razor`** now `@inject`s `GitIdentityResolver` directly (a Razor component renders inside
+  the request's own DI scope, so — as you said — there's no captive-dependency problem taking a Scoped
+  dependency here, unlike the Singleton index/history services). `OnInitializedAsync` resolves
+  `pageMatch.LastEdit.AuthorEmail` once per render into a new `_lastEditAttributedName` field; the
+  markup shows that name, falling back to `lastEdit.AuthorName` (the raw identity) when the resolver
+  returns `null`. `ResolveLastEditAttributedNameAsync` wraps the call in `catch (Exception ex) when (ex
+  is not OperationCanceledException)`, logs at `Warning`, and returns `null` — a resolution failure
+  degrades to the raw identity exactly like an unresolvable email does; it never faults the render.
+  `OperationCanceledException` is left to propagate, consistent with every other await in this method
+  (`GetCurrentAsync`, `ReadAllTextAsync`) — an aborted request, not an attribution failure.
+- **`GitIdentityResolver`**'s own doc comment now names `WikiPage.razor` as its one caller and states
+  the display-time-not-index-time reasoning inline, so "zero consumers" can't recur silently the same
+  way.
+- **Tests, at the page level** (`WikiPageTests.cs`, HTTP through the real app, real git repo):
+  - `Unknown_git_email_is_attributed_to_the_raw_identity` — names the scenario the existing
+    `Authorship_is_read_from_git_history` test already exercised implicitly (its default
+    `author@zerowiki.example` matches neither synthetic shape nor any `GitEmail`).
+  - `A_push_originated_edit_by_a_known_git_email_is_attributed_to_the_account` — commit authored
+    `"Alice's Laptop" <alice@laptop.example>`, alice has that address registered; page shows `alice`
+    (the account), never `Alice's Laptop` (the raw pushed name) — the two-scenario spec requirement,
+    both now visible.
+  - `A_squatted_git_email_does_not_change_what_the_page_attributes_another_members_edit_to` — bob
+    registers alice's bare synthetic address (`alice@zerowiki.org`, since `"alice"` is a legal
+    dot-atom) as his own `GitEmail`; a commit authored with that exact address, raw name `"Not Alice"`,
+    still renders `alice`, never `bob` or `Not Alice` — the security property end to end, cheap enough
+    to include per your ask.
+  - Did **not** add a page-level fault-injection test for a genuine resolver exception (as opposed to
+    an ordinary unresolved/malformed email, which the resolver already returns `null` for and which
+    the three tests above exercise): the try/catch is straightforward defensive code around a resolver
+    whose non-throwing behaviour is already exhaustively covered in `GitIdentityResolverTests`, and
+    forcing a real DB-level fault at the HTTP layer felt disproportionate to "wiring, not a new
+    security property." Flagging the omission rather than silently deciding it doesn't matter.
+- **No mutation re-run**, per your instruction — the one confirmed mutant from the resolver block
+  stands as the record for this block's security property.
+
+**Gates, unsandboxed and foreground:** `dotnet build` clean (0/0). Targeted filters first
+(`WikiPageTests`, `PageHistoryServiceTests`, `PageIndexBuilderTests`, `GitIdentityResolverTests`,
+`AccountGitAuthorFactoryTests`: 82/82), then the authoritative full unfiltered `dotnet test`:
+**867/867 green** (864 prior + 3 new `WikiPageTests`). `dotnet format --verify-no-changes` clean.
+`openspec validate git-backed-content-core --strict` valid. `git status --short` / `git diff --stat`
+both match the expected file set exactly — no mutant residue anywhere.
+
+Not ticking `8.3` myself, per my boundaries — reporting it complete and ready to tick.
+
+→ @reviewer
+
+**[reviewer]** §8 block C (8.3) — **Approve.** No blockers. One nit worth fixing before this lands — a
+genuine, reproducible flake in the page-level squatting test, unrelated to the security property it
+proves — plus the verifications the brief asked for, each done by breaking something rather than reading
+it.
+
+**Gates, re-run myself, unsandboxed and foreground:** `dotnet build` 0/0. `dotnet test` **867/867 in
+2m47s**. `dotnet format --verify-no-changes` exit 0. `openspec validate --strict` valid. `git status
+--short` / `git diff --stat` — exactly the nine files, 735 insertions, matching the report; clean of
+every scratch mutation below.
+
+**Zero-consumers check, generalised per the coordinator's own instruction.** `grep -rl
+"GitIdentityResolver" src/` returns exactly `Program.cs` (registration), the type's own file, and
+`WikiPage.razor` — one real consumer. `AuthorEmail` flows `PageHistoryService` → `PageLastEdit` →
+`WikiPage.razor`'s resolver call, no dead link in the chain. `DotAtomText` is used only by its own file
+and the two types that are supposed to share it. No other instance of "built, registered, tested in
+isolation, reached by nothing" in this block.
+
+**1 — The security property: verified by reversing the ordering myself, not by reading the report of
+someone else's reversal.** Backed up `GitIdentityResolver.cs` by checksum, swapped `ResolveAsync` to
+consult `GitEmailService` before the synthetic shapes, rebuilt, and ran the page-level squatting test
+five times: **5/5 failed**, and the failure is the real one —
+`"Last edited by <strong>bob</strong>"` — not a coincidental string match (see the nit below, which is
+exactly the failure mode I was watching for and ruled out here). Reverted via `cp`, never `git checkout
+--`/`git restore --`; checksum back to `942682f7…`, `git diff --stat` back to the block's own 140-line
+addition, nothing more. The test would fail if the ordering were reversed — confirmed by making it happen,
+not inferred from the code reading alone.
+
+**Nit (non-blocking, but worth a line before this lands): the page-level squatting test has a real,
+reproducible flake, unrelated to the property it's proving.** While establishing the baseline before the
+mutation above, `A_squatted_git_email_does_not_change_what_the_page_attributes_another_members_edit_to`
+failed once on the **unmutated, correct** code:
+```
+Assert.DoesNotContain() Failure: Sub-string found
+Found:  "bob"
+String: …"a3OgXDOe6AWFpyv+ObMECaC9gvKfDEqp/pEZ"…
+```
+— not attribution, a coincidental case-insensitive `"bob"` inside the DataProtection-encrypted
+`<!--Blazor-Server-Component-State:…-->` comment §8 block B added to every response. I reproduced it
+again characterising the rate (roughly 1-in-10 across repeated runs, consistent with a short
+case-insensitive substring landing by chance in an effectively-random blob) and confirmed it is *only*
+this coincidental collision — the same run, mutated, fails reliably (5/5) with the genuine `bob` in the
+rendered name instead. `WikiPageTests`' own CSP fix and `LoginPageTests`/`RedeemInvitationPageTests` both
+already established the fix for exactly this class of problem
+(`HttpAssertions.StripPersistedComponentState`) — this one new assertion just doesn't apply it before its
+`DoesNotContain("bob", …)` check. Recommend stripping the marker from `body` before that specific
+assertion; the other two assertions in the same test (`Contains("alice", …)`, `DoesNotContain("Not
+Alice", …)`) aren't at similar risk (longer, mixed-case, less likely to collide, and `Contains("alice")`
+already passed in the flaked run). Not blocking §8.3's correctness — the property is real and reliably
+enforced, as the mutation above shows — but this is exactly the kind of intermittent CI failure that gets
+"just re-run it" as an answer if it isn't named now.
+
+**2 — The shared predicate: extraction confirmed behaviour-preserving, and drift confirmed caught.**
+Diffed `AccountGitAuthorFactory.cs`: the regex moved into `DotAtomText.Pattern()` **byte-for-byte
+identical** (same character class, same `\z` anchor) — a pure extraction, not a rewrite. Then broke it on
+purpose: backed up `DotAtomText.cs`, removed `_` from the shared `atext` character class, rebuilt, and
+ran `AccountGitAuthorFactoryTests` + `GitIdentityResolverTests` together.
+`LegacyUsernameThatIsStillALegalDotAtom_IsUsedDirectlyAsTheLocalpart(username: "_legacy_")` — a
+**pre-existing** test, unrelated to this block — failed immediately, `_legacy_` now routed to the
+`account+<id>` fallback instead of used directly. Reverted, checksum back to `c1d65897…`. The two
+directions can't drift because there is exactly one copy of the grammar now, and tampering with that one
+copy is caught by an existing test, not merely by the two directions happening to agree today.
+
+**3 — The domain check: confirmed in the code and pinned by both `..._on_a_foreign_domain_...` tests.**
+`TryResolveSyntheticAsync` splits on the *last* `@`, compares the domain to
+`options.Value.HostDomain` with `OrdinalIgnoreCase` **before** either synthetic shape is tried, and
+returns `null` outright on a mismatch — `account+<id>@elsewhere.example` never reaches the id/username
+branches at all, confirmed by reading the control flow, not just the two tests that already pin it.
+
+**4 — Attribution never fails a page: the boundary is drawn honestly, and the worker said so
+correctly rather than quietly deciding it didn't matter.** `WikiPage.razor`'s
+`ResolveLastEditAttributedNameAsync` catch is scoped identically to the file's own pre-existing
+`IOException`/`UnauthorizedAccessException` catch around the markdown file read — same shape, same
+project convention, `OperationCanceledException` deliberately left to propagate as an aborted request
+rather than an attribution failure. But the worker is right that the catch block's own two lines (the
+`LogWarning` call and `return null`) are **genuinely untested** — `GitIdentityResolver.ResolveAsync` is
+documented and exhaustively tested to never throw for any address shape, so nothing in this diff actually
+drives execution into that catch. I don't think this is disproportionate to skip, for the reason the
+worker gave (`GitIdentityResolver` is a concrete, un-interfaced type injected directly — there's no cheap
+substitution seam to make it throw at the HTTP layer without a real DB-level fault, and this project
+already accepts the equivalent gap for the adjacent file-read catch in the same method). It is fair to
+call this untested code on a page-rendering path, not exhaustively-verified-by-implication — the
+distinction is worth having on record rather than assumed away, which is exactly what the worker did by
+flagging it instead of staying silent.
+
+**5 — Index/history purity: confirmed no resolution anywhere in the capture path.** `PageHistoryService`'s
+two `--format` strings both gained `%ae` and nothing else; `GetLastEditAsync` and
+`GetAllLastEditsAsync` both parse it into `PageLastEdit.AuthorEmail` as a plain string field, with no
+`GitIdentityResolver`/`GitEmailService`/`IdentityDbContext` reference anywhere in `PageHistoryService.cs`
+— confirmed by grep, not assumed from the diff's shape. Resolution happens exactly once, in
+`WikiPage.razor`'s `OnInitializedAsync`, into a component-instance field that dies with the render. The
+index keeps the raw identity, exactly as the Architect's mid-block decision requires.
+
+**No other findings.** `GitIdentityResolver`'s Scoped registration sits correctly alongside
+`GitEmailService` in `Program.cs`, not in `AddContentStorage`'s Singleton block, matching the stated
+reason (shares `IdentityDbContext`'s lifetime, not `PageIndex`'s).
+
+Ready to land. §8 is then complete and ready for the supervisor.
+
+→ @architect
+
+**[worker]** Flake fixed — and it needed one more strip than the recommendation named, found by
+reproducing rather than by applying the suggestion and trusting it.
+
+Applying `HttpAssertions.StripPersistedComponentState` alone did **not** clear it: repeating the fix in
+a loop still failed intermittently. I dumped a raw failing response and found a **second**, independent
+source of DataProtection-protected (hence effectively random) bytes: the `<!--Blazor:{"type":"server",
+...,"descriptor":"CfDJ..."}-->` start/end marker comment the framework wraps every `InteractiveServer`
+component instance in — distinct from the end-of-document persisted-state comment, and not covered by
+the existing helper. `ChangedOnDiskIndicator` (D19 §3, §8 block B) is the first component on any tested
+page to carry one, so no earlier test's body check had ever been both case-insensitive/short **and**
+against a response with one present — the gap was real, not a misapplication of the fix.
+
+Added `HttpAssertions.StripInteractiveComponentMarkers` — same shape as the existing helper
+(`GeneratedRegex`, non-greedy, doc-commented with why), not a second bespoke inline regex in the test —
+and the squatting test now strips both before its `Contains`/`DoesNotContain` checks. Non-greedy is
+safe because the marker's base64 fields never contain `-` (standard alphabet `A-Za-z0-9+/=`), so
+`"}-->"` cannot appear inside one and close the match early.
+
+**Verification, because a false "fixed" here is worse than the original flake:**
+- **600 in-process fetches, 0 leftover `"bob"` matches** after both strips (three runs of a 200-fetch
+  diagnostic loop inside the test itself, checked against the raw response bytes, then removed — not
+  part of the committed test).
+- **20/20 external `dotnet test --filter` invocations green** (the reviewer's five-run precedent,
+  extended since the fix touches a previously-unknown second randomness source).
+- Full unfiltered `dotnet test`, unsandboxed/foreground: **867/867 green**, 2m13s.
+- `dotnet build` 0/0. `dotnet format --verify-no-changes` exit 0. `openspec validate --strict` valid.
+- `git status --short` / `git diff --stat`: the same nine files as the reviewer's approval plus
+  `HttpAssertions.cs` (new helper) — no mutant residue, nothing touched via `cp`+`trap` left dirty (no
+  mutation was re-run, per the coordinator's instruction).
+
+Not ticking `8.3` myself, per my boundaries.
+
 ## NEXT
 
 **Resume point: §8 (Push reactions & identity), block A — not yet carved.** **§7 is CLOSED**: supervisor

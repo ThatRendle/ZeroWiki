@@ -10,6 +10,8 @@
 
 @inject PageIndex PageIndex
 @inject MarkdownPipeline MarkdownPipeline
+@inject GitIdentityResolver GitIdentityResolver
+@inject ILogger<WikiPage> Logger
 
 <PageTitle>@PageDisplayTitle</PageTitle>
 
@@ -37,7 +39,7 @@ else if (_renderedBody is { } body)
     @if (_page?.LastEdit is { } lastEdit)
     {
         <p class="page-last-edit">
-            Last edited by <strong>@lastEdit.AuthorName</strong> on
+            Last edited by <strong>@(_lastEditAttributedName ?? lastEdit.AuthorName)</strong> on
             <time datetime="@lastEdit.EditedAt.ToString("O")">@lastEdit.EditedAt.ToString("f", System.Globalization.CultureInfo.InvariantCulture)</time>
         </p>
     }
@@ -110,6 +112,15 @@ else
     private AmbiguousPageRoute? _ambiguousRoute;
     private MarkupString? _renderedBody;
     private string? _editHref;
+
+    /// <summary>
+    /// §8.3 (D19 §5): the account <see cref="GitIdentityResolver"/> attributes <c>_page.LastEdit</c>'s
+    /// raw git identity to, or <see langword="null"/> to fall back to
+    /// <see cref="PageLastEdit.AuthorName"/> as-is — set once in <see cref="OnInitializedAsync"/>, never
+    /// baked into the index itself (see <see cref="GitIdentityResolver"/>'s own remarks for why
+    /// resolution happens here, at display time, rather than when the index is built).
+    /// </summary>
+    private string? _lastEditAttributedName;
 
     private string PageDisplayTitle =>
         _page?.Title is { Length: > 0 } title ? title : _page?.RelativePath ?? "ZeroWiki";
@@ -254,6 +265,37 @@ else
         // metadata stale for the instant before a refresh, but never the rendered body.
         _page = pageMatch;
         _renderedBody = new MarkupString(Markdown.ToHtml(markdown, MarkdownPipeline));
+
+        if (pageMatch.LastEdit is { } lastEdit)
+        {
+            _lastEditAttributedName = await ResolveLastEditAttributedNameAsync(lastEdit, context.RequestAborted);
+        }
+    }
+
+    /// <summary>
+    /// §8.3: maps <paramref name="lastEdit"/>'s raw git author email back to the account it attributes
+    /// to (D19 §5's synthetic-first, then <c>GitEmails</c>, then raw-identity order), returning
+    /// <see langword="null"/> — never throwing — for an unresolvable, missing, or malformed address, or
+    /// a genuine resolution failure. A page must still render even when attribution cannot be computed;
+    /// the caller falls back to <see cref="PageLastEdit.AuthorName"/> exactly as git reported it (spec:
+    /// <em>Unknown git email is attributed to the raw identity</em>).
+    /// </summary>
+    private async Task<string?> ResolveLastEditAttributedNameAsync(PageLastEdit lastEdit, CancellationToken cancellationToken)
+    {
+        try
+        {
+            var resolved = await GitIdentityResolver.ResolveAsync(lastEdit.AuthorEmail, cancellationToken);
+            return resolved?.Username;
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            Logger.LogWarning(
+                ex,
+                "Resolving the git identity for '{Route}' failed; the page will render with the raw " +
+                "pushed identity instead of an attributed account.",
+                Route);
+            return null;
+        }
     }
 
     /// <summary>

@@ -228,6 +228,76 @@ public sealed class WikiPageTests : IDisposable
     }
 
     [Fact]
+    public async Task Unknown_git_email_is_attributed_to_the_raw_identity()
+    {
+        // Spec scenario, named explicitly rather than left implicit in the test above:
+        // "author@zerowiki.example" matches neither of GitIdentityResolver's synthetic shapes (wrong
+        // domain) nor any registered GitEmail, so the page must show exactly what git reports.
+        await SeedAccountAsync("alice");
+        await WritePageAsync("page.md", "Body.", authorName: "Unmapped Pusher", authorEmail: "unmapped@laptop.example");
+
+        var response = await (await SignInAsync("alice")).GetAsync("/wiki/page");
+        var body = await response.Content.ReadAsStringAsync();
+
+        Assert.Contains("Unmapped Pusher", body, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task A_push_originated_edit_by_a_known_git_email_is_attributed_to_the_account()
+    {
+        // §8.3 end to end: a commit's raw author name is whatever the pusher's local git config says
+        // (here deliberately different from the account's username) — the page must show the account
+        // the registered GitEmail resolves to, not the raw pushed name.
+        var aliceId = await SeedAccountAsync("alice");
+        await _app.WithDbAsync(async db =>
+        {
+            db.GitEmails.Add(new GitEmail { Id = Guid.NewGuid(), AccountId = aliceId, Email = "alice@laptop.example" });
+            await db.SaveChangesAsync();
+        });
+        await WritePageAsync("page.md", "Body.", authorName: "Alice's Laptop", authorEmail: "alice@laptop.example");
+
+        var response = await (await SignInAsync("alice")).GetAsync("/wiki/page");
+        var body = await response.Content.ReadAsStringAsync();
+
+        Assert.Contains("alice", body, StringComparison.Ordinal);
+        Assert.DoesNotContain("Alice's Laptop", body, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task A_squatted_git_email_does_not_change_what_the_page_attributes_another_members_edit_to()
+    {
+        // The security property D19 §5 exists for, proven end to end: bob registers alice's synthetic
+        // address (account+<id>@zerowiki.org, since "alice" is a legal dot-atom the outbound side would
+        // use directly — so alice's own synthetic address is bare "alice@zerowiki.org") as one of his
+        // own git emails. A commit whose author line is that exact address must still attribute to
+        // alice, never to bob, regardless of what he registered.
+        await SeedAccountAsync("alice");
+        var bobId = await SeedAccountAsync("bob");
+        var syntheticAliceAddress = $"alice@{ContentAuthorshipOptions.DefaultHostDomain}";
+        await _app.WithDbAsync(async db =>
+        {
+            db.GitEmails.Add(new GitEmail { Id = Guid.NewGuid(), AccountId = bobId, Email = syntheticAliceAddress });
+            await db.SaveChangesAsync();
+        });
+        await WritePageAsync("page.md", "Body.", authorName: "Not Alice", authorEmail: syntheticAliceAddress);
+
+        var response = await (await SignInAsync("alice")).GetAsync("/wiki/page");
+        // Two independent DataProtection-protected (hence effectively random) markers ride every
+        // response for a page that renders ChangedOnDiskIndicator (D19 §3): the end-of-document
+        // persisted-component-state comment and each InteractiveServer component's own start/end
+        // marker comment. Either can coincidentally contain "bob" and fail the case-insensitive check
+        // below on unmutated, correct code — both must be stripped first, exactly as
+        // HttpAssertions.StripInteractiveComponentMarkers's own remarks record (found by reproducing
+        // the flake, not merely by reading the reviewer's report of it).
+        var body = HttpAssertions.StripInteractiveComponentMarkers(
+            HttpAssertions.StripPersistedComponentState(await response.Content.ReadAsStringAsync()));
+
+        Assert.Contains("alice", body, StringComparison.Ordinal);
+        Assert.DoesNotContain("bob", body, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("Not Alice", body, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task Frontmatter_title_is_used_as_the_page_title_and_tags_are_shown()
     {
         await SeedAccountAsync("alice");

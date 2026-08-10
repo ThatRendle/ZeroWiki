@@ -1,4 +1,3 @@
-using System.Text.RegularExpressions;
 using Microsoft.Extensions.Options;
 using ZeroWiki.Identity;
 
@@ -28,10 +27,12 @@ namespace ZeroWiki.Content;
 /// <see cref="CredentialPolicy.UsernamePattern"/>.</b> D11's pattern accepts a strict subset of what a
 /// dot-atom allows (<c>accepted ⊆ legal</c>, deliberately not the other direction) — <c>_legacy_</c> is a
 /// perfectly legal dot-atom localpart and would be wrongly routed to the fallback if this reused D11's
-/// pattern as the legality test instead of RFC 5322's own grammar.
+/// pattern as the legality test instead of RFC 5322's own grammar. The test itself lives in
+/// <see cref="DotAtomText"/>, shared with <see cref="GitIdentityResolver"/>'s inbound match so the two
+/// directions cannot drift apart (D19 §5).
 /// </para>
 /// </remarks>
-public sealed partial class AccountGitAuthorFactory(IOptions<ContentAuthorshipOptions> options)
+public sealed class AccountGitAuthorFactory(IOptions<ContentAuthorshipOptions> options)
 {
     /// <summary>
     /// The fallback localpart prefix for an account whose username is not itself a legal RFC 5322
@@ -53,23 +54,10 @@ public sealed partial class AccountGitAuthorFactory(IOptions<ContentAuthorshipOp
     /// <summary>Builds the author identity for a commit made on <paramref name="account"/>'s behalf.</summary>
     public GitAuthor CreateAuthor(AuthenticatedAccount account)
     {
-        var localPart = IsLegalDotAtomText(account.Username)
+        var localPart = DotAtomText.IsLegal(account.Username)
             ? account.Username
             : $"{SyntheticLocalPartPrefix}{account.Id:N}";
 
         return new GitAuthor(account.Username, $"{localPart}@{options.Value.HostDomain}");
     }
-
-    /// <summary>
-    /// Whether <paramref name="value"/> satisfies RFC 5322 <c>dot-atom-text = 1*atext *("." 1*atext)</c>
-    /// in full — no leading, trailing, or doubled dot, and every character either <c>atext</c> or a
-    /// separating dot.
-    /// </summary>
-    private static bool IsLegalDotAtomText(string value) => DotAtomTextPattern().IsMatch(value);
-
-    // atext = ALPHA / DIGIT / "!" / "#" / "$" / "%" / "&" / "'" / "*" / "+" / "-" / "/" / "=" / "?" /
-    // "^" / "_" / "`" / "{" / "|" / "}" / "~" (RFC 5322 §3.2.3). \z, never $, for the same reason
-    // CredentialPolicy.UsernamePattern uses it: $ also matches immediately before a trailing newline.
-    [GeneratedRegex(@"^[A-Za-z0-9!#$%&'*+\-/=?^_`{|}~]+(\.[A-Za-z0-9!#$%&'*+\-/=?^_`{|}~]+)*\z")]
-    private static partial Regex DotAtomTextPattern();
 }

@@ -26,6 +26,10 @@ builder.Services.AddSingleton<IPasswordHasher, Argon2idPasswordHasher>();
 builder.Services.AddSingleton<ISecretTokenGenerator, SecretTokenGenerator>();
 builder.Services.AddScoped<GitTokenService>();
 builder.Services.AddScoped<GitEmailService>();
+// GitIdentityResolver lives in the Content namespace (AccountGitAuthorFactory's inbound mirror) but,
+// like GitEmailService above, depends on IdentityDbContext -- Scoped, not the Singleton every other
+// Content service in AddContentStorage is, so it is registered here rather than there.
+builder.Services.AddScoped<GitIdentityResolver>();
 builder.Services.AddScoped<BootstrapService>();
 builder.Services.AddScoped<LoginService>();
 builder.Services.AddScoped<InvitationService>();
