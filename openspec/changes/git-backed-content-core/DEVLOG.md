@@ -18390,6 +18390,594 @@ a form post, not an island; §6 added no interactive circuit.
 **@architect** — §6 is closed. Rewrite `## NEXT` before opening §7; items 1 and 7 above are the two that
 matter for the next section.
 
+## 7. Smart HTTP git remote
+
+**[architect]** Base: `cb81b47` — §7 exposes the content repository as a Smart HTTP git remote behind
+wiki authentication, with push receipt serialized against browser saves by the same write lock, and
+verifies it against a real `git` client.
+
+**[architect]** §7 is carved into three blocks (Product Owner decision; the reasoning and the full input
+list are in `## NEXT`, written at `ce4cad8`):
+
+- **A** — D18, the Smart HTTP surface. Design only, no feature code, ticks nothing.
+- **B** — 7.1 + 7.2 + 7.5, the complete server mechanism as one commit.
+- **C** — 7.3 + 7.4, verification against a real `git` client.
+
+**[architect] Brief — block A (D18). Ticks no boxes; commits `design.md` and any spec delta it proves
+necessary.**
+
+*Deliverable:* a new `### D18` in `design.md`, in the voice of D16/D17 — decisions with the measurement
+that settled each one, not a survey. Plus a spec delta **only if** you find a genuine gap; the
+expectation is none, and "none needed, here is why" is a valid and expected result.
+
+*What D18 must settle. Every one of these is a claim about a machine, so the standing rule binds: feed
+the literal to the machine and paste the output into this thread. Do not reason about what
+`git http-backend` does — run it.*
+
+1. **Route shape and the `PATH_INFO` it produces.** `info/refs`, `git-upload-pack`, `git-receive-pack`.
+   ZeroWiki serves exactly one repository, so the repo-name segment every git-hosting example carries
+   may or may not be needed — `http-backend` resolves `GIT_PROJECT_ROOT` + `PATH_INFO`, and what it does
+   with an empty or `/`-only `PATH_INFO` is a fact to observe, not to infer. Settle the exact route
+   templates and the exact `PATH_INFO` each must produce.
+2. **The CGI contract.** The full environment set (`GIT_PROJECT_ROOT`, `PATH_INFO`, `REQUEST_METHOD`,
+   `QUERY_STRING`, `CONTENT_TYPE`, `CONTENT_LENGTH`, `REMOTE_USER`, and the gzipped-request-body case),
+   the **export policy** — `GIT_HTTP_EXPORT_ALL` versus `http.uploadpack`/`git-daemon-export-ok`, and
+   which one this design picks — and how `http-backend`'s CGI response header block (`Status:`,
+   `Content-Type:`, `Cache-Control:`, `Expires:`, `Pragma:`) is parsed and translated onto an
+   `HttpResponse`. Note `http.receivepack=true` is already set on every start (`ef2b75b`); obligation 4
+   in `## NEXT` explains why its absence reads as an auth bug.
+3. **The streaming contract, and the fact that forces it.** `GitProcessRunner` captures stdout as a
+   **string** via `ReadToEndAsync` and never redirects **stdin** (`GitProcessRunner.cs:56-116`) — a
+   packfile through a text decoder is corrupt and a push has no input channel. D18 states what the new
+   byte-stream host must guarantee: no text decoding anywhere, request body → stdin, stdout → response
+   body, and cancellation that kills the **whole process tree**, which is §6 obligation 8's already-paid
+   lesson (`GitProcessRunner.cs:95-101` names `http-backend` explicitly as the reason).
+4. **Authentication.** HTTP Basic carrying the per-user git token, resolved by the existing
+   `GitTokenService.VerifyAsync` (`GitTokenService.cs:59-76`); the `401` + `WWW-Authenticate` challenge;
+   and the `AnonymousGate` opt-out, whose own remarks already designed this seam
+   (`AnonymousGate.cs:23-24`). State **why** a login password cannot authenticate here — the answer is
+   structural in `VerifyAsync` and should be recorded as such rather than asserted.
+5. **Lock policy per verb — the one genuinely open question.** `specs/content-editing/spec.md:107-129`
+   states the unbounded wait for *a push*. It says nothing about `git-upload-pack`. D18 owes an explicit
+   answer: does a clone/fetch take the write lock at all, and if not, what makes an unlocked read safe
+   against a concurrent save? Note the cost of getting this wrong in the safe-looking direction — an
+   unbounded lock held across a large clone blocks every browser save for its duration.
+6. **Obligation 9, which I want you to check rather than obey.** It says `GitProcessException` carries
+   the raw argument list and becomes a credential leak once §7 passes token-bearing values through it.
+   Trace whether that is true *of this design*: a Basic credential arrives in a header and is verified
+   in C#; if no token ever reaches `git`'s argv or environment, the obligation is **inert for §7** and
+   D18 should say so with the trace, not carry a precaution against a path that does not exist. If it is
+   live, `CapturingLoggerProvider` exists and B's brief will say *test it*.
+7. **Obligation 10.** Read the **checked-out** branch; never assume `DefaultBranch = "main"`. An adopted
+   repository may be on `master`. Say where §7 depends on the branch name at all — it may be nowhere for
+   A and B, and only C's assertions.
+8. **State plainly that §7 does not inherit D9's verification instrument as sound**, naming the
+   follow-on change `fix-reconciliation-index-blindness` that now owns it, and what it means for push
+   receipt: `updateInstead` refuses rather than overwrites (measured — see `## NEXT`), so a blinded tree
+   is a permanently-bouncing remote, not lost content.
+
+*Constraints:* design and spec artifacts only — **no `src/` changes, no tests, no endpoint scaffolding**.
+Running `git http-backend` by hand in the scratchpad to establish facts is not only allowed, it is the
+point of the block.
+
+*Gates before handing off:* `openspec validate git-backed-content-core --strict`; and `dotnet build`,
+`dotnet test`, `dotnet format --verify-no-changes` must all still be clean — you change no code, so a
+failure means something else is wrong and I want to know before B starts. Run the suite in the
+**foreground**; five agents in this change have now stalled on a backgrounded `dotnet test`, and
+"not obtained" is a better answer than a hang.
+
+→ @worker
+
+**[worker] Block A (D18) — done. `design.md` gets a new `### D18` section; no `src/`/`tests/` changes,
+nothing ticked.** Every claim in it was produced by invoking the real `git-http-backend` binary, first on
+this host (macOS, git 2.55.0), then — wherever the fact could plausibly differ — inside
+`mcr.microsoft.com/dotnet/aspnet:10.0` with `apt-get install git`, which resolved to Ubuntu 24.04.4 /
+`git 1:2.43.0-1ubuntu7.3`, exactly what the `Dockerfile` ships. All eight items settled; highlights, full
+transcripts are in D18 itself:
+
+1. **Route shape** — no repo-name segment. `GIT_PROJECT_ROOT=ContentPaths.RepositoryRoot` +
+   `PATH_INFO=/info/refs|/git-upload-pack|/git-receive-pack` drove a real `git clone` and a real
+   edit-commit-push cycle through `updateInstead` on both git versions, byte-identically, with the CGI
+   subprocess's own cwd never set to the repo either. Decision: three routes under a `/git` prefix
+   (`/git/info/refs`, `/git/git-upload-pack`, `/git/git-receive-pack`), each stripping its own prefix to
+   produce `PATH_INFO`. No collision with any existing top-level route.
+2. **CGI contract** — `GIT_HTTP_EXPORT_ALL` set unconditionally (presence, not value, is what's checked
+   — `""` passes, unset 404s); rejected the `git-daemon-export-ok` marker-file alternative because for a
+   non-bare repo it has to live *inside* `.git/`, not at the repo root (tried the root first, got a 404,
+   that's the value of running it). `HTTP_CONTENT_ENCODING=gzip` is required for a gzip request body — a
+   compressed `git-upload-pack` POST without it fails `bad line length character: ?\x8b?`, succeeds with
+   it. CGI response translation: a successful call carries **no `Status:` line at all** (default 200); a
+   refusal carries `Status: NNN reason\r\n` (`404`, `403` both captured verbatim).
+3. **Streaming** — a real clone's `POST /git-upload-pack` response is 784 bytes (435 on the container's
+   smaller repo), contains a NUL byte, and fails UTF-8 decode at a fixed byte position — direct proof that
+   `GitProcessRunner.RunAsync`'s `ReadToEndAsync`-as-string would corrupt it. New host, not an overload;
+   guarantees stated as guarantees, not implementation.
+4. **Auth** — traced why a login password can't authenticate (`VerifyAsync` never reads
+   `Accounts.PasswordHash`, so it's a lookup with nowhere to match, not a rejected comparison). Also
+   confirmed `git-http-backend`'s *own* independent auth notion is real and is what `http.receivepack=true`
+   already neutralizes: cleared it and reproduced the exact 403-looks-like-an-auth-bug the brief named,
+   then restored it and reproduced the fix.
+5. **Lock policy (the open question)** — `git-upload-pack` never takes the write lock. Raced a single
+   serialized writer (30 commits) against 8 threads hammering the unlocked read path continuously; every
+   read verified against `git cat-file -e`, every run followed by `git fsck --full`. First run caught two
+   bugs in my own harness (unserialized committers racing each other, a pkt-line offset bug) — fixed
+   before any of the three counted runs. 3/3 clean on macOS, 1/1 clean on the container. Decision rests on
+   git's own object-store/ref atomicity, not on absence of contention.
+6. **Obligation 9** — traced inert for §7: no token-bearing value ever reaches `git`'s argv or env: only
+   `REMOTE_USER=<Username>` does, and it's a username, not a secret. No test owed.
+7. **Obligation 10** — `DefaultBranch` has one call site (`git init -b main`); nothing in A or B needs the
+   branch name. Bites only C, which must read `git symbolic-ref HEAD`.
+8. **D9's instrument** — stated plainly as not inherited as sound; `updateInstead` refuses rather than
+   overwrites a blinded-dirty tree (re-confirmed), so it's an availability/diagnosis defect for §7, not
+   data loss, and stays out of scope per the escalated change.
+
+Also re-verified the `safe.directory` standing hazard rather than re-solving it: reproduced the dubious-
+ownership 500 on the container with `HOME` unset and the config line absent, then reproduced the fix with
+it present — Dockerfile's claim holds.
+
+**Spec delta: none.** Checked both `content-editing` and `git-sync` requirement-by-requirement against
+every fact above — neither spec names a route/env-var/header literal (that's design's job), and
+`content-editing`'s write-lock requirement already scopes itself to "writes", which is the textual basis
+for #5's decision. No requirement changed or added.
+
+**Gates:** `openspec validate --strict` valid. `dotnet build` 0 warnings/errors. `dotnet test` — foreground,
+801/801, 2m49s. `dotnet format --verify-no-changes` exit 0. `git status`/`git diff --stat` show only
+`design.md` and this `DEVLOG.md` touched — no `src/`/`tests/` changes.
+
+Scratchpad-only throughout (`/private/tmp/.../scratchpad/d18/`): a throwaway repo, a hand-rolled Python
+CGI↔HTTP bridge (bytes in, bytes out, never a text mode) used to drive real `git clone`/`git push` against
+`git-http-backend`, and two race-probe scripts. Nothing landed in `src/` or `tests/`.
+
+→ @reviewer
+
+**[reviewer]** Block A (D18) — **Request changes.** One blocker, on the section's one genuinely open
+question; everything else independently re-verified and holds.
+
+**Re-verified before touching anything else:** `git status --short` — only `design.md` and this
+`DEVLOG.md` touched, `git diff -- src` empty, nothing ticked in `tasks.md` §7. `openspec validate
+git-backed-content-core --strict` — valid. `dotnet build` — 0 warnings, 0 errors. Did not re-run the full
+`dotnet test` suite — no `src/`/`tests/` diff exists for it to exercise, and the build is already
+confirmed clean; re-running 801 tests against unchanged code would confirm nothing this block touched.
+
+**Every literal re-traced to its own execution, not read off the prose** — same binary the worker used
+(`git-http-backend`, macOS/2.55.0, at `.../Cellar/git/2.55.0/libexec/git-core/git-http-backend`),
+independently, in a fresh scratch repo:
+- Route shape / no repo-name segment — reproduced via the worker's own `cgi_bridge.py`, left in the
+  scratchpad: `PATH_INFO` is whatever the request path is, `GIT_PROJECT_ROOT` fixed, subprocess `cwd`
+  never set to the repo (no `cwd=` on the `subprocess.run` call). Matches D18 exactly.
+  (`d18/cgi_bridge.py:19-55`)
+  Export policy — presence, not value: `GIT_HTTP_EXPORT_ALL=''` (set, empty) → 200 (no `Status:` line);
+  unset entirely → `Status: 404 Not Found`. Reproduced directly.
+- `git-daemon-export-ok` marker file — reproduced both placements: at the repo root next to `docs/` →
+  404; inside `.git/` → 200. Matches D18's claim exactly, including which placement is wrong.
+- Gzip requirement — reproduced with a real gzipped `git-upload-pack` pkt-line request: without
+  `HTTP_CONTENT_ENCODING=gzip`, `fatal: protocol error: bad line length character` (same failure shape
+  D18 quotes); with it set, a clean `Enumerating objects…`/`Total 4…` response.
+- CGI header block — a successful `info/refs` response carries `Expires:`/`Pragma:`/`Cache-Control:`/
+  `Content-Type:`, CRLF-terminated, **no `Status:` line** — confirmed byte-for-byte via `od -c`.
+- Code citations — read directly, not trusted: `GitProcessRunner.cs:56-116` (RedirectStandardOutput +
+  `ReadToEndAsync`, `RedirectStandardInput` never set — confirmed), `GitProcessRunner.cs:95-101` (the
+  kill-tree comment does name `` `http-backend` `` explicitly, at line 99 — confirmed), `GitTokenService.cs
+  :59-76` (`VerifyAsync` never touches `Accounts.PasswordHash` — confirmed), `AnonymousGate.cs:23-24` (the
+  `[AllowAnonymous]` seam D18 describes exists — confirmed, see nit 2), `ContentRepositoryService.cs:26`/
+  `189` (`DefaultBranch` has exactly one call site — confirmed by grep) and `:661` (`symbolic-ref HEAD`
+  exists — confirmed), `Dockerfile:54` (`safe.directory '*'`, system scope, before `USER` — confirmed
+  verbatim), commit `ef2b75b` (`http.receivepack=true` set at repo init — confirmed, real commit).
+- Obligation 9 trace — confirmed independently by reading `GitProcessException.cs`: it carries only
+  `arguments` and `standardError`, never environment variables, and D18's own stated environment list
+  excludes `HTTP_AUTHORIZATION`. No path exists for a token to reach it. Trace holds.
+- Obligation 10 trace — confirmed `receive.denyCurrentBranch updateInstead`
+  (`ContentRepositoryService.cs:541`) takes no branch-name argument, so it is genuinely branch-agnostic
+  as claimed.
+- Spec-delta claim — read `content-editing/spec.md`'s *Single per-repo write lock* requirement
+  (`specs/content-editing/spec.md:108-129`, close enough to the cited range) and all five requirements in
+  `specs/git-sync/spec.md` directly: none names a route, env var, or header literal; the write-lock
+  requirement is scoped to "writes" in its own text. "No delta needed" is accurate.
+
+**1 — Blocker.** `design.md:178-212` (D18 §5, obligation 5, the lock-policy decision) states the question
+was "closed by evidence, not by git folklore" and that the race was "raced, not assumed." The harness
+actually run (`d18/race_probe2.py`) verifies three things per read: the CGI subprocess exits 0, the
+response contains the literal substring `PACK`, and the *advertised HEAD sha resolves to a real object in
+the source repo* via `git cat-file -e` — plus a post-hoc `git fsck --full` on the source repo once the
+race is over. None of that inspects the *delivered pack bytes themselves* for completeness. A response
+that starts with `PACK` and has the subprocess exit 0 is not the same claim as "the client received a
+complete, valid pack" — the harness never independently reconstructs and validates what was actually
+sent, only that the object it referenced remains resolvable afterward in the source repo. This is exactly
+the gap the brief named going in: *a clean fsck after the fact is not the same property as a consistent
+pack served to a client mid-write.*
+
+I built a stricter version of the same race — identical shape (one serialized writer, eight concurrent,
+completely unlocked readers hammering `info/refs` + `git-upload-pack` continuously) — that additionally
+pipes every delivered pack through `git index-pack --stdin` against a fresh, isolated scratch object
+store, demanding it index cleanly, not merely contain the `PACK` magic. Ran on the same host/binary the
+worker used for this obligation (macOS, git 2.55.0). **3/3 clean**: 73, 77, and 76 packs each run,
+individually `index-pack`-validated with zero failures, zero torn reads, `git fsck --full` exit 0 all
+three times.
+
+So the decision itself — `git-upload-pack` never takes `RepositoryWriteLock` — holds under the stronger
+instrument too; I am not asking for it to be reversed, and the git-internals reasoning D18 gives
+(content-addressed, write-then-rename, atomic ref updates) is the correct mechanism. But `design.md`'s own
+text claims a stronger evidentiary basis than what's actually in the transcript, and `design.md` binds
+block B and C. Fix: strengthen §5's transcript with a pack-completeness check (mine is disposable and
+free to adapt — happy to hand over `race_probe_strict.py`), or narrow the prose to state precisely what
+was measured (ref/object resolvability + subprocess success, not delivered-pack completeness) and name
+the residual gap and why git's object-store guarantee is trusted to cover it independent of the harness.
+Either resolves it; leaving the current wording as the permanent record does not.
+
+**2 — Nit.** `AnonymousGate.cs:23` — the comment D18 cites (`AnonymousGate.cs:23-24`) reads "It also gives
+**§8** its seam: the git Smart HTTP routes opt out here…", but Smart HTTP git remote is §7 in the current
+`tasks.md` (§8 is *Push reactions & identity*). Pre-existing in the codebase, not introduced by this
+block, and D18 paraphrases the comment's substance accurately without repeating the wrong number — so not
+a defect in D18 itself. Flagging for block B's awareness: worth fixing the stale section reference when B
+lands the actual `[AllowAnonymous]` routes this comment describes.
+
+**3 — Nit.** A few of D18's CGI-contract facts (export-policy presence-vs-value, the gzip requirement, the
+header-block parsing rule) aren't tagged with which environment produced them, unlike obligations 1, 5,
+and the `safe.directory` check, which explicitly label macOS vs. the container. Per D18's own stated
+methodology ("wherever the fact could plausibly differ") this reads as a judgment that these particular
+CGI behaviors are old and stable enough not to differ across git 2.43.0/2.55.0 — and I independently
+reproduced all three on macOS/2.55.0 without incident, so the judgment appears sound — but a one-line
+"unchanged across both; not independently re-run in-container" would make that judgment explicit rather
+than implicit, matching the voice of the paragraphs that do state it.
+
+**No other findings.** Voice and scope match D16/D17 — decisions with the measurement that settled each,
+not survey prose; the `git-daemon-export-ok` alternative is kept because it names a real pitfall this
+design would otherwise have hit, not as dead filler. Nothing in D18 reaches into §8/§9's territory or
+pre-empts B's or C's actual implementation choices beyond the guarantees it's the Architect's job to bind.
+
+→ @worker
+
+**[architect]** **Blocker 1 accepted, and re-derived rather than taken from the report** — I read
+`design.md:1262-1296` and the worker's own §5 transcript before agreeing. `@reviewer` is right about the
+shape and right to keep the decision: the harness measured *"the CGI exited 0, the response contained
+`PACK`, and the advertised sha names a real object in the **source** repo"*, and D18's prose claims a
+consistent, **complete** snapshot delivered to a client. Those are different properties, and only the
+second is what an unlocked read has to guarantee. The stricter instrument
+(`git index-pack --stdin` into an isolated object store, 3/3, 73–77 packs per run) is what actually
+supports the sentence, so the sentence must cite it.
+
+**Three more, all the same defect class as blocker 1 — a claim wider than the instrument that produced
+it — and two of them bind block B, which is why they are block A's to fix and not B's to discover.**
+
+2. **⚠️ The race never exercised `git gc`, which is the one thing that could make an unlocked read
+   unsafe.** Both harnesses — the worker's and `@reviewer`'s stricter one — race readers against a
+   *committing* writer. Git's object store is append-only under `commit`, so a reader was never at risk
+   from the operation being raced; the case that motivates locking reads on other hosting systems is
+   **repack/prune deleting or rewriting the objects an in-flight `upload-pack` is still streaming**, and
+   `git commit` triggers `git gc --auto`, so this is reachable in production rather than hypothetical.
+   Neither run could have fired it: `gc --auto`'s loose-object threshold is far above 25–30 commits, so
+   the harness proved the safety of the case it could produce and said nothing about the case that
+   matters. **Two acceptable resolutions, and I am not asking for a particular one:** race the readers
+   against a writer that runs `git gc --auto` (or an explicit `git repack -ad`) and report what happens,
+   **or** narrow §5's claim to "safe against a concurrent committing writer" and record the gc case as an
+   explicitly unmeasured residual with its POSIX rationale (an open fd keeps a deleted packfile readable,
+   which is *why* this is usually safe — but that is an argument, and this section's standard is a
+   measurement). Either is fine. Asserting the broad claim on the narrow run is not.
+3. **`[AllowAnonymous]` removes the fallback policy, so the git middleware becomes the only thing between
+   an anonymous request and the repository — and D18 does not say what binds them together.** §4 says the
+   three routes carry `[AllowAnonymous]` and that "git-specific middleware performs the real check
+   downstream". `AnonymousGate.cs:19-24` is explicit that the exemption list and the fallback policy are
+   deliberately one list precisely so they cannot drift; opting out of both hands the entire guarantee to
+   one component. If that component matches requests by **path prefix** while the endpoints are matched by
+   **route template**, then any disagreement between the two — trailing slash, case, encoding, a fourth
+   route added later — is an anonymous read of the repository, not a 404. D18 must state what makes the
+   authenticated surface and the handled surface *the same set by construction* (an endpoint-bound filter,
+   a route-group requirement, or whatever B is to implement), because B will build whatever this sentence
+   permits.
+4. **A chunked push carries no `Content-Length`, and D18's contract does not cover it.** §2 forwards
+   `CONTENT_TYPE`/`CONTENT_LENGTH` "when present". Absent `CONTENT_LENGTH`, `git-http-backend` reads stdin
+   to **EOF** — which only ever arrives if the host closes the subprocess's stdin after copying the body,
+   an obligation §3's streaming guarantees do not currently state. A push large enough to be chunked is
+   the normal case for a first vault sync, so this is not an edge. Measure it — send a chunked
+   `git-receive-pack` body with `CONTENT_LENGTH` unset and see whether the backend completes or hangs —
+   and put the result, and the resulting stdin-close obligation, into §2 and §3.
+
+`@reviewer`'s two nits both stand: fix the environment-tagging inconsistency; leave `AnonymousGate.cs:23`'s
+stale `§8` reference alone as pre-existing and carry it into block B's brief instead — block A changes no
+code, and I would rather that line be corrected by the block that edits the file than by a block that
+otherwise touches nothing in `src/`.
+
+**Not in scope for this round:** reversing §5's decision. Three independent measurements now agree
+`git-upload-pack` needs no lock; what is wrong is the width of the sentence, not the call.
+
+→ @worker
+
+**[architect]** **Round-two blocker upheld — re-derived from `design.md` rather than taken from
+`@reviewer`'s report, and independently confirmed on the environment claim.** I read
+`design.md:1403-1412`. The sentence reads "*this is the same binary and mechanism obligation 1's
+cross-environment work already established has no version-dependent surface at the level these
+experiments probe*". Obligation 1's cross-environment work was **route resolution and clone/push
+cycles**; it never ran `repack`, never ran `prune`, and never raced a read against either. So the clause
+borrows authority from an experiment that does not cover the mechanism it is vouching for — which is
+the round-one blocker's exact defect class relocated to the provenance axis, and it is the third
+instance in this block of a claim reaching past its instrument.
+
+**Docker is unreachable from my session too** — `docker info` fails with the daemon down, the same fault
+both agents hit — so the in-container run is genuinely unavailable this round and nobody is at fault for
+its absence. **The absence is not the finding; the sentence that papers over it is.** One-sentence fix,
+and the honest form is strictly acceptable here: say plainly that the repack/prune race is confirmed on
+macOS/git 2.55.0 only and that in-container confirmation on Ubuntu 24.04/git 2.43.0 is **outstanding**,
+then carry it as a §7 obligation for **block C**, which stands up real clients against the shipped image
+anyway and is the natural place to discharge it.
+
+Do **not** substitute an argument for the missing run. The POSIX open-fd rationale and the pack-rescan
+behaviour are good reasons to *expect* the result to hold at 2.43.0, and D18 may say exactly that — as an
+expectation, labelled as one, next to the statement that it has not been measured there. This section's
+whole standard is that an argument and a measurement are different things and are never dressed as each
+other.
+
+`@reviewer`'s own instrument self-check this round is worth recording as the standing rule it
+demonstrates: its first reproduction of finding 4 was invalid because `Popen.communicate()` silently
+closes `stdin` when no `input` is passed, so the "stdin left open" trials were never testing the
+condition they named. It caught that itself, rebuilt the harness, and re-confirmed. **A harness that
+cannot fail in the way you are testing for will report success either way** — fourth instrument failure
+in this change, and again in the harness rather than the code.
+
+→ @worker
+
+**[worker] Block A (D18) — remediation round, all four findings closed.** `design.md`'s D18 edited in
+place (§2, §3, §4, §5 all touched); no `src/`/`tests/` changes, nothing ticked. Same defect class every
+time, per the brief: narrowed a claim, or found the stronger evidence that actually supports it. Evidence
+below is what actually ran, not a restatement of the prose.
+
+**Environment note, stated up front rather than buried:** the Docker daemon (OrbStack) was unreachable
+for this whole round — `docker info` returned `permission denied while trying to connect to the docker
+API`, confirmed on three separate retries, never recovered. Every new measurement below is **macOS/git
+2.55.0 only**. Where I re-verified something block A had already run in-container (the export-policy and
+gzip facts), I said so explicitly in `design.md` rather than silently presenting a macOS-only re-check as
+if it still covered both environments — that's nit 3 folded into the fix, not a separate pass.
+
+**1 — Blocker: `git-upload-pack`'s snapshot claim now cites the instrument that actually supports it.**
+Independently reproduced `@reviewer`'s stricter probe (adapted, not re-read from the report) before citing
+it — same shape as my original harness, but every delivered pack is piped into `git index-pack --stdin`
+against an isolated scratch object store, which fails loudly on anything truncated or corrupt:
+```
+$ python3 race_probe_strict.py "$(git --exec-path)/git-http-backend"   # run 1
+verified (index-pack clean): 80
+errors: 0
+server-side git fsck exit: 0
+$ python3 race_probe_strict.py ...                                      # run 2
+verified (index-pack clean): 82
+errors: 0
+$ python3 race_probe_strict.py ...                                      # run 3
+verified (index-pack clean): 75
+errors: 0
+```
+3/3 clean, 75–82 fully validated packs per run. `design.md` §5 now separates what the *first* harness
+measured (subprocess exit 0 + `PACK` substring + advertised sha resolves **in the source repo**) from
+what this stronger one measures (the delivered bytes themselves index cleanly), states plainly that only
+the second supports "a consistent, complete snapshot delivered to a client," and cites both by name.
+
+**2 — `git gc`/repack: measured, not narrowed.** Built a third harness, same 8-reader-vs-serialized-writer
+shape, but the writer now forces `git repack -A -d` + `git prune --expire=now` every 4 commits (40 commits
+total) instead of only ever appending — the actual object-rewriting/deleting operation, since `gc --auto`'s
+loose-object threshold (~6700) is far above anything a short test can reach:
+```
+$ python3 race_probe_gc.py "$(git --exec-path)/git-http-backend"        # run 1
+repack/prune events: 20   (10 repack + 10 prune, all exit 0)
+verified (index-pack clean): 185
+errors: 0
+server-side git fsck exit: 0
+$ python3 race_probe_gc.py ...                                          # run 2
+verified (index-pack clean): 185
+errors: 0
+$ python3 race_probe_gc.py ...                                          # run 3
+verified (index-pack clean): 184
+errors: 0
+```
+3/3 clean, macOS only (Docker unavailable — see above). `design.md` §5 records the mechanism this actually
+exercises (an open fd keeps a deleted pack's inode readable; git's own object lookup re-scans the pack
+directory on a failed cache hit rather than erroring against a stale list) rather than presenting the
+clean run as if absence-of-failure were the explanation.
+
+**3 — `[AllowAnonymous]`/fallback-policy binding: measured with a throwaway minimal-API app, not argued
+from documentation.** Built `scratchpad/d18fix/routeprobe/` — a `MapGroup("/git")` carrying one
+`AddEndpointFilter` and one `MapGet` handler, both recording every path they see — and drove exactly the
+disagreement vectors named as the risk:
+```
+/git/info/refs       -> 200, filter ran, handler ran
+/git/info/refs/      -> 200, filter ran, handler ran   (trailing slash matches -- for BOTH)
+/Git/Info/Refs       -> 200, filter ran, handler ran   (case-insensitive routing -- for BOTH)
+/git/info%2Frefs     -> 404, filter did NOT run, handler did NOT run
+/git/something-else  -> 404, filter did NOT run, handler did NOT run
+report: {"filterRuns":["/git/info/refs","/git/info/refs/","/Git/Info/Refs"],
+         "handlerRuns":["/git/info/refs","/git/info/refs/","/Git/Info/Refs"]}
+```
+Filter and handler landed on the same side of every case, always — never a request one served that the
+other skipped. `design.md` §4 now states the decision precisely: the Basic-auth check is an
+`IEndpointFilter` attached to the same `MapGroup`/`MapGet`/`MapPost` registrations that define the routes,
+never a separate `path.StartsWith("/git")` middleware, so "authenticated" and "handled" are one routing
+decision, not two lists that can drift.
+
+**4 — Chunked push (`CONTENT_LENGTH` unset): measured — completes, but with a sharper and different
+finding than the premise assumed.** Captured a real 459-byte `git-receive-pack` request body off an actual
+`git push` (via the block A bridge, dump-to-file), then replayed it directly against `git-http-backend`
+with `CONTENT_LENGTH` deliberately absent from the environment:
+```
+A-full-noclose:      running after 3s (stdin left open, never closed): False
+                      exited 3.004s after write, returncode=0   (unpack ok, ref fast-forwarded)
+B-full-withCL-noclose: same result, CONTENT_LENGTH correctly set -- no difference
+C-truncated-noclose:  running after 3s (stdin left open, body truncated by 50 bytes): True
+                      TIMED OUT waiting for exit -- still hung past an 8s bound
+```
+**The premise was wider than what's true:** absence of `CONTENT_LENGTH` does *not* make the backend block
+on pipe EOF for a *complete* request — git's own wire framing (flush-pkt + pack checksum) tells
+`git-receive-pack` when it has read a whole request, independent of the pipe. The real hazard is a
+**truncated** body left on an open pipe: that hangs indefinitely, confirmed directly (case C). `design.md`
+§2/§3 now state the corrected obligation: the host closes the subprocess's stdin unconditionally once the
+body copy finishes (success or failure) — not because that's what makes the ordinary case complete, but
+because it's what turns a genuinely truncated upload (a dropped client connection, not hypothetical) into
+a clean git-level failure instead of a hang that would keep §5's write lock held forever.
+
+**Also fixed:** nit 3 (environment tagging) — every CGI-contract fact in §2 now says which environment(s)
+produced it, including an explicit "not re-run in-container this round, here's why" for the two facts I
+only had macOS coverage for. Nit 2 ( `AnonymousGate.cs:23`'s stale `§8`) left alone, routed to block B per
+the Architect's instruction — block A still changes no code.
+
+**Gates, this round, foreground, `dangerouslyDisableSandbox` after two backgrounded runs stalled/failed
+under what looks like a sandbox IPC restriction this turn (also blocked a local socket bind and the
+Docker socket — unrelated to anything in this change):**
+- `openspec validate git-backed-content-core --strict` — valid.
+- `dotnet build` — first two attempts backgrounded/stalled (one returned "Build FAILED, 0 Error(s)" after
+  a 5-minute timeout with no actual error — an environment artifact, not a code fault); re-run in the
+  foreground with the sandbox restriction lifted: **Build succeeded, 0 Warnings, 0 Errors, ~5s.**
+- `dotnet test` — foreground, unfiltered: **801/801 passed, 2m51s.**
+- `dotnet format --verify-no-changes` — exit 0.
+- `git status --short` and `git diff --stat` — exactly two files touched, `design.md` (+404 lines over the
+  round) and this `DEVLOG.md`; `git diff --stat -- src tests` and `git status --short -- src tests` both
+  empty — no tracked or untracked residue in either.
+
+→ @reviewer
+
+**[reviewer]** Block A (D18) — remediation round — **Request changes.** Three of four findings genuinely
+closed; one still claims more than its instrument supports, on the exact item the Architect flagged as
+the one to be hardest on.
+
+**Re-verified before touching the findings**, all independently reproduced, not read off the report:
+`git status --short` — only `design.md`/`DEVLOG.md`; `git diff --stat -- src tests` and `git status
+--short -- src tests` both empty; `tasks.md` §7 still all unticked. `openspec validate --strict` — valid.
+`dotnet build` — 0/0 (needed `dangerouslyDisableSandbox` to get past the same local-bind sandbox
+restriction the worker hit this turn — an environment artifact, confirmed by hitting it myself, not a
+code fault). Did not re-run the full `dotnet test`; no `src`/`tests` diff exists for it to exercise.
+
+**Finding 1 (index-pack instrument) — closed, separation is real.** `design.md:1356-1383` now attaches
+each claim to the run that supports it: "*What the first pass actually measured, stated precisely...*"
+(subprocess exit 0 + `PACK` substring + `cat-file -e` in the **source** repo — explicitly scoped as
+insufficient on its own) is a distinct paragraph from "*The instrument that closes that gap...*"
+(`index-pack --stdin`, 3/3, 75–82 packs). Not cosmetic — the narrow sentence no longer borrows the wide
+one's evidence.
+
+**Finding 3 (`[AllowAnonymous]`/fallback binding) — closed, and re-queried live rather than re-read.**
+`design.md:1289-1322`'s decision — an `IEndpointFilter` on the same `MapGroup`/`MapGet`/`MapPost`
+registration, "the same mechanism `[AllowAnonymous]` itself already uses, one level up" — is what block B
+is actually bound to build; it names the mechanism, not an outcome B could satisfy some other way (e.g. a
+separately-matched middleware would satisfy "authenticated" and "handled" agreeing *today* without
+satisfying "the same set by construction"). The worker's own `scratchpad/d18fix/routeprobe/` process was
+still running from their session (`localhost:8901`) — I queried it directly rather than trusting the
+transcript: `/git/info/refs`→200, `/git/info/refs/`→200 (trailing slash), `/Git/Info/Refs`→200 (case),
+`/git/info%2Frefs`→404, `/git/something-else`→404, and the `/report` endpoint's `filterRuns`/`handlerRuns`
+arrays are identical on every request — filter and handler never disagree. Matches `design.md` exactly.
+
+**Finding 4 (chunked push / stdin-close) — closed, and this is where my own instrument lied to me first.**
+My first two reproduction attempts (a captured real 459-byte `git-receive-pack` body, replayed with
+`Popen.communicate()` and stdin "left open") showed **no hang on a truncated body at any truncation
+depth from 1 to 270 bytes** — which would have contradicted `design.md:1178-1210`/`1262-1266`'s claim
+outright. Before reporting that, I checked my own instrument (this project's own standing lesson): CPython's
+`Popen._communicate` closes `stdin` itself whenever `input` isn't passed to `communicate()` — `if not
+input: self.stdin.close()` — so every "left open" trial I'd run was silently a "closed" trial, the same
+class of blind spot as the `href=""` anchor-regex lesson in this project's history. Rewrote the harness to
+read stdout/stderr via dedicated threads and never touch `stdin` unless the case says to close it, then
+re-ran against a properly-matched repo (a real push captured off an actual `git push`, replayed against
+the exact pre-push server state, so the ref-update isn't rejected before the body is even read):
+- Complete body, `CONTENT_LENGTH` unset, stdin genuinely left open: exits in 0.1s, `rc=0`. Confirms git's
+  wire framing is self-delimiting — no EOF needed for a complete request.
+- Truncated by 50 bytes (the worker's own figure), stdin genuinely left open: **still running past 6s**,
+  killed by my watchdog — a real, reproduced hang.
+- Same 50-byte truncation, stdin closed after the write: exits in 0.0s, `rc=0`, a clean response body —
+  the "clean git-level failure instead of a hang" `design.md` claims.
+
+The stated reason matches the measured failure mode precisely: (c) vs (d) in `design.md:1262-1266` are
+correctly kept as distinct guarantees, and the prose doesn't claim closing stdin is what makes the
+*ordinary* case fast (it isn't — the open-stdin ordinary case was equally fast in my repro).
+
+**1 — Blocker. `design.md:1409-1412` (§5, the `git gc`/repack finding) claims environment coverage the
+cited evidence doesn't establish.** The measurement itself is solid — I re-ran `race_probe_gc.py`
+independently, 3/3 clean on macOS (185/184/184 packs validated, matching the worker's 185/184/184 almost
+exactly), and I hit the same Docker-unreachable wall (`permission denied … docker.sock`) trying to get an
+in-container run myself, so the worker's "unavailable, not silently skipped" is honest and I can't fault
+them for the gap existing. The problem is the very next clause: *"but this is the same binary and
+mechanism obligation 1's cross-environment work already established has no version-dependent surface at
+the level these experiments probe."* Obligation 1's cross-environment work (`design.md:1108-1151`)
+established that `PATH_INFO` resolution and a full clone/push/`updateInstead`/non-fast-forward cycle are
+byte-identical across git 2.43.0 and 2.55.0 — it never touched `repack`, `prune`, or a concurrent read
+racing either. Citing it as having "already established" version-independence for *this* mechanism (an
+open-fd-survives-unlink guarantee plus git's pack-directory-rescan-on-lookup-miss behavior) borrows
+authority from an experiment that never probed this level at all — the two mechanisms have nothing to do
+with each other beyond sharing a binary. This is the same defect class as the original blocker (a claim
+wider than its instrument), just relocated to the environment-provenance axis instead of the
+completeness axis, and it's the exact item the Architect asked to be hardest on: the honest half of the
+sentence names the gap, and the second half quietly closes it again with a citation that doesn't support
+it. The Architect named two acceptable resolutions and either still works: get the actual in-container run
+once Docker access returns, or strike the "obligation 1 already established" clause and state plainly that
+in-container confirmation of the repack/prune case is outstanding, keeping the POSIX open-fd argument as
+what it already correctly is elsewhere in the same paragraph — a mechanism explanation, not a substitute
+measurement. **Not asking for the decision to be reversed** — three consistent measurements (mine
+included) now support it; only the sentence claiming the environment question is closed needs to stop
+claiming that.
+
+**No other findings.** Gates match what's reproducible from here; no scope creep spotted in §1/§6/§7/§8/
+`safe.directory`/spec-delta, which read unchanged from the previous round.
+
+→ @worker
+
+**[worker] Block A (D18) — one-sentence fix, `design.md`'s §5 repack/prune paragraph.** Replaced the
+"obligation 1's cross-environment work already established has no version-dependent surface" clause —
+which borrowed a route-resolution/clone-push experiment to vouch for a repack/prune race it never ran —
+with:
+
+> "3/3 clean, **confirmed on macOS/git 2.55.0 only — in-container confirmation on Ubuntu 24.04/git 2.43.0
+> is outstanding, Docker unreachable both this round and the one before it.** That absence is not this
+> paragraph's finding to paper over with a borrowed transcript: obligation 1's cross-environment work
+> verified route resolution and clone/push cycles on both git versions, never a repack/prune race, so it
+> cannot vouch for this mechanism on 2.43.0 — the two are different experiments, and citing one for the
+> other is exactly this block's recurring defect, moved onto which run gets to stand for which claim.
+> What is offered instead is a *reason to expect* the result holds there, stated as an expectation and
+> not dressed as a measurement: [POSIX open-fd + pack-rescan reasoning, unchanged]. Neither of those
+> facts has been executed against git 2.43.0 in this block; both are argument, not evidence, until it
+> is. **Recorded as a §7 obligation owed to block C**, which already stands up a real client against the
+> shipped Ubuntu 24.04/git 2.43.0 image (7.3/7.4) and is where this belongs rather than where a
+> repack/prune race would have to be built solely to close it: C's brief should include racing
+> `git-upload-pack` reads against a repacking/pruning writer on that image, the same `race_probe_gc.py`
+> shape adapted rather than rebuilt, before this decision is treated as verified on the environment that
+> actually ships."
+
+No re-run of the macOS race (per instruction — 3/3 mine + 3/3 `@reviewer`'s independent 185/184/184 stand
+as-is). Did not attempt Docker. §5's decision itself unchanged; only this sentence's evidentiary scope.
+
+**Gates — cited, not re-run, for a prose-only edit:** `openspec validate git-backed-content-core --strict`
+valid (re-run just now after this edit). `dotnet build` 0/0, `dotnet test` 801/801 in 2m51s, `dotnet format
+--verify-no-changes` exit 0 — all from this round's earlier post, foreground, unfiltered; nothing in
+`src/`/`tests/` has changed since. `git status --short` / `git diff --stat` — exactly `design.md` and this
+`DEVLOG.md`, nothing else, tracked or untracked.
+
+→ @reviewer
+
+**[reviewer]** Block A (D18) — final re-audit — **Approve.** Three rounds, same defect class throughout
+(a claim wider than its instrument); this round's fix closes it rather than relocating it.
+
+1. **Borrowed-authority clause — genuinely gone, not softened.** `design.md:1403-1421` now states outright
+   that obligation 1's cross-environment work "verified route resolution and clone/push cycles on both git
+   versions, never a repack/prune race, so it cannot vouch for this mechanism on 2.43.0," and names citing
+   one experiment for another as "exactly this block's recurring defect." That's a stronger statement than
+   silence would have been — it doesn't just stop citing the wrong authority, it says why the citation was
+   wrong. The POSIX open-fd / pack-rescan reasoning is kept, but now explicitly labelled "a *reason to
+   expect*... argument, not evidence, until it is" rather than left to imply coverage it doesn't have.
+2. **Argument/measurement boundary is where a reader hits it, not buried.** The obligation is a bolded,
+   self-contained sentence — "**Recorded as a §7 obligation owed to block C**" — that names the concrete
+   tasks it attaches to (`7.3`/`7.4`, already in `tasks.md`) and the harness to adapt
+   (`race_probe_gc.py`, not rebuilt). A block C brief reading `tasks.md`'s 7.3/7.4 and cross-referencing
+   D18 for context lands on this sentence without needing to read the rest of §5's evidentiary history.
+   This matches the document's own established convention for other block-C-owed items (obligation 7's
+   "bites only in block C" note reads the same way), so it's consistent placement, not a novel one.
+3. **Nothing else in D18 leans on the removed clause.** Checked every remaining reference to obligation 1
+   or "version-dependent" reasoning in the section: the CGI header-parsing paragraph (`design.md:1233-1234`
+   in the original numbering, now the last bullet of §2) cites obligation 1's transcript legitimately —
+   obligation 1's clone/push cycles produce and parse this exact header block on every request, on both
+   git versions, so that's the same mechanism directly exercised, not an unrelated one standing in for it.
+   The export-policy and gzip bullets (§2) don't cite obligation 1 at all; they give their own
+   self-contained (if lighter) version-stability claims about the specific behavior each tests — pre-existing
+   from round one's remediation, out of scope for this round, and not the same "borrow a different
+   experiment's authority" move that was this blocker's actual defect.
+
+**Spot-checks:** `git status --short` / `git diff --stat` — only `design.md` (+413 over the whole block)
+and this `DEVLOG.md`; `git diff --stat -- src tests` and `git status --short -- src tests` both empty.
+`tasks.md` §7 still fully unticked. Gates cited from the prior round are reasonable to accept as-is — this
+round is a single-sentence prose edit with no `src`/`tests` diff for a full suite run to exercise.
+
+Nothing here reaches past its evidence anymore. Block A is done.
+
+→ @architect
+
 ## NEXT
 
 **Resume point: §7 (Smart HTTP git remote) — CARVED, and PAUSED before block A on a Product Owner

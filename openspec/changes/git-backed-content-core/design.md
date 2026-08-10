@@ -1090,6 +1090,419 @@ most dangerous, because it *sounded* like the kind of reasoning this change asks
 argument is not self-certifying — its premises are claims about the code and have to be traced like any
 other.**
 
+### D18 — The Smart HTTP surface: routes, the CGI contract, the streaming host, and lock policy per verb
+
+D3 named `git http-backend` as the mechanism; D16 built the lock it runs under; D17 built the browser
+save it shares that lock with. Neither has been run. This settles the eight things §7 owes before B can
+write a line of the host: the route templates and the exact `PATH_INFO` each produces, the full CGI
+contract (environment in, headers out), why `GitProcessRunner` cannot host this and what the new host
+must guarantee instead, the authentication scheme, the lock policy for a read verb the spec never
+mentions, and three inherited obligations traced rather than carried forward unexamined. Every claim
+below that is a fact about `git-http-backend` was produced by invoking the real binary — first on this
+host (macOS, git 2.55.0) and then, wherever the fact could plausibly differ, inside
+`mcr.microsoft.com/dotnet/aspnet:10.0` with `apt-get install git`, the exact runtime image and package
+(`git 1:2.43.0-1ubuntu7.3`, Ubuntu 24.04.4) the `Dockerfile` ships. Every experiment ran against a
+throwaway non-bare repository in the scratchpad, shaped like `ContentPaths` (`docs/` working tree,
+`.git` at the root); nothing here touched `src/` or `tests/`.
+
+**1 — Route shape and `PATH_INFO`: no repository-name segment, verified by a real clone and a real push
+through both git versions.** `git help http-backend`'s own URL-translation section states the rule
+plainly — `git-http-backend` concatenates `GIT_PROJECT_ROOT` and `PATH_INFO` and lets git's ordinary
+non-bare repository discovery (the same walk any `git` command does from a working directory) find
+`.git` beneath the result. There is nothing in that rule that requires a repository-name path segment;
+it exists in every hosting example only because those examples serve *many* repositories under one
+`GIT_PROJECT_ROOT` and need `PATH_INFO` to pick one. ZeroWiki serves exactly one, at a `GIT_PROJECT_ROOT`
+that is already `ContentPaths.RepositoryRoot` and nothing else, so the segment carries no information
+and is dropped. Verified, not inferred: `GIT_PROJECT_ROOT=<RepositoryRoot>` with `PATH_INFO=/info/refs`,
+`/git-upload-pack` and `/git-receive-pack` — no other path component, and critically, **the CGI
+subprocess's own working directory was never set to the repository either** (the bridge script below
+invoked `git-http-backend` from its own directory, never `chdir`ing into the repo) — drove a real `git
+clone`, a real edit-commit-push cycle exercising `updateInstead`, and a real non-fast-forward rejection,
+byte-identically on both git versions:
+
+```
+$ git clone http://127.0.0.1:8791/ clone1        # macOS, git 2.55.0
+Cloning into 'clone1'...
+$ cat clone1/docs/page.md
+hello
+$ git -C clone1 log --oneline
+1ec01fb init
+```
+```
+=== [container, Ubuntu 24.04.4, git 2.43.0] Test C: real clone through python CGI bridge ===
+CLONE OK
+hello
+=== Test D: push through bridge with Basic auth header, updateInstead ===
+PUSH OK
+hello
+more
+(clean tree)
+```
+
+The non-fast-forward case rejects identically to what `## NEXT` already recorded for `updateInstead`
+directly (`! [rejected] HEAD -> main (fetch first)`), now reproduced through the actual HTTP/CGI path
+rather than a bare `git push` to a local remote. **Decision: three routes, `/git/info/refs` (GET),
+`/git/git-upload-pack` (POST), `/git/git-receive-pack` (POST), each stripping its own `/git` prefix to
+produce `PATH_INFO`; `GIT_PROJECT_ROOT` is `ContentPaths.RepositoryRoot`, fixed, never derived from the
+request.** The `/git` prefix is this decision's only free choice — it collides with nothing in
+`Program.cs`'s existing top-level routes (`/`, `/account`, `/bootstrap`, `/bootstrap/complete`,
+`/invitations`, `/login`, `/logout`, `/not-found`, `/invite/{Token}`, `/wiki/{*Route}`) and needs no
+route-space reservation the way `/wiki/` does, since git clients address it directly rather than through
+`PageRouteCodec`.
+
+**2 — The CGI contract, each literal fed to the real binary.**
+
+- *Export policy — `GIT_HTTP_EXPORT_ALL` set unconditionally, on every invocation, to a fixed non-empty
+  string.* Verified on macOS/git 2.55.0, unchanged when independently reproduced there a second time
+  during this round's remediation; not re-run in-container, on the judgment that CGI-level environment
+  parsing has no version-dependent surface (see `git-http-backend.c`'s own age and stability) — stated
+  explicitly here rather than left implicit. Presence, not value, is what `git-http-backend` checks:
+  `GIT_HTTP_EXPORT_ALL=""` (set, empty) passes; the same call with the variable entirely unset (`env -u
+  GIT_HTTP_EXPORT_ALL`) fails `Repository not exported`. The per-directory alternative — a
+  `git-daemon-export-ok` marker file — was tried and rejected on a fact this design would otherwise have
+  gotten wrong: for a **non-bare** repository the marker has to live *inside* `.git/`, not at the
+  repository root next to `docs/`; placing it at the root (the natural first guess, and where a bare
+  repository would want it) left the request 404ing with `Repository not exported` even though the file
+  existed. `GIT_HTTP_EXPORT_ALL` needs no marker file anywhere and cannot be placed in the wrong
+  directory, and it mirrors the precedent already set for `http.receivepack` (`ef2b75b`) — export policy
+  is an unconditional environment fact set by the app on every call, not repository-resident state.
+- *The full environment set*, all present on every invocation: `GIT_PROJECT_ROOT` (fixed, above),
+  `GIT_HTTP_EXPORT_ALL` (fixed, above), `PATH_INFO` (from the matched route), `REQUEST_METHOD` (`GET` for
+  `info/refs`, `POST` for the two service endpoints), `QUERY_STRING` (`service=git-upload-pack` on the
+  `info/refs` GET; empty on the POSTs), `CONTENT_TYPE` and `CONTENT_LENGTH` (forwarded from the request
+  when present — `info/refs` carries neither, and a chunked-transfer POST carries none either, below),
+  `REMOTE_USER` (the authenticated account's `Username`; see §4), and `HTTP_CONTENT_ENCODING` when the
+  request carries `Content-Encoding` (below). `HOME` is deliberately never set — the `Dockerfile`'s
+  system-scope `safe.directory` is what makes that safe (see the obligation check at the end of this
+  section) — and no other variable is passed. (macOS/git 2.55.0 only.)
+- *`CONTENT_LENGTH` absent — the shape a chunked-transfer request produces once Kestrel dechunks it,
+  since `HttpRequest.ContentLength` is `null` for one — measured rather than assumed to need special
+  handling, and the measurement corrected the premise it set out to check.* A real 459-byte
+  `git-receive-pack` request body (a genuine `git push`, captured off the wire) was replayed directly
+  against `git-http-backend` with `CONTENT_LENGTH` unset. It completed in milliseconds — `unpack ok`, ref
+  fast-forwarded — identically whether the subprocess's stdin was explicitly closed afterward or left
+  open. **The premise that absence of `CONTENT_LENGTH` makes the backend block on a pipe-level EOF is
+  false for a complete request**: git's own wire protocol is self-delimiting (the ref-update commands end
+  in a flush-pkt; the packfile that follows carries its own object count and a trailing checksum), so
+  `git-receive-pack` recognises "I have read a complete, valid request" from the protocol structure
+  itself and stops reading — it does not need the pipe to signal end-of-stream. The real hazard is a
+  **different** one: the same body truncated by 50 bytes (an incomplete pack, simulating a client
+  connection dropped mid-upload), with stdin left open, hung — still running past an 8-second bound.
+  Closing stdin at that point made no difference either way in the complete case (both closed and
+  left-open variants finished sub-millisecond, see the run below), so closing it is not what makes the
+  complete case fast; it is what turns the **incomplete** case from a permanent hang into a clean git-level
+  failure, since only EOF tells a blocked read "no more is coming, stop waiting and fail." (macOS/git
+  2.55.0.)
+  ```
+  [A-full-noclose] running after 3s (stdin still open, un-closed): False
+  [A-full-noclose] exited 3.004s after write, returncode=0
+  [C-truncated-noclose] running after 3s (stdin still open, un-closed): True
+  [C-truncated-noclose] TIMED OUT waiting for exit (still hung)
+  ```
+  **Decision: the host closes the subprocess's stdin once it has finished copying the request body —
+  successfully or not — in every invocation, regardless of whether `CONTENT_LENGTH` was set.** This is
+  not what makes an ordinary request fast; it is what keeps a truncated one (a real client disconnect
+  mid-push, not a hypothetical) from hanging the subprocess, and by extension the write lock it holds for
+  the whole `git-receive-pack` invocation (§5), forever. It composes with §3's existing cancellation
+  guarantee rather than replacing it: cancellation covers the host detecting the disconnect *during* its
+  own copy (`Request.Body.CopyToAsync` observing `RequestAborted`); closing stdin unconditionally
+  afterward covers the case where the copy itself returns normally but delivered less than a complete
+  request.
+- *The gzipped-request-body case, exercised end to end, not read off documentation.* `git-http-backend`'s
+  own environment list (its man page's ENVIRONMENT section) does not mention compression at all; the
+  binary's own strings do: `HTTP_CONTENT_ENCODING` alongside `inflateInit`/`inflate: %s`. Fed a
+  gzip-compressed `git-upload-pack` request body with the header unset, the backend misreads the
+  compressed bytes as a corrupt pkt-line stream: `fatal: protocol error: bad line length character:
+  ?\x8b?` (`\x8b` is gzip's magic second byte). The identical compressed body **with**
+  `HTTP_CONTENT_ENCODING=gzip` set produces a normal, valid packfile response. **Decision: the host
+  forwards the request's `Content-Encoding` header verbatim as `HTTP_CONTENT_ENCODING` — never decodes it
+  itself.** `git-http-backend` already does the inflation; a host that also decompressed would be
+  double-decoding or racing which layer does it, for no benefit. (macOS/git 2.55.0 only — not
+  independently re-run in-container; CGI environment parsing and zlib inflation are not version-dependent
+  surfaces for this claim.)
+- *CGI response header translation — `Status:` is optional and its absence means 200, not an omission to
+  guard against.* Every invocation's stdout is a CRLF-terminated header block, a blank line, then the
+  body, exactly as CGI specifies. A successful call carries **no `Status:` line at all** — only
+  `Expires:`, `Pragma:`, `Cache-Control:`, and `Content-Type:` when there is a body — and every real git
+  client in this section's tests treated that as 200 OK, which is the CGI default the host must
+  replicate. A refusal carries an explicit line in the form `Status: 404 Not Found\r\n` (unexported
+  repository) or `Status: 403 Forbidden\r\n` (receive-pack denied by git's own default policy — see §4);
+  both were produced and captured verbatim. **Decision: parse the header block by splitting on `\r\n` up
+  to the first blank line; a `Status:` line's leading token supplies the numeric code; its absence means
+  200; every other line is forwarded as a response header unchanged; every byte after the blank line is
+  the response body, copied without any decoding.** (macOS/git 2.55.0 and Ubuntu 24.04.4/git 2.43.0 —
+  both quoted in obligation 1's transcript, which exercises this same header block on every request.)
+
+**3 — The streaming contract, and why `GitProcessRunner` is disqualified rather than extended.**
+`GitProcessRunner.RunAsync` (`GitProcessRunner.cs:56-116`) sets `RedirectStandardOutput = true` and reads
+it with `process.StandardOutput.ReadToEndAsync()` — a `TextReader`, decoding through the platform's
+default encoding — and never sets `RedirectStandardInput` at all. Both are fatal here, and this section
+proved rather than assumed why. A real `git clone`'s `POST /git-upload-pack` response, captured raw off
+the CGI subprocess's stdout:
+
+```
+bytes: 784
+UTF-8 decode FAILED as expected: 'utf-8' codec can't decode byte 0x9f in position 190: invalid start byte
+contains NUL byte: True
+```
+
+(reproduced on the Ubuntu/2.43.0 image too — 435 bytes for a smaller repo, same failure mode, same NUL
+byte). A packfile is not text; reading it through `ReadToEndAsync` would silently corrupt it before a
+single byte reaches the client — not throw, since arbitrary bytes decode to *something* under most
+encodings, just not the bytes that were sent. A push has no channel to receive its packfile at all,
+since `RunAsync` never redirects standard input. **Decision, stated as a guarantee rather than an
+implementation:** §7's streaming host is a distinct type, not a `GitProcessRunner` overload, and must
+guarantee (a) no text decoding anywhere on either stream — the request body is copied to the
+subprocess's raw stdin stream and the subprocess's raw stdout stream is copied to the response body,
+both as bytes; (b) the CGI header block is peeled off that same raw byte stream (§2's blank-line rule),
+never by reading a decoded string and re-encoding it; (c) cancellation kills the **whole process
+tree**, which is not a new obligation but §6's already-paid one — `GitProcessRunner.cs:95-101`'s own
+comment names `http-backend` explicitly as the reason a killed `git` invocation must take its children
+with it, since `http-backend` forks `git-upload-pack`/`git-receive-pack`, which itself forks hooks; and
+(d) the subprocess's stdin is **closed** once the request-body copy finishes, unconditionally — success
+or failure — never merely left open once the last byte is written. (d) is a distinct guarantee from (c),
+not a restatement of it: (c) covers the host detecting a client disconnect *during* its own copy; (d)
+covers the copy returning normally having delivered an incomplete body, which §2's `CONTENT_LENGTH`
+finding below measured as a genuine, unbounded hang — not a theoretical one — when stdin is left open.
+The invocation carries no meaningful argument list either way it might be spawned (the resolved
+`git-http-backend` binary path, as this section's experiments used, or `git` with a single
+`"http-backend"` argument) — everything the process needs arrives through the environment and stdin, not
+argv — which matters for obligation 9, traced below.
+
+**4 — Authentication: HTTP Basic verified before any subprocess exists, never delegated to
+`git-http-backend`'s own policy.** The credential is the per-user git token (D-series identity work),
+presented as an HTTP `Basic` header's password field; `GitTokenService.VerifyAsync(username,
+presentedToken)` (`GitTokenService.cs:59-76`) is the entire authorization decision — it hashes the
+presented value and looks it up **only** among `GitTokens` rows matching that username, never touching
+`Accounts.PasswordHash`. That is why a login password cannot authenticate here, traced rather than
+asserted: there is no code path in `VerifyAsync` that reads the password hash at all, so a login password
+presented as a git credential is looked up in a table it was never written into and fails identically to
+any other wrong string — not by a comparison that rejects it, but by a lookup that has nowhere it could
+match. A `null` result yields `401` with `WWW-Authenticate: Basic realm="ZeroWiki"` **before
+`git-http-backend` is ever invoked** — no subprocess starts for a request that fails this check, for
+either service. `AnonymousGate`'s own remarks already name this seam (`AnonymousGate.cs:23-24`): the
+three git routes carry `[AllowAnonymous]` so the gate's cookie-authentication check doesn't swallow them.
+This is deliberately **not** the same authentication `AnonymousGate` performs for the browser (a
+signed-in cookie session) — a git client has no cookie to present, and D-series's own username+token
+design exists because of that.
+
+**What binds the authenticated surface to the handled surface, stated precisely because `[AllowAnonymous]`
+removes both `AnonymousGate` and the `AddAuthorization` fallback policy for these three routes, leaving
+nothing else in the general pipeline to answer for them.** `Program.cs:58-68`'s `FallbackPolicy` and
+`AnonymousGate` both work by reading `[AllowAnonymous]` off the **matched endpoint** — there is one
+exemption list, read twice, by design (`Program.cs:63-64`'s own comment: "so there is one exemption list
+rather than two that can drift"). Opting the git routes out of that list removes both readings for them,
+which is correct — the actual Basic-auth check has to run in their place — but it means the Basic-auth
+check must not become a **second**, independently-matched list of its own, or D16's own drift concern
+just moves rather than closing. **Decision: the Basic-auth check is not a separate middleware matching
+requests by path string — it is an ASP.NET Core endpoint filter (`IEndpointFilter`, via
+`.AddEndpointFilter()`) attached to the exact same `MapGroup("/git")` (or the individual `MapGet`/
+`MapPost` calls) that defines `PATH_INFO`'s three routes.** An endpoint filter is metadata carried on the
+specific `Endpoint` object routing matches — the same mechanism `[AllowAnonymous]` itself already uses,
+one level up — so "did this request get Basic-auth-checked" and "did this request get handled by a git
+route" are not two questions that could disagree; they are one question, answered once by routing, before
+either the filter or the handler runs. Verified rather than assumed, in a throwaway minimal-API app
+(`scratchpad/d18fix/routeprobe/`) with a filter and a handler both recording every path they see, attached
+to the same `MapGroup("/git")`, against exactly the disagreement vectors named as the risk — trailing
+slash, case, and an unrelated path under the same prefix:
+
+```
+/git/info/refs   -> 200, filter ran, handler ran
+/git/info/refs/  -> 200, filter ran, handler ran   (trailing slash: ASP.NET's routing matches it — for BOTH)
+/Git/Info/Refs   -> 200, filter ran, handler ran   (case-insensitive routing — for BOTH)
+/git/info%2Frefs -> 404, filter did NOT run, handler did NOT run
+/git/something-else -> 404, filter did NOT run, handler did NOT run
+```
+
+Every case landed on the same side for both filter and handler — never a request the filter skipped but
+the handler served, or vice versa — because there is only one routing decision, not two independently
+implemented ones. This is what "the same set by construction" means concretely: block B builds the Basic
+-auth check as a filter on the git route registrations themselves, never as `if (path.StartsWith("/git"))`
+in general middleware, and a fourth route added later inherits the same guarantee automatically by being
+added to the same group rather than by remembering to update a second list.
+
+`REMOTE_USER` is set to the authenticated account's `Username` purely so `git-receive-pack`'s reflog
+carries an identifying `GIT_COMMITTER_NAME`/`GIT_COMMITTER_EMAIL` (documented behavior, `git help
+http-backend`'s ENVIRONMENT section) — it plays **no role in this design's access control**, which is
+worth stating because `git-http-backend` has its own, independent notion of authorization that this
+design deliberately bypasses rather than relies on. That independent notion was also exercised and
+confirmed live: `http.receivepack`'s documented default is "disabled for anonymous users, enabled for
+users authenticated by the web server" — verified by toggling `REMOTE_USER` with `http.receivepack`
+*unset*: absent, `info/refs?service=git-receive-pack` answers `Status: 403 Forbidden`; present
+(`REMOTE_USER=alice`), the identical request succeeds. **This is exactly why `http.receivepack=true`
+being already set unconditionally on every start (`ef2b75b`) matters**, per the brief's own framing: with
+it set, `git-http-backend` offers `receive-pack` regardless of `REMOTE_USER`, so its absence would read
+as an authentication bug (a 403 that looks like a rejected credential) when it is actually this
+config default reasserting itself — confirmed by clearing `http.receivepack` and reproducing exactly that
+403 with `REMOTE_USER` unset, then confirmed cleared again with the config restored. `git-http-backend`
+therefore performs **zero** access control of its own in this design; all of it happens in the ASP.NET
+pipeline, before the subprocess exists.
+
+**5 — Lock policy per verb: `git-upload-pack` (clone/fetch) never takes the write lock; `git-receive-pack`
+(push) takes it unbounded, wrapping the whole invocation (D16, already decided). This is the section's
+one open question, and it is closed by evidence, not by git folklore about content-addressed
+stores.** `specs/content-editing/spec.md:107-129`'s *Single per-repo write lock* requirement serializes
+"all repository **writes** — browser commits and git push receipt"; a clone or fetch writes nothing on
+the server side, so the requirement's own text already excludes it — the question this section owes is
+whether an *unlocked* read is actually safe against a concurrent lock-held write, not whether the spec
+demands locking it.
+
+The claim under test: git's own object store (content-addressed, write-then-rename, never mutated in
+place) and its ref-update protocol (each ref update is itself lockfile-protected and atomic) already give
+a concurrent, completely unlocked reader a consistent, **complete** snapshot delivered to the client —
+either the pre-commit or the post-commit state in full, never a torn or partial one — independently of
+whether *our* `flock` is held.
+
+*What the first pass actually measured, stated precisely because the earlier wording claimed more than
+this.* A single serialized writer (matching production, where D16's lock guarantees exactly one writer is
+ever active) committing 30 times in a loop, racing **eight** threads hammering `git-http-backend`'s
+`info/refs` + `git-upload-pack` read path continuously and without ever touching the lock, each read
+checked three ways: the CGI subprocess exited 0, the response contained the literal `PACK`, and the
+advertised `HEAD` sha resolved with `git cat-file -e` **in the source repository**. That is real evidence
+that the source repository was never corrupted by the race and that the reader never advertised a sha the
+writer had not yet committed — but it does not inspect the bytes actually delivered, so it is not, on its
+own, evidence that a client receiving that response gets a complete, valid pack rather than one truncated
+mid-stream by an unlucky interleaving.
+
+*The instrument that closes that gap, independently reproduced rather than taken on report.* Every
+delivered pack piped into `git index-pack --stdin` against a fresh, isolated scratch object store,
+demanding it index cleanly — a check that fails loudly on anything truncated, corrupt, or incomplete,
+unlike a source-repository `cat-file -e` which says nothing about what actually left the process. Run
+independently (not merely re-read from the reviewer's report) on the same host and binary, macOS/git
+2.55.0:
+
+```
+verified (index-pack clean): 80 / 82 / 75   (three independent runs)
+errors: 0
+server-side git fsck exit: 0
+```
+
+3/3 clean, 75–82 fully-validated packs per run, zero index-pack failures. **This is the evidence that
+actually supports "a consistent, complete snapshot delivered to a client"; the first pass's transcript
+supports the narrower "the source repository stays intact under the race," which is necessary but not
+sufficient for the sentence this section makes.**
+
+*The second, separate gap: every writer above only ever appended.* `git commit` is append-only to the
+object store, so nothing in the race above could rewrite or delete an object a reader was mid-stream on —
+the operation that motivates locking reads on other git-hosting systems is **repack/prune**, which does
+both, and `git commit` triggers `git gc --auto` in production (reachable, not hypothetical), even though
+neither run above could have fired it — `gc --auto`'s loose-object threshold is far above 25–30 commits.
+Raced again with a writer that forces the actual operation rather than waiting on a threshold that would
+never trip in a short-lived test: the same eight-reader shape, now against a writer that runs `git repack
+-A -d` (rewrite every pack, delete the now-redundant old ones) and `git prune --expire=now` (drop
+unreachable loose objects immediately, the most aggressive prune git offers) every four commits, 40
+commits total, 10 repack+prune cycles landing squarely inside the read race:
+
+```
+repack/prune events: 20   (10 repack + 10 prune, all exit 0)
+verified (index-pack clean): 185 / 185 / 184   (three independent runs)
+errors: 0
+server-side git fsck exit: 0
+```
+
+3/3 clean, **confirmed on macOS/git 2.55.0 only — in-container confirmation on Ubuntu 24.04/git 2.43.0 is
+outstanding, Docker unreachable both this round and the one before it.** That absence is not this
+paragraph's finding to paper over with a borrowed transcript: obligation 1's cross-environment work
+verified route resolution and clone/push cycles on both git versions, never a repack/prune race, so it
+cannot vouch for this mechanism on 2.43.0 — the two are different experiments, and citing one for the
+other is exactly this block's recurring defect, moved onto which run gets to stand for which claim. What
+is offered instead is a *reason to expect* the result holds there, stated as an expectation and not
+dressed as a measurement: an already-open file descriptor keeps its inode's content readable after the
+directory entry is unlinked — the POSIX guarantee `## NEXT`'s carry-forward correction already invoked by
+name for a different reason — and git's own repack/lookup code additionally re-scans the pack directory on
+a failed lookup rather than trusting a cached list built once at process start, so a reader that has *not
+yet* opened the file it needs would still find it in the newly-written pack rather than erroring against a
+stale directory listing. Neither of those facts has been executed against git 2.43.0 in this block; both
+are argument, not evidence, until it is. **Recorded as a §7 obligation owed to block C**, which already
+stands up a real client against the shipped Ubuntu 24.04/git 2.43.0 image (7.3/7.4) and is where this
+belongs rather than where a repack/prune race would have to be built solely to close it: C's brief should
+include racing `git-upload-pack` reads against a repacking/pruning writer on that image, the same
+`race_probe_gc.py` shape adapted rather than rebuilt, before this decision is treated as verified on the
+environment that actually ships.
+
+**Decision, now resting on the stronger evidence: `git-upload-pack` requests never acquire
+`RepositoryWriteLock`, safe against both a committing writer and a repacking/pruning one.** What actually
+makes this safe is git's own atomicity and open-fd guarantees for the object store and refs, not an
+absence of contention — and getting this wrong in the "safe-looking" direction (locking reads too) has a
+real, named cost per the brief: an unbounded lock held across a large clone would block every browser
+save for the clone's entire duration, which is a strictly worse availability posture than the one this
+design chooses. `git-receive-pack` continues to take the lock unbounded around the **entire**
+`git-http-backend` invocation, exactly as D16 already settled — not reopened here, only confirmed as
+still the right shape once a real subprocess exists to wrap.
+
+**6 — Obligation 9 (the `GitProcessException` argument-leak concern): traced, and inert for §7.**
+The obligation assumed a token-bearing value could reach a git subprocess's argument list or environment
+and later surface in an exception message. Traced against this design rather than obeyed: the Basic
+credential is verified entirely in C# by `GitTokenService.VerifyAsync`, a database lookup with no git
+subprocess involved at all (§4); once verified, the only identity-shaped value that ever reaches the CGI
+environment is `REMOTE_USER=<Username>` — a username, not a token, not a hash. `§3`'s streaming host
+invokes `git-http-backend` with an empty (or single-literal, `"http-backend"`) argument list — nothing
+request-derived is ever a command-line argument. There is no path by which a token, a token hash, or any
+other secret becomes part of an argument list or an environment variable this design controls. **Obligation
+9 does not apply to §7 as designed**; §7.5's brief (block B) needs no defensive precaution against a path
+that does not exist, and no `CapturingLoggerProvider` test is needed for a leak this trace shows cannot
+occur. If a future change adds a git subprocess invocation that does carry request-derived data into
+`git`'s argv, that change re-opens the obligation for itself — it does not reattach to §7.
+
+**7 — Obligation 10 (the checked-out branch, never assumed `main`): does not bite blocks A or B.**
+`ContentRepositoryService.DefaultBranch = "main"` (`ContentRepositoryService.cs:26`) has exactly one call
+site — `git init -b main` at first-ever repository creation (`ContentRepositoryService.cs:189`) —
+confirmed by search, not inference. Nothing in this section's route templates, CGI contract, or lock
+policy names a branch: `git-http-backend` resolves `info/refs`/`git-upload-pack`/`git-receive-pack`
+against whatever `HEAD` the repository actually has, and `receive.denyCurrentBranch = updateInstead`
+(already configured) is itself branch-name-agnostic — it means "the branch currently checked out",
+resolved by git at push time, not a name this design supplies. An adopted repository on `master` is
+served identically to one on `main`; nothing here would need to change. The obligation bites only in
+block C, whose verification assertions must read the actual checked-out branch via `git symbolic-ref
+HEAD` — an existing call site, `ContentRepositoryService.cs:661` — rather than assume `DefaultBranch`,
+and that is C's brief to carry, not A's or B's.
+
+**8 — §7 does not inherit D9's verification instrument as sound.** `## NEXT`'s carry-forward already
+established, by execution, that `ContentRepositoryService`'s startup reconciliation (`git add -A` +
+`git status --porcelain`, `ContentRepositoryService.cs:792-806`) is blind to a working tree an operator
+has run `git update-index --assume-unchanged` against — a single stray invocation on the mounted volume,
+however it got there, and D9's own recovery mechanism can no longer see the divergence it exists to
+repair. That fix is escalated to its own change, `fix-reconciliation-index-blindness`, queued and out of
+this change's scope (`## NEXT`), because it amends a requirement (`specs/content-store/spec.md`'s
+*Working-tree-clean invariant*) that exists only on this branch and cannot land before this change
+archives. What it means specifically for §7's push receipt, also already measured rather than assumed: a
+`updateInstead` fast-forward push against a blinded-dirty tree is **refused**, not silently overwritten —
+`error: Entry '<file>' not uptodate. Cannot merge.` / `! [remote rejected] main -> main` — with the
+uncommitted local divergence surviving untouched. A blinded tree therefore produces a permanently-
+bouncing remote and a health check that reports clean while every push fails, which is an availability
+and diagnosis defect, not a data-loss one. §7 must not paper over this by, for instance, having its own
+push path re-verify cleanliness with the same blind instrument — it inherits the existing
+`AssertWorkingTreeIsCleanAsync` machinery as-is and carries the same blind spot forward, explicitly,
+rather than silently.
+
+**The `safe.directory` standing hazard named in obligation 4's environment list — discharged, and
+re-verified rather than re-solved, exactly as instructed.** `Dockerfile:54` runs `git config --system
+--add safe.directory '*'` as root before the `USER` switch. §7's CGI subprocess is the sharpest test of
+that line, since it runs with a constructed environment that deliberately omits `HOME` (§2) — a
+per-user `--global` setting would silently stop applying there. Reproduced inside the Ubuntu
+24.04.4/git 2.43.0 image: a repository owned by `appuser`, `git-http-backend` invoked as `root` with
+`HOME` unset (euid/owning-uid mismatch, `HOME` absent — the exact shape a CGI subprocess runs in) fails
+without the config line —
+
+```
+fatal: detected dubious ownership in repository at '/data/wiki/.git'
+Status: 500 Internal Server Error
+```
+
+— and succeeds cleanly, still with `HOME` unset, once `git config --system --add safe.directory '*'`
+is applied. The Dockerfile's own claim holds; nothing here changes it.
+
+**Spec delta: none needed, checked requirement by requirement rather than assumed.**
+`specs/git-sync/spec.md` already states the Smart HTTP surface, `updateInstead`, non-fast-forward
+rejection, re-index-and-broadcast, Obsidian compatibility, and git-identity mapping as SHALL-level
+requirements with scenarios; none of them name a route template, an environment variable, or a header —
+those are implementation literals that belong in this design document, not the spec, and every fact
+this section settled is consistent with what the spec already requires rather than in tension with it.
+`specs/content-editing/spec.md:107-129`'s *Single per-repo write lock* requirement already scopes itself
+to "repository writes", which is the textual basis for obligation 5's decision that `git-upload-pack`
+needs no lock at all — the requirement was never claiming otherwise, and nothing here weakens or extends
+what it demands of a push's unbounded wait. No requirement changes; none added.
+
 ## Risks / Trade-offs
 
 - **Dirty tree blocks all pushes** → Transactional save (`git checkout -- <file>` on commit failure, under lock) plus startup reconciliation (commit-as-recovered or discard) guarantee the tree returns to clean.
