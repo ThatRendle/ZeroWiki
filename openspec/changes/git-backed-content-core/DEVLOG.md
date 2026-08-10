@@ -18177,40 +18177,275 @@ would have been hard to construct honestly; a genuine failing run supplied it fo
   deployment target. **Stated as an assumption rather than a result** — which is the correct disposition
   given this section's history, and exactly the kind of thing that has bitten it before.
 
+**[supervisor]** §6 section **re-review, round three** — scope unchanged, `git diff 97029e7..HEAD`, HEAD
+now `bfcb843` (ten commits: blocks A, B, C1, C2, D1, D2, D3, D4 plus three remediation rounds).
+Everything below was reached by **running** something. Where an instrument could not see a thing, I name
+it. `801/801` is where I started, not what I am reporting.
+
+## Verdict: **Approve** — §6 closes
+
+My four blockers across three rounds are closed on their merits, each re-derived by execution rather
+than read off the thread. The findings below are `## NEXT` items, not conditions.
+
+---
+
+## What I ran that no round has run
+
+Both prior rounds — mine included — tested the guard as a *unit*: the reviewer and worker drove
+`PageSaveService` from xUnit, and I drove the method extracted byte-verbatim. Nobody has driven the
+**real application over HTTP against a real case-sensitive volume**. That is the composition my first
+two blockers both lived in, so that is what I did.
+
+### 1. The whole write path on a genuinely case-sensitive APFS volume, through the browser surfaces
+
+`hdiutil create -fs "Case-sensitive APFS"`, sanity-checked in-run (`A.txt` and `a.txt` both present),
+real app on `ContentStorage__DataRoot` pointed at the volume, bootstrap + login + every save driven as
+an actual form post with real antiforgery tokens.
+
+| step | observed |
+|---|---|
+| create `/wiki/Page`, then `/wiki/page` | both `Create page` → 302, both committed |
+| `GET /wiki/Page` / `GET /wiki/page` | own content each; `editHref` `/wiki/Page?edit` / `/wiki/page?edit` |
+| `GET /wiki/Page?edit` / `?edit` on `page` | **both `Edit page`**, distinct base revisions `055886a0…` / `c751f4d8…` |
+| **edit-save each, both casings on disk** | both `Saved`, correct file each |
+| `Notes/apple` + `notes/banana`, then edit under `Notes/` | all `Edit page`, all saved, neither subtree bricked |
+| final | 7 saves → **7 commits**, 1:1, author `admin <admin@zerowiki.org>` on every one |
+| `git status --porcelain` | **empty** |
+| HEAD bytes vs worktree bytes, all 5 files | identical, correct per file |
+
+**One thing this found that the suite cannot show, and it is not a defect.** The three new tests reach
+the fixed predicate only through their `LoadForEditAsync` re-resolutions. In each of them the
+`SaveAsync` call happens while **one** casing is on disk, so `PageSaveService.cs:834`'s `File.Exists`
+short-circuits and `SaveAsync`'s own call site (`PageSaveService.cs:169`) never enters the branch with a
+sibling present. The fix is one predicate serving both call sites so this changes nothing about its
+correctness — but the save-side call site's two-entry evidence is mine, not the suite's. Recorded so it
+is not later assumed to be covered.
+
+### 2. Round one's Blocker 1, re-run end to end on a case-insensitive host
+
+`core.ignoreCase=true`, `docs/Page.md` committed out-of-band with `Original body.` — the exact fixture
+from my first review's table.
+
+- `GET /wiki/page?edit` → **"This address cannot be edited"**, no `<textarea>`.
+- The naive POST returns **400** — the refused page renders no form, so it fails antiforgery and proves
+  nothing. I harvested a **valid** token and `_handler` from a different address's editor (`FormName`
+  is the static `"pageEditor"`, so one token serves every route) and posted to the refused address
+  anyway, `BaseRevisionToken=""`, exactly as round one exploited.
+- Result: **302 → PRG with a draft token**, message *"This address no longer identifies a single file,
+  so nothing was written"*, and the member's text — `Clobbered by the create path.` — **re-presented
+  verbatim in the textarea**.
+- `git status --porcelain` **empty**; log unchanged; `HEAD:docs/Page.md` and the on-disk file both
+  `Original body.`
+
+Every cell of round one's corruption table is inverted. And because that POST **bypassed the surface
+entirely**, it is the first demonstration of `content-editing`'s *"SHALL make that refusal in the save
+itself rather than only in whatever surface submitted it"* — previously argued from control flow.
+
+### 3. The guard's *approach*, one level down — the thing the brief asked for
+
+`Array.Exists` is order-independent by construction, and the descending series **terminates** here:
+round one asked the wrong subsystem, round two asked the right subsystem with an order-dependent
+lookup, round three asks an **existential** question whose answer is a property of the set. That is a
+categorical change, not a third approximation — there is no enumeration order under which it differs.
+
+I traced all four reachable paths for a false-*accept* (guard says proceed, a clobber follows) and there
+is none in the ordinary case, for a structural reason worth recording: **a folding filesystem can hold
+at most one member of a case pair**, so an ordinal-exact hit is proof the write lands on the entry it
+names. Two properties of the approach *are* worth naming, both confirmed by execution against real .NET
+APIs, **both pre-dating round three**, neither blocking:
+
+- **Unicode normalization false-refusal.** On this host's case-insensitive APFS, a file written NFD
+  (on-disk name `0063 0061 0066 0065 0301 …`) makes `File.Exists(NFC)` return **True** with no
+  ordinal-exact NFC entry → the guard **refuses**. Same shape as my round-two blocker, one axis over.
+  Materially narrower: it needs macOS-family folding *and* a name whose on-disk normalization differs
+  from the request's, which ZeroWiki's own round-trip never produces — enumeration encodes the on-disk
+  bytes and the browser returns them percent-encoded. On the Linux deployment target `File.Exists`
+  returns `false` and the guard never engages. Direction is safe (refuse, nothing written).
+- **`PageSaveService.cs:848-855`'s `catch` is a false-accept in the corruption direction.** With a
+  parent directory at mode `--x`, `File.Exists(d/page.md)` folds to **True** while
+  `Directory.GetFileSystemEntries` throws `UnauthorizedAccessException`, so the catch returns
+  **`true` — proceed** in exactly the state the guard exists to refuse. Round two's `hash-object`
+  verification is the backstop, so this cannot report a silent success: it lands as
+  `Failed`/`RollbackFailed`, which `specs/content-editing/spec.md`'s *"A failed save whose rollback also
+  failed is reported distinctly"* scenario explicitly provides for. It needs a permission state the app
+  never creates. The one-word shape is fail-closed (`return false`) in that catch.
+
+---
+
+## The two things you asked me to weigh rather than take on trust
+
+**The worker/reviewer disagreement about which member the old logic refused — the conclusion holds, and
+I can close it without reproducing either.** Both accounts are consistent with the fix being correct,
+because the old verdict depended on `GetFileSystemEntries`' order, which is an APFS name hash and is not
+stable across volumes; so *neither* account generalises and "the losing member is unpredictable" is the
+only defensible reading. That is what the Architect concluded, and it makes the both-orders requirement
+evidence rather than belt-and-braces. **The tests are genuinely swapped, not relabelled** — read off the
+calls, not the names: `:758` `CommitPageDirectlyAsync("Page.md")` + `:768` `SaveAsync("page")` against
+`:800` `CommitPageDirectlyAsync("page.md")` + `:808` `SaveAsync("Page")`. More important than either:
+each test's *discriminating* assertions (`:783-789`, `:819-825`, `:858-864`) re-resolve **both** members
+after both exist, which is order-proof whichever one enumerates first. The property that matters does
+not depend on settling who saw what.
+
+**Teardown-on-failure settled by accident — adequate, and I confirmed the resource state myself.** Three
+genuine assertion failures with `Dispose()` cleaning up every time is a stronger result than a
+constructed one, and the mechanism agrees: xUnit disposes the class after each test regardless of
+outcome, cleanup is unconditional, and the tracking fields are assigned before the test body runs.
+Execution and mechanism agreeing is the right standard. Independently: **10 attached images before my
+probes and 10 after, `/Volumes` back to `Macintosh HD` + `Sonic Pi`, no stray `ZeroWiki.dll` or
+`hdiutil` processes.**
+
+## The two open limits — neither blocks, and the second is the one I weighed hardest
+
+- **Provisioning-failure leak** — real, narrow, test-harness only, no production path, no data at risk,
+  never observed. `## NEXT`.
+- **The Linux no-op path, verified by reading only.** "Verified by reading" is this section's signature
+  failure mode, so this deserved more than a shrug. It does not block for a *specific* reason rather
+  than a general one: the unverified premise is not about ZeroWiki's behaviour, it is about whether ext4
+  lets two case-differing names coexist — and **the tests are fail-closed against their own premise**.
+  If it were false, `EnsureCaseSensitiveDataRootAsync` returns without provisioning, the two casings
+  collapse onto one file, and the assertions on *both* files' distinct contents (`:776-777`,
+  `:816-817`, `:853-854`) **fail loudly**. That is what makes reading sufficient here and did not make
+  it sufficient in rounds one and two, where a false premise produced a *passing* test. Worth a Linux CI
+  run; recorded as an assumption, correctly.
+
+---
+
+## Does §6 satisfy `content-editing`? — requirement by requirement
+
+- **Commit-on-save — met.** 7 saves → 7 commits measured 1:1, author well-formed on every one, tree
+  clean. Coalescing is structural (explicit Save, Static SSR form post, no autosave and no circuit).
+  Legacy-username authorship: `AccountGitAuthorFactory` (C1) + its tests. Byte-identical-reports-success
+  verified in round one by `rev-list --count` and in round two through the `hash-object` instrument,
+  including under a `.gitattributes eol=crlf` filter.
+- **A save refuses an address that does not identify exactly one file — met, and now demonstrated the
+  hard way.** The surface-bypassing forced POST above is the proof of the "in the save itself" clause.
+  Refusal is distinct from stale base at every layer.
+- **Browser editing surface — met, all six scenarios.** `Edit page` with distinct base revisions for
+  both casings; `Create page` with an empty token for an absent address; `cannot be edited` with no
+  textarea; **the rejected save re-presented the member's own text verbatim** — Blocker 3's
+  contradiction, now closed in the code's favour and measured rather than argued; five distinct
+  messages at `PageEditor.razor:46-59`.
+- **Optimistic concurrency on save — met.** Real blob shas carried as hidden fields, CAS under the lock;
+  current-base edits committed in my run; stale-base 409 covered by tests and by the Product Owner's
+  two-tab browser confirmation recorded above.
+- **Single per-repo write lock + Transactional save — met for §6's half.** `SaveWriteLockTimeout`
+  separate from `WriteLockTimeout` (6.6) with `RepositoryBusy` distinct from `Conflict`; the tree was
+  clean after every probe including the refused save. Push's unbounded wait is §7's to demonstrate.
+
+## Is §6's evidence base sound enough to close on? — **Yes.** The scenario gap has actually closed
+
+Last round I said "sound on integrity, thin on scenario coverage". That gap is closed rather than moved,
+and I can say which measurement closed it: the section's discriminating guard is now exercised with
+**both** subjects present, in both creation orders, at both call sites (two by the suite, the save-side
+one by my run above), and the whole path has been driven end to end on **both** filesystem kinds. The
+standing rule the Architect added — *a guard that discriminates between two things is not tested until
+it has been run with both of them present* — is the correct generalisation and it is now satisfied here.
+
+**No mutation residue — verified against a checksummed baseline, not a marker search.**
+`git status --short --untracked-files=all` empty; `git diff -- src` empty. Committed
+`PageSaveService.cs` = `d685f6d46ce4e668…`, **byte-identical to the reviewer's own post-fix backup** —
+so no post-Approve edit slipped in, which is the gap this change has opened twice. Diffed against my
+**own** round-two checksummed baseline `2c3fd5af8160e0c8…`, the delta is **exactly one hunk**, the
+guard. `bfcb843` touches three files, two of them the test file and the DEVLOG.
+
+On the record's known imperfections: round one's survived mutant was correctly read as a real gap and
+its round-two equivalent dies; the 2/798 → 1/798 correction is better-evidenced than the original; four
+live-mutant incidents all recovered, none shipped. Nothing here is hidden, which is the property that
+matters at close-out.
+
+## Cross-block coherence across all ten commits — clean
+
+No `draftRefused` residue. **No `TODO`/`FIXME`/`HACK`/placeholder anywhere in `src`.** All fifteen new
+`src` files have live references. `TryResolveWorkingTreePath` deleted (obligation 19) with a tombstone
+in `PageRouteCodecTests.cs:221`. One DI registration per service, singleton lifetimes coherent with the
+cross-process lock's assumption, no overlap. One `PageRouteCodec.ResolveUrlForms` producer serving both
+edit-URL sites — Blocker 2's deduplication has not regrown. Static SSR discipline intact: the editor is
+a form post, not an island; §6 added no interactive circuit.
+
+## For `## NEXT` (Architect, at close-out — no fix block)
+
+1. **`## NEXT` is materially false, and this is the second time I have raised it.** Not a blocker —
+   CLAUDE.md §3c.2 makes rewriting it the post-Approve action — but it would actively mislead a
+   resuming session into redoing shipped work. It currently claims: HEAD `751cf95`; *"Working tree is
+   DIRTY and deliberately so"*; *"State: 31/41 tasks ticked"*; D2 and D3 *"not started"*; obligation 8
+   *"not yet briefed"*; and round two's two blockers still open. All six are false. D4 is absent from
+   the progress table entirely.
+2. `PageSaveService.cs:848-855` — the `catch` returns `true` where fail-closed (`return false`) is the
+   safe default. One word; take it whenever this method is next opened.
+3. Unicode-normalization refusal on macOS-family volumes (measured above). Off the deployment target and
+   safe in direction; record it rather than fix it.
+4. `EnsureCaseSensitiveDataRootAsync` — record `imagePath` immediately after `create`, before `attach`.
+5. A Linux CI run of the three case-sensitive tests, to convert the last assumption into a result.
+6. Carried unchanged: `IPageIndex.Current` has no consumer (doc-comment references only);
+   `EditDraftStore` is per-instance state with no background expiry sweep; obligation 19 discharged;
+   obligation 26 closed.
+7. **Carried and load-bearing for §7:** `ContentRepositoryService.cs:792-806` — D9's reconciliation
+   still uses the `add -A` + porcelain instrument §6 rejected as blind to `assume-unchanged`, **and D9
+   is named as `RollbackFailed`'s recovery mechanism** (`PageSaveService.cs:582`,
+   `specs/content-editing/spec.md:86`). §7 must not inherit it as sound.
+8. Minor, member-visible: on a case-insensitive host `/wiki/page` still renders *"Page not found —
+   Create this page"* for an existing `docs/Page.md`, and that affordance now leads to *"This address
+   cannot be edited"*. Safe and honest, but a dead end. §3/§4's read path owns it, not §6.
+
+**@architect** — §6 is closed. Rewrite `## NEXT` before opening §7; items 1 and 7 above are the two that
+matter for the next section.
+
 ## NEXT
 
-**Resume point: §6 is at CLAUDE.md §3c.4 — a Product Owner decision, not a next block.** All eight §6
-blocks have landed and all six tasks are ticked, the supervisor requested changes, **one** remediation
-block was built, and its review found two further blockers. The rule is two rounds then stop. **Do not
-carve a third remediation without the Product Owner's direction.**
+**Resume point: §7 (Smart HTTP git remote), block A — not yet carved.** **§6 is CLOSED**: supervisor
+`Approve` over `97029e7..bfcb843` at the third section round. Pre-flight §7 per CLAUDE.md §2 before
+carving anything, and read the four §6 carry-forwards below first — one of them is load-bearing for §7's
+own design.
 
-**Working tree is DIRTY and deliberately so.** The remediation is uncommitted: `PageSaveService.cs`,
-`PageRouteCodec.cs`, `WikiPage.razor`, `PageEditor.razor`, `PageSaveServiceTests.cs`,
-`WikiPageEditorTests.cs`, `design.md`. Gates green at **796/796**, no `MUTANT` residue. **`design.md`
-carries one knowingly-false paragraph** (the surviving mutant's justification) — retracted in the
-`[architect]` post above, not yet rewritten, because the replacement depends on which fix is chosen.
+**Working tree CLEAN. State: 31/41 tasks ticked** (§6's 6.1–6.6 all done). Branch
+`change/git-backed-content-core`, HEAD **`bfcb843`**. Gates at §6's close, run in the foreground by the
+Architect with an explicit 10-minute timeout: `dotnet build` **0/0**; `dotnet test` **801/801**
+unfiltered in 2m12s; `dotnet format --verify-no-changes` exit 0; `openspec validate --strict` valid; no
+`MUTANT` residue; no stray mounts or attached images.
 
-**The two open blockers:**
+**§6 landed in ten commits:** A `52ea5c6`, B `b3d0d44`, C1 `ae3d963`, C2 `618e8fa`, D1 `245bad2`,
+D2 `9aaf8da`, D3 `9099d72`, D4 `751cf95`, then two supervisor remediations — `8d0bffb` (rounds one and
+two combined) and `bfcb843` (round three).
 
-1. **The general safety net verifies `git status`, which is the same subsystem whose bookkeeping is the
-   thing being doubted.** `git update-index --assume-unchanged` blinds `add`, `status` *and* D9's
-   reconciliation simultaneously — so a save reports success, `HEAD` stays stale, and **nothing ever
-   notices**. Permanent loss, unlike case-collapse's delayed-and-attributed-to-the-system loss. A
-   content-level check (hash the file, compare to `HEAD`'s blob) never consults the index and is immune;
-   that is the likely shape of a fix, unstarted.
-2. **The Blocker-1 regression test is not portable.** It pins `core.ignoreCase=true` via `git config`,
-   but the guard is gated on `File.Exists`, which answers from the filesystem. On a real case-sensitive
-   volume the save correctly succeeds as a new page, so the assertion would **fail on the Linux
-   deployment target**. The fix is correct on both filesystems; only the test is wrong.
+**§6 took three supervisor rounds and two Product Owner escalations at §3c.4.** Its three original
+blockers closed in the first remediation; the second and third rounds each fixed a defect the *previous
+remediation had introduced*, in a descending series — wrong subsystem, then right subsystem with an
+order-dependent lookup, then an existential check with no order to be wrong about. The Product Owner
+sanctioned rounds two and three explicitly rather than either being carved on the Architect's authority.
 
-**§6's base commit is `97029e7`** — the supervisor's scope is `git diff 97029e7..HEAD`, and the
-remediation must be committed before that range means anything.
+### §6 carry-forwards — read before carving §7
 
-**State: 31/41 tasks ticked** (6.1–6.6 all done). Branch `change/git-backed-content-core`, HEAD
-`751cf95`. §7 has **not** begun.
+1. **⚠️ Load-bearing for §7: D9's reconciliation still uses the instrument §6 rejected.**
+   `ContentRepositoryService.cs:792-806` verifies the working tree with `git add -A` + `git status
+   --porcelain`. §6 established by execution that a single `git update-index --assume-unchanged` blinds
+   **both** of those *and* `add`, so D9 cannot see a divergence of exactly the kind it exists to repair
+   — **and D9 is `RollbackFailed`'s named recovery mechanism**, so the save path's worst outcome is
+   documented as recoverable by a mechanism that shares the blind spot. §6 fixed its own guard
+   (`git hash-object`, which never consults the index); it did **not** fix D9. §7 must not inherit this
+   as sound.
+2. **The inherited-git-config class is unowned.** §6 pinned `core.autocrlf=false` on the content
+   repository after an inherited host `core.autocrlf=input` made an ordinary browser save refuse
+   startup. `core.quotePath` was the same defect fixed as a one-off earlier. Unverified remainder, in
+   rough severity order: `commit.gpgsign` (measured as failing *loudly* — a fresh repo refuses to start,
+   a running app fails saves honestly with a clean tree, so it is not silent), then `core.safecrlf`,
+   `core.symlinks`, `core.fileMode`, `core.ignoreCase`, `core.precomposeUnicode`,
+   `core.protectNTFS`/`protectHFS`. **The general rule: this app's correctness must not depend on
+   configuration inherited from the operator's `~/.gitconfig`.**
+3. **Two approach-level properties of the case-exact guard, both confirmed by execution at §6's close,
+   neither blocking.** A Unicode NFC/NFD false-**refusal** on macOS-family volumes (fails in the safe
+   direction; absent on Linux), and `PageSaveService.cs:848-855`'s `catch` returning `true` — a
+   false-**accept** under a `--x` parent directory, backstopped by the `hash-object` check into the
+   spec's own `RollbackFailed` scenario.
+4. **Two test-harness limits recorded honestly rather than closed.** The case-sensitive volume harness
+   leaks if `hdiutil create` succeeds but `attach` then throws (tracking fields unassigned, so
+   `Dispose()` has nothing to clean) — found by reading, not reproduced. And **the Linux no-op path has
+   never been executed on the deployment target**; it is fail-closed against its own premise (if ext4
+   were not case-sensitive the assertions fail loudly rather than passing vacuously), which is why it
+   cleared, but it remains an assumption rather than a result.
 
-**Blocks landed in §6:** A `52ea5c6`, B `b3d0d44`, C1 `ae3d963`, C2 `618e8fa`, D1 `245bad2`,
-D2 `9aaf8da`, D3 `9099d72`, D4 `751cf95`.
+**`EditDraftStore` notes for a later change**, neither blocking: it is per-instance state that does not
+survive a restart or a second process, and it has no background expiry sweep (entries expire lazily on
+read and under cap pressure).
 
 ### §6 progress — read this before the numbered obligations below
 
@@ -18220,48 +18455,37 @@ D2 `9aaf8da`, D3 `9099d72`, D4 `751cf95`.
 | B | `b3d0d44` | — | One posture on git exit codes; fixed a **live data-loss defect** |
 | C1 | `ae3d963` | — | Author identity total over accounts; codec distinct types |
 | C2 | `618e8fa` | 6.2, 6.3, 6.5, 6.6 | The save service |
-| D1 | *this commit* | — | D17 address correction + 3 PO decisions; found a **live save/read asymmetry** |
-| D2 | *not started* | — | Obligation 8: `GitProcessRunner` kills its subprocess on cancellation |
-| D3 | *not started* | 6.1, 6.4 | The `?edit` surface, the save post, **and** the save-path ambiguity refusal |
+| D1 | `245bad2` | — | D17 address correction + 3 PO decisions; found a **live save/read asymmetry** |
+| D2 | `9aaf8da` | — | Obligation 8: `GitProcessRunner` kills its subprocess on cancellation |
+| D3 | `9099d72` | — | The save path enforces D12; `LoadForEditAsync` |
+| D4 | `751cf95` | 6.1, 6.4 | The `?edit` surface, the save post, five outcomes |
+| rem. 1+2 | `8d0bffb` | — | Supervisor blockers 1–3; the `hash-object` guard |
+| rem. 3 | `bfcb843` | — | The case-exact guard asks for an exact match |
 
 **Block D was re-carved into D1/D2/D3** — see the `[architect]` post under `## 6.`. The original single
 block D, and the `/wiki/{*Route}/edit` address it named, are both **retracted**: that template is not
 routable (a catch-all may only be the last segment, verified by execution), and the address is now
 `/wiki/{*Route}` with an `edit` query flag.
 
-**Obligations 7, 14, 19, 25, 27 and 31 are DISCHARGED — do not act on their numbered entries below.**
-They are left unstruck only because striking six long entries by hand is itself an error surface; this
-table is authoritative over them. **This is the decay obligation 1 demonstrated** — it spent three
-sections asserting a Product Owner decision was owed after the decision had shipped, because `## NEXT`
-is append-mostly and unticked entries rot silently while the code moves. **Re-derive any forward
-obligation from the code before acting on it.**
+**Obligations 7, 8, 14, 19, 25, 26, 27 and 31 are DISCHARGED — do not act on their numbered entries
+below.** They are left unstruck only because striking eight long entries by hand is itself an error
+surface; **this list is authoritative over them.** Discharged in §6: **7** (author identity total over
+accounts, C1), **8** (`GitProcessRunner` kills its subprocess on cancellation, D2), **14** and **27**
+(one posture on git exit codes, B), **19** (the codec's callerless resolvers, C1), **25** (rollback
+invalidates the index, C2), **26** (closed at the section review — its trigger never fires, since the
+save's file choice never routes through `ApplyIncrementalUpdateAsync`), **31** (the write-lock timeout
+split, C2).
 
-**Still open and owed by §6:**
+**This is the decay obligation 1 demonstrated** — it spent three sections asserting a Product Owner
+decision was owed after the decision had shipped, because `## NEXT` is append-mostly and unticked
+entries rot silently while the code moves. **Re-derive any forward obligation from the code before
+acting on it.** §6 also produced the sharper form of the same rule: **name an obligation's owner by
+what it owns, not by its label** — an instruction addressed to a block *number* rots the moment the
+carve changes, which happened here when D3 split into D3/D4 and a design-doc instruction silently
+addressed the wrong block.
 
-- **Obligation 8 — `GitProcessRunner` still does not kill its git subprocess on cancellation, and C2 made
-  it materially more live.** It was parked in §2 as inert, went live in §4 when the freshness check put
-  git on the request path, and C2 has now put a *write* path there too: a cancelled save can orphan
-  `ls-tree`, `add`, `commit` or `rev-parse`. **Now explicitly homed: block D2**, placed before D3 for
-  the same reason block B preceded the save path — a foundation is fixed before callers are added to it.
-  **Not yet briefed**, and it carries an unresolved trade the Architect has flagged to the Product Owner:
-  `Process.Dispose()` kills nothing, so today a cancelled request orphans a live `git`; but nothing in
-  the codebase clears a stale `.git/index.lock`, so a naive kill mid-`commit` would refuse every later
-  git operation including startup reconciliation. The shape to settle is whether the **lock-held critical
-  section becomes non-cancellable** (a submitted save runs to completion) with the kill applying only
-  outside it.
-- **Obligation 26 — partially addressed.** C2 mutated the CAS install and the rollback ordering (both
-  killed, independently re-derived), but `ApplyIncrementalUpdateAsync`'s claimant reconstruction — the
-  specific condition 26 names — was **not** mutated. Confirm or close it at the section review.
-- **NEW, owed by D3 — the save path does not enforce D12's ambiguity rule, and D3 is what makes that
-  reachable.** Found by `@reviewer` on D1. `PageSaveService` consults `IPageIndex` exactly once
-  (`Invalidate()`); `AmbiguousRoutes` is never read there, so `WikiPage.razor` answers 409 on an
-  ambiguous route while `SaveAsync` writes to whichever claimant the greedy decode picks. Shipped in C2,
-  invisible only because nothing calls `SaveAsync` from a browser yet. D1 decides **that** the refusal
-  must live in the save path (not merely the surface, because a push can make a route ambiguous between
-  open and save) and deliberately leaves **which mechanism** to D3, with two constraints recorded:
-  consulting the index under the write lock is barred by D17's own lock-ordering reasoning, and a
-  working-tree answer must handle a collision in a *directory* segment (`a_b/` and `a  b/` both encode
-  to `a__b/`), so a single-directory scan is insufficient.
+**Nothing else is owed by §6 — it is closed.** The remaining numbered entries below are owed by §7–§10
+or by a later change; check each against the code before acting.
 
 **`SaveOutcome.RollbackFailed`'s spec scenario is DISCHARGED** — D1 wrote it, along with the correction
 that there are **five** failure outcomes at the surface, not four. `Refused` was omitted from every
@@ -18397,11 +18621,13 @@ fix stopped it.
 | §5 | remediation (S1 + S2 + startup-refusal test) | `fe9dab5` | — | → **Approve** (round 2) |
 | §5 | close-out (docs, mutant 3 re-valued) | *this commit* | — | — |
 
-**Execution order from here: §5 → §6 → … → §10.** §11, §2, §3 and §4 are done; the remaining sections run
-in `tasks.md` order.
+**Execution order from here: §7 → §8 → §9 → §10.** §11, §2, §3, §4, §5 and §6 are done; the remaining
+sections run in `tasks.md` order.
 
-**One decision is owed before §5 opens** — forward obligation 1 below. It is a Product Owner call, not
-a wording tidy-up, because one of its two options changes shipped behaviour.
+**No decision is owed before §7 opens.** `design.md`'s Open Questions remain resolved, and the four §6
+carry-forwards above are engineering work or recorded assumptions rather than Product Owner calls —
+with one caveat: **carry-forward 1 (D9's instrument) may become one**, because fixing it touches D9's
+recovery guarantee, which the spec names. Raise it when §7 is carved, not before.
 
 ### Forward obligations — each is owed by a specific section
 
