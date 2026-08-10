@@ -20001,19 +20001,182 @@ Ready to land and go back to the supervisor for the `cb81b47..HEAD` re-review.
 
 → @architect
 
+**[supervisor]** §7 section review, round two — scope `cb81b47..HEAD` (`ef91bd4`), four commits.
+**Verdict: Approve.** §7 is closed. Both blockers are genuinely fixed, and fixed in the right *shape*.
+
+**Why I am satisfied, specifically.** Blocker 1's fix is **structural, not enumerative** —
+`GitHttpBackendHost.cs:71-90` clears the environment and re-adds an explicit list, so the guarantee no
+longer depends on anyone having thought of every variable. That distinction is the whole point:
+*a claim wider than its instrument is fine when a structural argument bridges the gap, and defective only
+when an empirical instrument alone is asked to carry a universal.* The `GIT_TRACE` regression test is one
+variable standing for "no ambient variable leaks", which would have been an overclaim under the old
+overlay; under `Clear()` it is a legitimate witness that the clear happened, and the universal follows
+from the mechanism. The reviewer's observation to that effect is correct and is the best sentence in this
+remediation. Blocker 2's fix is correctly *conditional* — nothing forwarded when the client sends nothing,
+so the host never answers on the client's behalf.
+
+**D18 §2 and §9 now describe the running code.** I read both rewrites line by line against the shipped
+`GitHttpBackendHost.cs` and they match, including the two additions I could not check in round one:
+`PATH` named as the one deliberate exception with its reason, and the §9 paragraph rewritten to say the
+original experiment "was a legitimate test of the case that matters; it was just being cited for code
+that did not yet match it" — which is exactly the right diagnosis. Recording the correction as a visible
+addendum rather than a silent edit is the right call and makes the record more useful, not less.
+
+**I was wrong about the `Dockerfile` in round one, and the remediation was right to decline it.**
+`Dockerfile:28` reads "a constructed environment that **need not** include `HOME`" — permissive
+phrasing, which was defensible before the fix and is literally true after it. I flagged it as carrying
+the inverted reasoning; it does not. Declining that part of my finding, with the reason stated, was
+correct.
+
+**Ask 1 — is the evidence base sound enough to close on, after five instrument failures?** Yes, and I
+think the count argues *for* the section rather than against it.
+- All five were in **measurement, none in shipped code**, and every one was caught by this process —
+  worker, reviewer, or section review — rather than by a later section or a user. A visible
+  instrument-failure rate is categorically different from an invisible one. What would genuinely worry
+  me is a section this measurement-heavy reporting *zero* instrument failures, which would mean nobody
+  was checking their instruments.
+- My two blockers were **not** instrument failures. They were one false sentence propagating through
+  three artefacts, and the remediation names that precisely: "the shared instrument was a sentence
+  rather than a measurement of the real process." That is a different failure mode and the standing rule
+  now recorded for it is the correct response.
+- **The honest limit, which I want on the record rather than glossed:** every one of the five was a
+  false *positive* — an instrument reporting a problem that was not there. Those announce themselves.
+  A false *negative* — an instrument quietly passing something it should have failed — is by
+  construction not in that count, and I have no way to bound how many there were. Blocker 2 was exactly
+  such a case: 822 green tests, an instrument that could not see the defect, and nothing anomalous to
+  notice. The right response to that is not more measurement; it is preferring structural guarantees to
+  enumerated ones where a structural one exists, which is what this remediation did. On that basis the
+  section's conclusions are sound enough to build §8 on.
+
+**Ask 2 — a fourth instance, hunted through the section as a whole including the new prose. I found
+one. It is real, and it is decorative rather than load-bearing.**
+- *"Every git client since 2.26 sends `Git-Protocol: version=2`"* — `design.md` D18 §2's new bullet and
+  `GitHttpBackendRequest.cs`'s new doc comment. A universal claim about client behaviour across every
+  version from 2.26 onward, and **nothing in this section measured any client's request headers at all**
+  — the new tests set the header themselves via `HttpClient`, which proves the server honours it, not
+  that a client sends it. Protocol v2 also has a documented default-on/default-off history around
+  2.26–2.27, so "since 2.26" is probably not literally true.
+- *Measured, since asserting it was wrong without checking would be the same sin:* a real `git 2.55.0`
+  client, **no `-c` flag and with `GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM` neutralised**, sends
+  `Git-Protocol: version=2` on `GET /git/info/refs?service=git-upload-pack`. So the operative premise
+  holds for the versions this project ships and develops against. (My first probe forced
+  `-c protocol.version=2` and therefore proved nothing about the default; I re-ran it. Noting that
+  because it is the same trap.)
+- **Grading it honestly: not a blocker, and not worth a third round.** No decision rests on it — the
+  code forwards the header when present and adds nothing when absent, which is correct for *any* client
+  regardless of what any version does. Its falsity would cost nothing. Narrowing it to the measured
+  versions is a `## NEXT` wording fix, not a fix block. **This is the shape I would want §8 to inherit:
+  the claim is wide, but nothing structural depends on it.** The dangerous instances are the ones where
+  a wide claim is load-bearing, and I did not find one of those anywhere in the section.
+- Two smaller ones I checked and am *not* calling instances: "produced output identical **in shape**"
+  is properly hedged; and "nothing else is needed" generalises from `info/refs` + a real push in the
+  container, with the third verb (clone/`upload-pack`) covered under the cleared environment by
+  `GitSmartHttpRealClientTests` on macOS — the three verbs are covered, just split across two
+  environments, which composes.
+
+**Confirmed content for `## NEXT` rather than the fix block**, as asked: the ~35 lines of kill-tree
+boilerplate duplicated from `GitProcessRunner` (with the missing `_killEntireProcessTree` seam), and the
+unverified method-mismatch mechanism claim in `NoOpenRegistrationTests.cs`. Neither touches a shipped
+guarantee; both are cheap to close whenever `GitProcessRunner` is next opened. The DEVLOG transcript's
+"6 vars total" against an independently measured 8 is transcript-only and `design.md` does not repeat the
+number — worth the one-line correction already proposed, and it should not later be cited as a count.
+
+**Re-verified for the whole range, not just the fix:** `git diff -- src` empty and `git status --short`
+empty (untracked included); `Dockerfile` zero-diff; `tasks.md` §7 diff is the five ticks and nothing
+else; the remediation ticks nothing and adds no task numbers, correctly. The security barrier, the
+write-lock chain, and every `git-sync`/*Single per-repo write lock* requirement I walked in round one are
+untouched by this commit and still hold — the fix changed the subprocess environment and one forwarded
+header, neither of which is on the auth or locking path. Still no §7 SHALL clause owned by no task.
+
+**What this review could not see**, as before: no measurement of mine ran inside the Ubuntu 24.04/git
+2.43.0 container — the container facts here are the worker's and reviewer's, independently reproduced by
+each other but not by me — and I have not exercised a client that vanishes mid-push while the working
+tree is being updated.
+
+§7 is closed. → @architect
+
 ## NEXT
 
-**Resume point: §7 (Smart HTTP git remote) — CARVED, and PAUSED before block A on a Product Owner
-decision.** **§6 is CLOSED**: supervisor `Approve` over `97029e7..bfcb843` at the third section round.
-Pre-flight for §7 was run at `da6ed4f` and passed — tree clean, `openspec validate --strict` valid, on
-branch `change/git-backed-content-core`.
+**Resume point: §8 (Push reactions & identity), block A — not yet carved.** **§7 is CLOSED**: supervisor
+`Approve` over `cb81b47..ef91bd4` at the second section round. Pre-flight §8 per CLAUDE.md §2 before
+carving anything, and read §7's carry-forwards below first — obligation 3 is load-bearing for §8's very
+first decision.
 
-**No `Base:` post has been made for §7, deliberately.** 3a's base commit is what gives the supervisor its
-review scope, and it is only correct if it is `HEAD` at the moment the section's first block is briefed. A
-sha recorded now would be wrong the moment the escalated change below lands. §7 opens with its `Base:`
-post, not before.
+**Working tree CLEAN. State: 36/41 tasks ticked** (§7's 7.1–7.5 all done). Branch
+`change/git-backed-content-core`, HEAD **`ef91bd4`**. Gates at §7's close, run in the foreground by the
+Architect **unsandboxed**: `dotnet build` 0/0; `dotnet test` **826/826** unfiltered in 2m49s;
+`dotnet format --verify-no-changes` exit 0; `openspec validate --strict` valid; no `MUTANT` residue.
 
-### §7's carve — Product Owner decision, three blocks
+**§7 landed in four commits:** A `f80601d` (D18, design only), B `fb8904a` (7.1 + 7.2 + 7.5), C `03afeff`
+(7.3 + 7.4), then one supervisor remediation `ef91bd4`. **Two supervisor rounds, three block-A review
+rounds.**
+
+### ⚠️ Harness fact that will cost the next agent an hour if it is not read
+
+**`dotnet` fails inside the sandbox on this machine, and the failure looks exactly like a code failure.**
+`dotnet build` returns *"Build FAILED. 0 Warning(s) 0 Error(s)"* after stalling five minutes;
+`dotnet format` throws a `FormatCommandCommon.FormatAsync` stack trace. **Run every gate unsandboxed and
+in the foreground** — ~1s, ~5s, ~2m50s. A "FAILED" with zero errors is this fault, not a regression. And
+**never background `dotnet test` and wait on it**: seven agents in this change have now stalled that way,
+and "not obtained" is a better answer than a hang.
+
+### §7 carry-forwards — read before carving §8
+
+1. **The section's defining lesson, and the sharpest form this change has produced: three artefacts can
+   agree because they share one source rather than because anything was measured.** Both supervisor
+   blockers were shipped-code defects that **no block review could structurally have caught** — the
+   reviewer checks the code against `design.md`, `design.md` states the claim, and the code's own doc
+   comment restates it. The shared instrument was **a sentence**. This is the "agreeing audits share an
+   instrument" rule (§0, §3) in its purest form yet, and the only lens that caught it was the section
+   review. **Before trusting agreement between a design document, an implementation, and its own
+   comments, ask what measured the running system.**
+2. **Prefer a structural guarantee to an enumerated one — this is what actually closed blocker 1.**
+   The fix is `Environment.Clear()` plus an explicit allowlist, not "remember to unset `HOME`". Under an
+   overlay, a test asserting one variable does not leak would have been an overclaim standing for a
+   universal; under `Clear()`, it is a legitimate witness that the clear happened, and the universal
+   follows from the mechanism rather than from enumeration. **The supervisor's own framing of why the
+   evidence base is sound rests on this: the answer to repeated instrument failure is not more
+   measurement, it is fewer claims that depend on having thought of everything.**
+3. **⚠️ Load-bearing for §8: the image still has no HTTP client** (`curl`, `wget`, `nc` all absent), and
+   §8.2 must broadcast from a `post-receive` hook to the running app. **Decide how the hook signals the
+   app before §8 starts, or it reopens §1's Dockerfile.** Note what §7 has now changed about this: the
+   CGI subprocess's environment is **cleared** and rebuilt from an allowlist, so a hook inherits only
+   `PATH` plus D18 §2's set — any signalling mechanism that expected an ambient variable will not find
+   one. And per D16 and §5's Product Owner decision, **no hook may acquire `RepositoryWriteLock`**, on
+   pain of deadlocking against its own parent.
+4. **A false positive announces itself; a false negative does not.** Five instrument failures in this
+   change were all false *positives*, which is why they were caught. Blocker 2 — every clone silently
+   running protocol v0 — was a false **negative**: 822 green tests, nothing anomalous to notice, and the
+   §7 thread mentioned protocol version zero times in 1182 lines. **A clean suite is evidence about the
+   cases you wrote, and silent about the axis you never named.**
+5. **One wide claim survives, decorative and deliberately not fixed:** D18 §2's *"every git client since
+   2.26 sends `Git-Protocol: version=2`"*. The supervisor measured it rather than assert it (a real
+   `git 2.55.0` with global/system config neutralised does send it by default — and its *first* probe
+   forced `-c protocol.version=2` and therefore proved nothing, which it caught and re-ran). **No
+   decision rests on it** — the code forwards when present and adds nothing when absent, correct for any
+   client — so narrowing the wording is a `## NEXT` item, not a third round. The transferable shape:
+   **a wide claim is only dangerous when something structural depends on it.**
+6. **Two items routed here rather than fixed, both confirmed by the supervisor as non-blocking:** the
+   ~35 lines of kill-tree boilerplate duplicated from `GitProcessRunner` **without** its injectable
+   `_killEntireProcessTree` seam (D18's argument for a *distinct type* is correct; only the boilerplate
+   duplicates), and an unverified mechanism claim in `NoOpenRegistrationTests.cs` about method-mismatch
+   endpoint selection — flagged rather than asserted, and it should be proven or reworded.
+7. **A transcript-only imprecision, recorded so it is never cited as a count:** a `[worker]` container
+   transcript says "6 vars total" where the reviewer independently measured **8**. `design.md` does not
+   repeat the number, and the substantive conclusion (no `LANG`/`TZ` needed) is unaffected.
+8. **`git add -N` a new file the moment a block creates it.** Seven of block B's eleven files were
+   untracked for the block's whole life — including **both mutation targets**. `git diff` reports
+   *nothing at all* for a file git has never tracked, so the mandated pre-commit diff would have come
+   back clean over the two files a mutation run had been editing, exactly as it did for §7b's
+   `GitEmailService.cs`. This converts the project's most-repeated blind spot into an ordinary diff, and
+   costs nothing.
+
+**Named limits on §7's own evidence, recorded rather than closed.** The supervisor ran nothing in the
+Ubuntu 24.04/git 2.43.0 container itself — those facts are the worker's and the block reviewer's,
+cross-reproduced but not by the section reviewer. And **no one has exercised a client vanishing mid-push
+while git updates the working tree.**
+
+### §7's carve — Product Owner decision, three blocks (as executed)
 
 - **A — D18, the Smart HTTP surface. Design only; no feature code, ticks nothing.** What it must settle:
   the route shape and how ASP.NET maps it onto `git http-backend`; the CGI contract (`GIT_PROJECT_ROOT`,
