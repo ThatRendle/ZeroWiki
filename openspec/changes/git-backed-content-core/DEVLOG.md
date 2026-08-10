@@ -18978,6 +18978,336 @@ Nothing here reaches past its evidence anymore. Block A is done.
 
 → @architect
 
+**[architect]** **Block A landed — `f80601d`.** Reviewer `Approve` at round three; gates re-run in the
+foreground by me before committing, not cited from the block: `dotnet build` 0/0, `dotnet format
+--verify-no-changes` exit 0, `openspec validate --strict` valid, `dotnet test` **801/801 in 2m53s**.
+Tree verified clean of experiment residue on both tracked *and* untracked checks over `src`/`tests`, and
+no `MUTANT` residue. Nothing ticked, correctly — block A is design.
+
+**Harness note for every agent working §7: `dotnet` fails inside the sandbox on this machine, and the
+failure looks like a code failure.** `dotnet build` returned *"Build FAILED. 0 Warning(s) 0 Error(s)"*
+after stalling five minutes, and `dotnet format` threw a `FormatCommandCommon.FormatAsync` stack trace —
+both are the sandbox, not the code. Run the gates **unsandboxed and in the foreground**; unsandboxed they
+take ~1s, ~5s and ~2m53s. A "FAILED" with zero errors is this fault, not a regression — do not go hunting
+for a broken build.
+
+**[architect] Brief — block B (7.1 + 7.2 + 7.5). The complete server mechanism, one commit.** The
+section's base remains `cb81b47`; block B's own diff starts at `f80601d`.
+
+*Why these three tasks are one block (Product Owner decision at the carve):* splitting them ships an
+intermediate where `git-receive-pack` is reachable but either unauthenticated or unserialized against
+browser saves. In-branch only — but a knowingly-false safety property costs more here than a long review.
+
+**D18 is binding. Read it first (`design.md`, `### D18`) — it is this block's specification, and every
+literal in it was produced by executing the real binary.** Do not re-derive its facts; do not contradict
+one without saying so in this thread first. What it binds you to:
+
+1. **Three routes** — `/git/info/refs` (GET), `/git/git-upload-pack` (POST), `/git/git-receive-pack`
+   (POST), each stripping its own `/git` prefix to produce `PATH_INFO`. `GIT_PROJECT_ROOT` is
+   `ContentPaths.RepositoryRoot`, fixed, **never derived from the request**. No repository-name segment.
+2. **The CGI contract exactly as D18 §2 states it** — `GIT_HTTP_EXPORT_ALL` set unconditionally
+   (presence, not value), the full environment list, `HOME` deliberately never set, `Content-Encoding`
+   forwarded verbatim as `HTTP_CONTENT_ENCODING` and **never decoded by the host**, and the response
+   header rule: parse to the first blank line; a `Status:` line's leading token gives the code; **its
+   absence means 200**; every other line forwards unchanged; every byte after the blank line is body,
+   copied without decoding.
+3. **A new byte-stream subprocess host — a distinct type, not a `GitProcessRunner` overload.** D18 §3
+   proved `RunAsync`'s `ReadToEndAsync` corrupts a real packfile (UTF-8 decode failure at a fixed offset,
+   NUL bytes present) and that it never redirects stdin at all. Guarantees: no text decoding on either
+   stream; the CGI header block peeled off the raw byte stream, never via a decoded string; cancellation
+   kills the **whole process tree** (§6 obligation 8 — `GitProcessRunner.cs:95-101` already names
+   `http-backend` as the reason); and **stdin is always closed after the body copy, regardless of
+   `CONTENT_LENGTH`** — measured: a complete request is self-delimiting and needs no EOF, but a
+   *truncated* one hangs indefinitely with stdin left open, and closing it turns that hang into a clean
+   git-level failure.
+4. **Authentication bound to the endpoints by construction, never by path prefix.** `[AllowAnonymous]`
+   opts these routes out of `AnonymousGate` *and* of the fallback policy, so your check is the only thing
+   between an anonymous request and the repository. It must be an `IEndpointFilter` on the same route
+   registration as the handler — proven in D18 to keep the authenticated surface and the handled surface
+   identical across trailing-slash, case and encoded-segment disagreement vectors. A path-prefix
+   middleware is **not** an acceptable substitute; the entire point is that the two cannot disagree.
+5. **The credential is the per-user git token via `GitTokenService.VerifyAsync`** — the whole
+   authorization decision, in C#, **before any subprocess exists**. A `null` result is `401` with
+   `WWW-Authenticate: Basic realm="ZeroWiki"` and **no subprocess started**. `REMOTE_USER` carries the
+   account's `Username` for reflog identity only and plays no part in access control.
+6. **7.5 — the write lock.** `git-receive-pack` takes `RepositoryWriteLock` **unbounded**, wrapping the
+   **entire** `git-http-backend` invocation (D16; `specs/content-editing/spec.md:107-129` forbids
+   bounding a push's wait — scenario *"Push's wait for the lock has no ceiling"*). `git-upload-pack` and
+   `info/refs` **never acquire it** (D18 §5). D16 leaves you one genuine choice: an effectively-infinite
+   timeout through `AcquireAsync`'s existing poll loop, or a true blocking `LOCK_EX` path added to
+   `RepositoryWriteLock`. **That decision is yours to make and to justify in this thread** — D16
+   explicitly declined to make it for you.
+
+*Also in this block, because it edits the file:* `AnonymousGate.cs:23`'s remark calls the git routes
+"§8's seam". They are §7's. One word, and it belongs to the block that touches the file — I kept it out
+of block A deliberately.
+
+*Tests.* The security properties are what matter: an unauthenticated request refused with `401` and **no
+subprocess spawned**; a revoked token refused; a valid token belonging to a *different* account refused;
+a login password refused. Plus the lock: a push and a browser save serialized, neither leaving a dirty
+tree.
+
+*Mutation testing — this is an auth path, so it applies, and it is capped.* **Three confirmation runs
+maximum**, on the authentication check and the lock acquisition only — **not** on the CGI plumbing.
+Verify under the **full unfiltered suite**, never a filter: a filtered figure is not wrong, it is
+irrelevant. Checksum the target before *and* after each mutation, and `cp` the file aside and restore
+from that copy via `trap` — **never** `git checkout --` / `git restore --`, which restore from `HEAD` and
+would take this block's own uncommitted work with them. That has happened twice in this project. Stop and
+summarise when the mutant at hand is resolved; a genuine finding is not licence to keep digging.
+
+*Gates:* `dotnet build`, `dotnet test`, `dotnet format --verify-no-changes`, `openspec validate
+git-backed-content-core --strict` — all clean, all **unsandboxed and foreground** per the harness note.
+Tick `7.1`, `7.2` and `7.5` in `tasks.md` only once they are green. Do not commit; hand to `@reviewer`.
+
+→ @worker
+
+**[worker] Block B (7.1 + 7.2 + 7.5) — done, one deliverable, gates green.** New: `GitHttpBackendHost`/
+`GitHttpBackendRequest` (`Content/`), `GitBasicAuthenticationFilter`/`GitSmartHttpEndpoints` (`Web/`).
+Touched: `ContentStorageStartupExtensions.cs` (DI registration), `Program.cs` (`app.MapGitSmartHttp()`),
+`AnonymousGate.cs` (the stale `§8`→`§7` fix D18 routed here). Nothing in `tasks.md` ticked — that's the
+Architect's call once this post is reviewed.
+
+**1 — the byte-stream host (7.1).** `GitHttpBackendHost` is its own type, not a `GitProcessRunner`
+overload, exactly as D18 §3 requires: both streams stay raw bytes end to end (`process.StandardInput
+.BaseStream`/`.StandardOutput.BaseStream`, never the `TextReader`/`TextWriter` wrappers); the CGI header
+block is peeled off by pattern-matching the literal `\r\n\r\n` bytes, decoded only once correctly
+delimited; cancellation kills the whole process tree (mirrors `GitProcessRunner`'s own handling,
+independently — chose not to extract a shared helper, since touching an already-reviewed, mutation-
+tested file for this block's convenience felt like the wrong trade against "stay in scope"); stdin is
+closed unconditionally after the body copy, regardless of `CONTENT_LENGTH`. Request-body-write and
+response-relay run **concurrently**, not sequentially — kicked off before `WaitForExitAsync` the same way
+`GitProcessRunner` already drains stdout/stderr concurrently with the wait, because a large push's
+packfile (stdin) and a large clone's response (stdout) both exceed the OS pipe buffer; writing one to
+completion before ever reading the other would deadlock the moment either side blocks on a full pipe.
+`GIT_PROJECT_ROOT`/`GIT_HTTP_EXPORT_ALL` are fixed facts the host itself supplies — `GitHttpBackendRequest`
+structurally cannot carry a request-derived repository root.
+
+**Fix found by execution, not anticipated:** `CopyRequestBodyToStdinAsync`'s write can legitimately throw
+`IOException` ("Broken pipe") when the subprocess closes its own stdin (or exits) before the copy
+finishes — reachable, not hypothetical: `git-http-backend` can decide a request is malformed from its
+first pkt-line and stop reading before the client has sent the rest, which one of my own write-lock
+tests did by accident (a small, deliberately-malformed `git-receive-pack` body). Originally unhandled, it
+propagated out of `InvokeAsync` as an unhandled exception → `UseExceptionHandler` → 500, tearing down the
+connection mid-write and surfacing to the *client* as a broken-pipe `HttpRequestException` instead of a
+clean response. Now caught and swallowed at the source: the subprocess's own answer is already on its way
+out via the concurrent stdout relay, and a write racing a pipe the reader has already closed is not this
+host's fault to fail the whole invocation over.
+
+**2 — authentication (7.2), bound to the endpoints by construction.** `GitBasicAuthenticationFilter
+.InvokeAsync` is a bare `Func<EndpointFilterInvocationContext, EndpointFilterDelegate, ValueTask<object?>>`
+attached via `.AddEndpointFilter(...)` to the exact `MapGroup("/git")` that defines all three routes —
+never `AddEndpointFilter<T>()`'s generic overload, which constructs the filter once from the *root*
+service provider at endpoint-build time; `GitTokenService` is Scoped (depends on the per-request
+`IdentityDbContext`), so that overload would be a captive-dependency hazard. Resolved instead via
+`httpContext.RequestServices` inside the per-request delegate. `VerifyAsync` null → `401` +
+`WWW-Authenticate: Basic realm="ZeroWiki"`, **before any subprocess exists** — the filter never calls
+`next` on that path, so the handler's own body (and the CGI subprocess it starts) is structurally
+unreachable, not merely conventionally skipped.
+
+**Bug found by execution, blocking every 401 until fixed:** `Results.StatusCode(401)` leaves an empty
+body, which is exactly the shape `Program.cs`'s `UseStatusCodePagesWithReExecute("/not-found", ...)`
+intercepts — it re-executes the **whole pipeline** at `/not-found` as a fresh request, and does **not**
+restore the original status code itself (the re-executed target has to, by reading
+`IStatusCodeReExecuteFeature`). The re-executed request lands on `/not-found` still unauthenticated, which
+`AnonymousGate` answers with its own `200` landing page — silently replacing the `401` with `200` while
+leaving the `WWW-Authenticate` header attached (confirmed with a bare `curl` against the real running app:
+`200`, anonymous-landing-page HTML, `WWW-Authenticate: Basic realm="ZeroWiki"` still on the response —
+self-contradictory and would never prompt a real git client for credentials). Fix: `Challenge` disables
+`IStatusCodePagesFeature` for this response before returning, which is the documented way to opt an
+intentional, already-fully-formed empty-body response out of that machinery. Re-verified with the same
+`curl` afterward: real `401`, no body, `Content-Length: 0`. This is the first `401` this application has
+ever produced — no existing surface collided with `UseStatusCodePagesWithReExecute` this way before, so
+nothing prior could have caught it.
+
+**3 — the write lock (7.5), decision made and justified as the brief asked.** D16 left two choices; I
+took the poll-loop route: `RepositoryWriteLock.AcquireAsync(paths.LockFilePath, TimeSpan.MaxValue,
+httpContext.RequestAborted)`, not a new true-blocking `LOCK_EX` path. `TimeSpan.MaxValue` (not
+`Timeout.InfiniteTimeSpan`, which is negative and `AcquireAsync` rejects it) makes the loop's own
+elapsed-time check never trip in any real run. Reasoning: it reuses the same, already-proven acquisition
+path §5.2's save uses rather than adding new P/Invoke surface, and — the sharper reason — a genuine
+blocking `flock(2)` call is exactly what D16's own remarks say "cannot be cancelled from .NET without
+leaking the native thread it runs on," while the poll loop composes cleanly with `RequestAborted` via
+`Task.Delay`. That matters concretely here: a client that vanishes while queued for the lock shouldn't sit
+there on behalf of a connection nobody is waiting on anymore. This does **not** narrow the spec's "no
+ceiling" guarantee (`specs/content-editing/spec.md`'s *Push's wait for the lock has no ceiling* scenario):
+a push whose client is still connected never observes `RequestAborted` firing, so its wait is genuinely
+unbounded exactly as required — only a dead connection's wait gets cut short, and cutting it short costs
+nothing (nothing was written). `git-receive-pack` is the only one of the three routes that acquires the
+lock, wrapping the entire `InvokeAsync` call; `info/refs` and `git-upload-pack` never do (D18 §5).
+
+**Tests — 16 new, all passing, plus one pre-existing test's route list updated.**
+- `GitHttpBackendHostTests` (4): CGI plumbing directly against a real bootstrapped repo and a real
+  `git http-backend` subprocess — successful `info/refs` advertisement as raw bytes (byte-exact prefix
+  check, not a string compare), a genuine `Status: 404` refusal translated onto the response, a garbage
+  body completing promptly rather than hanging, cancellation killing the subprocess. Not mutation-tested
+  (CGI plumbing, out of scope per the brief).
+- `GitSmartHttpAuthenticationTests` (9): unauthenticated 401 + exact `WWW-Authenticate` value, never the
+  AD21 landing page, unknown username, wrong token, revoked token, cross-account token, login password
+  rejected (the HTTP-level twin of `GitTokenServiceTests`' existing service-level test), an empty
+  credential store, and a valid token reaching a real advertisement. This is the mutation target for the
+  auth check.
+- `GitSmartHttpWriteLockTests` (3): `RepositoryWriteLock.AcquireAsync` held directly on
+  `ContentPaths.LockFilePath` (the same primitive `PageSaveService`'s save path and D9's reconciliation
+  already use) rather than trying to keep a real `git-receive-pack` subprocess artificially stalled from
+  outside — deliberately, after a stalling-request-body version of this test produced a genuine deadlock
+  in `GitHttpBackendHost` (see the fix above) that had nothing to do with the lock property being tested.
+  Three properties: `git-receive-pack` waits behind an externally-held lock then proceeds once it's
+  freed; a browser save (`PageSaveService`) does too; `info/refs`/`git-upload-pack` never wait for it at
+  all. All three assert the *final* response/outcome strictly (never `401`, never `500`) rather than
+  relying on a fixed-delay "hasn't completed yet" check as primary proof — see the mutation-testing note
+  below for why that distinction is load-bearing, not stylistic. Working tree confirmed clean via `git
+  status --porcelain` after both writer scenarios.
+- `NoOpenRegistrationTests.AnonymouslyReachableRoutes` gained `/git/info/refs` (GET-mapped, so this
+  test's GET-only probe can observe it; the two POST-only git routes carry the identical `[AllowAnonymous]`
+  exemption but this probe never matches their endpoint on a method mismatch, so they don't appear here —
+  `GitSmartHttpAuthenticationTests` covers all three directly). Reachable-but-refused, not usable: a
+  `401`, never an account-creating page.
+
+**Mutation testing — capped at 3, both confirmed, one genuine instrument defect found and fixed along
+the way.**
+
+*Auth check* (`GitBasicAuthenticationFilter.InvokeAsync`): `if (account is null)` → `if (account is not
+null)`. **3/3 dead**, full unfiltered suite, consistent failure mode both times through: invalid
+credentials now fall through to the handler, which casts `HttpContext.Items[...] as AuthenticatedAccount`
+against a `null` value and throws `InvalidOperationException` → `500`; a *valid* token now gets challenged
+instead → `401`. 9 tests fail identically all three runs (`Failed: 9, Passed: 808, Total: 817`, ~2m43s–
+3m18s). Checksummed before/after/after-revert every run (`0b9526f2f5…` unmutated, `042129e10a…` mutated,
+back to `0b9526f2f5…` after); reverted via `cp` + `trap ... EXIT`, never `git checkout --`/`git restore
+--`, confirmed by re-checksumming and `git status --short -- src` showing only this block's own expected
+diff each time.
+
+*Lock acquisition* (`GitSmartHttpEndpoints`'s `UnboundedWait`): `TimeSpan.MaxValue` → `TimeSpan
+.FromMilliseconds(1)`. **First pass survived the full suite (817/817 green) while dying cleanly under a
+filtered run of just the write-lock tests — the project's own recurring trap, caught live rather than
+read about.** My original `ReceivePack_WaitsForTheWriteLockAlreadyHeldElsewhere...` test used a
+fixed-delay "hasn't completed within 300ms" check as its primary proof of waiting, then only asserted
+`!= 401` on the eventual response. Under the mutant, `AcquireAsync` throws `RepositoryLockTimeoutException`
+near-instantly (uncaught → `UseExceptionHandler` → `500`); under a filtered run that's fast enough to
+still be "not completed" at the 300ms mark relative to a snappy `/Error` render, but under the full
+817-test parallel suite the `/Error` re-execution itself is slow enough under load that the 300ms check
+still (accidentally) read "not yet completed," and the final assertion never ruled out `500` in the first
+place — a mutant that fails *fast* was hiding behind an assertion built to catch one that fails *slow*.
+Fixed the instrument, not the target: dropped the fixed-delay check as load-bearing, hold the externally-
+acquired lock a full second (past every bounded timeout anywhere in this codebase) before releasing, and
+assert the **final** response is neither `401` nor `500` — a check that is correct regardless of how fast
+or slow the failure path is. Re-confirmed **3/3 dead** on the hardened test under the full suite
+afterward, same failure every time (`Assert.NotEqual() Failure … Expected: Not InternalServerError,
+Actual: InternalServerError`, `Failed: 1, Passed: 816, Total: 817`, ~2m42s–3m43s). Checksummed and
+reverted the same way as the auth mutant, confirmed each time.
+
+**Gates, final clean run, unsandboxed and foreground per the harness note:** `dotnet build` 0/0.
+`dotnet test` **817/817**, ~2m29s (one earlier run in the middle of the mutation-testing sequence saw
+`RepositoryWriteLockTests.HeldByAnotherProcess_BoundedWaitGivesUpAfterRealElapsedTimeReachesTheTimeout`
+fail on a real-timing 150ms margin — unrelated file, untouched by this block, confirmed passing in
+isolation immediately after; attributed to sustained CPU load from the back-to-back full-suite mutation
+runs, not a regression). `dotnet format --verify-no-changes` exit 0. `openspec validate
+git-backed-content-core --strict` valid. `git status --short -- src` / `git diff -- src` show exactly this
+block's diff: `ContentStorageStartupExtensions.cs`, `Program.cs`, `AnonymousGate.cs` modified;
+`GitHttpBackendHost.cs`, `GitHttpBackendRequest.cs`, `GitBasicAuthenticationFilter.cs`,
+`GitSmartHttpEndpoints.cs` new — no mutant residue in either.
+
+**Scope note for block C (7.3/7.4):** deliberately did not attempt a protocol-valid `git push`/clone
+against a real listening Kestrel from inside this block's tests — that is explicitly block C's task, and
+D18 §5's own outstanding obligation (the repack/prune race on Ubuntu 24.04/git 2.43.0) is already routed
+there. Everything here was verified either directly against `GitHttpBackendHost` with a real (but
+locally-invoked, non-HTTP) `git-http-backend` subprocess, or through the app's real HTTP pipeline via
+`ZeroWikiAppFactory`'s in-memory `TestServer`.
+
+→ @reviewer
+
+**[reviewer]** Block B (7.1 + 7.2 + 7.5) — **Approve.** Read `GitBasicAuthenticationFilter.cs` and
+`GitSmartHttpEndpoints.cs` in full myself rather than inferring from the diff, per the coordinator's
+note that both were untracked for the whole block and so unverifiable by any git command until now —
+both say what they should. No blockers; two nits.
+
+**Gates, re-run myself, unsandboxed and foreground:** `dotnet build` 0/0. `openspec validate --strict`
+valid. `dotnet format --verify-no-changes` exit 0. `dotnet test` baseline **817/817 in 2m29s**, matching
+the report.
+
+**1 — Auth-filter binding property, driven beyond the block's own vectors.** Wrote a throwaway test file
+(`ReviewerScratchGitRouteProbeTests.cs`, deleted after use — `git status --short -- src tests` below
+shows only the block's own diff) against the real `ZeroWikiAppFactory` pipeline, unauthenticated, over:
+trailing slash, case (`/Git/Info/Refs`, `/GIT/INFO/REFS`), a double slash (`/git//info/refs`), an encoded
+slash (`/git/info/refs%2F` and `/git/info%2Frefs`), a malformed `Authorization` header, a credential with
+no `:` separator, and unauthenticated `POST` to both `git-upload-pack` and `git-receive-pack` with a
+body. Two vectors returned `200` at first — `/git//info/refs` and `/git/info/refs%2F` — which looked
+alarming until I read the body: byte-for-byte `AnonymousLandingPage.Html` (confirmed against the exact
+string, not eyeballed), meaning routing never matched these to the git group at all — they fall through
+to the same anonymous-landing-page treatment as any other unmapped path, which is the safe default the
+whole app already relies on (AD21), not a git-specific bypass. My first assertion was simply too strict
+(`!= 200` instead of "200 only as the landing page"); fixed it, reran, **13/13 pass**. Also confirmed the
+positive direction: a *valid* credential against the case-different path (`/Git/Info/Refs`) reaches the
+real backend identically to the canonical path — filter and handler agree both ways, not just when
+refusing.
+
+**2 — The `401`/status-code-pages fix.** Read `GitBasicAuthenticationFilter.Challenge` directly: it
+disables `IStatusCodePagesFeature` only on the response it is itself constructing, never globally or for
+any other status path — `UseExceptionHandler("/Error")`, the `404`/`403` translations
+`GitHttpBackendHost` produces from `git-http-backend`'s own `Status:` lines, and every other page's status
+handling are untouched by this method. Confirmed end-to-end via the existing
+`GitSmartHttpAuthenticationTests` (real `401`, `WWW-Authenticate: Basic realm="ZeroWiki"`, never AD21's
+page) run through `ZeroWikiAppFactory`'s `TestServer`, which executes the identical middleware chain
+`Program.cs` wires for `Production` — not a separate, lighter pipeline — and re-confirmed by re-running
+the auth mutant myself (below): flipping the null-check does not merely fail an assertion, it produces
+exactly the two failure modes the report names (`500` on a bad credential now falling through to the
+cast-and-throw, `401` on a good one), which only makes sense if the real `401` path is intact and
+distinguishable from both.
+
+**3 — `TimeSpan.MaxValue` in the poll loop.** Read `RepositoryWriteLock.AcquireAsync` directly: `elapsed`
+is a real `Stopwatch.Elapsed` that cannot approach `TimeSpan.MaxValue` (~29,000 years) in any process
+lifetime, `remaining = timeout - elapsed` cannot underflow for the same reason, and `delay = PollInterval
+<= remaining ? PollInterval : remaining` always resolves to the fixed 50ms `PollInterval` — no overflow,
+no short-circuit, a genuine unbounded poll. `HandleReceivePackAsync` catches exactly
+`OperationCanceledException` around `AcquireAsync` and returns without ever having held the lock; once
+held, `finally { writeLock.Dispose(); }` wraps the entire backend invocation, so a mid-push
+`RequestAborted` (cancellation observed inside `GitHttpBackendHost.InvokeAsync`, which kills the process
+tree and rethrows) still releases the lock on the way out — no path leaves it held after cancellation.
+
+**4 — Streaming guarantees and the broken-pipe swallow.** `GitHttpBackendHost` never touches a
+`TextReader`/`TextWriter` on either stream, peels the CGI header off raw bytes by pattern-matching
+`\r\n\r\n`, kills the whole process tree on cancellation (mirroring `GitProcessRunner`'s already-reviewed
+handling), and closes stdin unconditionally in a `finally` regardless of `CONTENT_LENGTH`. The swallowed
+`IOException` in `CopyRequestBodyToStdinAsync` is scoped to exactly the one `CopyToAsync` call writing to
+the subprocess's stdin — it cannot catch anything from `RelayResponseAsync` (a separate task, separately
+awaited) or from `WaitForExitAsync`, so a real failure delivering the response is not reachable through
+this catch. Minor imprecision, not a bug: the doc comment attributes the exception solely to "the
+subprocess closed its own stdin," but the same catch equally (and correctly) absorbs the client's own
+connection dropping mid-upload on the read side of that same `CopyToAsync` call — see nit 1.
+
+**5 — Mutation evidence, both mutants reconfirmed by me under the full unfiltered suite, checksummed and
+reverted via `cp`/manual restore, never `git checkout --`:**
+- Auth (`if (account is null)` → `if (account is not null)`): **9/817 fail**, identical shape to the
+  report — wrong credentials now reach the handler and throw on the null cast (`500`), a *valid* token
+  now gets challenged (`401`). Reverted; checksum back to `e3cd6ab…`.
+- Lock (`TimeSpan.MaxValue` → `TimeSpan.FromMilliseconds(1)`): **1/817 fails** —
+  `ReceivePack_WaitsForTheWriteLockAlreadyHeldElsewhere_ThenProceedsOnceItIsReleased`,
+  `Assert.NotEqual() … Expected: Not InternalServerError, Actual: InternalServerError` — exactly the
+  report's corrected-instrument failure mode, and exactly what the *original*, fixed-delay instrument
+  would have missed under a filtered run. Reverted; checksum back to `834544f…`.
+
+Both ran under the real `dotnet test` (no filter), the condition that matters per this project's own
+standing rule.
+
+**Nits (non-blocking):**
+1. `GitHttpBackendHost.cs`'s `CopyRequestBodyToStdinAsync` swallow has no log line, unlike the file's
+   other error paths (non-zero exit code, kill-tree failure), and its doc comment names only one of the
+   two legitimate causes (the subprocess closing its end) without mentioning the client's own connection
+   dropping mid-read is absorbed the same way. Not a masking risk — just worth a debug-level log and a
+   more complete comment for whoever debugs a silent partial upload later.
+2. `ReadCgiHeaderBlockAsync` buffers into an unbounded `MemoryStream` until it finds `\r\n\r\n` or the
+   subprocess closes stdout. Not exploitable with a well-behaved `git-http-backend` and D18 doesn't ask
+   for a bound here, but worth a passing mention if a future change ever makes the header-producing side
+   less trusted than it is today.
+
+**Spot-checks:** `git status --short` / `git diff --stat` — exactly this block's 11 `src`/`tests` files
+plus the `DEVLOG.md`, `1268` insertions in `src`/`tests` matching the brief exactly; `git status --short
+-- src tests` clean of my own scratch file after deletion. `tasks.md` §7.1/7.2/7.5 still unticked —
+correctly the Architect's call, not the worker's or mine.
+
+Nothing here reaches past its evidence. Ready for `7.1`/`7.2`/`7.5` to be ticked and committed.
+
+→ @architect
+
 ## NEXT
 
 **Resume point: §7 (Smart HTTP git remote) — CARVED, and PAUSED before block A on a Product Owner

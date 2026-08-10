@@ -177,6 +177,11 @@ app.UseAntiforgery();
 app.MapStaticAssets().AllowAnonymous();
 app.MapRazorComponents<App>();
 
+// §7: the Smart HTTP git remote (D18). AllowAnonymous() on the whole group -- applied inside
+// MapGitSmartHttp itself -- opts these three routes out of AnonymousGate and the fallback policy
+// above; GitBasicAuthenticationFilter, attached to the same route group, is the real check.
+app.MapGitSmartHttp();
+
 app.Run();
 
 /// <summary>

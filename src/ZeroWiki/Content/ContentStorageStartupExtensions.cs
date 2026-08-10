@@ -41,6 +41,10 @@ public static class ContentStorageStartupExtensions
         services.AddSingleton<GitHookInstaller>();
         services.AddSingleton<ContentRepositoryService>();
 
+        // §7: the Smart HTTP git remote's CGI subprocess host (D18 §3) -- stateless beyond
+        // ContentPaths, already a singleton, so this is one too.
+        services.AddSingleton<GitHttpBackendHost>();
+
         // §3: page enumeration/routing and frontmatter parsing (D12, D14). The Markdown pipeline is
         // built once here — raw HTML already disabled per D13 — and shared with body rendering in 3b.
         services.AddSingleton(MarkdownPipelineFactory.Create());

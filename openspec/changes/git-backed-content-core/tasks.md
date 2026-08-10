@@ -47,11 +47,11 @@
 
 ## 7. Smart HTTP git remote
 
-- [ ] 7.1 Map `info/refs`, `git-upload-pack`, `git-receive-pack` routes to the `git http-backend` CGI subprocess (stream stdin/stdout, set env)
-- [ ] 7.2 Protect the git routes with wiki authentication (Basic over TLS or per-user token); refuse unauthenticated access
+- [x] 7.1 Map `info/refs`, `git-upload-pack`, `git-receive-pack` routes to the `git http-backend` CGI subprocess (stream stdin/stdout, set env)
+- [x] 7.2 Protect the git routes with wiki authentication (Basic over TLS or per-user token); refuse unauthenticated access
 - [ ] 7.3 Verify authenticated clone/fetch/push against the running app
 - [ ] 7.4 Confirm `updateInstead` fast-forward push updates the working tree; confirm non-fast-forward push is rejected
-- [ ] 7.5 Hold the repository write lock around the whole `git http-backend` invocation, so push receipt is serialized against browser saves (moved from 5.3; see §5's DEVLOG for why no hook can do this)
+- [x] 7.5 Hold the repository write lock around the whole `git http-backend` invocation, so push receipt is serialized against browser saves (moved from 5.3; see §5's DEVLOG for why no hook can do this)
 
 ## 8. Push reactions & identity
 

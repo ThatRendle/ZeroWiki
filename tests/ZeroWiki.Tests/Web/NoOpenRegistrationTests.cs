@@ -48,12 +48,25 @@ public sealed class NoOpenRegistrationTests : IDisposable
     /// <c>/_framework/opaque-redirect</c> left it when AD21 made every non-exempt URL answer an
     /// anonymous caller with the landing page.
     /// </para>
+    /// <para>
+    /// §7 added <c>/git/info/refs</c> — carrying <c>[AllowAnonymous]</c> deliberately (D18 §4), so
+    /// <see cref="ZeroWiki.Web.AnonymousGate"/> lets it through to
+    /// <see cref="ZeroWiki.Web.GitBasicAuthenticationFilter"/>, which is the real check: an
+    /// unauthenticated GET gets a real <c>401</c> with <c>WWW-Authenticate</c>, never the AD21
+    /// landing page — "reachable" here means "not swallowed by the gate", not "usable without a
+    /// credential". <c>/git/git-upload-pack</c> and <c>/git/git-receive-pack</c> carry the identical
+    /// exemption but are POST-only, so this test's GET-only probe never matches their endpoint at
+    /// all (no endpoint selected on a method mismatch falls back to the gate's own denial, the same
+    /// as any unmapped path) — <c>GitSmartHttpAuthenticationTests</c> covers all three routes' real
+    /// refusal behaviour directly.
+    /// </para>
     /// </remarks>
     private static readonly string[] AnonymouslyReachableRoutes =
     [
         "/Error",
         "/bootstrap",
         "/bootstrap/complete",
+        "/git/info/refs",
         InvitationRedemptionRoute,
         "/login",
     ];
