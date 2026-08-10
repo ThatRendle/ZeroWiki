@@ -18392,13 +18392,81 @@ matter for the next section.
 
 ## NEXT
 
-**Resume point: §7 (Smart HTTP git remote), block A — not yet carved.** **§6 is CLOSED**: supervisor
-`Approve` over `97029e7..bfcb843` at the third section round. Pre-flight §7 per CLAUDE.md §2 before
-carving anything, and read the four §6 carry-forwards below first — one of them is load-bearing for §7's
-own design.
+**Resume point: §7 (Smart HTTP git remote) — CARVED, and PAUSED before block A on a Product Owner
+decision.** **§6 is CLOSED**: supervisor `Approve` over `97029e7..bfcb843` at the third section round.
+Pre-flight for §7 was run at `da6ed4f` and passed — tree clean, `openspec validate --strict` valid, on
+branch `change/git-backed-content-core`.
+
+**No `Base:` post has been made for §7, deliberately.** 3a's base commit is what gives the supervisor its
+review scope, and it is only correct if it is `HEAD` at the moment the section's first block is briefed. A
+sha recorded now would be wrong the moment the escalated change below lands. §7 opens with its `Base:`
+post, not before.
+
+### §7's carve — Product Owner decision, three blocks
+
+- **A — D18, the Smart HTTP surface. Design only; no feature code, ticks nothing.** What it must settle:
+  the route shape and how ASP.NET maps it onto `git http-backend`; the CGI contract (`GIT_PROJECT_ROOT`,
+  `PATH_INFO`, `QUERY_STRING`, `REQUEST_METHOD`, `CONTENT_TYPE`, `CONTENT_LENGTH`, the gzipped-request-body
+  case, `REMOTE_USER`, and export policy — `GIT_HTTP_EXPORT_ALL` versus per-repo config); the streaming
+  contract and **why a new subprocess host is needed rather than `GitProcessRunner`** (see the live inputs
+  below); the auth scheme (HTTP Basic carrying the per-user git token, the `401` +
+  `WWW-Authenticate` challenge, and the `AnonymousGate` opt-out seam); and the **lock policy per verb** —
+  the spec's unbounded wait is stated for *a push*, so D18 owes an explicit answer for `git-upload-pack`
+  (clone/fetch): whether it takes the write lock at all, and if not, what makes an unlocked read safe
+  against a concurrent save. Also carries obligations 9 and 10 (below), and states plainly that §7 does
+  **not** inherit D9's verification instrument as sound.
+- **B — 7.1 + 7.2 + 7.5: the complete server mechanism, landing as one commit.** The streaming CGI host,
+  the authentication, and the write lock wrapping the whole invocation.
+- **C — 7.3 + 7.4: verification against a real `git` client** driven at a really-listening Kestrel —
+  clone, fetch, push; `updateInstead` fast-forward updating the working tree; non-fast-forward rejected.
+  Obligation 10 bites here.
+
+**Why B is one block and not three.** 7.1, 7.2 and 7.5 are one mechanism, and splitting them ships an
+intermediate whose safety property is knowingly false: a commit where `git-receive-pack` is reachable but
+either unauthenticated (7.2's whole content) or unserialized against browser saves (7.5's). In-branch
+only, never deployed — but this change's record is that a knowingly-wrong intermediate state costs more
+than a long review, and the alternative buys nothing except three smaller diffs. The Product Owner chose
+this over the four-block carve on exactly that trade.
+
+### §7's live inputs — established at the carve by reading the code, not by re-reading this file
+
+- **`GitProcessRunner` cannot host `http-backend`, and this is the block's sharpest edge.** It captures
+  stdout via `ReadToEndAsync` **as a string** and never redirects **stdin** (`GitProcessRunner.cs:56-116`).
+  A packfile through a text decoder is corrupt, and a push has no input channel at all. §7 needs a
+  byte-stream subprocess host as a distinct thing — not a parameter added to the existing runner.
+- **`GitTokenService.VerifyAsync` already exists and was built for exactly this** — username plus
+  presented token, hashed and looked up among issued git tokens only, so a login password has no path in
+  (`GitTokenService.cs:59-76`). 7.2 consumes it; it does not need writing.
+- **`AnonymousGate`'s own remarks already name the git routes as its opt-out seam** — `[AllowAnonymous]`
+  metadata plus a real `401`/`WWW-Authenticate` answer, "without this mechanism changing"
+  (`AnonymousGate.cs:23-24`). The seam is designed; §7 uses it as designed or says why not.
+- **The `safe.directory` standing rule is DISCHARGED** — `Dockerfile:54` already runs
+  `git config --system --add safe.directory '*'` as root before the `USER` switch, which is what the rule
+  demanded. Do not re-brief it as owed work; verify it still holds and move on.
+- **7.5 needs no spec delta.** `specs/content-editing/spec.md:107-129` already carries *Single per-repo
+  write lock* in full, including the SHALL that forbids bounding a push's wait and the scenario
+  *"Push's wait for the lock has no ceiling"*. §7's spec obligation is to satisfy it, not to write it.
+- **Obligations 9 and 10 are live for §7** and belong in B's and C's briefs respectively: 9 —
+  `GitProcessException`'s message carries the raw argument list, which becomes a credential leak once
+  token-bearing values pass through; `CapturingLoggerProvider` exists, so the brief says *test it*.
+  10 — read the **checked-out** branch, never assume `DefaultBranch = "main"`; an adopted repository may
+  be on `master`, and 7.4 is where it bites.
+
+### Carry-forward 1 (D9's instrument) is ESCALATED to its own OpenSpec change — Product Owner decision
+
+D9's startup reconciliation still verifies the tree with `git add -A` + `git status --porcelain`
+(`ContentRepositoryService.cs:792-806`), which a single `git update-index --assume-unchanged` blinds — and
+D9 is `RollbackFailed`'s named recovery mechanism, so the save path's worst outcome is documented as
+recoverable by an instrument that shares the blind spot. §6 fixed its **own** guard (`git hash-object`)
+and did not fix D9. Fixing it touches a guarantee `specs/content-store/spec.md`'s *Working-tree-clean
+invariant* names, which is why it is not §7's to absorb quietly.
+
+**Status: a proposal is being written for it as a separate change. The Product Owner will decide, after
+reading that proposal, whether it applies before or after §7** — §7 stays paused at this carve until that
+order is settled. Neither §7's blocks nor its base commit may open before then.
 
 **Working tree CLEAN. State: 31/41 tasks ticked** (§6's 6.1–6.6 all done). Branch
-`change/git-backed-content-core`, HEAD **`bfcb843`**. Gates at §6's close, run in the foreground by the
+`change/git-backed-content-core`, HEAD **`da6ed4f`**. Gates at §6's close, run in the foreground by the
 Architect with an explicit 10-minute timeout: `dotnet build` **0/0**; `dotnet test` **801/801**
 unfiltered in 2m12s; `dotnet format --verify-no-changes` exit 0; `openspec validate --strict` valid; no
 `MUTANT` residue; no stray mounts or attached images.
