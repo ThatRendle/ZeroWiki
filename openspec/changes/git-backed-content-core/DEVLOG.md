@@ -17748,6 +17748,435 @@ the fifth §6 finding of the form *right conclusion, wrong stated reason*, and t
 
 The incident post above stands as written — the DEVLOG is append-only — and this is its correction.
 
+**[supervisor]** §6 section **re-review** — scope unchanged, `git diff 97029e7..HEAD`, HEAD now `8d0bffb`
+(nine commits, blocks A–D4 plus the combined two-round remediation). Everything below was reached by
+**running** something; where an instrument could not see a thing, I name it.
+
+## Verdict: **Request changes** — one blocker, in the remediation's own new surface
+
+My three original blockers are **closed on their merits** — I re-derived each rather than reading the
+thread. The blocker below is **not** one of them and is not a re-open: it is a defect the remediation
+*introduced*, in the exact property round two set out to protect, and it is live on this project's own
+Linux deployment filesystem.
+
+Per §3c.4 this goes to the Product Owner, not to a third remediation carved on my say-so.
+
+---
+
+### Blocker — `ResolvedPathMatchesOnDiskCaseExactly` **falsely refuses** on a genuinely case-sensitive filesystem once both casings coexist. One page of every such pair becomes permanently uneditable; a directory pair bricks the whole subtree. §6 remediation (both rounds).
+
+`PageSaveService.cs:860-866`. The `File.Exists`/`Directory.Exists` gate is correct and does what its
+doc comment claims — but it only *delays entry* to the name-comparison branch, it does not protect it.
+Once the exact-case path genuinely exists, the method falls into
+
+```csharp
+var actualName = Array.Find(
+    entries, entry => string.Equals(Path.GetFileName(entry), segment, StringComparison.OrdinalIgnoreCase));
+```
+
+— a **name-only case-insensitive** lookup that returns the *first* readdir match, not the *exact* one.
+When a differently-cased sibling happens to precede it in directory order, the guard reads back the
+sibling's name, sees a case difference, and returns `false`. Both call sites
+(`PageSaveService.cs:169` in `SaveAsync`, `PageSaveService.cs:405` in `LoadForEditAsync`) turn that
+straight into `Refused` with no intervening gate.
+
+**Measured on a real case-sensitive APFS volume** (`hdiutil create -fs "Case-sensitive APFS"`,
+`diskutil` confirmed, sanity-checked in-run: `case-insensitive volume? False`), driving the shipped
+method **extracted byte-verbatim** from `PageSaveService.cs:825-872`:
+
+| on disk (all legitimate, non-ambiguous D12 routes) | address asked | guard |
+|---|---|---|
+| `docs/Page.md` only | `docs/page.md` | PROCEED ✓ *(the only scenario either round tested)* |
+| `docs/Page.md` + `docs/page.md` | `docs/page.md` | PROCEED ✓ |
+| `docs/Page.md` + `docs/page.md` | `docs/Page.md` | **REFUSE ✗** |
+| `README.md` + `readme.md` | `README.md` | **REFUSE ✗** |
+| `Index.md` + `index.md` | `Index.md` | **REFUSE ✗** |
+| `Notes/` + `notes/` (dirs) | `Notes/a.md` | **REFUSE ✗** — and so is *every* page under `Notes/` |
+
+Reproduced with creation order reversed and with twelve filler siblings: the outcome is fixed by APFS's
+own readdir hash, not by creation order. Exactly one member of each pair survives, and **which one is
+arbitrary**.
+
+**Reachable through ZeroWiki's own two surfaces, no inherited state required.** On Linux/ext4: save
+`/wiki/Page` (creates `docs/Page.md` — guard proceeds, nothing there yet); save `/wiki/page` (creates
+`docs/page.md` — guard proceeds, `File.Exists("docs/page.md")` is `false` on a case-sensitive host). Both
+succeed, both are correct, both are distinct routes — `EncodedRoute` is an ordinal `record struct` and
+`Encode` never case-folds, so `IsAmbiguousRoute` does not fire. From that moment `/wiki/Page` renders
+fine and its own "Edit this page" link leads to *"This address cannot be edited"*, forever. Also
+reachable by Obsidian push and by an adopted repository that already carries both casings.
+
+**This contradicts the guard's own contract and a spec requirement.** `PageSaveService.cs:804-815`
+states the opposite in terms: *"a name-only case-insensitive comparison would wrongly refuse … `File.Exists`
+… returns `false` for a differently-cased sibling on a case-sensitive filesystem (nothing to disagree
+with — proceed)"*. That reasoning covers only the one-file-present case. And
+`specs/content-editing/spec.md:59, 63-66` — *"the surface SHALL open for an address that identifies no
+existing page; it SHALL NOT open for an address that does not identify exactly one file"*, scenario
+**Editing surface loads a page with its base revision** — is violated: `Page` identifies exactly one
+file and the surface refuses it.
+
+**Why neither round caught it, and this is the part that matters.** Both the worker and the reviewer
+provisioned a **real** case-sensitive volume — genuinely independent work, correctly done — and both
+asked the *same question*: *"with only `Page.md` on disk, does saving `page` still succeed?"* Both
+tests shipped (`PageSaveServiceTests.cs:547`, `:597`) place exactly **one** casing on disk, so the
+`Array.Find` branch is never reached with a competing sibling present. Two real volumes, two agents, one
+scenario: this section's own **audits sharing an instrument** rule, arriving a third time, now in the
+*scenario* rather than the tool.
+
+**And it is the same shape of flaw as round one, one level down — which the brief asked me to look
+for.** Round one asked the wrong *subsystem* (`git status`, the index it was built to distrust). Round
+two asks the right subsystem — the filesystem — but takes the **first** answer instead of the **exact**
+one. Both guards answer a question adjacent to the one being asked. A guard whose verdict depends on
+readdir order is not verifying an invariant.
+
+**Suggested remediation shape (one small fix; the Architect carves it).** In
+`ResolvedPathMatchesOnDiskCaseExactly`, test for an **ordinal-exact** entry before consulting the
+case-insensitive one: refuse only when no exact-case entry exists *and* a differently-cased one does.
+Traced against all three cases — case-insensitive host with `Page.md` only, ask `page.md` → still
+refuses; case-sensitive host with both, ask either → proceeds; case-sensitive host with one, ask the
+other → proceeds. Regression tests must put **both** casings on disk (the missing scenario), and cover a
+**directory**-segment pair, on whichever host runs — the existing `IsWorkingTreeFileSystemCaseInsensitive()`
+probe already gives the portable branch, and on a case-insensitive host the two-file precondition simply
+cannot be constructed, so that branch asserts the one-file behaviour it already asserts.
+
+---
+
+## The three original blockers — each re-derived, each closed
+
+- **Blocker 1 (silent wrong-success) — closed, and the round-two instrument is sound.** I re-derived
+  both of `hash-object`'s claimed properties independently rather than reading them off `design.md`:
+  under `update-index --assume-unchanged`, `status --porcelain` reports clean for both the scoped path
+  and the whole tree while `hash-object` returns a sha that disagrees with `ls-tree HEAD`'s blob — the
+  index cannot blind it. And I tested an attribute case **neither round did**: a `.gitattributes`
+  `*.md text eol=crlf` filter. `hash-object` matched the stored blob exactly, both on first commit and
+  on a byte-identical re-save (`e5c5c558…` three ways), so the byte-identical `Saved` path does not
+  become a false failure under the most likely real-world attribute in a wiki repo. The in-process-SHA
+  rejection recorded in `design.md:818-823` is correct. Control flow re-read, not inferred:
+  `PageSaveService.cs:274` gates the comparison on `HeadPathState.Blob`, so an `AbsentAtHead` page that
+  stages nothing falls unconditionally to the fault at `:286`.
+- **Blocker 2 (edit URL from the decoded path) — closed, and genuinely deduplicated.**
+  `PageRouteCodec.ResolveUrlForms` (`PageRouteCodec.cs:393`) is the single producer;
+  `WikiPage.razor:197` uses it and `Request.Path.Value` is gone; `PageEditor.razor:187` calls the same
+  method and its private `CanonicalRouteForms` is deleted rather than left as a second correct copy.
+  One implementation, which was the actual finding.
+- **Blocker 3 (D17 vs. what shipped) — closed.** `design.md:795-835` now records the `hash-object`
+  instrument, the executed `assume-unchanged` evidence, why `status` was the wrong instrument, the
+  in-process-SHA rejection and the two further empty-staging causes; the `EditDraftStore`/PRG/
+  `NormalizeLineEndings`/`autocrlf` material is present, so the four code citations of D17 are now
+  true. The contradiction is resolved in the code's favour, per the Product Owner:
+  `PageEditor.razor:230-231` sets `_saveMessage` and **returns** without `NavigateTo`, `Input` is never
+  reassigned on that path, and `specs/content-editing/spec.md:61` keeps its absolute SHALL with no
+  carve-out. The `draftRefused` query parameter and its GET handling are gone — no dead scaffolding
+  left behind by the superseded PRG shape.
+
+## Carried-forward items — all four still hold
+
+Obligation 26 **closed** (`_index` still appears once in `PageSaveService`, `Invalidate()` only; the
+save's file choice never routes through `ApplyIncrementalUpdateAsync`). The per-save `EnumeratePages()`
+walk **unchanged and still sound**. `EditDraftStore` **untouched** by both rounds — the per-account cap
+and ownership-gated `TryGet` are byte-identical to what I audited. The inherited-git-config class
+**stays §7's**.
+
+## Is §6's evidence base sound enough to close on? — asked explicitly, answered explicitly
+
+**Yes on integrity, no on scenario coverage, and the blocker above is precisely that gap realised.**
+
+- **No mutation residue, verified myself, not read off the thread.** `PageSaveService.cs` checksums
+  `2c3fd5af8160e0c8390382aee00e9fa311231e8dd1af3b2c3ac7da782d319ce4` — identical to the recorded
+  baseline. `git status --porcelain --untracked-files=all` is **completely empty**, so §7b's
+  untracked-file blind spot does not apply; all 27 §6 `src` files are tracked. I also swept the
+  section's added `src` lines for mutant-shaped literals (`return true;`, `|| true`, `&& false`) and
+  every hit is a legitimate branch in a guard I read in full. Four live-mutant incidents, all recovered,
+  none shipped. Note the limit: a checksum baseline exists for **one** file; for the other 26 the
+  evidence is the clean tree plus my own reading.
+- **The mutation record is now accurate.** 2/798 → **1/798** is correctly retracted, and the correction
+  is better-evidenced than the original: reproduced twice independently, plus an argument from control
+  flow for why `Save_ByteIdenticalContent_…` *cannot* die from that mutation. Recording the correction
+  rather than the number is the right call.
+- **Round one's surviving mutant was correctly read as a real gap, not defence-in-depth**, and round
+  two's equivalent dies. That is the evidence standard working.
+- **The gap:** the section's coverage is strong on *mechanisms* and thin on *scenarios*. Every §6
+  filesystem-case test places one file on disk. That is a coverage shape, not an oversight of one
+  agent — and it is what the blocker walks through.
+
+## For `## NEXT` (Architect, at close-out — not the fix block)
+
+- **D9's reconciliation still shares the instrument §6 just rejected.** `ContentRepositoryService.cs:792-806`
+  is `add -A` plus a whole-tree porcelain assertion — blinded by the same `assume-unchanged` bit, as
+  `design.md:803` itself records. §6's own paths are now safe, and the rollback clears the bit
+  (`git reset` rewrites the index entry — proven by `PageSaveServiceTests.cs:216`), so this is not §6's
+  to fix. But `PageSaveService.cs:582` and `specs/content-editing/spec.md:86` both name that
+  reconciliation as `RollbackFailed`'s recovery mechanism, so §7 should not inherit it as sound.
+  Re-derive the working-tree-clean invariant at §7's open rather than assuming §6 established it
+  repository-wide.
+- Carried unchanged from my first review: `IPageIndex.Current` has no consumer; `EditDraftStore` is
+  per-instance state with no background expiry sweep; obligation 19 discharged.
+- **A standing test-design rule this section earned, worth keeping:** *a filesystem-behaviour test must
+  construct the collision, not merely run on a filesystem that permits one.* Two agents built real
+  case-sensitive volumes and both asked the one-file question; the two-file question was never asked by
+  anyone.
+
+**@architect** — this is §3c.4 territory: one remediation round has already been sanctioned by the
+Product Owner and the section still does not close. The blocker is small, local and has an obvious
+regression shape, but the call on whether to fix it, re-cut §6, or ship with it recorded is the Product
+Owner's, not mine and not yours. I am not asking for a third round on my own authority.
+
+**[architect]** **Blocker accepted, verified by reading the branch rather than the report.**
+`PageSaveService.cs:860-866` takes the **first** case-insensitive match and then requires it to be
+ordinally equal:
+
+```csharp
+var actualName = Array.Find(entries, e =>
+    string.Equals(Path.GetFileName(e), segment, StringComparison.OrdinalIgnoreCase));
+if (actualName is not null && !string.Equals(Path.GetFileName(actualName), segment, StringComparison.Ordinal))
+    return false;
+```
+
+With `Page.md` and `page.md` both present — legitimate, non-ambiguous D12 routes on a case-sensitive
+host — a request for `Page.md` can match `page.md` first, fail the ordinal check and return `Refused`.
+Which of the pair loses is decided by readdir order, and both call sites turn `false` straight into
+`Refused`, so **one of two valid pages becomes permanently uneditable while still rendering fine**. A
+directory pair takes its whole subtree with it. Reachable in two ordinary saves on the Linux deployment
+target with no inherited state.
+
+**Why this is the section's own lesson arriving a fourth time, in the place it is hardest to see.** The
+worker and the reviewer each provisioned a *real case-sensitive volume* — independent, correct,
+expensive work — and both asked the same question: *does one file on disk behave correctly?* Every
+shipped test places a single casing on disk, so the misfiring branch is never reached with a sibling
+present. **The shared instrument was not the tool this time; both tools were right. It was the
+scenario.** And it is round one's flaw one level down: round one asked the wrong subsystem, round two
+asks the right subsystem and takes the **first** answer instead of the **exact** one.
+
+**[architect]** ❓ @product-owner — §3c.4, second time. **Answered: a third round, scoped tight.** The
+three original blockers are genuinely closed and the defects form a *descending* series (wrong
+subsystem → wrong lookup) rather than a stuck one, so the evidence does not support the rule's default
+reading that the breakdown or the spec is wrong. Rejected: closing §6 with the defect re-homed to §7
+(ships a page that is silently uneditable on the deployment target), and re-cutting the section
+(discards converging work whose original findings are all closed).
+
+**[architect]** Brief — §6 remediation, round three. **No task numbers, ticks nothing.** Base `8d0bffb`.
+Keep it to these two things. → @worker
+
+**Fix — one line of logic.** The question the guard must ask is *"is there an entry whose name matches
+`segment` exactly?"*, not *"does the first entry that matches case-insensitively also match exactly?"*.
+`File.Exists` has already said the path resolves; the only remaining question is whether that is because
+the exact name is genuinely present or because the filesystem folded it onto a different casing. So: if
+an ordinal match exists, accept; otherwise refuse. Nothing else in the method changes, and the fix must
+not weaken the case-insensitive-host behaviour the previous round established.
+
+**Tests — this is the actual deliverable, and the reason the round exists.** Every guard that
+discriminates between two things must be exercised with **both present**, not one:
+
+- both file casings on disk (`Page.md` + `page.md`), asserting **each** resolves to itself and neither is
+  refused, on a **case-sensitive** host;
+- both **directory** casings (`Notes/` + `notes/`) — the supervisor found a directory pair bricks the
+  losing subtree, so a file-only test would miss it;
+- **readdir order must not decide the outcome** — construct the pair in both creation orders, or assert
+  in a way that cannot pass by luck, since which member currently loses is fixed by hash order;
+- the case-insensitive-host behaviour still refuses the folded case, unchanged.
+
+Reuse the case-sensitive volume technique already proven twice in this section (`hdiutil`), and keep the
+test correct on both host kinds rather than skipping on either.
+
+**Standing requirement, added to this change and binding from here:** *a guard that discriminates
+between two things is not tested until it has been run with **both** of them present. A single-subject
+test exercises the guard's existence, not its discrimination.* Three rounds running, the new code was
+exercised with one scenario and the defect lived in the second.
+
+**No mutation this round** unless the fix turns out to be larger than one line — ask first. Explicit
+≥10-minute timeout on every full-suite command; if you background a suite your turn may end with the
+tree mutated, which has happened four times here. Do not tick, do not commit. → @reviewer when green.
+
+**Recorded for §7, not to be fixed here** (supervisor): `ContentRepositoryService.cs:792-806` — D9's
+reconciliation still uses the `add -A` + porcelain-status instrument that §6 rejected as unable to see
+`assume-unchanged`, **and D9 is named as `RollbackFailed`'s recovery mechanism**. §7 must not inherit it
+as sound.
+
+**[worker]** Round three done. `PageSaveService.cs:860-866`'s guard now asks *"does an entry matching
+`segment` exactly exist?"* directly — `Array.Exists(entries, e => Ordinal-equals segment)` — instead of
+taking the first `OrdinalIgnoreCase` match and demanding that one be exact. `File.Exists`/`Directory.Exists`
+still gate entry into the block unchanged; only the inner discrimination logic changed. Nothing else in
+the method touched, case-insensitive-host branch untouched.
+
+Four new `PageSaveServiceTests.cs` tests, each forced onto a real case-sensitive filesystem (this
+section's `hdiutil create -fs "Case-sensitive APFS"` technique, gated on `OperatingSystem.IsMacOS()` —
+off macOS, ext4's default case-sensitivity already suffices, so `EnsureCaseSensitiveDataRootAsync` is a
+no-op there and the volume is detached/deleted in `Dispose`):
+
+- `Save_BothFileCasingsCoexistOnACaseSensitiveHost_UppercaseCommittedFirst_NeitherIsRefused`
+- `Save_BothFileCasingsCoexistOnACaseSensitiveHost_LowercaseCommittedFirst_NeitherIsRefused` (creation
+  order reversed — both physical orders exercised, not just one)
+- `Save_BothDirectoryCasingsCoexistOnACaseSensitiveHost_NeitherSubtreeIsBricked` (`Notes/`+`notes/`,
+  the supervisor's named directory-pair concern)
+
+Each test re-resolves **both** routes/subtrees after both entries exist on disk, not just the one just
+written — so whichever member readdir happens to return first can't decide the outcome by luck, without
+needing to inspect or control actual readdir order.
+
+**Red/green, on the real forced volume, foreground:**
+- Pre-fix (reinstated the old first-match logic, checksum confirmed reverted after): all 3 new
+  discriminating tests failed 3/3 — `Expected: Found, Actual: Refused` on the second-created member in
+  every case (file-uppercase-first, file-lowercase-first, directory pair).
+- Post-fix: same 3 tests pass, plus the two pre-existing case-fold tests
+  (`Save_`/`LoadForEdit_RouteCaseDisagreesWithAnExistingFilesCaseOnThisHostsFilesystem_BehavesCorrectlyForIt`)
+  still pass unchanged, confirming the folded-case refusal on a case-insensitive host holds.
+- `git diff -- src/ZeroWiki/Content/PageSaveService.cs` is exactly the intended one-guard change; `git
+  status --short -- src` clean otherwise.
+
+**Gates:** `dotnet build` 0 warnings/0 errors. `dotnet test` (full, unfiltered, foreground, no
+background/timeout dodge) **801/801**, 3m31s. `dotnet format --verify-no-changes` clean. `openspec
+validate git-backed-content-core --strict` valid. No mutation testing run — fix stayed one line as
+scoped, no ask needed.
+
+**What to check hardest:** that `Array.Exists` over `entries` genuinely can't reintroduce an
+order-dependency (it's existence over the whole array, not first-match, so it shouldn't — but this is
+exactly the class of claim that misfired twice already this section); that the two "both creation
+orders" tests actually differ in more than name (uppercase-first commits `Page.md` directly then saves
+`page`, lowercase-first commits `page.md` directly then saves `Page` — confirm the git-committed member
+and the `SaveAsync`-written member are genuinely swapped, not just the assertion labels); and that the
+directory test's re-resolution after both directories exist is doing real work, not passing on the
+already-known-good `Notes/apple` alone. → @reviewer
+
+**[reviewer]** **Approve.** Round three closes §6.
+
+**Tree/gates:** taken from the architect's foreground measurement rather than re-run, per the explicit
+instruction not to run a fourth backgrounded suite in this section — `dotnet build` 0/0, `dotnet test`
+**801/801** unfiltered foreground (798 + this round's 3 new facts, arithmetic checks out), fix present
+and intact at `PageSaveService.cs:865`, `OrdinalIgnoreCase` absent from the file, exactly three files
+touched, `MUTANT` clean. I independently confirmed: no stray `hdiutil`/`dotnet test` processes running
+now; `git diff 8d0bffb -- src/ZeroWiki/Content/PageSaveService.cs` is exactly the one hunk (`Array.Find`
++ ordinal-exact-demand → `Array.Exists` asking existence directly) — nothing else in the guard changed.
+
+**Round one/two's work confirmed undisturbed** — `git diff 8d0bffb --stat` over `WikiPage.razor`,
+`PageEditor.razor`, `PageRouteCodec.cs`, `WikiPageEditorTests.cs`, and `design.md` is empty. Round three
+touched only `PageSaveService.cs`, its test file, and the DEVLOG.
+
+**`Array.Exists` order-independence — verified by construction, not merely asserted:** `Array.Exists`
+is an existential predicate over the collection; its boolean result depends only on set membership, never
+on enumeration order — reordering `entries` cannot change whether some element ordinally equals
+`segment`. I walked all four reachable cases through the surrounding gate (`ResolvedPathMatchesOnDiskCaseExactly`,
+lines ~820-869) to confirm no other branch reintroduces order-sensitivity:
+- Case-sensitive host, both casings present, either segment requested → the exact entry is always found
+  regardless of which of the two appears first in `entries`. This is the bug the fix closes.
+- Case-insensitive host, only one casing on disk, the other requested → `File.Exists` folds to `true`,
+  `entries` contains only the real on-disk name, no element is ordinally equal to the requested segment
+  → refused. Unchanged from before.
+- Case-sensitive host, requested segment has no on-disk sibling at all → `File.Exists`/`Directory.Exists`
+  on the exact-case candidate returns `false` before `entries` is ever consulted → proceeds. Unaffected
+  by this hunk.
+There is no ordering under which a legitimate exact match gets refused; the fix removes the order
+dependency by construction, exactly as claimed.
+
+**I re-derived the red/green claim myself rather than taking it on report, since "no mutation needed,
+re-derive the revert-to-red" was the explicit brief.** `cp`-backed up the fixed file (checksum recorded),
+reinstated the pre-fix `Array.Find`/`OrdinalIgnoreCase` logic, rebuilt, and ran the three new facts on a
+freshly-provisioned real case-sensitive APFS volume (this class's own `EnsureCaseSensitiveDataRootAsync`,
+triggered automatically on this macOS host) — **3/3 failed**, `Expected: Found, Actual: Refused`, in
+every case. Restored via the same backup and confirmed the checksum matched the fixed baseline exactly
+before doing anything else. Post-fix, the same three re-ran green in isolation (3/3 pass), and no
+`/Volumes/zwcs*` mount or stray `.dmg` was left behind on either run.
+
+One factual correction to the record above, not a defect: **my reproduction refused the git-committed
+(first-created) member in all three cases, not the second-created member as posted.** `Array.Find`'s
+first-match order comes from `Directory.GetFileSystemEntries`' enumeration order, which this evidence
+shows is not creation-order on APFS — in my run the later-created entry consistently enumerated first,
+so the earlier one lost the ordinal-match check. This doesn't change the verdict (the fix is order-
+independent regardless of which direction the old bug happened to break, and the discriminating tests
+check both directions either way), but it's worth recording precisely: which member a case-fold
+collision refuses is filesystem-internal and can vary run to run, host to host, or volume to volume — a
+further argument, not a weaker one, for why both creation-order tests are needed rather than one.
+
+**This also empirically answers the open question about teardown on a failing run**, which the architect
+asked me to settle by reading rather than running: my revert-to-red pass had all three tests **fail**
+(assertion exceptions, not a clean pass), and `Dispose()` still detached and deleted the volume/image in
+every case — no stray mount, no stray `.dmg`, confirmed by directory listing immediately after the run.
+xUnit invokes `IDisposable.Dispose()` on the test class after each test regardless of outcome (an
+`Assert` failure is an ordinary exception caught by the runner, not a process-level fault that could skip
+teardown), and the code doesn't gate cleanup on success — `Dispose()` unconditionally attempts the detach
+or delete once `_forcedCaseSensitiveVolumeMountPoint`/`_forcedCaseSensitiveVolumeImagePath` are set,
+which happens as soon as `EnsureCaseSensitiveDataRootAsync` finishes provisioning, before the test body
+(and its assertions) ever run. So teardown on a failing test holds by actual execution, not merely by
+inspection.
+
+**One narrower gap worth naming, found by reading rather than running (I did not manufacture this
+failure):** `_forcedCaseSensitiveVolumeImagePath`/`_forcedCaseSensitiveVolumeMountPoint` are only
+assigned *after* both `hdiutil create` and `hdiutil attach` succeed and the mount point is parsed
+(`PageSaveServiceTests.cs`, `EnsureCaseSensitiveDataRootAsync`). If `create` succeeds but `attach` throws,
+or `attach` succeeds but the mount-point parse throws before assignment, the `.dmg` (and possibly a live
+mount) would never be recorded and `Dispose()` would have nothing to clean up — a leak on a failure
+*inside provisioning itself*, distinct from and narrower than the "does a failing test clean up"
+question that was asked and that I did verify holds. I did not reproduce this failure mode (it would mean
+deliberately breaking `hdiutil`, which felt like manufacturing a finding rather than confirming one, and
+it's outside what a one-line guard fix needs to cover) — flagging it as an architectural note rather than
+a blocker, since it needs an `hdiutil` command to actually fail, which every run so far has not done.
+
+**The two "creation order" tests genuinely swap the git-committed member and the `SaveAsync`-written
+member — confirmed by reading the exact calls, not the test names:**
+- `…UppercaseCommittedFirst…`: `CommitPageDirectlyAsync("Page.md", …)` (git-committed) →
+  `SaveAsync(new RouteValue("page"), …)` (`SaveAsync`-written).
+- `…LowercaseCommittedFirst…`: `CommitPageDirectlyAsync("page.md", …)` (git-committed) →
+  `SaveAsync(new RouteValue("Page"), …)` (`SaveAsync`-written).
+These are opposite pairings, not a relabelled copy — the worker's own stated biggest doubt is resolved.
+
+**Case-insensitive-host behaviour unchanged:** confirmed by reading the gate (see the second bullet
+above) and by the fact that round two's own regression tests for this
+(`Save_`/`LoadForEdit_RouteCaseDisagreesWithAnExistingFilesCaseOnThisHostsFilesystem_…`) are untouched by
+this round's diff and are included in the reported 801/801.
+
+**Linux no-op path — verified by reading only, not by execution; flagging this explicitly rather than
+inferring it.** I have no Linux host available in this session. `EnsureCaseSensitiveDataRootAsync`
+returns immediately when `!OperatingSystem.IsMacOS()`, before doing anything — the volume-provisioning
+step is skipped, but the test body and every assertion after it still run unconditionally against the
+ordinary `_dataRoot` temp directory. That is correct only insofar as the project's Linux deployment
+target (and Linux CI) mounts its temp directory on a case-sensitive filesystem by default (ext4/overlayfs
+under Docker), which is true in the ordinary case but is an assumption I could not verify by running
+these three tests on Linux myself. Not a blocker — the reasoning is sound and matches this section's own
+established technique note — but recorded as unverified-by-execution rather than confirmed.
+
+**Nits:** none worth blocking on.
+
+**Architectural notes (not blocking):**
+- The narrower provisioning-failure cleanup gap above (`create`-succeeds/`attach`-fails leaving an
+  untracked `.dmg`) — worth a future one-line hardening (record the image path immediately after
+  `create` succeeds, before `attach` is attempted) if this section or a later one touches this harness
+  again, but not on its own worth a fourth remediation round for a defect that has not actually occurred.
+- The Linux no-op path's correctness rests on an assumption about the deployment target's filesystem that
+  has not been executed against in this review (or, as far as this DEVLOG records, in CI) — worth
+  confirming wheither in a Linux CI run or explicitly accepting as a documented assumption.
+
+§6 is clear from this reviewer. Ready for supervisor re-review.
+
+**[architect]** **Round three approved and committed.** Tree verified after `@reviewer`'s own
+revert-to-red: `Array.Exists` present at `PageSaveService.cs:865`, **no `OrdinalIgnoreCase` anywhere in
+the file**, three files touched, no stray mounts, attached-image count 10 before and after (all
+pre-existing system/Xcode images). Gates run in the foreground by the Architect with an explicit
+10-minute timeout: `dotnet build` **0/0**; `dotnet test` **801/801 unfiltered** in 2m12s; `dotnet format
+--verify-no-changes` exit 0; `openspec validate --strict` valid.
+
+**Record correction, and it strengthens the round rather than undermining it.** `@worker`'s post says
+the old first-match logic refused the **second-created** member; `@reviewer`'s independent reproduction
+refused the **first-created** one each time. Both observed a real refusal — the disagreement is about
+*which* member loses, and that is the point: **APFS enumeration order is not creation order**, so the
+losing member is not predictable from the test's own setup. A test that asserted on "the second one"
+would have been asserting on a coincidence of the author's machine. This is precisely why the round
+required both creation orders, and the correction is evidence the requirement was right rather than
+belt-and-braces.
+
+**The teardown-on-failure question was settled by accident, and the accident is the best evidence
+available.** I asked whether the disk-image teardown holds when a test *fails*, and noted my own passing
+run could not answer it. `@reviewer`'s revert-to-red made **all three tests fail** — and `Dispose()`
+still detached the volume and removed the image every time. A deliberate test of cleanup-on-failure
+would have been hard to construct honestly; a genuine failing run supplied it for free.
+
+**Two limits recorded honestly, neither blocking, both carried to `## NEXT`:**
+
+- **A leak scoped to provisioning failure**: if `hdiutil create` succeeds but `attach` (or mount-point
+  parsing) then throws, the tracking fields are never assigned and `Dispose()` has nothing to clean.
+  Found by reading, not reproduced — it would require deliberately breaking `hdiutil`. Real but narrow.
+- **The Linux no-op path was verified by reading only, never executed.** The reasoning is sound (ext4
+  and CI temp dirs are case-sensitive), but nobody in this section has run these tests on the actual
+  deployment target. **Stated as an assumption rather than a result** — which is the correct disposition
+  given this section's history, and exactly the kind of thing that has bitten it before.
+
 ## NEXT
 
 **Resume point: §6 is at CLAUDE.md §3c.4 — a Product Owner decision, not a next block.** All eight §6

@@ -14,8 +14,13 @@ namespace ZeroWiki.Tests.Content;
 /// </summary>
 public sealed class PageSaveServiceTests : IDisposable
 {
-    private readonly string _dataRoot = Path.Combine(Path.GetTempPath(), $"zerowiki-page-save-{Guid.NewGuid():n}");
+    private string _dataRoot = Path.Combine(Path.GetTempPath(), $"zerowiki-page-save-{Guid.NewGuid():n}");
     private readonly GitProcessRunner _git = new();
+
+    // §6 remediation round three: set only by EnsureCaseSensitiveDataRootAsync, when it forces
+    // _dataRoot onto a scratch case-sensitive APFS volume. Torn down in Dispose.
+    private string? _forcedCaseSensitiveVolumeMountPoint;
+    private string? _forcedCaseSensitiveVolumeImagePath;
 
     private ContentPaths Paths => new(_dataRoot);
     private string RepositoryRoot => Paths.RepositoryRoot;
@@ -25,7 +30,126 @@ public sealed class PageSaveServiceTests : IDisposable
     {
         if (Directory.Exists(_dataRoot))
         {
-            Directory.Delete(_dataRoot, recursive: true);
+            try
+            {
+                Directory.Delete(_dataRoot, recursive: true);
+            }
+            catch (IOException)
+            {
+                // _dataRoot may sit on a volume already unmounted below by the time this runs on some
+                // orderings; the volume detach that follows is what actually reclaims the space.
+            }
+        }
+
+        if (_forcedCaseSensitiveVolumeMountPoint is not null)
+        {
+            RunToolBestEffort("hdiutil", ["detach", _forcedCaseSensitiveVolumeMountPoint, "-force"]);
+        }
+
+        if (_forcedCaseSensitiveVolumeImagePath is not null && File.Exists(_forcedCaseSensitiveVolumeImagePath))
+        {
+            File.Delete(_forcedCaseSensitiveVolumeImagePath);
+        }
+    }
+
+    /// <summary>
+    /// §6 remediation round three. Repoints <see cref="_dataRoot"/> at a genuinely case-sensitive
+    /// filesystem, using this section's proven technique -- a scratch case-sensitive APFS volume via
+    /// <c>hdiutil</c> -- on macOS, whose default filesystem folds case. Not needed off macOS: this
+    /// project's Linux deployment target, and Linux CI, are case-sensitive by default already (ext4), so
+    /// an ordinary temp directory already lets two differently-cased entries coexist on disk. Forcing the
+    /// volume on macOS is what turns "does the guard behave on some case-sensitive host or other" into a
+    /// test that actually runs, rather than one that would need a Linux box to mean anything. Must be
+    /// called before <see cref="InitializeRepositoryAsync"/> -- it replaces <see cref="_dataRoot"/>
+    /// before the repository is ever created there.
+    /// </summary>
+    private async Task EnsureCaseSensitiveDataRootAsync()
+    {
+        if (!OperatingSystem.IsMacOS())
+        {
+            return;
+        }
+
+        var imagePath = Path.Combine(Path.GetTempPath(), $"zerowiki-case-sensitive-{Guid.NewGuid():n}.dmg");
+        var volumeName = $"zwcs{Guid.NewGuid():n}"[..16];
+
+        await RunToolOrThrowAsync(
+            "hdiutil",
+            ["create", "-size", "64m", "-fs", "Case-sensitive APFS", "-volname", volumeName, imagePath]);
+        var attachOutput = await RunToolOrThrowAsync("hdiutil", ["attach", imagePath, "-nobrowse"]);
+
+        var mountPoint = attachOutput
+            .Split('\n', StringSplitOptions.RemoveEmptyEntries)
+            .Select(line => line.Split('\t', StringSplitOptions.RemoveEmptyEntries))
+            .Where(fields => fields.Length > 0)
+            .Select(fields => fields[^1].Trim())
+            .LastOrDefault(field => field.StartsWith("/Volumes/", StringComparison.Ordinal))
+            ?? throw new InvalidOperationException($"hdiutil attach did not report a mount point:\n{attachOutput}");
+
+        _forcedCaseSensitiveVolumeMountPoint = mountPoint;
+        _forcedCaseSensitiveVolumeImagePath = imagePath;
+        _dataRoot = Path.Combine(mountPoint, "data");
+        Directory.CreateDirectory(_dataRoot);
+    }
+
+    private static async Task<string> RunToolOrThrowAsync(string fileName, string[] arguments)
+    {
+        using var process = new System.Diagnostics.Process
+        {
+            StartInfo = new System.Diagnostics.ProcessStartInfo(fileName)
+            {
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+            },
+        };
+        foreach (var argument in arguments)
+        {
+            process.StartInfo.ArgumentList.Add(argument);
+        }
+
+        process.Start();
+        var stdoutTask = process.StandardOutput.ReadToEndAsync();
+        var stderrTask = process.StandardError.ReadToEndAsync();
+        await process.WaitForExitAsync();
+        var stdout = await stdoutTask;
+        var stderr = await stderrTask;
+
+        if (process.ExitCode != 0)
+        {
+            throw new InvalidOperationException(
+                $"{fileName} {string.Join(' ', arguments)} exited {process.ExitCode}:\n{stdout}\n{stderr}");
+        }
+
+        return stdout;
+    }
+
+    /// <summary>Best-effort cleanup only -- a failed detach/delete must never fail a test that has
+    /// already passed or failed on its own merits.</summary>
+    private static void RunToolBestEffort(string fileName, string[] arguments)
+    {
+        try
+        {
+            using var process = new System.Diagnostics.Process
+            {
+                StartInfo = new System.Diagnostics.ProcessStartInfo(fileName)
+                {
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    UseShellExecute = false,
+                },
+            };
+            foreach (var argument in arguments)
+            {
+                process.StartInfo.ArgumentList.Add(argument);
+            }
+
+            process.Start();
+            process.WaitForExit(10_000);
+        }
+        catch
+        {
+            // Best-effort cleanup only; see the doc comment above.
         }
     }
 
@@ -616,6 +740,128 @@ public sealed class PageSaveServiceTests : IDisposable
         {
             Assert.Equal(PageLoadForEditOutcome.New, result.Outcome);
         }
+    }
+
+    [Fact]
+    public async Task Save_BothFileCasingsCoexistOnACaseSensitiveHost_UppercaseCommittedFirst_NeitherIsRefused()
+    {
+        // §6 remediation round three -- the defect this test targets: ResolvedPathMatchesOnDiskCaseExactly
+        // used to take the FIRST case-insensitive match from Directory.GetFileSystemEntries and demand
+        // that one be ordinally exact, rather than asking whether an exact match exists anywhere in the
+        // listing. With "Page.md" and "page.md" both genuinely present -- legitimate, non-colliding D12
+        // routes on a case-sensitive host -- readdir order (not either file's own correctness) decided
+        // which route the guard refused. Forced onto a real case-sensitive volume (see
+        // EnsureCaseSensitiveDataRootAsync) so this runs deterministically regardless of the host that
+        // happens to execute the suite.
+        await EnsureCaseSensitiveDataRootAsync();
+        await InitializeRepositoryAsync();
+        await CommitPageDirectlyAsync("Page.md", "Upper case body.");
+
+        var service = CreateService(out _);
+
+        // The pre-existing entry must still resolve to itself once a second, differently-cased entry is
+        // about to join it.
+        var loadUpperBeforeSibling = await service.LoadForEditAsync(new RouteValue("Page"), CancellationToken.None);
+        Assert.Equal(PageLoadForEditOutcome.Found, loadUpperBeforeSibling.Outcome);
+        Assert.Equal("Upper case body.", loadUpperBeforeSibling.Content);
+
+        var saveLower = await service.SaveAsync(
+            new RouteValue("page"),
+            "Lower case body.",
+            PageBaseRevision.AbsentAtHead,
+            Author(),
+            CancellationToken.None);
+
+        Assert.Equal(SaveOutcome.Saved, saveLower.Outcome);
+        Assert.Equal("Upper case body.", await File.ReadAllTextAsync(Path.Combine(WorkingTree, "Page.md")));
+        Assert.Equal("Lower case body.", await File.ReadAllTextAsync(Path.Combine(WorkingTree, "page.md")));
+
+        // Both entries are now genuinely on disk together. Re-resolve BOTH routes -- not just the one
+        // that was just written -- so whichever member readdir happens to enumerate first cannot decide
+        // either outcome by luck: the surviving defect made exactly one direction fail, and which one
+        // depended on hash order, not on which assertion this test happened to write.
+        var reloadUpper = await service.LoadForEditAsync(new RouteValue("Page"), CancellationToken.None);
+        Assert.Equal(PageLoadForEditOutcome.Found, reloadUpper.Outcome);
+        Assert.Equal("Upper case body.", reloadUpper.Content);
+
+        var reloadLower = await service.LoadForEditAsync(new RouteValue("page"), CancellationToken.None);
+        Assert.Equal(PageLoadForEditOutcome.Found, reloadLower.Outcome);
+        Assert.Equal("Lower case body.", reloadLower.Content);
+    }
+
+    [Fact]
+    public async Task Save_BothFileCasingsCoexistOnACaseSensitiveHost_LowercaseCommittedFirst_NeitherIsRefused()
+    {
+        // The mirror of the sibling test above with the creation order reversed -- "which member loses"
+        // was fixed by readdir order, which this codebase has no control over, so the only way to prove
+        // order isn't deciding the outcome is to exercise both physical creation orders, not just one.
+        await EnsureCaseSensitiveDataRootAsync();
+        await InitializeRepositoryAsync();
+        await CommitPageDirectlyAsync("page.md", "Lower case body.");
+
+        var service = CreateService(out _);
+
+        var loadLowerBeforeSibling = await service.LoadForEditAsync(new RouteValue("page"), CancellationToken.None);
+        Assert.Equal(PageLoadForEditOutcome.Found, loadLowerBeforeSibling.Outcome);
+        Assert.Equal("Lower case body.", loadLowerBeforeSibling.Content);
+
+        var saveUpper = await service.SaveAsync(
+            new RouteValue("Page"),
+            "Upper case body.",
+            PageBaseRevision.AbsentAtHead,
+            Author(),
+            CancellationToken.None);
+
+        Assert.Equal(SaveOutcome.Saved, saveUpper.Outcome);
+        Assert.Equal("Lower case body.", await File.ReadAllTextAsync(Path.Combine(WorkingTree, "page.md")));
+        Assert.Equal("Upper case body.", await File.ReadAllTextAsync(Path.Combine(WorkingTree, "Page.md")));
+
+        var reloadLower = await service.LoadForEditAsync(new RouteValue("page"), CancellationToken.None);
+        Assert.Equal(PageLoadForEditOutcome.Found, reloadLower.Outcome);
+        Assert.Equal("Lower case body.", reloadLower.Content);
+
+        var reloadUpper = await service.LoadForEditAsync(new RouteValue("Page"), CancellationToken.None);
+        Assert.Equal(PageLoadForEditOutcome.Found, reloadUpper.Outcome);
+        Assert.Equal("Upper case body.", reloadUpper.Content);
+    }
+
+    [Fact]
+    public async Task Save_BothDirectoryCasingsCoexistOnACaseSensitiveHost_NeitherSubtreeIsBricked()
+    {
+        // The supervisor's specific concern: a directory pair (not just a file pair) takes its whole
+        // subtree with it when the guard misfires, because ResolvedPathMatchesOnDiskCaseExactly walks
+        // every path segment -- including intermediate directories -- and refuses the whole save the
+        // moment any one segment disagrees. "Notes" and "notes" are legitimate, non-colliding directories
+        // on a case-sensitive host, each with its own page underneath.
+        await EnsureCaseSensitiveDataRootAsync();
+        await InitializeRepositoryAsync();
+        await CommitPageDirectlyAsync(Path.Combine("Notes", "apple.md"), "Apple body.");
+
+        var service = CreateService(out _);
+
+        var loadBeforeSibling = await service.LoadForEditAsync(new RouteValue("Notes/apple"), CancellationToken.None);
+        Assert.Equal(PageLoadForEditOutcome.Found, loadBeforeSibling.Outcome);
+
+        var saveInLowercaseDirectory = await service.SaveAsync(
+            new RouteValue("notes/banana"),
+            "Banana body.",
+            PageBaseRevision.AbsentAtHead,
+            Author(),
+            CancellationToken.None);
+
+        Assert.Equal(SaveOutcome.Saved, saveInLowercaseDirectory.Outcome);
+        Assert.Equal("Apple body.", await File.ReadAllTextAsync(Path.Combine(WorkingTree, "Notes", "apple.md")));
+        Assert.Equal("Banana body.", await File.ReadAllTextAsync(Path.Combine(WorkingTree, "notes", "banana.md")));
+
+        // Re-resolve both subtrees now that both directories genuinely coexist, in both directions, so
+        // readdir order over the two directory entries cannot decide the outcome by luck either.
+        var reloadUppercaseSubtree = await service.LoadForEditAsync(new RouteValue("Notes/apple"), CancellationToken.None);
+        Assert.Equal(PageLoadForEditOutcome.Found, reloadUppercaseSubtree.Outcome);
+        Assert.Equal("Apple body.", reloadUppercaseSubtree.Content);
+
+        var reloadLowercaseSubtree = await service.LoadForEditAsync(new RouteValue("notes/banana"), CancellationToken.None);
+        Assert.Equal(PageLoadForEditOutcome.Found, reloadLowercaseSubtree.Outcome);
+        Assert.Equal("Banana body.", reloadLowercaseSubtree.Content);
     }
 
     [Fact]

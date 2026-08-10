@@ -855,12 +855,17 @@ public sealed class PageSaveService
             }
 
             // The filesystem's own existence check above says this exact-case path exists -- read back
-            // the real, literal on-disk name to see whether that is because it genuinely matches, or
-            // because the filesystem folded it onto a differently-cased entry.
-            var actualName = Array.Find(
-                entries, entry => string.Equals(Path.GetFileName(entry), segment, StringComparison.OrdinalIgnoreCase));
+            // the on-disk names to see whether that is because an entry genuinely matches exactly, or
+            // because the filesystem folded it onto a differently-cased entry. This must ask "does an
+            // entry matching `segment` exactly exist?" directly, rather than taking the first
+            // case-insensitive match and demanding that one be exact: on a case-sensitive host, two
+            // distinct entries (e.g. "Page.md" and "page.md") can both match case-insensitively, and
+            // which one Directory.GetFileSystemEntries happens to return first is readdir order, not a
+            // property of either file.
+            var exactMatchExists = Array.Exists(
+                entries, entry => string.Equals(Path.GetFileName(entry), segment, StringComparison.Ordinal));
 
-            if (actualName is not null && !string.Equals(Path.GetFileName(actualName), segment, StringComparison.Ordinal))
+            if (!exactMatchExists)
             {
                 return false;
             }
