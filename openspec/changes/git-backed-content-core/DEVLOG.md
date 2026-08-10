@@ -19572,6 +19572,435 @@ complete and ready for the supervisor.
 
 → @architect
 
+**[supervisor]** §7 section review — scope `cb81b47..HEAD` (`03afeff`), blocks A/B/C.
+**Verdict: Request changes.** Two blockers, one root cause, one fix block. Everything else I checked
+is sound, and I have listed below both what I verified and what my checks could not see.
+
+**Both blockers are the section's own recurring defect class — a claim wider than the instrument that
+produced it — and this is the first time it has survived into shipped code rather than into prose.**
+Block A's three review rounds each caught an instance in `design.md`; neither block review could catch
+these two, because the reviewer checks code against D18, D18 states the claim, and the code's own doc
+comment restates it. Nothing in either diff contains the word that would have exposed it.
+
+**1 — Blocker. D18 §2's environment contract is false about what shipped, in both directions. The CGI
+subprocess inherits the app's entire environment, `HOME` included.** Blocks A (the claim) and B (the
+code). `GitHttpBackendHost.cs:62-77` builds a `ProcessStartInfo` and *overlays* six keys onto
+`startInfo.Environment` — it never clears it. `ProcessStartInfo.Environment` is pre-populated with a
+copy of the current process's environment, so the overlay adds to ~100 inherited variables rather than
+replacing them. Measured, not inferred: replicating `InvokeAsync`'s exact construction and exact 6-key
+overlay, the subprocess sees **108** variables including `HOME=/Users/rendle`.
+
+Two stated facts are therefore untrue:
+- *"`HOME` is deliberately never set"* — `GitHttpBackendHost.cs:119-121`, `design.md` D18 §2 and §9.
+- *"and no other variable is passed"* — `design.md` D18 §2's full-environment-set paragraph.
+
+Why it matters beyond the documentation:
+- **D18 §9's discharge of the `safe.directory` obligation rests on the false premise.** It reproduces
+  the container experiment with "`HOME` unset — the exact shape a CGI subprocess runs in". That is not
+  the shape the code produces. The *conclusion* (system-scope `safe.directory` works) still holds and is
+  strictly the safer choice, so **`Dockerfile:54` needs no change** — but the evidence offered does not
+  establish it for what ships, and the stated *reason* is inverted: with `HOME` inherited, a `--global`
+  setting *would* apply. `Dockerfile:23-29`'s header comment carries the same inverted reasoning.
+- **Live consequence.** `git-http-backend` and its `upload-pack`/`receive-pack` children now consult
+  `$HOME/.gitconfig` and inherit every ambient `GIT_*` variable in the app's process environment
+  (`GIT_DIR`, `GIT_WORK_TREE`, `GIT_CONFIG_GLOBAL`, `GIT_ALTERNATE_OBJECT_DIRECTORIES`,
+  `GIT_CEILING_DIRECTORIES`, …). This project already treats ambient git config as a live hazard —
+  `ContentRepositoryService.cs:559-566` reasons explicitly about a developer's `~/.gitconfig`
+  `core.autocrlf` bricking startup — and §7 has now put the push-receipt path behind that same
+  unguarded door. Benign in the shipped container today (no `~/.gitconfig` is created there); not
+  hypothetical on the Product Owner's dev machine.
+
+*Why no block review could see it:* every test passes identically whether `HOME` is inherited or not,
+because `safe.directory` is system-scope and the dev machine's `~/.gitconfig` happens to be benign.
+Block C's real-client clone/fetch/push is cited as evidence the environment contract holds; it cannot
+distinguish the two worlds.
+
+**2 — Blocker (same root cause, same fix block). `HTTP_GIT_PROTOCOL` is never forwarded: every clone,
+fetch and push is silently downgraded to protocol v0.** Blocks A (the omission) and B (the code).
+D18 §2 enumerates "*the full environment set*, all present on every invocation" and omits it.
+`GitSmartHttpEndpoints.cs:100-111` never reads the request's `Git-Protocol` header and
+`GitHttpBackendRequest` has no field for it. `git-http-backend` reads exactly that variable and
+re-exports it as `GIT_PROTOCOL` to its child — confirmed in the shipped binary's own strings
+(`HTTP_GIT_PROTOCOL`, `GIT_PROTOCOL`, `GIT_PROTOCOL=version=%d`).
+
+Measured against the shipped env set, git 2.55.0, same request, only `HTTP_GIT_PROTOCOL=version=2` added:
+
+```
+without:  001e# service=git-upload-pack  + full v0 ref advertisement, whole capability list   (545 bytes)
+with:     000eversion 2 / ls-refs=unborn / fetch=shallow wait-for-done / object-format=sha    (310 bytes)
+```
+
+Every git client since 2.26 sends `Git-Protocol: version=2` and falls back to v0 transparently when the
+server does not answer in kind — which is exactly why all 822 tests are green, and why block C's real
+`git` client proves nothing here. **The §7 thread mentions protocol version zero times in 1182 lines.**
+This is not a SHALL violation (clone/fetch/push all work), but v0 re-advertises every ref on every
+fetch where v2's `ls-refs` does not — a permanent cost on the hot path §9's Obsidian sync will land on.
+If the Architect and Product Owner prefer to accept v0, that is a legitimate answer; it must be a
+recorded decision in D18, not an omission nobody noticed.
+
+**The two findings interact, and I measured the interaction rather than assuming it.** Because the
+environment is inherited (1), an ambient `GIT_PROTOCOL` in the app's process environment *does* reach
+`upload-pack` when `HTTP_GIT_PROTOCOL` is absent: the same request with `GIT_PROTOCOL=version=2`
+inherited produces a response that differs from the baseline, i.e. the server would answer v2 to a
+client that asked for v0. (I confirmed it differs from baseline; I did **not** byte-compare it against
+the true v2 response, and the remediation is the same either way.)
+
+**Suggested remediation shape — one fix block, no new `N.M` numbers.**
+1. Make the subprocess environment explicit in `GitHttpBackendHost.BuildEnvironmentVariables`/
+   `InvokeAsync`. **Not a blind `startInfo.Environment.Clear()`** — `ProcessStartInfo("git")` resolves
+   `git` via `PATH` and the backend needs `PATH` for its own helpers, so this is clear-then-allowlist
+   with the allowlist justified by execution, or an explicit decision to inherit. Either way it must be
+   what D18 says.
+2. Forward `Git-Protocol` as `HTTP_GIT_PROTOCOL` (a new `GitHttpBackendRequest` member + the header read
+   in `GitSmartHttpEndpoints.InvokeGitHttpBackendAsync`), **or** record in D18 the deliberate decision to
+   serve v0 only. Whichever, a test that asserts the served protocol — the suite currently has no
+   instrument that can see it at all.
+3. Correct `design.md` D18 §2 (both claims) and §9 (the `safe.directory` premise and its inverted
+   reasoning — the Dockerfile decision itself stands), `GitHttpBackendHost.cs:118-121`, and
+   `Dockerfile:23-29`'s comment.
+
+**What I verified and found sound — recorded so the fix block does not re-litigate it.**
+- **The security barrier is airtight on every vector I could construct beyond the reviewer's.** These
+  routes opt out of `AnonymousGate` and the fallback policy, so `GitBasicAuthenticationFilter` is the
+  only gate — and it holds: multi-valued `Authorization` (joins with `", "` → base64 `FormatException`
+  → 401); empty username (`":tok"` → no account → 401); `HEAD /git/info/refs` (ASP.NET's HEAD→GET
+  fallback selects the *same* endpoint, so the group filter still runs — no bypass); base64 with
+  embedded whitespace decodes to the same credential; `?service=` becomes an env var, never a shell
+  argument (`UseShellExecute=false` + `ArgumentList`). No path reaches `GitHttpBackendHost` without the
+  filter having called `next`, and `GitSmartHttpEndpoints.cs:95-98` throws rather than defaulting if
+  `Items` is missing. I found no bypass. Attaching the filter to the same `MapGroup` as the handlers —
+  one routing decision, not a second path-matching list — is the right shape and is what makes that true.
+- **The write-path invariant chain composes.** `git-receive-pack` is the only route that writes and the
+  only one that locks (`GitSmartHttpEndpoints.cs:60-83`); the lock wraps the *entire* `InvokeAsync`,
+  including git's own `updateInstead` working-tree update, not just the subprocess spawn.
+- **`UnboundedWait = TimeSpan.MaxValue` is arithmetically safe** — I specifically looked for the
+  overflow this idiom usually hides. `AcquireAsync` computes `elapsed >= timeout` and
+  `remaining = timeout - elapsed` (`RepositoryWriteLock.cs:127-134`); neither overflows for
+  `TimeSpan.MaxValue`, and there is no `CancellationTokenSource(timeout)` anywhere, which *would* have
+  thrown above ~24.8 days. The `RequestAborted` composition does not narrow the spec's "no ceiling":
+  only a wait on behalf of a connection that no longer exists is cut short.
+- **Spec, requirement by requirement.** *Smart HTTP git remote behind wiki auth* — satisfied (three
+  routes, uniform anonymous refusal, real clone/fetch/push with a token). *Accept pushes into the
+  checked-out branch* — satisfied; `receive.denyCurrentBranch=updateInstead` and `http.receivepack=true`
+  are pinned at `ContentRepositoryService.cs:541,549` and `GitSmartHttpRealClientTests` drives both the
+  fast-forward-updates-the-working-tree case and the non-fast-forward rejection through the real HTTP
+  path, asserting the server's tree. *Single per-repo write lock* — all four SHALL clauses hold,
+  including the one forbidding a bound on a push's wait. *Re-index and broadcast* and *Git identity
+  mapping* are §8's; *Obsidian compatibility* is §9's. **I looked for a §7 SHALL clause owned by no
+  task — the §5-style gap that became 6.6 — and there is none.**
+- **Test-strategy boundary applied correctly**: the auth check mutation-tested and capped at 3, CGI
+  plumbing deliberately not, write-lock tests built to assert final outcomes rather than timing.
+- **No mutation residue**: `git diff -- src` empty and `git status --short` empty across the whole tree,
+  untracked included.
+- **No unrecorded human-in-the-loop tick.** 7.3/7.4 were settled by automated gates — a real `git`
+  binary against a real listening Kestrel — which is stronger evidence than a one-off manual run, not
+  weaker. The manual recipe is an extra deliverable, still outstanding for the Product Owner and
+  correctly not a precondition.
+
+**What my own checks could not see** (naming it, per this change's most expensive lesson): I did not
+run the section in the Ubuntu 24.04/git 2.43.0 container, so every environment measurement above is
+macOS/git 2.55.0. `HOME` inheritance is a .NET `ProcessStartInfo` property and is not version- or
+OS-dependent; the *value* of `$HOME` and the contents of `$HOME/.gitconfig` in the container are, and I
+have not inspected them. I did not exercise a client that vanishes mid-push while the working tree is
+being updated.
+
+**Not blockers — for `## NEXT`, not the fix block.**
+- *Duplicated kill-tree logic.* `GitHttpBackendHost.cs:47,287-318` duplicates `GitProcessRunner`'s
+  near-verbatim — same 3s constant, same catch triple, same two log messages. The worker recorded the
+  decision not to extract a shared helper (staying out of an already-reviewed, mutation-tested file),
+  which is defensible and I am not reversing it. But the copy did not carry over `GitProcessRunner`'s
+  injectable `_killEntireProcessTree` seam, so `GitHttpBackendHost`'s kill-failure branch (`:296-303`)
+  is unreachable in test where the original's is reachable. Two copies of one hazard-handling, one now
+  untestable, free to drift. **To be clear on D18's own question: the argument that the host must be a
+  distinct type is correct** — the raw-byte streaming, redirected stdin and CGI header peeling genuinely
+  cannot be a `GitProcessRunner` overload. Only the ~35 lines of kill/wait boilerplate duplicate.
+- *A mechanism claim in a test comment, unverified by me.* `NoOpenRegistrationTests.cs` (block C) says
+  the POST-only git routes mean "no endpoint selected on a method mismatch falls back to the gate's own
+  denial". I believe ASP.NET's `HttpMethodMatcherPolicy` *does* select a synthesised 405 endpoint
+  carrying empty metadata, in which case `AnonymousGate.cs:35-40` finds a non-null endpoint without
+  `IAllowAnonymous` and answers with the landing page instead. The conclusion (anonymous is denied, no
+  repository data) is right either way. **I did not measure this** — flagging it for someone to check
+  rather than asserting it, which is the same discipline these two blockers are about.
+- *Process nit:* no `[architect]` "Block C landed" post closes the thread, unlike blocks A and B.
+- *Sequencing:* blocker 2 is worth closing before §9 opens, not after — §9's Obsidian work lands
+  directly on the surface it degrades.
+
+→ @architect
+
+**[architect]** **Block C landed — `03afeff`; `7.3` and `7.4` ticked** (closing the thread `@supervisor`
+correctly noted was left open). Gates re-run by me unsandboxed and in the foreground: build 0/0, format
+exit 0, `--strict` valid, `dotnet test` **822/822 in 2m10s**. No `MUTANT` residue.
+
+**Both supervisor blockers accepted, and both re-derived from the code before I acted on them** — this
+change's own rule, and the one that caught a supervisor's wrong arithmetic in §4.
+
+- **Blocker 1 confirmed by reading `GitHttpBackendHost.cs:62-74`.** The loop does
+  `startInfo.Environment[key] = value` — an **overlay** onto a dictionary .NET pre-populates from the
+  current process. Nothing clears it. So the subprocess inherits the app's whole environment, and both
+  the doc comment at `:118-121` and D18 §2's *"no other variable is passed"* are false as written.
+- **Blocker 2 confirmed by search.** `GIT_PROTOCOL`, `Git-Protocol` and `HTTP_GIT_PROTOCOL` appear
+  **nowhere** in `src/`. Every clone, fetch and push therefore runs protocol v0.
+
+**Both are the section's own recurring defect — a claim wider than its instrument — and `@supervisor` is
+right that this is the first time it reached shipped code rather than prose.** The reason no block review
+could catch it is worth recording as a standing rule: **the reviewer checks the code against D18, D18
+states the claim, and the code's own doc comment restates it — three artefacts agreeing because they
+share one source, not because anything measured the process.** That is this change's "agreeing audits
+share an instrument" lesson in its purest form yet, and the instrument here was *a sentence*.
+
+**[architect] Brief — §7 remediation block. No new task numbers, ticks nothing** (every §7 box is already
+ticked; the findings and the fix live here, and that is the record). Base `03afeff`.
+
+1. **Stop inheriting the ambient environment — and mind the trap that makes the naive fix an outage.**
+   The CGI subprocess must receive the constructed set and nothing else. **`startInfo.Environment.Clear()`
+   alone will break process startup**: `ProcessStartInfo("git")` resolves the binary through `PATH`, so
+   clearing without restoring `PATH` means `git` is not found at all. Establish **by execution, inside
+   the shipped image**, the minimal set the subprocess genuinely needs (`PATH` certainly; check whether
+   anything else — `LANG`, `TZ`, `SystemRoot`-equivalents — is actually required rather than assumed),
+   then clear and set exactly that plus D18 §2's list. **Measure the resulting variable count and paste
+   it**, the way `@supervisor` measured 108.
+2. **Correct D18 §2 and the doc comment to describe what ships.** Not a softened version of the old
+   claim — the sentence must be true after the fix, and must say what the deliberate set now is.
+3. **⚠️ D18 §9's `safe.directory` reasoning is inverted and must be fixed, but the `Dockerfile` decision
+   itself stands and must not be touched.** §9 discharged that hazard by reproducing it with `HOME`
+   unset, calling that "the exact shape a CGI subprocess runs in". It was not that shape — `HOME` *was*
+   inherited. After fix 1 it becomes that shape, which makes `Dockerfile:54`'s system-scope
+   `safe.directory` load-bearing for the reason §9 gave, rather than incidentally. Rewrite the reasoning;
+   change no Dockerfile line.
+4. **Forward `Git-Protocol` as `HTTP_GIT_PROTOCOL`.** Read the request header, pass it through. Do not
+   invent a value when the client sends none — forward what was sent, or nothing. Measure the
+   advertisement before and after (`@supervisor` measured 545 bytes v0 → 310 bytes `version 2`/`ls-refs`)
+   and paste both.
+5. **A regression test that fails if either fix is reverted.** For the environment: assert the subprocess
+   does **not** see a variable the parent sets. For the protocol: assert v2 is actually negotiated when
+   the client asks. Clients fall back transparently — which is exactly why 822 green tests said nothing —
+   so a test that only checks "the clone worked" is not a test of either fix.
+
+*Scope discipline:* fix 1 removes the CGI path's exposure to `$HOME/.gitconfig`, which overlaps §6
+carry-forward 2's inherited-git-config class. **Do not widen into that class.** `/etc/gitconfig` is still
+read and must be — that is where `safe.directory` lives. The rest of the class stays unowned by §7.
+
+*Not in scope:* the ~35 lines of kill-tree boilerplate duplicated from `GitProcessRunner` and the
+unverified `NoOpenRegistrationTests.cs` mechanism claim — `@supervisor` routed both to `## NEXT`
+deliberately, and I am keeping them there.
+
+*Mutation testing:* not indicated. These are missing-behaviour fixes with direct regression tests; a
+mutant adds nothing a reverted fix does not already show.
+
+*Gates:* build, test, format, `--strict` — all clean, all **unsandboxed and foreground**. `git add -N`
+any new file. Do not commit; hand to `@reviewer`.
+
+→ @worker
+
+**[worker] §7 remediation block — both blockers fixed, gates green, no task numbers ticked.** Touched:
+`GitHttpBackendHost.cs`, `GitHttpBackendRequest.cs`, `GitSmartHttpEndpoints.cs` (`src/`);
+`design.md` D18 §2 and §9; `ZeroWiki.LockTestHarness/Program.cs` (a third verb, mirroring the existing
+`reconcile-under-hostile-git-config` one); new `EnvironmentIsolationHarnessProcess.cs`,
+`GitSmartHttpProtocolNegotiationTests.cs`; extended `GitHttpBackendHostTests.cs`. `Dockerfile` untouched,
+`tasks.md` untouched, `## NEXT`'s two routed items left alone — all as the brief specified.
+
+**1 — Environment: `Clear()` then re-add exactly `PATH` plus the deliberate set, established by
+execution inside the shipped image, not assumed.** `GitHttpBackendHost.cs` now does
+`startInfo.Environment.Clear()` before anything is added back — the naive-fix trap the brief named
+(`Clear()` alone breaks `git` resolution via `PATH`) is closed by restoring `PATH` from this process's own
+environment, unmodified, as the one deliberate exception. Confirmed by execution inside
+`mcr.microsoft.com/dotnet/aspnet:10.0` (Ubuntu 24.04/git 2.43.0, the shipped image) that nothing else
+ambient is genuinely required — `LANG`/`TZ` included:
+
+```
+$ docker run --rm --user 1654 mcr.microsoft.com/dotnet/aspnet:10.0 env
+HOME=/home/app                      # confirms the container itself sets HOME -- not a dev-machine-only finding
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+...(6 vars total, no LANG/TZ)
+
+$ su app -c "env -i PATH=... GIT_PROJECT_ROOT=... GIT_HTTP_EXPORT_ALL= PATH_INFO=/info/refs \
+    REQUEST_METHOD=GET QUERY_STRING=service=git-upload-pack REMOTE_USER=alice git http-backend < /dev/null"
+exit=0 bytes=538   # info/refs, PATH + D18 §2's own list only, env -i cleared -- identical shape to the
+                   # ambient-attached baseline run right before it
+```
+Also exercised a real push (clone → commit → local push into the seeded repo) under the same minimal
+environment, including the repository's installed no-op `pre-receive`/`post-receive` hooks running as
+children of the constrained process — no failure attributable to a missing ambient variable.
+`GitHttpBackendHost.cs`'s doc comment (`:140-149`) and `design.md` D18 §2 both corrected to state what
+ships now, with the addendum explaining the overlay-vs-Clear() distinction the original claim missed.
+
+**2 — `Git-Protocol` → `HTTP_GIT_PROTOCOL`, forwarded verbatim, never invented.** New
+`GitHttpBackendRequest.GitProtocol`, populated in `GitSmartHttpEndpoints.InvokeGitHttpBackendAsync` from
+`request.Headers.TryGetValue("Git-Protocol", ...)`, forwarded by `GitHttpBackendHost` only when present.
+Measured against the same minimal environment as above, same repo, same request, only the header added:
+
+```
+without: 538 bytes -- "001e# service=git-upload-pack\n..." (full v0 advertisement, every ref)
+with:    319 bytes -- "000eversion 2\n0015agent=git/2.43.0\n0013ls-refs=unborn\n..." (v2 negotiated)
+```
+(The supervisor's own numbers, 545/310, were against a differently-shaped repo at review time; the
+mechanism and the ~225-byte delta match.)
+
+**3 — D18 §9 rewritten, Dockerfile untouched.** The paragraph now says plainly that its own
+`HOME`-unset reproduction was, at the time it was written and for the whole of block B, testing a shape
+the code did not yet produce (the overlay bug meant `HOME` *was* inherited) — and that fix 1 above is what
+makes the reproduction accurate rather than aspirational. `Dockerfile:54`'s system-scope `safe.directory`
+was always the correct, safer-regardless choice and needed no change; `Dockerfile:23-29`'s header comment
+already describes the post-fix environment correctly (checked directly, not assumed) and was left alone
+per the brief.
+
+**4 — Regression tests, verified to actually fail on each reverted fix, not merely to pass on the current
+code.** For each of the two fixes, the diff was reverted, the specific new test run alone, confirmed
+`[FAIL]` with the expected error, then restored and reconfirmed green — the same discipline as this
+project's mutation-testing convention, applied here without calling it mutation testing (the brief said
+it isn't indicated, and this is exactly the reason: a reverted fix is the mutant, and it needs no capped
+confirmation-run count because there's exactly one way to revert each).
+
+- `GitHttpBackendHostTests.InvokeAsync_WhenTheRequestCarriesGitProtocol_NegotiatesTheRequestedProtocolVersion`
+  — byte-exact prefix assertions (`"001e# service=git-upload-pack\n"` / `"000eversion 2\n"`), not merely
+  "the bytes differ", so a mutant that forwards the value under a different variable name and still
+  changes the response length by accident would not pass by luck. Reverting the `HTTP_GIT_PROTOCOL`
+  forward made it fail exactly as expected (`Assert.Equal` on the v2 prefix, actual bytes still v0's).
+  `GitSmartHttpProtocolNegotiationTests` (new file, `Web/`) closes the loop end-to-end over real HTTP
+  through `ZeroWikiAppFactory`, proving the header is actually read off a real request, not just forwarded
+  correctly once already in hand.
+- `GitHttpBackendHostTests.InvokeAsync_DoesNotLeakThisProcessAmbientEnvironmentToTheSubprocess` — uses
+  `GIT_TRACE` pointed at a uniquely-named marker file as the leak detector (any git invocation that
+  inherits it writes trace lines there; the CGI response and repository are both unaffected either way).
+  **First version set `GIT_TRACE` directly on the shared xUnit test-host process and failed under the
+  full suite while passing filtered — a real false positive, not hypothesised: an unrelated,
+  concurrently-running test's own git subprocess inherited the ambient value during the test's window and
+  wrote the marker file too.** This is exactly the hazard `ReconcileHarnessProcess`'s own remarks already
+  document for `GIT_CONFIG_GLOBAL` (§6 block D4), and the fix is the same one: a genuine second OS
+  process. Added a third verb to the existing `ZeroWiki.LockTestHarness` (`check-git-http-backend-
+  environment-isolation`, mirroring `reconcile-under-hostile-git-config`'s shape exactly) rather than a
+  new harness project, plus `EnvironmentIsolationHarnessProcess.cs` on the caller side (mirrors
+  `ReconcileHarnessProcess.cs`). **Second bug, found the same way (revert-and-confirm), in the harness
+  itself, not the fix under test:** the harness originally set `GIT_TRACE` before running
+  `ContentRepositoryService.EnsureRepositoryAsync()` and the seed commit, both of which use
+  `GitProcessRunner` (which correctly inherits ambient environment for its own calls) — so *those* git
+  invocations wrote to the marker file before `GitHttpBackendHost.InvokeAsync` ever ran, reporting `LEAKED`
+  unconditionally regardless of whether the fix under test was even present. Fixed by moving
+  `Environment.SetEnvironmentVariable("GIT_TRACE", ...)` to immediately before the one call under test.
+  Reverting the `Clear()`/`PATH` fix now makes this test fail with the expected `LEAKED` result; with the
+  fix restored, both harness-based runs pass and the property is safe under full parallelism (confirmed
+  by two consecutive full-suite runs, 826/826 both times, no flake).
+
+**Gates, final, unsandboxed and foreground:** `dotnet build` 0/0. `dotnet test` **826/826**, run twice
+consecutively (~2m21s–2m51s each) to specifically re-confirm the new environment-isolation test's safety
+under the real parallel suite after the harness fix — no flake either time. `dotnet format
+--verify-no-changes` exit 0. `openspec validate git-backed-content-core --strict` valid. `git status
+--short` / `git diff --stat`: `GitHttpBackendHost.cs`, `GitHttpBackendRequest.cs`,
+`GitSmartHttpEndpoints.cs`, `design.md`, `ZeroWiki.LockTestHarness/Program.cs` modified;
+`EnvironmentIsolationHarnessProcess.cs`, `GitSmartHttpProtocolNegotiationTests.cs` new (both `git add -N`'d
+as created); `Dockerfile` and `tasks.md` both show **zero** diff, confirmed directly rather than assumed
+from not having opened them.
+
+*Not attempted, per the brief:* mutation testing (the brief judged it not indicated for missing-behaviour
+fixes with direct regression tests, and the revert-and-confirm discipline above is the same evidentiary
+shape without the capped-run bookkeeping a genuine mutation matrix would need). The kill-tree boilerplate
+duplication and the `NoOpenRegistrationTests.cs` mechanism claim were not touched — both remain exactly
+where `@supervisor` and `@architect` routed them, in `## NEXT`.
+
+→ @reviewer
+
+**[reviewer]** §7 remediation block — **Approve.** No blockers. For each fix I asked what would have to
+be true for it to be wrong and measured that directly, rather than checking the code against its own new
+comment — the failure mode this whole block exists to correct.
+
+**Gates, re-run myself, unsandboxed and foreground:** `dotnet build` 0/0. `dotnet test` **826/826**, run
+twice consecutively (3m4s, 2m6s), no flake. `dotnet format --verify-no-changes` exit 0. `openspec
+validate --strict` valid. `git diff --stat -- Dockerfile openspec/changes/git-backed-content-core/tasks.md`
+— empty, confirmed genuinely zero-diff on both, not merely absent from `git status`.
+
+**1 — Blocker 1 (environment leak): fix verified by breaking it, not by reading it.** Backed up all four
+touched files by checksum before starting (`cp`, never `git checkout --`/`git restore --`, which would
+have taken this uncommitted block with it). Reverted `Clear()`+`PATH`-restore back to the old overlay —
+`InvokeAsync_DoesNotLeakThisProcessAmbientEnvironmentToTheSubprocess` failed exactly as it should
+(`The subprocess wrote a GIT_TRACE marker file…`). Restored, re-checksummed, confirmed the diff back to
+exactly this block's own 47/9/5-line shape.
+
+**"PATH is the only necessary exception" — pushed past what the block's own smoke test covered, since
+that was the claim most likely to be narrow.** The worker's own container measurement showed `info/refs`
+and a real push through the no-op hooks work identically under `env -i`; I specifically went looking for
+the classic case a clone/push smoke test hides — locale/encoding-dependent behaviour — because neither
+info/refs nor a plain push exercises it. Inside the same shipped `mcr.microsoft.com/dotnet/aspnet:10.0`
+image, built a repo, cloned it, and committed a file with a **non-ASCII filename, non-ASCII UTF-8
+content, and a non-ASCII commit message** (`café-日本語.md`, café/日本語/🚀 in both body and message),
+captured the real `git-receive-pack` request body off an actual push, reset the server repo to
+pre-push, then replayed the identical captured body directly against `git-http-backend` under `env -i`
+with only `PATH` plus D18 §2's list — no `HOME`, `LANG`, `TZ`, `LC_*`. Exit 0, no stderr, the file landed
+under its exact non-ASCII name with byte-identical content, and `git log` recovered the non-ASCII commit
+message intact. Git's object store and CGI transport are locale-independent for this — LANG mainly
+governs *translated CLI messages*, not object/path bytes — but I wanted the case actually tried rather
+than argued, and now it has been.
+
+Also confirmed `Environment.Clear()` structurally forecloses the whole class the brief worried about:
+because the mechanism is clear-then-allowlist rather than a blocklist that omits `HOME`, an unnoticed
+future ambient variable (e.g. `XDG_CONFIG_HOME`, which can supply a global git config even without
+`HOME`) can't leak through by omission — it would have to be added to the allowlist deliberately. That's
+a stronger property than "we checked LANG/TZ and they were absent."
+
+**2 — Blocker 2 (protocol v0): fix verified against the real binary, all four cases the brief named.**
+Reverted the endpoint's header-forwarding line — `A_client_that_sends_Git_Protocol_version_2_is_answered_with_a_v2_advertisement`
+failed (v0 bytes back instead of v2's `000eversion 2\n`), while the "sends no header" test kept passing,
+confirming the two are actually independent assertions, not one masking the other. Separately reverted
+`GitHttpBackendHost`'s own forwarding — the unit-level `InvokeAsync_WhenTheRequestCarriesGitProtocol_...`
+failed too, so both the "header read off the request" half and the "forwarded into the subprocess" half
+have their own regression coverage, not just the composite. Restored both, checksums confirmed.
+
+Then drove the real `git-http-backend` binary directly through the four cases named: no
+`HTTP_GIT_PROTOCOL` → v0 (373-byte body, `# service=git-upload-pack` prefix); `version=2` → v2 negotiated
+(138-byte body, `version 2` prefix — same ~225-byte-class delta the DEVLOG reports, my own repo shape
+again, consistent with the report's own note that the exact byte counts move with repo shape); `version=0`
+sent explicitly → v0, byte-identical to the no-header case, exit 0; a garbage value
+(`garbage-nonsense-value`) → also v0, byte-identical, exit 0, no error. `git-http-backend`'s own fallback
+absorbs anything it doesn't recognise; the host never has to guard against a malformed header itself.
+
+**3 — The harness's two instrument failures: the second one reproduced directly, not taken on the
+account.** The first (`GIT_TRACE` on the shared xUnit process producing a false positive under full
+parallelism) is a shape I can't cheaply force to recur on demand, but the fix for it — a genuine second
+OS process (`EnvironmentIsolationHarnessProcess` → `ZeroWiki.LockTestHarness`) — is the same, already-
+proven pattern `ReconcileHarnessProcess` uses for `GIT_CONFIG_GLOBAL`, and I read both side by side; they
+match. **The second bug I reproduced myself:** moved `Environment.SetEnvironmentVariable("GIT_TRACE", …)`
+in `LockTestHarness/Program.cs` back to *before* `EnsureRepositoryAsync()`/the seed commit — with the
+**real production fix still in place** — and re-ran the leak test. It failed with `LEAKED`, a false
+positive exactly as the DEVLOG describes: `GitProcessRunner`'s own (deliberately ambient-inheriting) calls
+during repo setup wrote the marker file before `GitHttpBackendHost.InvokeAsync` ever ran. Restored the
+harness to its current ordering, re-ran: passes. This is about as direct a confirmation as this kind of
+claim gets — I didn't just read the story, I made the described failure happen and then made it stop.
+Also confirmed the new verb can't itself mutate shared state: `dataRoot` and `traceMarkerPath` are
+per-call `Guid.NewGuid()` paths, and `GIT_TRACE` is set inside the spawned harness process's own
+environment, never the caller's.
+
+**4 — `design.md`'s §2/§9 rewrite: read line by line against what was actually measured, the same
+scrutiny applied to block A's three rounds.** No overclaiming found. The addendum states the overlay
+mechanism precisely (pre-populated dictionary, not a replacement), attributes the `HOME=/home/app`
+finding to the shipped image specifically, and states the `env -i` vs. full-ambient-environment
+comparison as what it is — a shape comparison, not exhaustive proof, which is honest framing rather than
+inflated. §9's rewrite is exactly right on the one point that mattered most: **the Dockerfile decision
+itself is correctly left unchanged and correctly described as unchanged** — I read `Dockerfile:23-29`
+directly and its existing comment ("a constructed environment that need not include HOME…a per-user
+setting would silently stop applying") was already accurate for the post-fix code without editing,
+which is what design.md claims. It does not claim the pre-fix reproduction retroactively becomes true;
+it says plainly the experiment tested a shape the code did not yet produce, which is the correct and
+non-defensive way to narrate a documentation bug caused by unmeasured code, not a documentation bug
+caused by a wrong measurement.
+
+**5 — Nit (non-blocking). The worker's container-environment transcript undercounts by 2.** DEVLOG:
+`docker run --rm --user 1654 mcr.microsoft.com/dotnet/aspnet:10.0 env` → "`...(6 vars total, no
+LANG/TZ)`". I ran the identical command against the identical image and got **8**: `APP_UID`,
+`ASPNET_VERSION`, `ASPNETCORE_HTTP_PORTS`, `DOTNET_RUNNING_IN_CONTAINER`, `DOTNET_VERSION`, `HOME`,
+`HOSTNAME`, `PATH`. The substantive conclusion is unaffected either way — no `LANG`/`TZ` in either count,
+which is the only thing the paragraph's argument rests on — and `design.md`'s own restatement doesn't
+repeat the "6" figure at all (it only cites the 108-ambient-variable number and `HOME=/home/app`, both of
+which I independently confirmed exactly). So this is a transcript imprecision in the DEVLOG record, not
+a claim baked into the binding document. Worth a one-line correction in the DEVLOG for the record's own
+sake, given this project's standard for literal counts, but not blocking.
+
+**No other findings.** `NoOpenRegistrationTests.cs` and the kill-tree duplication are confirmed untouched
+(`git diff --stat` empty for the former; no `GitProcessRunner.cs` in this diff at all). `tasks.md` §7 is
+unchanged — all five already `[x]`, correctly, since this block ticks nothing.
+
+Ready to land and go back to the supervisor for the `cb81b47..HEAD` re-review.
+
+→ @architect
+
 ## NEXT
 
 **Resume point: §7 (Smart HTTP git remote) — CARVED, and PAUSED before block A on a Product Owner

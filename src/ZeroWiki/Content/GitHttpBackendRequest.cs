@@ -47,6 +47,15 @@ public sealed class GitHttpBackendRequest
     public string? ContentEncoding { get; init; }
 
     /// <summary>
+    /// The request's <c>Git-Protocol</c> header, forwarded verbatim as <c>HTTP_GIT_PROTOCOL</c> when
+    /// present — never invented when absent (§7 remediation, supervisor blocker 2). Every git client
+    /// since 2.26 sends <c>Git-Protocol: version=2</c> and falls back to protocol v0 transparently when
+    /// the server does not answer in kind, which is why an absent forward is silent rather than a
+    /// visible failure — and exactly why this field exists rather than being left unforwarded again.
+    /// </summary>
+    public string? GitProtocol { get; init; }
+
+    /// <summary>
     /// <c>REMOTE_USER</c> — the authenticated account's username, for <c>git-receive-pack</c>'s reflog
     /// identity only (D18 §4). Plays no role in access control; the request already passed
     /// <see cref="ZeroWiki.Web.GitBasicAuthenticationFilter"/> by the time this is built.

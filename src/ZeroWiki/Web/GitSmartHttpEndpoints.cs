@@ -106,6 +106,11 @@ public static class GitSmartHttpEndpoints
             ContentType = request.ContentType,
             ContentLength = request.ContentLength,
             ContentEncoding = request.Headers.ContentEncoding is { Count: > 0 } encoding ? encoding.ToString() : null,
+            // §7 remediation (supervisor blocker 2): forwarded verbatim when the client sends one,
+            // never invented when it does not -- see GitHttpBackendRequest.GitProtocol's own remarks.
+            GitProtocol = request.Headers.TryGetValue("Git-Protocol", out var gitProtocol) && gitProtocol.Count > 0
+                ? gitProtocol.ToString()
+                : null,
             RemoteUser = account.Username,
             RequestBody = request.Body,
         };

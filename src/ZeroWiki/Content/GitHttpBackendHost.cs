@@ -68,6 +68,28 @@ public sealed class GitHttpBackendHost(ContentPaths paths, ILogger<GitHttpBacken
         };
         startInfo.ArgumentList.Add("http-backend");
 
+        // §7 remediation (supervisor blocker 1): ProcessStartInfo.Environment starts as a COPY of the
+        // *current* process's entire environment -- assigning keys onto it, as this method used to,
+        // is an overlay, not a replacement, and the subprocess inherited everything the app itself had
+        // (HOME included; measured at 108 ambient variables). Clear() is what actually excludes
+        // anything the block below does not explicitly re-add.
+        //
+        // PATH is the one deliberate exception, forwarded from this process's own environment rather
+        // than hardcoded: ProcessStartInfo("git") resolves the `git` binary itself via PATH, so
+        // clearing without restoring it breaks process startup outright. Nothing else ambient is
+        // needed -- measured by execution inside the shipped mcr.microsoft.com/dotnet/aspnet:10.0
+        // image, not assumed: a git-http-backend invocation given only PATH plus
+        // BuildEnvironmentVariables' own list, under a fully cleared environment (`env -i`), produced
+        // output identical in shape to one with this process's full ambient environment attached, for
+        // both info/refs and a real push exercising the installed no-op hooks (DEVLOG §7 remediation
+        // thread). No `LANG`/`TZ`/locale variable is read anywhere in this call chain.
+        startInfo.Environment.Clear();
+        var path = Environment.GetEnvironmentVariable("PATH");
+        if (!string.IsNullOrEmpty(path))
+        {
+            startInfo.Environment["PATH"] = path;
+        }
+
         foreach (var (key, value) in BuildEnvironmentVariables(request))
         {
             startInfo.Environment[key] = value;
@@ -115,10 +137,16 @@ public sealed class GitHttpBackendHost(ContentPaths paths, ILogger<GitHttpBacken
         }
     }
 
-    /// <summary>D18 §2's environment set. <c>GIT_PROJECT_ROOT</c> and <c>GIT_HTTP_EXPORT_ALL</c> are
-    /// fixed facts of this deployment, never derived from <paramref name="request"/>. <c>HOME</c> is
-    /// deliberately never set here — the <c>Dockerfile</c>'s system-scope
-    /// <c>git config --system --add safe.directory '*'</c> is what makes that safe.</summary>
+    /// <summary>
+    /// D18 §2's environment set — the entire deliberate set the subprocess sees, together with the
+    /// forwarded <c>PATH</c> that <see cref="InvokeAsync"/> adds separately (see its own remarks).
+    /// <c>GIT_PROJECT_ROOT</c> and <c>GIT_HTTP_EXPORT_ALL</c> are fixed facts of this deployment, never
+    /// derived from <paramref name="request"/>. <c>HOME</c> is never set — <see cref="InvokeAsync"/>
+    /// clears the subprocess's environment before this method's values (and <c>PATH</c>) are the only
+    /// things added back, so there is no ambient value left for it to inherit — and the
+    /// <c>Dockerfile</c>'s system-scope <c>git config --system --add safe.directory '*'</c> is what
+    /// makes that safe rather than merely convenient.
+    /// </summary>
     private IReadOnlyDictionary<string, string> BuildEnvironmentVariables(GitHttpBackendRequest request)
     {
         var variables = new Dictionary<string, string>
@@ -153,6 +181,17 @@ public sealed class GitHttpBackendHost(ContentPaths paths, ILogger<GitHttpBacken
             // gzip-compressed body itself (D18 §2); decoding it a second time here would double-decode
             // or race which layer does it, for no benefit.
             variables["HTTP_CONTENT_ENCODING"] = request.ContentEncoding;
+        }
+
+        if (request.GitProtocol is not null)
+        {
+            // §7 remediation (supervisor blocker 2): forwarded verbatim, never invented -- a client
+            // that sends no `Git-Protocol` header gets no `HTTP_GIT_PROTOCOL` variable, and
+            // git-http-backend answers protocol v0 exactly as it always has. `git-http-backend` itself
+            // reads this variable and re-exports it as `GIT_PROTOCOL` to the child it execs
+            // (`upload-pack`/`receive-pack`); this host does not construct `GIT_PROTOCOL` directly, so
+            // there is exactly one place a client's requested protocol version can come from.
+            variables["HTTP_GIT_PROTOCOL"] = request.GitProtocol;
         }
 
         return variables;

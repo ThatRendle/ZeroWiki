@@ -1171,10 +1171,36 @@ route-space reservation the way `/wiki/` does, since git clients address it dire
   `info/refs`, `POST` for the two service endpoints), `QUERY_STRING` (`service=git-upload-pack` on the
   `info/refs` GET; empty on the POSTs), `CONTENT_TYPE` and `CONTENT_LENGTH` (forwarded from the request
   when present — `info/refs` carries neither, and a chunked-transfer POST carries none either, below),
-  `REMOTE_USER` (the authenticated account's `Username`; see §4), and `HTTP_CONTENT_ENCODING` when the
-  request carries `Content-Encoding` (below). `HOME` is deliberately never set — the `Dockerfile`'s
-  system-scope `safe.directory` is what makes that safe (see the obligation check at the end of this
-  section) — and no other variable is passed. (macOS/git 2.55.0 only.)
+  `REMOTE_USER` (the authenticated account's `Username`; see §4), `HTTP_CONTENT_ENCODING` when the
+  request carries `Content-Encoding` (below), and `HTTP_GIT_PROTOCOL` when the request carries
+  `Git-Protocol` (a §7 remediation addition — see the new bullet below, after the CGI response header
+  translation one). `PATH` is forwarded from the app's own process environment,
+  unmodified — the one deliberate exception, because `git` itself is resolved through it. **`HOME` is
+  never set, and no other variable is passed — enforced by clearing the subprocess's environment before
+  this list (plus `PATH`) is added back, not merely by omitting `HOME` from an overlay onto the
+  inherited one.** (macOS/git 2.55.0 only.)
+
+  **Addendum — the first version of this sentence was false about what shipped, discovered by the
+  supervisor's §7 section review, not by either block review (Product Owner decision, recorded here
+  rather than silently corrected).** The implementation this obligation described built exactly the
+  dictionary above and assigned it onto `ProcessStartInfo.Environment` key by key — but that property is
+  pre-populated with a **copy of the current process's own environment** the first time it is read, so
+  the assignment was an *overlay*, never a replacement. The subprocess therefore inherited the app's
+  entire ambient environment, `HOME` included: measured at **108 variables** on the development machine,
+  and confirmed to include `HOME=/home/app` inside the shipped `mcr.microsoft.com/dotnet/aspnet:10.0`
+  image too (`docker run --user 1654 mcr.microsoft.com/dotnet/aspnet:10.0 env` — the base image itself
+  sets it, not something a per-deployment config could have avoided). The doc comment restated the same
+  false claim, and this design's own sentence restated it a third time — three artefacts agreeing because
+  they shared one source, not because anything had measured the process. **Fix: `ProcessStartInfo
+  .Environment.Clear()` before this obligation's list is applied, then `PATH` restored from the app's own
+  process, unmodified.** `Clear()` alone is not safe on its own — `ProcessStartInfo("git")` resolves the
+  `git` binary itself via `PATH`, so a cleared environment with nothing restored fails process startup
+  outright — which is why `PATH` is the one exception. Whether anything else ambient (`LANG`, `TZ`, a
+  locale or timezone variable) is genuinely required was checked by execution, not assumed: inside the
+  shipped Ubuntu 24.04/git 2.43.0 image, `git http-backend` given only `PATH` plus this list, under a
+  fully cleared environment (`env -i`), produced output identical in shape to the same call with the
+  full ambient environment attached — for `info/refs`, and for a real push exercising the repository's
+  installed no-op hooks. Nothing else is needed, and nothing else is passed.
 - *`CONTENT_LENGTH` absent — the shape a chunked-transfer request produces once Kestrel dechunks it,
   since `HttpRequest.ContentLength` is `null` for one — measured rather than assumed to need special
   handling, and the measurement corrected the premise it set out to check.* A real 459-byte
@@ -1232,6 +1258,26 @@ route-space reservation the way `/wiki/` does, since git clients address it dire
   200; every other line is forwarded as a response header unchanged; every byte after the blank line is
   the response body, copied without any decoding.** (macOS/git 2.55.0 and Ubuntu 24.04.4/git 2.43.0 —
   both quoted in obligation 1's transcript, which exercises this same header block on every request.)
+- *`Git-Protocol` → `HTTP_GIT_PROTOCOL` — §7 remediation addition, found missing by the supervisor's
+  §7 section review, absent from every version of this obligation until now.* This bullet's own list
+  enumerated "the full environment set" and never named it — an omission, not a considered exclusion; the
+  §7 thread that implemented this design never mentions protocol version at all. `git-http-backend` reads
+  the CGI variable `HTTP_GIT_PROTOCOL` (the standard `HTTP_`-prefixed translation of the request header
+  `Git-Protocol`, the same convention `HTTP_CONTENT_ENCODING` already uses in this same list) and
+  re-exports it as `GIT_PROTOCOL` to whichever child it execs. Every git client since 2.26 sends
+  `Git-Protocol: version=2` and falls back to v0 transparently when the server does not answer in kind —
+  which is exactly why this omission was invisible to every test in this section: clone, fetch, and push
+  all worked, just at protocol v0, which re-advertises every ref on every request where v2's `ls-refs`
+  does not. Measured inside the shipped Ubuntu 24.04/git 2.43.0 image, under the corrected minimal
+  environment above, same repository, same request, only `HTTP_GIT_PROTOCOL` added:
+  ```
+  without: 538 bytes -- full v0 ref advertisement (# service=git-upload-pack, every ref, full capability list)
+  with:    319 bytes -- version 2 / ls-refs=unborn / fetch=shallow wait-for-done / object-format=sha1
+  ```
+  **Decision: the host forwards the request's `Git-Protocol` header verbatim as `HTTP_GIT_PROTOCOL` when
+  present, and adds no variable at all when it is absent — never inventing a value for a client that did
+  not ask.** `git-http-backend` already does the negotiation and the fallback; a host that invented a
+  version would be answering on the client's behalf.
 
 **3 — The streaming contract, and why `GitProcessRunner` is disqualified rather than extended.**
 `GitProcessRunner.RunAsync` (`GitProcessRunner.cs:56-116`) sets `RedirectStandardOutput = true` and reads
@@ -1494,14 +1540,24 @@ push path re-verify cleanliness with the same blind instrument — it inherits t
 `AssertWorkingTreeIsCleanAsync` machinery as-is and carries the same blind spot forward, explicitly,
 rather than silently.
 
-**The `safe.directory` standing hazard named in obligation 4's environment list — discharged, and
-re-verified rather than re-solved, exactly as instructed.** `Dockerfile:54` runs `git config --system
---add safe.directory '*'` as root before the `USER` switch. §7's CGI subprocess is the sharpest test of
-that line, since it runs with a constructed environment that deliberately omits `HOME` (§2) — a
-per-user `--global` setting would silently stop applying there. Reproduced inside the Ubuntu
-24.04.4/git 2.43.0 image: a repository owned by `appuser`, `git-http-backend` invoked as `root` with
-`HOME` unset (euid/owning-uid mismatch, `HOME` absent — the exact shape a CGI subprocess runs in) fails
-without the config line —
+**The `safe.directory` standing hazard named in obligation 4's environment list — discharged, but the
+reasoning below was inverted until the §7 remediation block corrected it, and is rewritten here rather
+than left standing (Product Owner decision).** `Dockerfile:54` runs `git config --system --add
+safe.directory '*'` as root before the `USER` switch. The paragraph originally here reproduced the
+container experiment with `HOME` unset and called that "the exact shape a CGI subprocess runs in" — but
+at the time it was written, and for the whole of block B, that was **not** the shape the code produced:
+§2's overlay defect meant the subprocess inherited the app's own `HOME`, so a per-user `--global` setting
+would in fact have applied there, the opposite of what this paragraph concluded from. The experiment
+itself was a legitimate test of the case that matters; it was just being cited for code that did not yet
+match it.
+
+**After the §7 remediation fix, this experiment describes the running code correctly, not
+prospectively.** §2's environment is now genuinely cleared before `PATH` and its own list are added back,
+so the CGI subprocess has no `HOME` for a `--global` setting to write into or read from — `Dockerfile:54`
+running at *system* scope is what makes ownership verification work at all, rather than being a defence
+that happened not to be exercised by what shipped. Reproduced inside the Ubuntu 24.04.4/git 2.43.0 image:
+a repository owned by `appuser`, `git-http-backend` invoked as `root` with `HOME` unset (euid/owning-uid
+mismatch, `HOME` absent) fails without the config line —
 
 ```
 fatal: detected dubious ownership in repository at '/data/wiki/.git'
@@ -1509,7 +1565,12 @@ Status: 500 Internal Server Error
 ```
 
 — and succeeds cleanly, still with `HOME` unset, once `git config --system --add safe.directory '*'`
-is applied. The Dockerfile's own claim holds; nothing here changes it.
+is applied. **The Dockerfile decision itself was already correct and needs no change** — system scope was
+always the safer choice regardless of what the CGI subprocess's environment happened to contain, and
+`Dockerfile:23-29`'s own header comment already describes the environment this fix produces (a
+`--global` setting silently not applying), so it stands unmodified rather than being corrected to match
+something it already said correctly. Only this design document's reasoning was inverted, not the
+Dockerfile's, and not the decision the Dockerfile records.
 
 **Spec delta: none needed, checked requirement by requirement rather than assumed.**
 `specs/git-sync/spec.md` already states the Smart HTTP surface, `updateInstead`, non-fast-forward
