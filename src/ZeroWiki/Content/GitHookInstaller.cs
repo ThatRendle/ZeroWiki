@@ -3,11 +3,13 @@ namespace ZeroWiki.Content;
 /// <summary>
 /// Installs the two Smart HTTP git hooks (<c>pre-receive</c>, <c>post-receive</c>) into the content
 /// repository's own hooks directory on every application start (Product Owner decision, §2). Both
-/// hooks ship with no-op bodies today and are rewritten unconditionally on every call — an upgraded
-/// image ships an updated hook body rather than inheriting whatever the volume happens to hold, and a
-/// hand-edit is discarded on the next start rather than silently kept. Each hook's own header comment
-/// says so, so an operator who edits one directly learns it from the file rather than from a silently
-/// reverted change.
+/// hooks are deliberately no-op, permanently (D19: a completed push reaches the app in-process, since
+/// §7.5 already made the app the parent of the whole <c>git http-backend</c> invocation these hooks run
+/// as children of — there is no <c>post-receive</c> signalling path and none is planned), and are
+/// rewritten unconditionally on every call — an upgraded image ships an updated hook body rather than
+/// inheriting whatever the volume happens to hold, and a hand-edit is discarded on the next start rather
+/// than silently kept. Each hook's own header comment says so, so an operator who edits one directly
+/// learns it from the file rather than from a silently reverted change.
 /// </summary>
 /// <remarks>
 /// <para>
@@ -39,9 +41,12 @@ public sealed class GitHookInstaller
     public const string PreReceiveHookName = "pre-receive";
 
     /// <summary>
-    /// Filename of the hook that will re-index and broadcast changes (§8.1-§8.2). Do not use it to
-    /// acquire the repository write lock either (see <see cref="PostReceiveHookBody"/> and this type's
-    /// remarks) — same reason as <see cref="PreReceiveHookName"/>.
+    /// Filename of the post-receive hook. Deliberately no-op, permanently (D19, Product Owner decision,
+    /// DEVLOG §8): re-index and broadcast happen in-process in <c>GitSmartHttpEndpoints.
+    /// HandleReceivePackAsync</c>, whose parent process this hook runs as a child of, so it has nothing
+    /// to signal. Do not use it to acquire the repository write lock either (see
+    /// <see cref="PostReceiveHookBody"/> and this type's remarks) — same reason as
+    /// <see cref="PreReceiveHookName"/>.
     /// </summary>
     public const string PostReceiveHookName = "post-receive";
 
@@ -72,17 +77,18 @@ public sealed class GitHookInstaller
         "# hand-edit to this file is discarded on the next start, not preserved. Treat this file as\n" +
         "# generated, not as operator configuration.\n" +
         "#\n" +
-        "# No-op today. Filled in by sections 8.1-8.2: re-index the changed pages and broadcast the\n" +
-        "# change to connected browsers.\n" +
+        "# Deliberately no-op, permanently -- not a placeholder waiting on a task number. Re-index\n" +
+        "# and broadcast happen in-process in GitSmartHttpEndpoints.HandleReceivePackAsync, the\n" +
+        "# parent process this hook runs as a child of: it already knows exactly when a push has\n" +
+        "# landed and needs nothing from this hook to tell it (design.md D19, Product Owner decision,\n" +
+        "# DEVLOG section 8). No future task will fill this hook in.\n" +
         "#\n" +
-        "# WARNING, if you are the one filling this in: do NOT acquire the repository write lock\n" +
-        "# here. The app already holds it for the whole 'git http-backend' invocation this hook\n" +
-        "# runs as a child of (design.md D16, task 7.5) - taking the same lock here would block\n" +
+        "# WARNING, if you are nonetheless the one editing this hook: do NOT acquire the repository\n" +
+        "# write lock here. The app already holds it for the whole 'git http-backend' invocation this\n" +
+        "# hook runs as a child of (design.md D16, task 7.5) - taking the same lock here would block\n" +
         "# this process against its own parent, and flock(2) gives a separate process no\n" +
         "# re-entrancy. The wait is unbounded by design, so the result is not a slow push but one\n" +
-        "# that never returns, with an operator's only recourse being to restart the app. The\n" +
-        "# re-index/broadcast work below needs none of this: it can safely assume the push has\n" +
-        "# already finished landing under the app's own lock by the time this hook runs.\n" +
+        "# that never returns, with an operator's only recourse being to restart the app.\n" +
         "exit 0\n";
 
     private readonly GitProcessRunner _git;

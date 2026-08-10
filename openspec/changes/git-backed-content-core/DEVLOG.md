@@ -20095,6 +20095,273 @@ tree is being updated.
 
 §7 is closed. → @architect
 
+## 8. Push reactions & identity
+
+**[architect]** Base: `e4e5022` — §8 makes a received push visible: the changed pages are re-indexed,
+connected viewers of those pages are told the content changed on disk, and push-originated edits are
+attributed to the account that made them.
+
+**[architect] ⚠️ Product Owner decision, taken before the carve, because it changes what §8 *is*.**
+
+**A completed push reaches the app in-process. There is no `post-receive` signalling path, and none will
+be built.** §7.5 made the app the **parent** of the whole `git http-backend` invocation
+(`GitSmartHttpEndpoints.HandleReceivePackAsync`), holding the write lock around it — so the app already
+knows exactly when a push has landed and needs nothing to tell it.
+
+*Why this was a decision rather than an implementation detail:* `tasks.md` 8.1 and 8.2 both name the
+`post-receive` hook explicitly, and the installed hooks say *"Filled in by sections 8.1-8.2"*. **The spec
+does not.** `specs/git-sync/spec.md`'s *Re-index and broadcast on received push* says *"The system SHALL,
+after a push updates the working tree, re-index the changed files and broadcast…"* — mechanism-neutral.
+So the tasks presupposed a mechanism the spec never required, and §7 made that mechanism both harder and
+unnecessary: obligation 3's "the image has no HTTP client" still stands, and §7's remediation now clears
+the CGI environment to an allowlist, so a hook inherits only `PATH` plus D18 §2's set and cannot even
+discover the app's address. **This is the case CLAUDE.md §4 names — implementation revealing the tasks
+wrong — so it went to the Product Owner rather than being improvised around.**
+
+**Two consequences, both Architect calls; `@supervisor` should challenge either if it disagrees:**
+
+1. **`tasks.md` 8.1/8.2 are reworded to name the system rather than the hook.** This follows the Product
+   Owner's decision; it is not scope being quietly rewritten. Block A does it, and the DEVLOG is the
+   record of why.
+2. **The two installed hooks stay, but stop being pending scaffolding.** Removing them would reverse
+   **§2.3**, a ticked task with its own tests, to delete something harmless. Leaving their bodies saying
+   *"Filled in by sections 8.1-8.2"* would leave a promise nothing will ever keep — and an unfilled
+   promise in generated text is exactly the dead-scaffolding shape a section review hunts. So block A
+   rewrites both bodies as a **documented deliberate no-op**, stating that re-index and broadcast happen
+   in-process and that no task will fill these in. §2.3 stands; only the text it generates becomes
+   honest. **Do not delete `GitHookInstaller`.** The deadlock warning both bodies carry is still
+   load-bearing for anyone who later edits them, and it is now the only thing standing between a future
+   contributor and D16's unbounded self-deadlock.
+
+**[architect]** §8 is carved into three blocks:
+
+- **A** — D19, the push-reaction surface. Design only, plus the two artefact corrections above. Ticks
+  nothing.
+- **B** — 8.1 + 8.2: re-index the changed pages and broadcast to connected viewers. One mechanism, one
+  trigger point, one block.
+- **C** — 8.3: git-email → account mapping and push-originated attribution.
+
+**[architect] Brief — block A (D19). Ticks no boxes; commits `design.md`, `tasks.md`, and
+`GitHookInstaller`'s hook bodies.**
+
+*Deliverable:* a new `### D19` in `design.md`, in the voice of D16/D17/D18 — decisions with the
+measurement that settled each, not a survey. Same evidence standard as D18: **a paragraph containing a
+literal a machine consumes does not ship until that literal has been fed to that machine and the output
+pasted back.**
+
+What D19 must settle:
+
+1. **The trigger point, precisely.** Where in `HandleReceivePackAsync` the reaction runs — and critically
+   **whether it runs inside or outside the write lock**, with the reason. Both are defensible and they
+   fail differently: inside, the reaction delays every subsequent writer; outside, a second push can land
+   between the release and the reaction. Say which, and what the consequence is for the spec's own
+   scenario.
+2. **What "the changed files" actually means here, given the app never sees the ref pair.** A
+   `post-receive` hook is handed old/new sha per ref on stdin; the app is not. So establish **by
+   execution** how the app determines what changed — capturing `HEAD` before and after the invocation and
+   diffing, or another route — and what happens when the push updated no ref at all, was rejected, or
+   `HEAD` is unchanged. A push that fails must trigger nothing.
+3. **The broadcast transport.** D7 says the default render mode is Static SSR with `InteractiveServer`
+   opted into per-component, and names the "changed on disk" indicator as the **first** interactive
+   island. So this is the change that introduces SignalR to this app: say what the hub is, what a viewer
+   subscribes to (a page? a route?), and what a viewer that is *not* looking at an affected page must
+   **not** receive.
+4. **How this composes with §4's index**, which already refreshes when it notices `HEAD` has moved
+   (D15's stamp check — `specs/content-store/spec.md`'s *Content changed by an unannounced writer is
+   still reflected*). Is 8.1 then a **freshness** win rather than a correctness one? Say so plainly if
+   it is, and say what would break if 8.1 did nothing at all — that is the honest measure of what this
+   task buys, and D18 §5 is the precedent for stating a decision's real value rather than its assumed
+   one.
+5. **8.3's resolver ordering, which is already constrained.** `AccountGitAuthorFactory`'s remarks bind
+   it: D10's *Consequence binding §8.3* requires the inbound resolver to match the **synthetic**
+   `account+<id>@<domain>` form **first**, ahead of registered `GitEmails` rows, so a squatted row can
+   never capture another member's attribution. `GitEmailService` and the `GitEmails` table already
+   exist. D19 states the ordering and why; block C implements it.
+
+*Constraints:* design and artefact changes only — **no new feature code, no tests**. Rewording
+`tasks.md` and the two hook bodies is in scope and is the block's own work.
+
+*Gates:* `openspec validate git-backed-content-core --strict`, plus `dotnet build`, `dotnet test`,
+`dotnet format --verify-no-changes` clean — **unsandboxed and in the foreground** (see the harness note
+in `## NEXT`; a sandboxed "Build FAILED. 0 Warning(s) 0 Error(s)" is the sandbox, not you). Changing hook
+body text **will** move `ContentRepositoryServiceTests`, so the suite is not a formality here.
+
+→ @worker
+
+**[worker]** Block A done — design.md D19, tasks.md 8.1/8.2 reworded, `GitHookInstaller`'s two hook
+bodies rewritten as a documented deliberate no-op. No feature code, no tests, as briefed.
+
+**D19's five points, and the evidence each rests on** (full text in `design.md`, after D18):
+
+1. **Trigger point split across the lock boundary.** `HandleReceivePackAsync` captures `git rev-parse
+   HEAD` twice — right after the lock is acquired, and right after `InvokeGitHttpBackendAsync` returns —
+   both still inside the `try`/`finally` that holds `writeLock`. The *reaction* (diff, re-index,
+   broadcast) runs after `writeLock.Dispose()`, closing over the two already-captured shas rather than
+   re-reading "current `HEAD`". Reasoning: the capture must be inside (bounded, must not race a
+   concurrent writer); the reaction must be outside (unbounded, must not lengthen every subsequent
+   writer's already-unbounded queue per *Push's wait for the lock has no ceiling*). Consequence for the
+   spec's own scenario: a second push can land and finish before push *N*'s reaction runs — safe, because
+   the reaction is keyed to fixed shas, not "current `HEAD`"; the only visible effect is that push *N*'s
+   broadcast can arrive slightly behind push *N*+1 having landed, which §4 addresses.
+
+2. **"Changed files" = `before`/`after` `HEAD` around that same trigger, verified by execution, not
+   assumed.** Real transcripts (scratchpad, macOS git 2.55.0, non-bare repo shaped like `ContentPaths`),
+   quoted verbatim in `design.md`:
+   ```
+   successful ff push:        BEFORE=a933401c… AFTER=6a6edcae…  RC=0  diff --name-only: docs/page.md
+   rejected non-ff push:      BEFORE=4fe8f409… AFTER=4fe8f409…  RC=0  (! [rejected] … fetch first)
+   push with nothing to send: BEFORE=4fe8f409… AFTER=4fe8f409…  RC=0  (Everything up-to-date)
+   ```
+   Two findings that weren't assumed going in: `git-receive-pack` **exits 0 even when the ref update is
+   rejected** — an exit-code check would be wrong, consistent with D17's own caution about trusting a
+   git exit code — so `before == after` is what correctly says "nothing to react to". And a no-op push
+   still invoked the wrapper standing in for the trigger (empty command set, `before == after`) under
+   this transport; whether every real Smart-HTTP client always issues the POST in that case wasn't
+   independently reproduced, and doesn't need to be — either way is already safe (never invoked: nothing
+   runs; invoked-empty: `before == after` still yields no reaction).
+
+3. **Broadcast = the circuit D7 already named, not a second SignalR connection.** D7's "changed on disk"
+   indicator opting into `InteractiveServer` *is* the framework's own `/_blazor` circuit — not a bespoke
+   `Hub`. Decision: an in-process singleton keyed by page route; a viewer on an unaffected route has no
+   registered callback under any changed route, so it is never invoked at all, not told-then-filtered.
+
+4. **Composition with D15 — asked to answer honestly, answered honestly: 8.1 is a freshness win, not a
+   correctness one.** D15's stamp check already refreshes lazily on the next page view for any writer
+   that never notifies the app, `specs/content-store/spec.md`'s *unannounced writer* scenario names this
+   exact case, and it already covers a push with zero help from §8. If 8.1's eager re-index did nothing:
+   correctness is unaffected. What it actually buys: the first viewer to reload after a push skips paying
+   the incremental-refresh cost synchronously. What 8.1 is *not* optional for: 8.2 needs the changed-route
+   set (D15's lazy check only ever asks "did `HEAD` move", never "which paths moved") — that's §2's diff,
+   required regardless of whether the index-refresh half runs eagerly.
+
+5. **8.3 resolver ordering.** `AccountGitAuthorFactory` constructs two outbound shapes (`<username>@domain`
+   when the username is a legal dot-atom, `account+<id:N>@domain` otherwise). D10's *Consequence binding
+   §8.3* requires the inbound resolver to test both synthetic shapes first, ahead of any `GitEmails` row,
+   falling through to `GitEmails` only when neither matches, and to the raw pushed identity only after
+   that. No schema/behaviour change needed in `GitEmailService`/`GitEmails` — block C implements the
+   resolver.
+
+**Artefact corrections:** `tasks.md` 8.1/8.2 reworded to name the in-process mechanism, not the hook
+(ticks nothing, per brief). `GitHookInstaller`'s `post-receive` body and doc comments now state the no-op
+is permanent (D19, DEVLOG §8) rather than "filled in by 8.1-8.2"; the write-lock deadlock warning is kept
+verbatim in substance in both hook bodies. `GitHookInstaller` itself is untouched — still installs both
+hooks on every start (§2.3 stands).
+
+**Gates**, run unsandboxed/foreground per the harness note: `dotnet build` — 0 warnings, 0 errors.
+`dotnet test` — 826/826 passed, 2m57s (hook-text change did **not** move `ContentRepositoryServiceTests`
+— its assertions check for `File.Exists`, the executable bit, and `Contains("exit 0", …)`/
+`DoesNotContain("hand-edited", …)`, none of which reference the removed "Filled in by 8.1-8.2" string).
+`dotnet format --verify-no-changes` — clean, exit 0. `openspec validate git-backed-content-core --strict`
+— valid.
+
+→ @reviewer
+
+**[reviewer]** §8 block A (D19) — **Approve.** No blockers. Same evidence standard as §7: I re-derived the
+load-bearing claim by execution rather than reading the transcript and moving on, and it held up under a
+harder test than the one that produced it.
+
+**Gates, re-run myself, unsandboxed and foreground:** `dotnet build` 0/0. `dotnet test` **826/826 in
+2m19s**. `dotnet format --verify-no-changes` exit 0. `openspec validate --strict` valid. `git status
+--short` — exactly the four files reported, nothing ticked in `tasks.md` §8.
+
+**1 — Artefact corrections: faithful, not scope drift; deadlock warning survives in substance in both
+hook bodies; §2.3 intact.** `tasks.md` 8.1/8.2's reworded text names the in-process mechanism and cites
+D19/§7.5 — checked against `specs/git-sync/spec.md`'s *Re-index and broadcast on received push*
+directly, which is genuinely mechanism-neutral ("re-index the changed files and broadcast," no
+`post-receive` anywhere), so the reword neither narrows nor widens what the requirement demands.
+`GitHookInstaller.cs`: `PreReceiveHookBody` is **untouched by this diff** — its own deadlock warning
+(`flock(2)` self-deadlock, unbounded wait, restart-only recourse) reads exactly as before. `PostReceive
+HookBody` was rewritten, but the same warning survives near-verbatim — same mechanism, same consequence,
+same "operator's only recourse being to restart the app" line — only the no-longer-applicable closing
+sentence about the (now nonexistent) re-index/broadcast work below it was dropped, which is correct
+rather than a thinning. `InstallHooksAsync` itself is unchanged and still writes both hooks
+unconditionally on every start (`WriteHookAsync` called for both names) — §2.3 stands.
+
+**2 — The exit-code claim: reproduced independently, and by a harder route than a naive replay would
+have found.** My first attempt (clone twice, second clone never fetches, both `git push` over the real
+Smart HTTP transport) reproduced `before == after` and a client-side `! [rejected] … (fetch first)` —
+but the bridge's own subprocess-exit-code log showed **`git-receive-pack` was never invoked at all** for
+that second push: the client's own preflight (comparing its locally-known parent against the
+freshly-fetched `info/refs` advertisement) refuses to send the `POST` in the first place when it can
+already tell a fast-forward is impossible. That's a real, useful thing to know for block B's own tests
+— it means "two ordinary git clients, one stale" tests the client's refusal, not the server's — but it
+doesn't touch D19's claim, since a request that never arrives trivially yields `before == after` too.
+
+So I built the scenario that actually forces the subprocess to reject internally: captured a real,
+successful push's raw request bytes off the wire (via a CGI bridge, the same technique D18's own
+obligation 1 used), let it land, then **replayed the identical bytes a second time** directly against
+`git-http-backend` — its embedded `old-sha` now stale by construction, since the server has already
+moved past it. This is exactly the shape D16's write-lock race actually produces (two writers, the
+second's old-sha claim outdated by the time it runs under the lock), not a contrived one:
+
+```
+SUBPROCESS EXIT CODE: 0
+0094\x02error: cannot lock ref 'refs/heads/main': is at 508f1dc5… but expected 0b325511f0…
+004b\x01000eunpack ok
+0034ng refs/heads/main incorrect old value provided
+0000
+server HEAD after replay: 508f1dc5… (unchanged)
+```
+
+Confirmed on the nose: `unpack ok` (the pack itself was accepted), `ng refs/heads/main incorrect old
+value provided` (the ref-update specifically was refused, via git's report-status side-channel), the
+**process exits 0** regardless, and the working tree is untouched. `before == after` is exactly what
+correctly signals "nothing to react to" here, matching D17's own caution about trusting a git exit code,
+now independently confirmed for this specific subprocess and this specific failure shape rather than
+taken on the transcript.
+
+**3 — Trigger-point split: the reasoning is sound and the stated consequence is honest.** Nothing to
+execute yet (no code in this block), so I checked the argument on its own terms: capturing inside the
+lock is cheap and bounded (two `rev-parse` calls) and must bracket *this* push's own invocation, which
+only holding the lock guarantees; reacting outside it is unbounded and would otherwise stack behind
+every subsequent writer's already-unbounded wait (`specs/content-editing/spec.md`'s *Push's wait for the
+lock has no ceiling*, already spec text, already binding). The stated consequence — a second push can
+land and finish before push *N*'s own reaction runs, and that's safe because the reaction closes over
+two already-fixed shas rather than re-reading `HEAD` — is the correct characterization: nothing about a
+closure over fixed values can go stale the way "read current HEAD later" would. It plainly says the
+visible cost (ordering: a broadcast can arrive behind a later push having already landed) rather than
+hiding it, and correctly routes the ordering question to §4 rather than pretending §1 resolves it.
+
+**4 — Composition claim: checked against the actual index code and the actual spec text, not accepted on
+the design's own say-so.** `PageIndexBuilder.RefreshAsync` genuinely uses `git diff --no-renames
+--name-only -z` for its incremental refresh (`PageIndexBuilder.cs:174-182`) — the same shape D19 claims
+8.1's diff would use. `specs/content-store/spec.md`'s *Content changed by an unannounced writer is still
+reflected* scenario **names "an incoming push updating the working tree" explicitly** as one of its two
+worked examples (the other is a direct commit on the volume) — this is not an inference from a
+general-sounding scenario, the push case is spelled out verbatim. So "8.1 is a freshness win, not a
+correctness one" is not generous rounding; the correctness guarantee this composition claim leans on is
+already shipped, already spec text, and already names this exact case. The "not optional" half checks
+out the same way: D15's stamp check is cited correctly as only ever asking "has `HEAD` moved," never
+"which paths" — confirmed by reading `PageIndex.cs`'s stamp-comparison path, which triggers a full
+`RefreshAsync` call with no route-level granularity of its own. §2's diff is genuinely the only source of
+the changed-route set 8.2 needs. Neither overstated (§7's defect) nor understated (the one this block was
+warned equally against).
+
+**5 — Broadcast transport: consistent with D7, and correctly framed as work block B still has to do, not
+work already done.** D7 (line 65) names the "changed on disk" indicator as the first component to opt
+into `InteractiveServer` — D19 cites this accurately as a prior decision, not a present fact about the
+code. Checked `Program.cs` and the whole of `src/ZeroWiki/` directly: **no
+`AddInteractiveServerComponents`, no `.AddInteractiveServerRenderMode()`, no `Hub` subclass, no SignalR
+anywhere** — only `AddRazorComponents()` with nothing chained, and `_Imports.razor`'s routine `@using
+static … RenderMode` (template boilerplate, not evidence of use). D19's phrasing never claims this
+already exists; it names the two framework APIs block B must call and states the decision (framework
+circuit, not a bespoke `Hub`) block B is bound to. Consistent with the brief's own framing that this is
+the change that introduces SignalR to the app — D19 doesn't contradict that, it prepares for it.
+
+**8.3 resolver ordering (point 5 of D19):** confirmed `AccountGitAuthorFactory.CreateAuthor` genuinely
+builds the two outbound shapes D19 describes — `<username>@domain` for a legal RFC 5322 dot-atom
+username, `account+<id:N>@domain` (via `SyntheticLocalPartPrefix = "account+"`) otherwise — so the
+resolver-ordering decision for block C is derived from real code, not asserted.
+
+**No other findings.** `ContentRepositoryServiceTests` not moving is correct rather than a gap: its
+assertions (`DoesNotContain("hand-edited", …)`, `Contains("exit 0", …)`) check behaviour (rejects a
+hand-edit, exits 0), never the hook's exact prose — coupling a test to comment wording would be the
+wrong kind of coverage, not a missing kind.
+
+Ready to land. Nothing here reaches past its evidence.
+
+→ @architect
+
 ## NEXT
 
 **Resume point: §8 (Push reactions & identity), block A — not yet carved.** **§7 is CLOSED**: supervisor

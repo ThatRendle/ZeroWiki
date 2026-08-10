@@ -1583,6 +1583,141 @@ to "repository writes", which is the textual basis for obligation 5's decision t
 needs no lock at all — the requirement was never claiming otherwise, and nothing here weakens or extends
 what it demands of a push's unbounded wait. No requirement changes; none added.
 
+### D19 — Push reactions: trigger point, changed-file determination, broadcast transport, and composition with §4
+
+**Product Owner decision, DEVLOG §8:** a completed push reaches the app in-process. §7.5 already made the
+app the parent of the whole `git http-backend` invocation (`GitSmartHttpEndpoints.HandleReceivePackAsync`),
+holding `RepositoryWriteLock` around it — there is no `post-receive` signalling path, and none will be
+built. `tasks.md` 8.1/8.2 named the hook; `specs/git-sync/spec.md`'s *Re-index and broadcast on received
+push* does not — "after a push updates the working tree, re-index the changed files and broadcast" is
+mechanism-neutral, and this section supplies the mechanism the spec actually asks for. Every literal below
+was fed to the real `git-receive-pack` binary (macOS, git 2.55.0) against a throwaway non-bare repository
+in the scratchpad, shaped like `ContentPaths` (`docs/` working tree, `.git` at the root, `receive.deny
+CurrentBranch=updateInstead`) — the same methodology D18 used, at the same layer D18 already proved the
+CGI path behaves identically to (obligation 1's clone/push transcripts).
+
+**1 — Trigger point: split across the lock boundary, not uniformly inside or outside it.**
+`HandleReceivePackAsync` already acquires `writeLock` before calling `InvokeGitHttpBackendAsync` and
+disposes it in a `finally`. The **capture** of "what HEAD was" happens twice inside that boundary — once
+immediately after the lock is acquired, before the backend runs, and once immediately after
+`InvokeGitHttpBackendAsync` returns, still inside the `try` — each a single bounded `git rev-parse HEAD`
+subprocess. The **reaction** — diffing the captured shas for changed paths, refreshing the index,
+broadcasting — runs *after* `writeLock.Dispose()`, taking the captured `(before, after)` pair as fixed
+values rather than re-reading "current `HEAD`" at reaction time.
+
+*Why split rather than putting the whole thing on one side.* Fully inside: the reaction's slowest parts —
+walking a diff, re-reading frontmatter for however many files changed, fanning a broadcast out to however
+many connected circuits — would run while every subsequent writer sits in D16's already-unbounded queue
+(`specs/content-editing/spec.md`'s *Push's wait for the lock has no ceiling*), stacking unbounded work
+behind an already-unbounded wait for no benefit the spec asks for. Fully outside: capturing "before" `HEAD`
+without the lock held risks racing a second writer between the read and the actual push landing, which
+would attribute another writer's change to this push's diff. Splitting keeps the only work that must be
+serialized (the two cheap `rev-parse` calls, which must bracket *this* push's invocation and no one else's)
+inside the lock, and defers everything unbounded to after release. **Consequence for the spec's own
+scenario:** a second push (or a browser save) can start, and finish, before push *N*'s own reaction
+executes — accepted, and not a correctness hazard, because the reaction closes over two already-computed,
+immutable shas rather than "current `HEAD`"; push *N*'s diff and broadcast describe exactly what push *N*
+changed regardless of what lands after it. The only observable effect is ordering: push *N*'s "changed on
+disk" signal can reach viewers slightly behind push *N*+1 having already landed — addressed in §4 below,
+because a signal is a nudge to refresh, not a claim about which commit a viewer will see.
+
+**Decision: capture inside the lock (bounded, cheap, must not race a concurrent writer); react outside it
+(unbounded, must not lengthen another writer's already-unbounded wait).**
+
+**2 — What "the changed files" means, established by execution rather than assumed, because the app never
+receives a ref/old-sha/new-sha triple the way a `post-receive` hook would.** A wrapper standing in for the
+trigger point above — `git rev-parse HEAD` before invoking `git-receive-pack`, the invocation, `git
+rev-parse HEAD` after — was run against three real pushes:
+
+```
+=== successful fast-forward push ===
+TRIGGER: BEFORE=a933401c68227b2e4f8a63373786bf9350a3ed58 AFTER=6a6edcae268358a0d15a7f3babf0ba7a0b51733a RC=0
+TRIGGER: HEAD moved -- changed files:
+docs/page.md
+
+=== non-fast-forward push (rejected) ===
+TRIGGER: BEFORE=4fe8f4096fb65ed6cef9a6bb95ea65cca710da5c AFTER=4fe8f4096fb65ed6cef9a6bb95ea65cca710da5c RC=0
+TRIGGER: HEAD unchanged -- no reaction
+ ! [rejected]        main -> main (fetch first)
+
+=== push with nothing new to send ===
+TRIGGER: BEFORE=4fe8f4096fb65ed6cef9a6bb95ea65cca710da5c AFTER=4fe8f4096fb65ed6cef9a6bb95ea65cca710da5c RC=0
+TRIGGER: HEAD unchanged -- no reaction
+Everything up-to-date
+```
+
+Two findings, neither assumed beforehand. First: **`git-receive-pack` exits `0` in the rejected case** —
+the ref *update* was refused, not the subprocess — so an exit-code check would have wrongly reacted to a
+push that changed nothing on disk; this is the same caution D17 already states about trusting a git exit
+code, now confirmed for this subprocess too. `before == after` is what correctly reports "nothing to react
+to," not the return code. Second: **a push with no new commits to send still invoked the wrapper** (an
+empty ref-update command set, exit `0`, `HEAD` unchanged) under this test's transport — whether every real
+Smart-HTTP client's `git push` always issues the `POST /git-receive-pack` in this case, or short-circuits
+client-side after the `info/refs` negotiation and never sends it at all, was not independently reproduced
+here, and it does not need to be: **either way is already safe under this design.** Never invoked means
+`HandleReceivePackAsync`'s own trigger never runs at all; invoked-with-nothing-to-do reports `before ==
+after` and reacts to nothing, by the same rule as the rejected case above.
+
+**Decision: the app reconstructs the equivalent of a `post-receive` ref-pair for itself by bracketing its
+own `git-receive-pack` invocation with `git rev-parse HEAD`, and treats `before == after` as "nothing
+changed" — never the subprocess exit code, and never an assumption about whether a no-op push even reaches
+the route.** `before != after`, the ordinary case, feeds `git diff --name-only <before> <after>` — the
+same shape D15's own incremental refresh already uses — to name exactly the changed paths. A failed,
+rejected, or no-op push triggers nothing, verified rather than assumed.
+
+**3 — Broadcast transport: the circuit D7 already named, not a second SignalR connection this design
+stands up alongside it.** D7 named the "changed on disk" indicator as the first component to opt into
+`InteractiveServer` — that render-mode flip *is* the SignalR circuit (the framework's own `/_blazor` hub,
+wired by `AddInteractiveServerComponents`/`.AddInteractiveServerRenderMode()`), not a bespoke `Hub`
+subclass this section adds. **Decision:** the publish/subscribe layer riding on that circuit is an
+in-process singleton keyed by page route — a component registers a callback under its own route when it
+activates (`OnInitialized`/`OnAfterRenderAsync`) and disposes the registration when its circuit ends; §2's
+reaction looks up only the routes named by its diff and invokes exactly those callbacks. A viewer on a
+route the push never touched has no callback registered under any of the changed routes, so it is **never
+invoked at all** — not told and then filtering client-side, simply never addressed — which is what answers
+"must not receive": nothing crosses that viewer's circuit, because the reaction never reaches for it.
+
+**4 — Composition with §4/D15: 8.1 is a freshness win, not a correctness one, stated plainly rather than
+assumed in its favour.** D15 already stamps the in-memory index with the `HEAD` it was built from and
+refreshes it — incrementally, via the identical `git diff --name-only` shape §2 verified above — whenever
+a page-serving request notices the stamp is stale, "covering every writer identically … *including writers
+that never notify the app*" (D15's own words), which is exactly what a push is if §8.1 did nothing at all.
+`specs/content-store/spec.md`'s *Content changed by an unannounced writer is still reflected* scenario
+already demands this and, per D15, already delivers it — for a push exactly as for a manual commit on the
+volume — with zero help from §8. **If 8.1's eager re-index did literally nothing: correctness is
+unaffected.** The next page view of any affected page, by anyone, still triggers D15's stamp check,
+notices `HEAD` moved, and refreshes before serving. What 8.1's re-index half actually buys is narrower and
+purely a latency property: the first viewer to reload after a push does not pay the incremental-refresh
+cost synchronously on their own request, because it already happened at push time. **What 8.1 is not
+optional for** is different: 8.2 needs to know *which* routes changed in order to notify only their
+viewers (§3's "must not receive"), and D15's lazy stamp check never computes that — it only ever asks "has
+`HEAD` moved," never "which paths moved." §2's diff is that missing piece, and it is required
+infrastructure for 8.2 regardless of whether the index-refresh half of 8.1 runs eagerly or is left to
+D15's own lazy path. **Decision, stated as D18 §5 states its own evidence rather than its assumed value:**
+correctness never depended on 8.1 running eagerly and does not start depending on it here; what 8.1 buys is
+the changed-route set 8.2 needs, plus a warmed index for whoever reloads first.
+
+**5 — 8.3's resolver ordering: settled here, implemented in block C.** `AccountGitAuthorFactory` (already
+shipped, D10/§6) constructs the *outbound* synthetic address in one of two shapes per account: the raw
+`Username` as the localpart when it is itself a legal RFC 5322 `dot-atom-text`, or the deterministic
+fallback `account+<accountId:N>` when it is not (`AccountGitAuthorFactory.cs:34-60`). D10's *Consequence
+binding §8.3* requires the *inbound* resolver to match the synthetic form first, ahead of registered
+`GitEmails` rows, so a member squatting another member's address in `/account` can never capture their
+attribution. Because the outbound side has two shapes, the inbound resolver must test both before ever
+consulting `GitEmails`: match `account+<id>@<domain>` against a live account's `Id` directly; separately,
+match `<localpart>@<domain>` against a live account's `Username` when that username is itself a legal
+dot-atom (the same legality test `AccountGitAuthorFactory` already applies outbound, so the two directions
+cannot drift apart). Either match resolves synthetically and short-circuits before `GitEmails` is
+consulted at all. Only an address matching neither synthetic shape falls through to a `GitEmails` lookup,
+and only failing that does it fall back to the raw pushed identity (spec: *Unknown git email is attributed
+to the raw identity*). **Decision: synthetic-first (both shapes), `GitEmails` second, raw identity last —
+`GitEmailService` and the `GitEmails` table need no schema or behaviour change to support it, as D10
+already noted.** Block C implements the resolver and its tests; nothing here is new code.
+
+**Spec delta: none.** `specs/git-sync/spec.md`'s *Re-index and broadcast on received push* requirement and
+its *Viewers notified after a push* scenario are already mechanism-neutral and are satisfied by the
+mechanism this section settles; no scenario changes.
+
 ## Risks / Trade-offs
 
 - **Dirty tree blocks all pushes** → Transactional save (`git checkout -- <file>` on commit failure, under lock) plus startup reconciliation (commit-as-recovered or discard) guarantee the tree returns to clean.
