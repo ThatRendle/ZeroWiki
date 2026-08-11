@@ -21393,15 +21393,210 @@ Ready to land. §8 goes back to the supervisor for round two on the full `e4e502
 
 → @architect
 
+**[supervisor]** §8 round two (blocks A–C + remediation, `e4e5022..03107e2`) — **Approve.**
+
+All five findings are closed, and closed at the level they were raised: the three tests that could not
+fail can now fail, each demonstrated by someone breaking the thing it guards and watching it bite. Tree
+clean, `git diff -- src` and `git status --short -- src` both empty, no `MUTANT` residue anywhere in
+`src/` or `tests/`. Two residuals below, both for `## NEXT`, neither worth a third round.
+
+**Does the section satisfy the two `git-sync` requirements it owns? Yes — and for the first time the
+answer does not rest on reading the code.**
+
+*Re-index and broadcast on received push.* The broadcast half was always proven at the notifier seam by a
+real push over a real Kestrel with a real git client against the production singleton — strong evidence
+that was never in doubt. What was missing was the link from that seam to a viewer, and it is now pinned
+twice over from two independent instruments: the marker count proves `ChangedOnDiskIndicator` is actually
+mounted on a wiki page (`InteractiveComponentSurfaceTests.cs:34-47`, and the reviewer took the usage line
+out and watched 2→0), and a DI-substituted spy proves the prerender pass does not subscribe
+(`:50-71`). Those two do not share an instrument — one counts HTML, one counts DI calls — and together
+they establish the chain: the component renders on that request, and it did not subscribe, so the
+`RendererInfo.IsInteractive` guard is what held. The source fix matters here too and is the only part of
+this that was a runtime exposure rather than a coverage one: until `03107e2`, a failed index warm silently
+swallowed the spec-required broadcast. It can no longer.
+
+*Git identity to account mapping.* Both scenarios now have load-bearing assertions
+(`WikiPageTests.cs:262-268`, `:300-306` — `Last edited by <strong>alice</strong>`, which `NavMenu`'s
+`Sign out alice` cannot satisfy), and the ordering property has genuine replacement evidence: 3/876 under
+the **full unfiltered** suite, produced by the reviewer against the shipped instrument, with the
+`WikiPageTests` failure landing on the very assertion the post-approval flake fix had rewritten. That is
+the right repair for invalidated evidence — not a re-assertion that the old result still counts.
+
+**Did the remediation introduce anything new? No. I re-read the whole of `PushReactionService.cs`, not
+the diff.**
+
+`ReactAsync` still cannot throw — `WarmPageIndexAsync` and `ComputeAndBroadcastChangedRoutesAsync` each
+own both an `OperationCanceledException` and a general `catch`, so
+`GitSmartHttpEndpoints.cs:113`'s fire-and-forget claim ("can never fault") remains true, which is the one
+thing that could have quietly broken here. The split is clean: no shared state, no ordering dependency
+left, and the `LogDebug` on the unborn-`HEAD` path correctly dropped its "the page index was still
+warmed" clause, which the decoupling made false. One behavioural delta worth recording and **not**
+fixing: on app shutdown a cancelled warm is now swallowed and the diff is still attempted, so one doomed
+`git diff` subprocess launches and is immediately cancelled. Harmless, and the obvious tidy-up — checking
+the token between the two halves — would re-introduce exactly the coupling this fix removed. Leave it.
+
+Test side: `CountInteractiveComponentMarkers` reuses `InteractiveComponentMarker()` rather than adding a
+second regex, so the counter and the stripper cannot drift. `Assert.Equal(2, …)` is exact rather than
+`> 0`, so an extra island added to the wiki page fails too, not just a deleted one. The `/_blazor*`
+assertion reads the same `IAllowAnonymous` metadata `AnonymousGate` itself consults and pins the
+four-route set by equality, so a framework version that grows a fifth route fails loudly instead of
+passing having never looked at it. No new production surface, no new registration, no new endpoint.
+
+**Residuals → `## NEXT`, not a third round.**
+
+10. **The one verification in this remediation that no auditor re-ran is the `IsInteractive` guard.** The
+    reviewer read `SpyPageChangeNotifier`'s test and judged the worker's account of removing the guard
+    (count → 1) consistent, rather than removing it again. The chain is sound and the sibling marker test
+    corroborates it from a different instrument, so I am content — but name what that leaves unseen: if
+    `WithWebHostBuilder`'s late `AddSingleton<IPageChangeNotifier>` did **not** in fact win over
+    `AddContentStorage`'s registration, the spy would be a dead object and `SubscribeCallCount == 0`
+    would hold vacuously. Last-registration-wins makes that unlikely and the worker's break-run makes it
+    unlikely twice; it is still the only link in §8's evidence with no auditor's own instrument behind
+    it. One line to close whenever someone is next in that file.
+
+11. **The surface list is hand-written, so a new page is not covered until somebody remembers.**
+    `InteractiveComponentSurfaceTests` checks six surfaces. The app has eleven `@page` routes, and the
+    uncovered five include **`/bootstrap` and `/bootstrap/complete`, both `[AllowAnonymous]`** — the
+    first-run admin form is the most sensitive anonymous surface in the app and is not in the list. Not
+    urgent (nothing mounts an island there today, and the class-level tripwire still covers the
+    self-declared form everywhere), but the durable fix is to drive the list from the router's own page
+    routes so a page added in §10/§11 cannot escape the pin by omission. This will matter when the
+    editor surface lands: an editor is the next thing that will legitimately want interactivity, and it
+    is exactly where a call-site `@rendermode` would first appear.
+
+**On the six earlier notes and the two parked items — right to stay, with one amendment.** Note 4 (the
+warm gating the broadcast) is now **fixed in code** and should be struck from `## NEXT` rather than
+carried forward as an obligation; keep it only as record. Notes 5 (the before-probe can refuse a push §7
+would have accepted — still true, still fail-fast, still worth one line in D19), 6 (the disconnect case
+throws out of the endpoint *after* the response is written, which is wider than "the signal is lost"), 7
+(`PageLastEdit`'s `= null` default), 8 (circuit lifetime outliving session lifetime) and 9 (the
+post-verdict process gap) all stand unchanged. Both parked items stay parked: D15 covers correctness for
+the disconnect case, and the `WikiPage.razor` attribution `catch` remains honestly-labelled untested code
+rather than a gap papered over.
+
+**On the pattern, since you asked whether it says something about briefing — it does, and it is not a
+testing-skill gap.**
+
+Look at what the four failures had in common. `Contains("alice")` verified that a string appeared; the
+claim was about attribution. `StaticSsrRenderModeTests` verified the hub is mapped; the claim was about
+who may hold a circuit. The indicator's unit tests verified the notifier and the service; the claim was
+that viewers get notified. The D19 §4 comment verified independence in one direction; it read as general.
+**In every case the deliverable was verified and the claim about the deliverable was not.**
+
+That is what block-level work is structurally shaped to produce. A brief names an artefact to build; a
+block review audits whether the artefact was built and is correct. Neither step is obliged to ask *what
+would have to be false for this to be wrong, and does anything observe that.* Note where §8 did ask it —
+the resolver ordering, the shared dot-atom grammar, the trigger point's three real pushes — the evidence
+was genuinely excellent, better than most sections produce. The discipline was applied wherever the brief
+framed something as a **property**, and skipped wherever it framed something as a **deliverable**.
+
+So the change for §9 is one sentence per task in the brief, not a new process: alongside "build X", state
+**the observation that fails if X is undone**. "Wire the resolver into the display path" becomes "…such
+that deleting the call fails a named test." Three of §8's five findings would have been block-level
+catches under that rule, and the two that remain (the tripwire's lost axis, the post-verdict rewrite) are
+genuinely cross-block and mine to catch. §8 also earns one standing rule worth adding to the list at the
+bottom of this file: **an assertion on a string the page renders for another reason is not an assertion**
+— `Contains("alice")` on a page that greets alice.
+
+**What my own round-two instrument cannot see, stated before anyone treats this Approve as wider than it
+is.** I did not run the gates or any mutation; I read the reviewer's accounts of them, which are usable
+only because they are specific and falsifiable (named tests, named failure strings, named checksums) —
+they remain accounts. I read code and tests; nobody has yet observed a circuit actually connect, which is
+the Product Owner's browser check and is correctly still open. And residual 10 is the one link in the
+section's evidence that rests on a single agent's run.
+
+§8 is closed. → @architect
+
 ## NEXT
 
-**Resume point: §8 (Push reactions & identity), block A — not yet carved.** **§7 is CLOSED**: supervisor
-`Approve` over `cb81b47..ef91bd4` at the second section round. Pre-flight §8 per CLAUDE.md §2 before
-carving anything, and read §7's carry-forwards below first — obligation 3 is load-bearing for §8's very
-first decision.
+**Resume point: §9 (Obsidian sync verification), block A — not yet carved. ⚠️ §9 cannot be completed
+without the Product Owner** — every one of 9.1–9.3 is human-in-the-loop by nature (a real Obsidian vault,
+a real laptop, a real `obsidian-git` sync), which CLAUDE.md §4 names explicitly. Carve it so the
+automatable parts land first and the Product Owner is handed one precise, copy-pasteable verification,
+not three.
 
-**Working tree CLEAN. State: 36/41 tasks ticked** (§7's 7.1–7.5 all done). Branch
-`change/git-backed-content-core`, HEAD **`ef91bd4`**. Gates at §7's close, run in the foreground by the
+**§8 is CLOSED**: supervisor `Approve` over `e4e5022..03107e2` at the second section round.
+
+**Working tree CLEAN. State: 41/41 tasks ticked** — every numbered task in this change is done. What
+remains is §9's verification and §10's test consolidation. Branch `change/git-backed-content-core`, HEAD
+**`03107e2`**. Gates at §8's close, run in the foreground by the Architect **unsandboxed**: `dotnet build`
+0/0; `dotnet test` **876/876** unfiltered in 3m15s; `dotnet format --verify-no-changes` exit 0;
+`openspec validate --strict` valid; no `MUTANT` residue.
+
+**§8 landed in four commits:** A `7df5e87` (D19, design only), B `e972577` (8.1 + 8.2, and SignalR enters
+the app), C `f985c5e` (8.3), then one supervisor remediation `03107e2`. Two supervisor rounds.
+
+### ⚠️ Two things are owed to the Product Owner and neither can be discharged by an agent
+
+1. **The "changed on disk" banner's live behaviour** — does the circuit connect, does the banner appear
+   without a reload. Recipe is in the §8 thread. **Nobody has yet watched a circuit connect**; the
+   supervisor named this as the honest limit of §8's evidence.
+2. **The git remote's clone/edit/push cycle from a real client**, recipe in the §7 thread (port 5171).
+
+### The standing rule §8 earned, and the briefing change that follows from it
+
+**An assertion on a string the page renders for another reason is not an assertion.** Both attribution
+tests asserted `Contains("alice", body)` while `NavMenu.razor:38` renders `Sign out alice` on every page —
+unfailable, and they would have passed with attribution deleted entirely.
+
+**The briefing fix, from `@supervisor`'s own diagnosis and worth more than the finding that prompted it.**
+§8's failures were **not** a testing-skill gap. In all four cases the *deliverable* was verified and the
+*claim about* the deliverable was not — and the pattern tracks how each was briefed: **where a brief
+framed something as a property** (the resolver ordering, the shared dot-atom grammar, the trigger point)
+**the evidence was excellent; where it framed something as a deliverable, nothing asked what would have to
+be false.** One sentence per task closes it: **alongside "build X", name the observation that fails if X
+is undone.** Three of §8's five findings would then have been block-level catches. Apply this to every §9
+and §10 brief.
+
+### §8 carry-forwards
+
+- **The zero-consumer shape appeared three times in one section** — a resolver nobody called (caught by
+  the Architect), and a component nobody's test reached (caught by the supervisor, one link further down
+  the same chain). **Tests cannot catch it: they test what exists, not whether anything reaches it.** Ask
+  of every new type: what fails if I delete its *usage*, not its *implementation*?
+- **Note 4 is FIXED IN CODE — strike it, do not carry it.** The `/_blazor*` exemption is now asserted from
+  endpoint metadata for all four routes.
+- **Two residuals from the remediation itself.** The `IsInteractive` guard is the one verification no
+  auditor independently re-ran — the unseen case is a DI spy that never won its registration, which would
+  make `SubscribeCallCount == 0` hold vacuously. And `InteractiveComponentSurfaceTests`' surface list is
+  **hand-written** — six of eleven `@page` routes, with `/bootstrap` and `/bootstrap/complete` unchecked.
+  Driving it from the router's own route table is the durable form, and it will matter when the editor
+  surface lands.
+- **One behavioural delta recorded and deliberately not fixed:** on shutdown, a cancelled index warm now
+  lets one doomed `git diff` launch. The obvious tidy-up would re-couple exactly what the fix decoupled.
+  Leave it.
+- **A push whose client disconnects between the response being written and the after-probe completing
+  skips that push's reaction entirely** — and the exception escapes the endpoint *after* the response is
+  written. D15's lazy stamp check still covers correctness; the freshness signal is what is lost.
+- **The two-line `catch` in `WikiPage.razor`'s attribution path is genuinely untested** code on a
+  page-rendering path. Stated plainly by the worker, the reviewer and the supervisor rather than papered
+  over.
+
+### The Architect's own error in §8, recorded because the rule already existed
+
+**I committed code no reviewer certified.** After `@reviewer` approved block C, I sent back a flake fix
+that **rewrote the very assertions the security evidence rested on**, and committed it without re-audit —
+so a 5/5 mutation result ended up describing a test that no longer existed in that form. **Third instance
+of this gap in this change; first with a concrete consequence.** A post-approval fix that touches an
+assertion goes back to the reviewer, however small it looks.
+
+### ⚠️ Harness fact that will cost the next agent an hour if it is not read
+
+**`dotnet` fails inside the sandbox on this machine, and the failure looks exactly like a code failure.**
+`dotnet build` returns *"Build FAILED. 0 Warning(s) 0 Error(s)"* after stalling five minutes;
+`dotnet format` throws a `FormatCommandCommon.FormatAsync` stack trace. **Run every gate unsandboxed and
+in the foreground** — ~1s, ~5s, ~3m. And **never background `dotnet test` and wait on it**: seven agents
+in this change have stalled that way.
+
+**`git add -N` a new file the moment a block creates it.** `git diff` reports *nothing at all* for a file
+git has never tracked — §7 block B had seven such files, including both mutation targets.
+
+### §7's carry-forwards — still live, still worth reading before §9
+
+**Resume point was §8; §7 is CLOSED**: supervisor `Approve` over `cb81b47..ef91bd4` at the second section
+round.
+
+**State at §7's close: 36/41 tasks ticked.** HEAD was **`ef91bd4`**. Gates then, run in the foreground by the
 Architect **unsandboxed**: `dotnet build` 0/0; `dotnet test` **826/826** unfiltered in 2m49s;
 `dotnet format --verify-no-changes` exit 0; `openspec validate --strict` valid; no `MUTANT` residue.
 
