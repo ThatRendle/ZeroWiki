@@ -58,3 +58,69 @@ code path — this is how local development points at a gitignored `App_Data` fo
 
 The image sets both to their `/data` defaults already; only override them if you're relocating the
 mount.
+
+## Syncing with Obsidian
+
+The content repository is a real git remote, reachable over Smart HTTP at:
+
+```
+https://<your-host>/git
+```
+
+(`/info/refs`, `/git-upload-pack`, `/git-receive-pack` — no repository-name segment; ZeroWiki
+serves exactly one repository.) The pages themselves live in the `docs/` subdirectory of that
+repository, so an Obsidian vault should be opened at `<clone>/docs`, not at the clone's root.
+
+### Getting a credential
+
+Git does not accept your sign-in password. Sign in, go to **Account**, and generate a git access
+token — it's shown once, so copy it immediately. Your git username is the same username you sign
+in with. Revoking a token (also on the Account page) does not touch your sign-in password or
+anything else about the account.
+
+### Cloning a fresh vault
+
+```sh
+git clone https://<username>@<your-host>/git zerowiki
+```
+
+Git will prompt for the password; paste the access token there. (Embedding the token directly in
+the URL, `https://<username>:<token>@<your-host>/git`, also works but leaves the token sitting in
+your shell history and in `.git/config` — prefer letting git prompt, or use a credential helper.)
+Open `zerowiki/docs` as the vault in Obsidian.
+
+### Pointing an existing vault at ZeroWiki
+
+If you already keep a vault under git, add ZeroWiki as a remote and pull:
+
+```sh
+cd /path/to/your/vault
+git remote add origin https://<username>@<your-host>/git
+git pull origin HEAD --allow-unrelated-histories
+```
+
+The vault's own folder must be the repository's `docs/` directory — either move the vault's
+contents there first, or clone fresh (above) and copy your notes in.
+
+### Configuring the `obsidian-git` plugin
+
+Install the community plugin **obsidian-git**, then in its settings:
+
+- Leave **Vault backup interval (minutes)**, **Auto pull/push** etc. at whatever cadence you
+  want — the plugin talks to the remote exactly like the `git` CLI above, over the same Smart
+  HTTP endpoint with the same basic-auth credential.
+- The first pull or push will ask for the git username and access token from the previous
+  section. Most git credential helpers (macOS Keychain, Windows Credential Manager) will offer
+  to remember it after the first prompt.
+- No other setting is ZeroWiki-specific — `obsidian-git` speaks plain Smart HTTP, which is all
+  this remote is.
+
+### When a push is rejected
+
+The server accepts a push only if it fast-forwards the branch it has checked out; if the vault's
+history and the wiki's history have both moved on since the vault last pulled, the push is
+**rejected** outright. The server does not attempt to merge or resolve anything — that is
+deliberate, so it never guesses at intent. Resolve it the same way you would with any other git
+remote: pull (Obsidian's "Pull" command, or `git pull`) to merge the remote changes into the
+vault locally, resolve any conflicting lines if Obsidian or git can't merge them automatically,
+then push again.

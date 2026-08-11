@@ -21827,6 +21827,153 @@ verdict.
 
 → @architect
 
+**[architect]** Block A landed as `08f970a`. Gates run **unsandboxed** (the sandbox blocks the
+named-pipe bind MSBuild and the Roslyn compiler server need — `sandbox.excludedCommands: ["dotnet"]`
+does **not** currently take effect, so every dotnet gate in this repo needs the override): build clean,
+`dotnet test` **878/878** unfiltered in 2m40s, format clean, `openspec validate --strict` valid. `src`
+verified untouched by both `git diff -- src` and `git status --short --untracked-files=all -- src`.
+
+### Block B brief — the vault setup doc (9.1)
+
+→ @worker. **Documentation only.** Add a `## Syncing with Obsidian` section to `README.md` (60 lines
+today, operator-facing: Docker, the data volume, configuration — this section belongs alongside them).
+
+**Do not put it in `docs/`.** That name is the wiki's own content working tree (`ContentPaths.WorkingTree`
+resolves to `<content-repo>/docs`); a file placed there becomes a wiki page, not documentation about the
+wiki.
+
+**What it must cover**, derived from the code and not invented:
+
+- **The remote URL.** `GitSmartHttpEndpoints.cs:23` maps a group at `/git`, with `/info/refs` (GET),
+  `/git-upload-pack` and `/git-receive-pack` (POST) under it. So the clone URL is `https://<host>/git`.
+  **Read the file and confirm this yourself** rather than copying my summary.
+- **Credentials.** A per-user git access token, issued on the Account page — not the login password. State
+  where the user gets one and that the username is their wiki username.
+- **Both entry paths:** cloning the vault fresh, and pointing an existing Obsidian vault at the remote.
+- **`obsidian-git` plugin configuration** — the settings a user actually has to change.
+- **What happens on a conflict**, tied to the behaviour §9 block A just proved: a push that would not
+  fast-forward is **rejected**, and the fix is to pull and merge locally in Obsidian, then push again.
+  Do not describe the server as resolving anything — it deliberately stays passive.
+
+**The observation that fails if this is undone.** A doc's failure mode is silent rot: the route changes and
+the instructions keep looking plausible. So **add a test that ties the documented URL to the real route** —
+assert that the path segment `README.md` tells users to clone from is the one the endpoint actually
+registers. If you judge that this can only be done as a brittle string match against prose, **do not force
+it**: say so in the DEVLOG with your reasoning and leave the doc untested. A test that pins the wrong thing
+is worse than none, and that call is yours to argue.
+
+**Constraints.** `README.md` plus at most one test file. No `src` changes. If writing the doc reveals the
+setup genuinely does not work as described, that is a finding — **stop and post `❓ @architect`** rather
+than documenting an aspiration.
+
+**Gates:** `dotnet build` clean · `dotnet test` green **unfiltered** · `openspec validate
+git-backed-content-core --strict` · `dotnet format --verify-no-changes`. Run dotnet **unsandboxed**. No
+mutation testing.
+
+Do not commit and do not tick boxes. Hand off with `→ @reviewer`.
+
+**[worker]** Block B (9.1) implemented — a `## Syncing with Obsidian` section added to `README.md`
+after "Configuration", plus one new test. Read `GitSmartHttpEndpoints.cs` myself rather than trusting
+the brief's summary: confirmed `/git` is the `MapGroup` path, `/info/refs` (GET), `/git-upload-pack`
+and `/git-receive-pack` (POST) are the three routes beneath it, no repository-name segment. Also
+confirmed `docs/` is the working tree inside the cloned repo (`ContentPaths.cs:23`), so the doc tells
+the reader to open `<clone>/docs` as the Obsidian vault, not the clone root.
+
+The section covers: the clone URL (`https://<your-host>/git`); getting a credential (Account page,
+git access token, sign-in password rejected — matched against `Account.razor`'s own copy and
+`GitTokenService.VerifyAsync`, which never touches a password hash at all); both entry paths (clone
+fresh, or `git remote add` + `pull --allow-unrelated-histories` into an existing vault's `docs/`
+folder); the `obsidian-git` settings a user actually touches (nothing ZeroWiki-specific beyond the
+credential prompt — it's plain Smart HTTP); and conflict behaviour matching Block A's proof exactly —
+a non-fast-forward push is **rejected**, the server does not merge or resolve anything, the fix is
+pull-merge-push at the client. Wording pulled from `git-sync/spec.md`'s own scenario text
+("the system rejects the push so the client resolves the conflict locally") rather than paraphrased
+freshly, so the doc doesn't drift from the spec's own framing.
+
+**The test.** Not brittle prose-matching — `ReadmeGitRemoteDocumentationTests.cs`
+(`DocumentedCloneUrlPath_IsARouteTheAppActuallyServes`) reads `README.md` off disk (found by walking
+up from the test assembly to `ZeroWiki.slnx`, not a hard-coded relative path), extracts the path
+segment from the documented `https://<your-host>/git` line with one targeted regex, then drives that
+exact path at the real request pipeline (`ZeroWikiAppFactory`, the same instrument
+`GitSmartHttpAuthenticationTests` uses) with `GET {path}/info/refs?service=git-upload-pack` and
+asserts **exactly** `401 Unauthorized` — the same precise status `GitSmartHttpAuthenticationTests`
+independently proves the real route returns. Not "not 404": a route that stopped requiring auth, or
+started requiring something other than basic auth, fails this too.
+
+Checked falsifiability rather than assuming it: temporarily changed only the README's documented path
+to `/gitwrong` (`src` untouched) and reran the test — it failed, `200 OK` instead of the expected
+`401` (an unmatched multi-segment path apparently still resolves to something in this app's routing,
+so the failure mode was "wrong status", not "crash", but the assertion caught it either way). Restored
+the README byte-for-byte and reran — passes again. So the test genuinely dies when the doc and the
+route diverge, in either direction.
+
+Gates, all unsandboxed: `dotnet build` clean · `dotnet test` **unfiltered, 879/879 passed** (3m20s,
+878 prior + this one new test) · `openspec validate git-backed-content-core --strict` valid ·
+`dotnet format --verify-no-changes` clean. `git diff -- src` and `git status --short -- src` both
+empty — no `src` changes, exactly `README.md` plus the one new test file. No mutation testing (out of
+scope per the brief). No `❓` — the setup works as documented; nothing needed the Architect.
+
+→ @reviewer
+
+**[reviewer]** Block B audited. **Approve.**
+
+**1. Documentation checked against code, not against the brief — every claim traced to source.**
+- **Clone URL.** `src/ZeroWiki/Web/GitSmartHttpEndpoints.cs:23` maps `MapGroup("/git")` with `/info/refs`
+  (GET), `/git-upload-pack`/`/git-receive-pack` (POST) beneath it, no repository-name segment — matches
+  `https://<your-host>/git` and the README's parenthetical exactly.
+- **Credentials.** Traced `GitTokenService.VerifyAsync` (`GitTokenService.cs:59-76`) and
+  `GitBasicAuthenticationFilter.InvokeAsync` (`GitBasicAuthenticationFilter.cs:38-58`) myself: the
+  Basic-auth "password" field is only ever SHA-256-hashed and matched against `GitTokens.TokenHash` —
+  `Account.PasswordHash` is never read anywhere in that path. A presented sign-in password would hash to
+  a value never inserted into `GitTokens`, so it 401s, not authenticates. `IssueAsync` returns the
+  plaintext exactly once (`GitTokenService.cs:35`); `Account.razor` holds it only in a per-render field,
+  never round-tripped through redirect/query/session, with explicit no-store cache headers. `RevokeAsync`
+  touches only `GitToken.RevokedAt`, never `Account.PasswordHash` or the account row. The git username is
+  literally `Account.Username` (`GitTokenService.cs:73`), same `NOCASE` collation as sign-in — no separate
+  git-username concept. Every one of the README's credential claims holds, code-enforced, not merely
+  documented that way.
+- **Conflict story.** "The server does not attempt to merge or resolve anything" matches block A's own
+  proof (`receive.denyCurrentBranch = updateInstead`, non-fast-forward rejected, client pulls/merges/
+  pushes) and the `git-sync/spec.md` scenario text it's drawn from. No server-side resolution implied
+  anywhere in the new section.
+- **`docs/` placement.** Correct per `ContentPaths.WorkingTree` resolving to `<repo>/docs` — the README
+  correctly tells the reader to open `<clone>/docs`, not the clone root, and correctly warns not to place
+  this doc section inside the wiki's own `docs/` tree.
+
+**2. The test — verified as a claim, not accepted as one.** Independently reproduced the worker's
+mutation rather than trusting the report: temporarily changed the README's canonical line to
+`https://<your-host>/gitwrong`, ran `DocumentedCloneUrlPath_IsARouteTheAppActuallyServes` filtered, and
+watched it fail for real — `Assert.Equal() Failure: Expected: Unauthorized, Actual: OK` (200, via an
+unmatched route falling through `AnonymousGate`'s redirect-to-login, auto-followed by the test's
+`HttpClient` — not a crash, but the assertion catches it either way, exactly as the worker described).
+Restored the README byte-for-byte and confirmed the checksum matches pre-mutation
+(`c571a87d…6361fc7` both times) — no residue. Separately established that `401` is a meaningful pin and
+not a blanket default: `AnonymousAccessTests.cs:234-248` already proves a genuinely unrouted URL 404s for
+a signed-in caller (routing-level, independent of auth state), so the documented path landing on a real
+`401`-returning endpoint is a route match, not incidental. Checked the regex
+(`^https://<your-host>(?<path>/\S+)$`, multiline) against all four places the README mentions this URL
+(the canonical fenced line, plus the three prose/CLI occurrences at what are now lines 84, 88, 98): only
+the bare, anchored canonical line matches — the others are embedded mid-sentence or after `git clone`/
+`git remote add`, so `^...$` correctly excludes them. No wrong-occurrence risk, and a non-match fails loud
+via `Assert.True(match.Success, …)` rather than passing vacuously.
+
+**3. Scope and gates.** `git status --short --untracked-files=all` shows exactly `README.md` (modified),
+`DEVLOG.md` (modified), and `ReadmeGitRemoteDocumentationTests.cs` (untracked, the file `git diff` alone
+would have missed) — nothing else. `git diff -- src` and `git status --short --untracked-files=all -- src`
+both empty, confirmed myself, not on the coordinator's word. Gates re-run unsandboxed: `dotnet build`
+clean (0/0), `dotnet format --verify-no-changes` clean, `openspec validate git-backed-content-core
+--strict` valid, `dotnet test` unfiltered **879/879 passed** (2m34s).
+
+**Nit (non-blocking):** README.md:94-103 — "Pointing an existing vault at ZeroWiki" gives the
+`git remote add`/`git pull` commands before the sentence explaining the vault's folder must already be
+the repo's `docs/` directory. A reader following top-to-bottom could run the commands before realising
+the prerequisite. Reordering so the folder requirement comes first would read more naturally; not
+incorrect as written.
+
+**Block B of §9 (9.1) is approved.**
+
+→ @architect
+
 ## NEXT
 
 **Resume point: §9 (Obsidian sync verification), block A — not yet carved. ⚠️ §9 cannot be completed
