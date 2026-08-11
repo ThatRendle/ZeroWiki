@@ -22133,16 +22133,75 @@ recipe has been handed to the PO; `9.1` is written after `9.2`/`9.3` are observe
 
 ## NEXT
 
-**Resume point: §9 (Obsidian sync verification), block A — not yet carved. ⚠️ §9 cannot be completed
-without the Product Owner** — every one of 9.1–9.3 is human-in-the-loop by nature (a real Obsidian vault,
-a real laptop, a real `obsidian-git` sync), which CLAUDE.md §4 names explicitly. Carve it so the
-automatable parts land first and the Product Owner is handed one precise, copy-pasteable verification,
-not three.
+**Resume point: §9 is OPEN and BLOCKED ON THE PRODUCT OWNER. Do not start §10 until it closes.**
 
-**§8 is CLOSED**: supervisor `Approve` over `e4e5022..03107e2` at the second section round.
+**Both of §9's blocks have landed** — `08f970a` (block A, the 9.2/9.3 tests) and `daa1b3a` (block B, the
+9.1 README doc). Both passed `reviewer` Approve. **The section review returned `Request changes`**
+(`39f6d38..HEAD`), so §9 is **not closed**, and CLAUDE.md's outer loop forbids opening §10 until it is.
+That was **round one** of two; if the next round still requests changes, stop and put it to the Product
+Owner rather than carving a third.
 
-**Working tree CLEAN. State: 35/41 tasks ticked.** Six remain, all of them in §9 and §10: `9.1`–`9.3`
-(Obsidian verification, human-in-the-loop) and `10.1`–`10.3` (test consolidation).
+**What the supervisor blocked on — neither is an engineering defect. A1, A2 and the README test are all
+sound and would be approved on their own.**
+
+1. **`9.1`–`9.3` were ticked with no Product Owner confirmation.** CLAUDE.md §4 requires waiting for it.
+   **The Product Owner directed they be unticked; `ae30ad7` did so.** This blocker is therefore
+   **discharged** — but the boxes stay open until the PO confirms their run.
+2. **The README's `obsidian-git` guidance is unsourced and contradicted by the plugin's own repo** —
+   `README.md:69-70` (vault layout), `:104-106` (the credential-prompt claim, inverted — there is no TTY
+   inside Obsidian), `:107-112` (two setting names absent from `settings.ts`; the real ones are
+   `Pull on commit-and-sync` and `Merge strategy`). **Still open.**
+
+**The Product Owner has been handed the verification recipe** (in the session that produced `ae30ad7`;
+reproduce it from the supervisor's "what remains to verify by hand" list under `## 9.` if needed). It
+covers only what no test can reach: credential acquisition **through the plugin**, whether the plugin
+tolerates the repo root sitting above the vault, commit-and-sync against a real rejection plus a
+line-level conflict, and **the "changed on disk" banner rendering in a live circuit — still never
+observed by anyone.** Mobile is explicitly out of scope (different git implementation).
+
+**Sequencing, decided deliberately — do not reverse it.** The README remediation is written **after** the
+PO's run, **from what actually worked**, not beforehand from the plugin's documentation. Documentation of
+a third-party integration written from a first-hand result beats documentation written from that third
+party's docs — which is exactly the distinction that produced blocker 2. So: PO verifies → their report
+becomes the source → remediation block rewrites the plugin half of the README → re-run the supervisor on
+`39f6d38..HEAD` → tick `9.1`–`9.3` **only** on the PO's confirmation.
+
+**Do NOT ask the Product Owner to re-verify these — they are proven by tests:** the clone/edit/push round
+trip, the non-fast-forward rejection *and its recovery*, the server staying passive, and the documented
+route. §7's old "clone/edit/push from a real client" debt is **discharged by automation** and should be
+struck from the owed list below.
+
+**Working tree CLEAN. State: 35/41 tasks ticked.** Six remain: `9.1`–`9.3` (open pending PO confirmation)
+and `10.1`–`10.3` (test consolidation, its own section review still to come).
+
+**Two follow-on tasks parked with the Product Owner, neither belonging to §9:**
+
+- **`credential.helper = osxkeychain` is set at global git scope on this machine.** Under the full
+  parallel suite a credential cached by one real-git test can be offered to another's git process —
+  `UnauthenticatedClone_FailsAtTheClient` failed once with `Authentication failed` instead of the expected
+  `terminal prompts disabled`. It predates §9 (inherent to §7's real-git pattern). **The suite can write
+  real credentials into the developer's OS keychain.** Pinning `-c credential.helper=` on client-side git
+  invocations closes both.
+- Eleven now-redundant `Bash(dotnet ...)` entries in `.claude/settings.local.json`, superseded by a
+  global `Bash(dotnet:*)`.
+
+### ⚠️ Harness fact from §9 — run every `dotnet` command UNSANDBOXED
+
+**A sandboxed `dotnet` fails after exactly `00:05:00` with `Build FAILED`, `0 Warning(s)`, `0 Error(s)`
+and no other message.** The real cause only surfaces in a `dotnet test` log:
+`SocketException (13): Permission denied` on a **named-pipe bind** — the sandbox blocks the Unix domain
+sockets MSBuild's out-of-proc nodes and the Roslyn compiler server need. `0 Error(s)` alongside
+`Build FAILED` is the tell; the five-minute round number is the second tell.
+
+**`sandbox.excludedCommands: ["dotnet"]` in `~/.claude/settings.json` does NOT take effect** — a *bare*
+`dotnet build` was still sandboxed and still failed. So the exclusion cannot be relied on; pass
+`dangerouslyDisableSandbox: true` on every dotnet Bash call and brief agents to do the same.
+
+Two further self-inflicted failures from the same session, both worth not repeating: **never run
+`dotnet build` and `dotnet test` concurrently** (they contend over restore and MSBuild nodes, producing
+`Restore operation failed` and internal MSBuild errors that look like real gate failures), and
+**never pipe a gate to `tail`** — the pipeline's exit code is `tail`'s, so a failed run reports success.
+Capture each gate's own `$?`.
 
 > **Correction, made at §8's close-out and recorded rather than silently fixed.** The first version of
 > this paragraph — and the `2942a61` commit body — said **"41/41 tasks ticked, every numbered task is
