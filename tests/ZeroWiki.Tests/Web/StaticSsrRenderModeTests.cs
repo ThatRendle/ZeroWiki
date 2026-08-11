@@ -1,5 +1,6 @@
 using System.Net;
 using System.Reflection;
+using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Components;
 using Microsoft.AspNetCore.Routing;
 using Microsoft.Extensions.DependencyInjection;
@@ -16,15 +17,26 @@ namespace ZeroWiki.Tests.Web;
 /// <remarks>
 /// Originally pinned "no component anywhere declares an interactive render mode" — true only until
 /// §8 block B wired D7's own planned exception in. Narrowing the pin to name that one component
-/// exactly, rather than deleting it, keeps the tripwire's real point intact: the day some other
-/// component (especially one on the authentication surface below) gains
-/// <c>@rendermode InteractiveServer</c>, this still fails and names the offender, the same as before
-/// §8. <see cref="ZeroWiki.Components.Pages.ChangedOnDiskIndicator"/> only ever mounts inside
-/// <c>WikiPage.razor</c>'s rendered-body branch (never on an anonymous, login, or invitation
-/// surface), so the second test below still holds unchanged: a signed-in member's own authenticated
-/// pages other than a wiki page in view still establish no circuit, and the endpoint is asserted
-/// mapped now rather than absent, since D19 §3 rides the framework's own hub rather than a bespoke
-/// one.
+/// exactly, rather than deleting it, keeps the tripwire's real point intact for the one axis it can
+/// see: the day some other component gains its <em>own</em> <c>@rendermode InteractiveServer</c>
+/// declaration, this still fails and names the offender.
+/// </remarks>
+/// <remarks>
+/// <b>§8 remediation (supervisor finding): this test has a blind axis, corrected here rather than
+/// left implicit.</b> <c>GetCustomAttribute&lt;RenderModeAttribute&gt;</c> only ever sees a
+/// <em>class-level</em> declaration — <c>@rendermode InteractiveServer</c> written inside a
+/// component's own file. The call-site form — <c>&lt;SomeComponent @rendermode="InteractiveServer" /&gt;</c>
+/// written inside a <em>caller</em>, e.g. <c>Login.razor</c> — emits no such attribute on any class
+/// and is invisible to this test; before §8 that did not matter, because with no interactive render
+/// mode registered at all there was no <c>/_blazor</c> hub for either form to reach. §8 both made
+/// that hazard reachable (registering <c>InteractiveServer</c> app-wide) and inverted the only test
+/// that forbade it — the earlier revision of this docstring claimed the second test below still
+/// covered it, which was false; it asserted only that the hub exists, nothing about who may hold a
+/// circuit. <see cref="InteractiveComponentSurfaceTests"/> is the actual backstop for this axis now:
+/// it is outcome-based (counts the marker every interactive component instance renders, not a
+/// class-level C# attribute), so it is sensitive to <em>either</em> form of <c>@rendermode</c> and to
+/// <c>ChangedOnDiskIndicator</c> actually being mounted, on every authentication-surface page it
+/// checks.
 /// </remarks>
 public sealed class StaticSsrRenderModeTests : IDisposable
 {
@@ -71,6 +83,42 @@ public sealed class StaticSsrRenderModeTests : IDisposable
             .ToList();
 
         Assert.NotEmpty(routes);
+    }
+
+    [Fact]
+    public void None_of_the_mapped_blazor_hub_family_is_anonymously_exempt()
+    {
+        // §8 remediation (supervisor finding): the earlier evidence for this posture was one
+        // anonymous `GET /_blazor`, which cannot see /_blazor/negotiate, /_blazor/disconnect/, or
+        // /_blazor/initializers/ -- "sample one path and reason about the rest" is the exact shape
+        // §7 shipped twice. Reads AnonymousGate's own instrument (IAllowAnonymous endpoint metadata)
+        // for the whole mapped family instead of sampling a request against one of them.
+        //
+        // Measured directly (not assumed): the real family this app maps is exactly these four routes
+        // -- confirmed by enumerating EndpointDataSource against a running instance. A future ASP.NET
+        // Core version changing that shape should fail this assertion loudly, not pass silently having
+        // never checked the new member.
+        var blazorHubEndpoints = _app.Services.GetRequiredService<EndpointDataSource>().Endpoints
+            .OfType<RouteEndpoint>()
+            .Where(endpoint => (endpoint.RoutePattern.RawText ?? string.Empty)
+                .StartsWith("/_blazor", StringComparison.Ordinal))
+            .ToList();
+
+        var patterns = blazorHubEndpoints
+            .Select(endpoint => endpoint.RoutePattern.RawText)
+            .OfType<string>()
+            .OrderBy(pattern => pattern, StringComparer.Ordinal)
+            .ToList();
+
+        Assert.Equal(
+            new[] { "/_blazor", "/_blazor/disconnect/", "/_blazor/initializers/", "/_blazor/negotiate" }
+                .OrderBy(pattern => pattern, StringComparer.Ordinal),
+            patterns);
+
+        foreach (var endpoint in blazorHubEndpoints)
+        {
+            Assert.Null(endpoint.Metadata.GetMetadata<IAllowAnonymous>());
+        }
     }
 
     private async Task SeedAccountAsync() =>

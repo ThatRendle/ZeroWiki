@@ -30,6 +30,19 @@ namespace ZeroWiki.Content;
 /// logged at <see cref="LogLevel.Warning"/> — not <c>Error</c>, because nothing about the push itself
 /// failed, only the index warm or the broadcast that follows it — and never rethrown.
 /// </remarks>
+/// <remarks>
+/// <b>The index warm (8.1) and the route diff/broadcast (8.2) fail independently, in both directions
+/// (§8 remediation, supervisor finding).</b> An earlier revision ran both inside one <c>try</c>, warm
+/// first: true to D19 §4 in the direction it stated ("[the warm] is independent of whether the route
+/// diff below succeeds") but silent about the direction that matters — a warm that <em>throws</em>
+/// would abort the method before the diff/broadcast ever ran, silently dropping 8.2's own
+/// spec-required work (<c>specs/git-sync/spec.md</c>'s <em>Re-index and broadcast on received push</em>)
+/// behind a failure in what is, by D19 §4's own account, a latency-only optimisation. <see cref="WarmPageIndexAsync"/>
+/// and the diff/broadcast below now each own their exception handling, so a failed warm can never
+/// prevent the broadcast from running, and — symmetrically — a failed diff/broadcast can never prevent
+/// the warm from having already run. Pinned by
+/// <c>PushReactionServiceTests.ReactAsync_IndexWarmThrows_StillComputesAndBroadcastsTheChangedRoutes</c>.
+/// </remarks>
 public sealed class PushReactionService
 {
     private readonly ContentPaths _paths;
@@ -73,27 +86,67 @@ public sealed class PushReactionService
             return;
         }
 
+        // 8.1 and 8.2 are decoupled, deliberately not one shared try/catch (see this type's own
+        // remarks): a failed warm must never drop the spec-required broadcast, and a failed
+        // diff/broadcast must never appear to have skipped a warm that actually ran.
+        await WarmPageIndexAsync(cancellationToken).ConfigureAwait(false);
+
+        if (beforeSha is null || afterSha is null)
+        {
+            // No previous (or no current) commit to diff against -- there is no prior servable state
+            // anyone could have been viewing, so there is nothing meaningful to name as "changed" for
+            // 8.2. The index warm above still ran (or was attempted) regardless.
+            _logger.LogDebug(
+                "Push reaction skipped the route diff for an unborn HEAD transition " +
+                "({BeforeSha} -> {AfterSha}).",
+                beforeSha ?? "(none)",
+                afterSha ?? "(none)");
+            return;
+        }
+
+        await ComputeAndBroadcastChangedRoutesAsync(beforeSha, afterSha, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// 8.1: warms the index. D15's own lazy stamp check already covers correctness for every writer,
+    /// including one that never notifies the app at all (the scenario this reuses), so this eager call
+    /// buys latency for the first reader after the push, not correctness (D19 §4). Never lets an
+    /// exception escape -- see this type's own remarks on why this is its own try/catch rather than
+    /// sharing one with <see cref="ComputeAndBroadcastChangedRoutesAsync"/>.
+    /// </summary>
+    private async Task WarmPageIndexAsync(CancellationToken cancellationToken)
+    {
         try
         {
-            // 8.1: warm the index. D15's own lazy stamp check already covers correctness for every
-            // writer, including one that never notifies the app at all (the scenario this reuses), so
-            // this eager call buys latency for the first reader after the push, not correctness (D19
-            // §4) -- it is independent of whether the route diff below succeeds.
             await _pageIndex.GetCurrentAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            // Ordinarily app shutdown (ApplicationStopping) -- not a fault of the push, which already
+            // landed and was already acknowledged; nothing to log as a warning.
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(
+                ex,
+                "The push reaction's index warm failed; the push itself already succeeded and is " +
+                "unaffected, and the route diff/broadcast below still runs regardless. The next page " +
+                "view of any affected page will still refresh correctly (D15's own lazy stamp check), " +
+                "just without this push's eager warm.");
+        }
+    }
 
-            if (beforeSha is null || afterSha is null)
-            {
-                // No previous (or no current) commit to diff against -- there is no prior servable
-                // state anyone could have been viewing, so there is nothing meaningful to name as
-                // "changed" for 8.2. The index warm above still ran.
-                _logger.LogDebug(
-                    "Push reaction skipped the route diff for an unborn HEAD transition " +
-                    "({BeforeSha} -> {AfterSha}); the page index was still warmed.",
-                    beforeSha ?? "(none)",
-                    afterSha ?? "(none)");
-                return;
-            }
-
+    /// <summary>
+    /// 8.2: the route diff and broadcast (D19 §2/§3) — the spec-required half of this reaction. Never
+    /// lets an exception escape; see this type's own remarks.
+    /// </summary>
+    private async Task ComputeAndBroadcastChangedRoutesAsync(
+        string beforeSha,
+        string afterSha,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
             var changedRoutes = await ComputeChangedRoutesAsync(beforeSha, afterSha, cancellationToken)
                 .ConfigureAwait(false);
 
@@ -108,9 +161,10 @@ public sealed class PushReactionService
         {
             _logger.LogWarning(
                 ex,
-                "The push reaction for HEAD {BeforeSha} -> {AfterSha} failed; the push itself already " +
-                "succeeded and is unaffected. The next page view of any affected page will still refresh " +
-                "correctly (D15's own lazy stamp check), just without this push's eager warm or broadcast.",
+                "The push reaction's route diff/broadcast for HEAD {BeforeSha} -> {AfterSha} failed; " +
+                "the push itself already succeeded and is unaffected. The next page view of any " +
+                "affected page will still refresh correctly (D15's own lazy stamp check), just without " +
+                "this push's broadcast.",
                 beforeSha,
                 afterSha);
         }

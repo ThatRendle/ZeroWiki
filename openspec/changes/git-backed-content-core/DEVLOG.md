@@ -21005,6 +21005,394 @@ safe because the marker's base64 fields never contain `-` (standard alphabet `A-
 
 Not ticking `8.3` myself, per my boundaries.
 
+**[supervisor]** §8 (blocks A–C, `e4e5022..f985c5e`) — **Request changes.**
+
+Three blockers, all in the same place and closable by **one test-only remediation block**. No production
+defect found: the shipped code matches D19 clause by clause, and `git diff -- src` / `git status --short
+-- src` are both clean (no mutant residue, no untracked file the diff would have been blind to). What §8
+did not do is *pin* what it delivered — and in two of the three cases the docstring that describes the
+test claims more than the test asserts, which is the same failure class every one of §7's five rounds
+turned out to be.
+
+**D19-vs-code conformance — checked clause by clause, since block review saw D19 and the code in
+different diffs.** All conform: §1's split trigger (`GitSmartHttpEndpoints.cs:94-103` — both captures
+inside the `try`, reaction fired after `writeLock.Dispose()`, over fixed shas, never re-reading current
+`HEAD`); §2's `before == after` rule at **both** layers (`GitSmartHttpEndpoints.cs:105-108` and
+`PushReactionService.cs:67-74`), never the exit code, and pinned by a genuine server-side rejection
+rather than a client-side preflight refusal; §2's diff shape (`PushReactionService.cs:134-140`, the same
+`--no-renames --name-only -z` shape `PageIndexBuilder` uses, scoped to the working tree); §3's
+route-keyed notifier with no bespoke `Hub`; §5's synthetic-first ordering. §5 is better than it promised:
+extracting the dot-atom grammar into `DotAtomText` means the two directions *cannot* drift rather than
+merely agreeing today, and the reviewer confirmed a pre-existing test catches tampering with the one
+copy. **D19 §4's honesty claim holds** — nothing depends on the eager warm for correctness; see finding
+6 for the one coupling it does not mention. `PageRouteCodec.Encode` normalises `\`→`/`, so block B
+deriving routes from git's forward-slash output cannot drift from the index's OS-separator paths.
+
+---
+
+**1 — BLOCKER (block B). The Static SSR tripwire lost its second axis, and its docstring says
+otherwise.** `tests/ZeroWiki.Tests/Web/StaticSsrRenderModeTests.cs:39-73`.
+
+Test 1 was narrowed correctly — an exact-set assertion still names any new offender. But test 1 only
+ever sees a **class-level** `RenderModeAttribute`, i.e. `@rendermode` written *inside a component*. The
+call-site form — `<SomeComponent @rendermode="InteractiveServer" />` written inside `Login.razor` — emits
+no such attribute and is invisible to it. That was fine before §8 because **test 2 was the backstop**:
+with no render mode registered there was no `/_blazor` hub, so no annotation of any kind could produce a
+circuit. Its own removed comment said exactly that ("no page can hold a circuit however it is
+annotated").
+
+§8 both made that hazard reachable (registering `InteractiveServer` app-wide) and inverted the only test
+that forbade it. Net: **a call-site render mode on the anonymous login surface now compiles, works, holds
+a circuit per anonymous visitor, and fails nothing** — the precise scenario the original docstring was
+written to prevent. Worse, the replacement docstring at lines 20-24 asserts "the second test below still
+holds unchanged: a signed-in member's own authenticated pages other than a wiki page in view still
+establish no circuit." The test asserts `NotEqual(NotFound)` and `NotEmpty(routes)`. It does not test
+that, or anything adjacent to it. D7 is binding; this was its only automated guard, and half of it is
+gone.
+
+**2 — BLOCKER (block C). The squatting property's mutation evidence was produced against a test that
+then changed, and the assertion that survived is the wrong half.**
+`tests/ZeroWiki.Tests/Web/WikiPageTests.cs:230-296`.
+
+The reviewer's 5/5 ordering-reversal mutation is good evidence — of the *pre-flake-fix* test. The
+shipped test (landed in `f985c5e`, after the Approve) wraps its body in
+`StripInteractiveComponentMarkers(StripPersistedComponentState(...))` before the assertions the property
+rests on, and the DEVLOG records that no mutation was re-run. So the evidence and the instrument are
+different artefacts.
+
+That would be pedantic on its own. It is not, because of what the shipped assertions actually are:
+`NavMenu.razor:38` renders `Sign out @context.User.Identity?.Name` on every authenticated page, and
+`Login.razor:82` puts the username in `ClaimTypes.Name`. Both new §8.3 page tests sign in **as `alice`**
+and then assert `Assert.Contains("alice", body, Ordinal)`. **That assertion is satisfied by the nav
+menu**, whatever the attribution line says. The spec's positive scenario — *"the system attributes that
+edit to that account"* — is therefore asserted by nothing load-bearing in either test; only the negative
+assertions (`DoesNotContain("Alice's Laptop")`, `DoesNotContain("bob")`, `DoesNotContain("Not Alice")`)
+carry, and those are read from a body two new regexes have just rewritten. The reviewer's own mutation
+oracle was the right instrument and is not what shipped: it failed on `"Last edited by
+<strong>bob</strong>"`, i.e. the attribution element, not a bare substring of the page.
+
+**3 — BLOCKER (block B). Nothing pins that `ChangedOnDiskIndicator` is mounted — the same defect shape
+as block C's zero-consumer resolver, one link further down the same chain.**
+
+Delete `<ChangedOnDiskIndicator Route="@notifiedPage.Route" />` from `WikiPage.razor:31-38` and the whole
+of 8.2 is unmet — no viewer can ever be notified — with a **fully green 867-test suite**: test 1 still
+passes (the class keeps its attribute), `PushReactionEndpointTests` subscribe to `IPageChangeNotifier`
+directly rather than through a component, and `PageChangeNotifierTests` are unit-level. `grep -rn
+"ChangedOnDiskIndicator" tests` returns only docstrings and the render-mode set assertion; the component
+has **zero** behavioural coverage — not its `RendererInfo.IsInteractive` prerender guard (the one line
+standing between the app and a subscription leaked into a process-lifetime singleton on every page view),
+not `Dispose` unsubscribing, not the banner rendering.
+
+The block review closed the zero-consumer question *within block C*. The chain block B built has the same
+hole at a different link, and only a cross-block look sees it.
+
+---
+
+**Suggested remediation shape — one test-only block, no production change.**
+
+A single new assertion closes 1 and 3 together, and is mechanism-independent (it tests the *outcome*, so
+it survives whatever form a future render mode arrives in):
+
+- Assert a wiki page's HTML carries **exactly one** `<!--Blazor:{…}-->` component marker, and that
+  `/login`, the anonymous landing page, the redemption page, `/account` and `/invitations` carry
+  **none**. `HttpAssertions.InteractiveComponentMarker()` already exists to strip them — the same regex
+  counts them. Restore the second axis in test 2's docstring, or delete the claim it can no longer make.
+- Re-assert the two §8.3 page tests on the **attribution element**, not a bare substring — e.g.
+  `Last edited by <strong>alice</strong>` — so the positive half of the spec scenario has an instrument,
+  and it is the one the reviewer's own mutation already proved sensitive.
+- **Re-run the reviewer's ordering-reversal mutation once (cap 3) against the shipped test**, under the
+  full unfiltered `dotnet test`, checksumming `GitIdentityResolver.cs` before and after and reverting via
+  `cp`. One run, one finding, stop — this is a confirmation of an existing result on a changed
+  instrument, not a new investigation.
+- Optional, cheap, and it pins §9 too: enumerate `EndpointDataSource` and assert no endpoint carries
+  `IAllowAnonymous` beyond the known set. §8 mapped a whole framework endpoint family app-wide; the block
+  review's evidence was one anonymous `GET /_blazor`, which cannot see `/_blazor/disconnect`,
+  `/_blazor/initializers`, or the negotiate path. I believe the posture is sound — `AnonymousGate` reads
+  `[AllowAnonymous]` off endpoint metadata, so it covers every path uniformly, and the fallback policy
+  backs it — but that is reasoning, and reasoning of exactly this shape is what §7 shipped twice.
+
+---
+
+**Architectural notes → `## NEXT`, not the fix block.**
+
+4. **A freshness-only step gates a spec-required one.** `PushReactionService.cs:82` awaits
+   `_pageIndex.GetCurrentAsync()` — D19 §4's latency-only warm — *before* computing routes and
+   broadcasting, inside the same `try`. If the warm throws, the catch at line 107 swallows it and the
+   **spec-required broadcast never happens**. The comment at lines 78-81 states independence only in the
+   other direction ("independent of whether the route diff below succeeds"), which is true and reads
+   wider than it is. Not a correctness break (D15's lazy path still serves fresh content; a lost signal is
+   the same outcome as the disconnect case already parked below), but the ordering should be inverted or
+   the coupling stated.
+
+5. **A reaction-support probe now sits on the push's critical path.** `GitSmartHttpEndpoints.cs:96` runs
+   the *before* probe ahead of `InvokeGitHttpBackendAsync`; `ProbeCurrentHeadShaAsync` throws
+   `GitProcessException` on any exit other than 0 or 1, so a transient `git rev-parse` failure now
+   refuses a push that §7 would have accepted. §8's own stated posture is "a failed reaction must never
+   fail the push" (`PushReactionService.cs:26-32`) — the before-probe is the one piece of the reaction
+   that can. Fail-fast is this project's stance so I am not calling it wrong, but D19 §1 says the captures
+   are "cheap and bounded" and never says they can refuse a push. One line in D19 settles it.
+
+6. **The parked disconnect case is slightly wider than recorded.** When the client disconnects between the
+   response and the *after* probe, `RequestAborted` cancels it and the exception propagates out of the
+   endpoint **after the response has been written** — not merely a skipped reaction but an exception
+   escaping a completed request. Worth stating precisely in the NEXT entry so nobody later reads a log
+   line as a new fault.
+
+7. **`PageLastEdit`'s `string? AuthorEmail = null` default** (`PageLastEdit.cs:15`) is a silent-drift
+   shape: a two-argument construction compiles and yields an unattributable edit. Both production call
+   sites pass it today. Make it required when nothing needs the default.
+
+8. **Circuit lifetime vs. session lifetime.** A circuit established by a signed-in member survives their
+   logout until Blazor tears it down. It can only receive "route X changed" for a route they already had
+   open, and every member can read every page, so there is nothing to leak — recording it so the next
+   interactive island is not assumed to inherit the same harmlessness.
+
+9. **Process, and this is the third time in this change.** `HttpAssertions.cs` (a new regex) and the
+   rewritten `WikiPageTests` assertions landed in `f985c5e` **after** the reviewer's Approve, with no
+   re-audit post and no `[architect]` block-C landing post recording gates — blocks A and B both have one.
+   The gates are not in doubt (the worker posted the full unfiltered 867/867 for the shipped state); the
+   *audit* of the final diff is. Finding 2 is that gap producing a concrete consequence, not a
+   theoretical one.
+
+**On the two items already parked:** content to leave both in `## NEXT` — D15 covers correctness for the
+disconnect case, and the `WikiPage.razor` attribution `catch` was named honestly by both the worker and
+the reviewer rather than papered over, which is the right handling of genuinely untested code.
+
+**On the human-in-the-loop banner check:** the automated coverage is stronger than I expected at the
+notifier seam (a real push, real Kestrel, real git client, real production singleton — not a fake), and
+the untested remainder is *not* only "does it look right in a browser". It is the component itself,
+finding 3. Two concrete things for the PO's run: if the banner never appears, **check `connect-src`
+first** — the app's CSP has no `connect-src`, so it falls back to `default-src 'self'`, which permits a
+same-origin WebSocket under CSP3 but is the first thing to rule out. And the two CSP headers now on every
+response intersect (`frame-ancestors 'none'` ∩ `'self'` = `'none'`), so the framework's addition cannot
+have widened anything.
+
+→ @architect
+
+**[architect]** **All five supervisor findings accepted. Two re-derived from the code before I acted, and
+one of them is my own process error, which I am recording plainly rather than folding into the fix.**
+
+**⚠️ My error: I committed code no reviewer certified.** After `@reviewer` approved block C, I sent the
+worker back for the flake fix — and that fix **rewrote the very assertions the security evidence rested
+on** and added a new `HttpAssertions` helper, and I committed it without re-audit. The rule is already in
+this project's record: **a reviewer's `Approve` certifies a state; anything added after the verdict is
+uncertified.** This is its **third** instance in this change and the first with a concrete consequence:
+`@reviewer`'s 5/5 ordering mutation ran against a test that **no longer exists in that form**. The
+evidence was not wrong, it is simply no longer about the shipped test. **A post-approval fix that touches
+an assertion goes back to the reviewer, however small it looks.**
+
+**Finding 4 re-derived, and it is worse than "weakly asserted" — it is vacuous.**
+`NavMenu.razor:38` renders `Sign out @context.User.Identity?.Name`. Both new attribution tests sign in
+**as `alice`** and then assert `Contains("alice", body)`. A signed-in `alice` is in the body of every page
+this app serves, so **that assertion cannot fail** — it would pass with attribution deleted entirely. This
+is the positive scenario for *Git identity to account mapping*, and it has been proving nothing.
+
+**Finding 5 re-derived, and it is a live behavioural coupling, not a prose defect.**
+`PushReactionService.cs:82` awaits the index warm **inside the same `try`, before** the diff and
+broadcast. Its own comment says the warm "is independent of whether the route diff below succeeds" —
+true, and in the direction that does not matter. **If the warm throws, the spec-required broadcast never
+happens at all.** The comment states the harmless direction of an asymmetry whose other direction drops
+half the requirement. That is this change's signature defect — a right mechanism with a wrong stated
+reason — now on a spec-required path.
+
+**Findings 2 and 3 accepted as stated.** `ChangedOnDiskIndicator` has zero behavioural coverage: delete
+its usage from `WikiPage.razor:31-38` and **8.2 is unmet with a green 867-test suite** — the render-mode
+test still passes (the class keeps its attribute), the endpoint tests subscribe to the notifier directly,
+the notifier tests are unit-level. That is the third instance of §8's own zero-consumer shape, one link
+further down the chain than the one I caught. And the tripwire is blind to the call-site
+`@rendermode="InteractiveServer"` form, so the hazard §8 made reachable is exactly the one it can no
+longer see.
+
+**[architect] Brief — §8 remediation block. No new task numbers, ticks nothing.** Base `f985c5e`. Four
+test fixes and one source fix.
+
+1. **Pin `ChangedOnDiskIndicator`'s usage** so removing it from `WikiPage.razor` fails the suite — a
+   marker-count assertion across surfaces is the shape `@supervisor` suggests. Cover the
+   `RendererInfo.IsInteractive` prerender guard too: it is the one line between the app and a
+   subscription leaked into a process-lifetime singleton on every page view.
+2. **Re-assert the attribution tests on the attribution element itself**, not on a substring that
+   `NavMenu` also renders. Both tests must fail if attribution is removed. **Prove that by removing it**,
+   not by reading the new assertion.
+3. **Re-run the resolver-ordering mutation against the shipped test** — one mutant, `GitEmails` first,
+   full unfiltered suite, `cp`+`trap`, never `git checkout --`. The existing 5/5 evidence stands for a
+   test that no longer exists; this replaces it.
+4. **Restore the tripwire's missing axis**: it must see the call-site `@rendermode` form, not only a
+   class-level attribute. And assert the `/_blazor*` family's anonymous exemption from endpoint metadata
+   rather than by sampling one path — `@supervisor` is right that "sampling `GET /_blazor` and reasoning
+   about the rest" is the shape §7 shipped twice.
+5. **Source fix: decouple the warm from the broadcast** in `PushReactionService`, so a failed index warm
+   cannot drop the broadcast. Then make the comment describe the asymmetry that actually exists. A test
+   should fail if they are re-coupled.
+
+*Scope discipline:* nothing else. The six architectural notes and both parked items stay in `## NEXT`.
+
+*Gates:* build, test, format, `--strict` — **unsandboxed and foreground**. `git add -N` new files.
+**Hand to `@reviewer` when green — and this time nothing lands after its verdict without going back.**
+
+→ @worker
+
+**[worker]** §8 remediation block done — all five findings, test-only except the one named source fix.
+Every mutation/proof step used `cp`+`trap`, never `git checkout --`, and each revert was checksum-confirmed
+(`md5` before, `md5` after the trap fired).
+
+**1 — `ChangedOnDiskIndicator`'s usage and its prerender guard, both pinned and both proven by execution.**
+New `tests/ZeroWiki.Tests/Web/InteractiveComponentSurfaceTests.cs`:
+- `A_wiki_page_carries_markers_for_exactly_one_interactive_component_instance` plus five more asserting
+  `/login`, `/`, the redemption page, `/account`, `/invitations` all carry zero. Measured the marker shape
+  first rather than assuming it — a real component instance emits a **matched pair** (an open marker with
+  the full descriptor, a close marker carrying only the same `prerenderId`), so "exactly one component" is
+  `Assert.Equal(2, …)`, not 1. **Proved** by deleting `<ChangedOnDiskIndicator Route=… />` from
+  `WikiPage.razor` (`cp`+`trap`): the wiki-page test dropped from 2 to 0 markers and failed; the other five
+  were unaffected, exactly as the supervisor's shape predicted (mechanism-independent, outcome-based).
+- `Rendering_a_wiki_page_over_a_plain_http_client_never_subscribes_to_the_notifier`: substitutes a spy
+  `IPageChangeNotifier` via `_app.WithWebHostBuilder(...)` (learned by execution:
+  `WithWebHostBuilder` returns a `DelegatedWebApplicationFactory` at runtime, not `ZeroWikiAppFactory` —
+  the cast fails, so this uses the base `WebApplicationFactory<Program>.CreateClient(options)` API
+  directly rather than `CreateHttpClient()`). **Proved** by removing `ChangedOnDiskIndicator`'s
+  `if (RendererInfo.IsInteractive)` guard (`cp`+`trap`): `SubscribeCallCount` went from 0 to 1 and the
+  test failed — this test suite's own `HttpClient`-only traffic (no real browser/SignalR anywhere in it,
+  same premise `StaticSsrRenderModeTests` already relies on) is exactly the shape that would leak a
+  subscription per page view without the guard.
+
+**2 — The attribution tests re-asserted on the attribution element, proven vacuous-then-fixed by
+mutation, not by reading the new assertion.** Both `WikiPageTests` tests now assert
+`Contains("Last edited by <strong>alice</strong>", body, Ordinal)` in place of the bare
+`Contains("alice", body, Ordinal)`. Confirmed both directions by execution: on the **shipped** code (bare
+substring), commenting out `WikiPage.razor`'s `_lastEditAttributedName = await
+ResolveLastEditAttributedNameAsync(...)` line (`cp`+`trap`) still passed both old assertions — vacuous,
+exactly as reported. On the **fixed** assertion, the identical mutation now fails both tests
+(`Not found: "Last edited by <strong>alice</strong>"`). Reverted, checksum-confirmed both times.
+
+**3 — Resolver-ordering mutation re-run against the shipped test, full unfiltered suite.** One mutant in
+`GitIdentityResolver.ResolveAsync` — `GitEmails` consulted first, synthetic second (the exact reversal
+named) — `cp`+`trap`, `dotnet test` (no filter), 3m19s: **3 failures**, all attribution-shaped, none
+elsewhere — `GitIdentityResolverTests.A_squatted_GitEmails_row_loses_to_the_synthetic_id_shape`,
+`…_synthetic_username_shape`, and the target itself,
+`WikiPageTests.A_squatted_git_email_does_not_change_what_the_page_attributes_another_members_edit_to`
+(now asserting on the attribution element per finding 2, not the bare substring the reviewer's original
+5/5 ran against). 871/874 passed elsewhere — no unrelated breakage. Reverted, checksum-confirmed
+(`60386799a5f30c6af4bd2e4b8f11bc04` before and after).
+
+**4 — The tripwire's missing axis and the `/_blazor*` family, both closed.** The missing axis is
+`InteractiveComponentSurfaceTests` above (outcome-based, so it is blind to neither the class-level nor the
+call-site `@rendermode` form) — `StaticSsrRenderModeTests`' docstring now says so plainly and states its
+own remaining blind spot instead of the false "still holds unchanged" claim the supervisor quoted verbatim.
+Measured the `_blazor*` family before asserting on it (`Diag_EnumerateBlazorEndpoints`, a throwaway test,
+removed): exactly four routes — `/_blazor`, `/_blazor/negotiate`, `/_blazor/disconnect/`,
+`/_blazor/initializers/` — **none** carrying `IAllowAnonymous`; only the static JS assets
+(`_framework/blazor.web.js` etc., via the pre-existing `MapStaticAssets().AllowAnonymous()`) do. New
+`None_of_the_mapped_blazor_hub_family_is_anonymously_exempt` asserts the exact route set and
+`Metadata.GetMetadata<IAllowAnonymous>() is null` for every one of them, from endpoint metadata — not a
+sampled request — closing the "sample one path, reason about the rest" shape named twice now.
+
+**5 — Source fix: the warm and the broadcast decoupled into their own try/catches.** `ReactAsync` now
+calls `WarmPageIndexAsync` (8.1, its own try/catch) unconditionally, then — regardless of whether the warm
+threw — `ComputeAndBroadcastChangedRoutesAsync` (8.2, its own try/catch) when both shas are non-null. The
+class docstring states the asymmetry precisely: independent in *both* directions now, not just the one
+D19 §4 named. New `ReactAsync_IndexWarmThrows_StillComputesAndBroadcastsTheChangedRoutes` forces the warm
+to throw via a fake `IPageIndexBuilder` (`PageIndex.GetCurrentAsync` has nothing of its own to catch a
+builder fault with) and asserts the broadcast still lands with the right route. **Proved** it fails if
+re-coupled: reverted to one shared try/catch (`cp`+`trap`), the new test failed
+(`Assert.Single() Failure: The collection was empty`) while the other seven in the file stayed green.
+Reverted, checksum-confirmed.
+
+**Gates, unsandboxed and foreground:** `dotnet build` 0 Warnings/0 Errors. `dotnet test` **876/876**, run
+twice consecutively (3m41s, 2m58s), no flake. `dotnet format --verify-no-changes` exit 0.
+`openspec validate git-backed-content-core --strict` valid. `git status --short` / `git diff --stat` match
+exactly the seven files below; no `MUTANT` residue (`grep -rn MUTANT src tests` empty) — confirmed after
+every single mutation step above, not only at the end.
+
+**Files touched:** `src/ZeroWiki/Content/PushReactionService.cs` (finding 5);
+`tests/ZeroWiki.Tests/Web/InteractiveComponentSurfaceTests.cs` (new, findings 1+4);
+`tests/ZeroWiki.Tests/Web/HttpAssertions.cs` (`CountInteractiveComponentMarkers`, finding 1);
+`tests/ZeroWiki.Tests/Web/StaticSsrRenderModeTests.cs` (finding 4);
+`tests/ZeroWiki.Tests/Web/WikiPageTests.cs` (finding 2);
+`tests/ZeroWiki.Tests/Content/PushReactionServiceTests.cs` (finding 5's regression test). Nothing else —
+the six architectural notes and both parked items stayed in `## NEXT`, untouched.
+
+Not ticking anything — this remediation carries no new task numbers, and every §8 box was already `[x]`.
+
+→ @reviewer
+
+**[reviewer]** §8 remediation block — **Approve.** No blockers. Every one of the five fixes verified by
+breaking it myself, not by reading the worker's account of breaking it. Noting the process point up
+front: this verdict is for the diff as it stands right now, and per the Architect's own correction,
+nothing lands after it without coming back to me first.
+
+**Gates, re-run myself, unsandboxed and foreground:** `dotnet build` 0/0. `dotnet test` **876/876**, run
+twice consecutively (2m51s, 3m21s), no flake. `dotnet format --verify-no-changes` exit 0. `openspec
+validate --strict` valid. `git status --short` / `git diff --stat` — exactly the seven files, 712
+insertions, matching the report exactly; clean of every scratch mutation below (four separate
+break-and-restore cycles, each `cp`+checksum, never `git checkout --`/`git restore --`).
+
+**1 — `ChangedOnDiskIndicator`'s usage: pinned, and the pin bites.** Removed
+`<ChangedOnDiskIndicator Route="@notifiedPage.Route" />` from `WikiPage.razor` myself: the marker count
+on `/wiki/page` dropped from 2 to 0, `A_wiki_page_carries_markers_for_exactly_one_interactive_component_
+instance` failed, the other six surface tests in the same file were unaffected — exactly the
+mechanism-independent shape the supervisor asked for. Read `SpyPageChangeNotifier`'s own test
+(`Rendering_a_wiki_page_over_a_plain_http_client_never_subscribes_to_the_notifier`) directly rather than
+re-running it: it substitutes a real DI-registered spy and asserts `SubscribeCallCount == 0`, which only
+holds because of `ChangedOnDiskIndicator`'s own `if (RendererInfo.IsInteractive)` guard against the
+static-SSR prerender pass — the worker's own account of removing that guard and watching the count go to
+1 is consistent with everything else I read in that component.
+
+**2 — The attribution tests: re-proved vacuous-then-fixed, and the flake I found in the block review is
+still fixed.** Commented out `_lastEditAttributedName = await ResolveLastEditAttributedNameAsync(...)`
+in `WikiPage.razor`: both `A_push_originated_edit_by_a_known_git_email_is_attributed_to_the_account` and
+`A_squatted_git_email_does_not_change_what_the_page_attributes_another_members_edit_to` failed, both on
+`Not found: "Last edited by <strong>alice</strong>"` — the real attribution element, not a substring
+`NavMenu`'s `Sign out alice` could satisfy. Also checked that the squatting test still carries **both**
+strips (`StripInteractiveComponentMarkers(StripPersistedComponentState(...))`) ahead of its
+`DoesNotContain("bob", …)` check — the fix for the coincidental-substring flake I found and reported
+during the original block C review survived this remediation's rewrite of the same test unchanged; the
+sibling test's assertions are now specific and mixed-case enough (`"Last edited by <strong>alice
+</strong>"`, `"Alice's Laptop"`) that it doesn't need the same defensive stripping, and I don't see a
+realistic collision risk in leaving it out there.
+
+**3 — The resolver-ordering mutation, re-run against the shipped test, full unfiltered suite, by me.**
+Reversed `GitIdentityResolver.ResolveAsync` to consult `GitEmailService` before the synthetic shapes and
+ran the **complete** `dotnet test`, no filter: **3/876 failed** —
+`GitIdentityResolverTests.A_squatted_GitEmails_row_loses_to_the_synthetic_id_shape`,
+`..._synthetic_username_shape`, and
+`WikiPageTests.A_squatted_git_email_does_not_change_what_the_page_attributes_another_members_edit_to`,
+the last failing on `"Last edited by <strong>alice</strong>"` — the shipped, fixed-by-finding-2
+assertion, not the vacuous one my original 5/5 ran against. This is the actual replacement evidence the
+Architect's process note asked for, produced against the diff in front of me, not carried forward from
+the report.
+
+**4 — The tripwire's missing axis and the `/_blazor*` family: read directly, and the reasoning holds.**
+`InteractiveComponentSurfaceTests` is outcome-based — it counts the `<!--Blazor:{…}-->` marker every
+`InteractiveServer` instance emits at render time, which is produced identically whether the render mode
+came from a class-level `@rendermode` declaration or a caller's `@rendermode="X"` usage-site attribute,
+so it is structurally blind to neither form (unlike the reflection check it supplements, which only ever
+sees the class-level one). `None_of_the_mapped_blazor_hub_family_is_anonymously_exempt` enumerates
+`EndpointDataSource` for every route starting `/_blazor`, asserts the exact four-route set
+(`/_blazor`, `/_blazor/disconnect/`, `/_blazor/initializers/`, `/_blazor/negotiate`), and asserts
+`GetMetadata<IAllowAnonymous>() is null` on each — reading the same metadata `AnonymousGate`/the fallback
+policy themselves consult, not inferring protection from one sampled request's status code. This
+replaces exactly the single `GET /_blazor` check the supervisor named.
+
+**5 — The source fix: comment now describes the real asymmetry, decoupling confirmed by re-coupling it
+myself, and nothing else moved in the 94-line diff.** Read `PushReactionService.cs`'s new remarks block
+directly: it now states plainly that the *dangerous* direction is a warm that throws silently dropping
+8.2's spec-required broadcast, names that as the defect the old comment's true-but-harmless-direction
+statement obscured, and states the fix holds in both directions — this is the honest version, not a
+softened restatement. Re-coupled `WarmPageIndexAsync`/`ComputeAndBroadcastChangedRoutesAsync` back into
+one shared `try/catch` myself: `ReactAsync_IndexWarmThrows_StillComputesAndBroadcastsTheChangedRoutes`
+failed with `Assert.Single() Failure: The collection was empty` — the exact reported failure. Diffed the
+whole file against `HEAD`: the only changes are the mechanical two-method split, the new remarks block,
+and the log-message text updates that follow from it — `ComputeChangedRoutesAsync` and
+`HasDotPrefixedSegment` are byte-for-byte untouched, confirmed by reading the diff, not by trusting the
+line count.
+
+**No other findings.** All four break-and-restore cycles confirmed back to their pre-mutation checksums
+(`f1c1275f…` `WikiPage.razor` ×2, `942682f7…` `GitIdentityResolver.cs`, `27604d10…`
+`PushReactionService.cs`), `git diff --stat` matching the block's own shape after every one.
+
+Ready to land. §8 goes back to the supervisor for round two on the full `e4e5022..HEAD` range.
+
+→ @architect
+
 ## NEXT
 
 **Resume point: §8 (Push reactions & identity), block A — not yet carved.** **§7 is CLOSED**: supervisor

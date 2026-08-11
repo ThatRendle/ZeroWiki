@@ -259,7 +259,12 @@ public sealed class WikiPageTests : IDisposable
         var response = await (await SignInAsync("alice")).GetAsync("/wiki/page");
         var body = await response.Content.ReadAsStringAsync();
 
-        Assert.Contains("alice", body, StringComparison.Ordinal);
+        // §8 remediation (supervisor finding 2): asserted on the attribution element itself, not a
+        // bare substring -- NavMenu.razor's own "Sign out alice" renders "alice" on every authenticated
+        // page regardless of what this test proves, so a bare Contains("alice", ...) cannot fail and
+        // was proving nothing (confirmed: removing attribution from GitIdentityResolver.ResolveAsync
+        // still passed the old assertion, and fails this one -- see the DEVLOG for the mutation).
+        Assert.Contains("Last edited by <strong>alice</strong>", body, StringComparison.Ordinal);
         Assert.DoesNotContain("Alice's Laptop", body, StringComparison.Ordinal);
     }
 
@@ -292,7 +297,10 @@ public sealed class WikiPageTests : IDisposable
         var body = HttpAssertions.StripInteractiveComponentMarkers(
             HttpAssertions.StripPersistedComponentState(await response.Content.ReadAsStringAsync()));
 
-        Assert.Contains("alice", body, StringComparison.Ordinal);
+        // §8 remediation (supervisor finding 2): asserted on the attribution element itself -- a bare
+        // Contains("alice", ...) is satisfied by NavMenu.razor's "Sign out alice" on every authenticated
+        // page and cannot fail, proving nothing about the security property this test exists for.
+        Assert.Contains("Last edited by <strong>alice</strong>", body, StringComparison.Ordinal);
         Assert.DoesNotContain("bob", body, StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain("Not Alice", body, StringComparison.Ordinal);
     }

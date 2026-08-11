@@ -44,6 +44,19 @@ public sealed class PushReactionServiceTests : IDisposable
             paths, _git, historyService, pageIndex, _notifier, NullLogger<PushReactionService>.Instance);
     }
 
+    /// <summary>Builds a service whose <see cref="PageIndex"/> is backed by <paramref name="builder"/>
+    /// instead of a real <see cref="PageIndexBuilder"/> -- the seam that lets a test force the 8.1 warm
+    /// to throw without needing to corrupt the repository the 8.2 diff also reads from.</summary>
+    private PushReactionService CreateServiceWithPageIndexBuilder(IPageIndexBuilder builder)
+    {
+        var paths = Paths;
+        var historyService = new PageHistoryService(paths, _git, NullLogger<PageHistoryService>.Instance);
+        var pageIndex = new PageIndex(builder, NullLogger<PageIndex>.Instance);
+
+        return new PushReactionService(
+            paths, _git, historyService, pageIndex, _notifier, NullLogger<PushReactionService>.Instance);
+    }
+
     private async Task InitializeRepositoryAsync()
     {
         var repositoryRoot = Paths.RepositoryRoot;
@@ -184,6 +197,36 @@ public sealed class PushReactionServiceTests : IDisposable
         await CreateService().ReactAsync(null, after, CancellationToken.None);
 
         Assert.Empty(_notifier.Calls);
+    }
+
+    [Fact]
+    public async Task ReactAsync_IndexWarmThrows_StillComputesAndBroadcastsTheChangedRoutes()
+    {
+        // §8 remediation (supervisor finding): 8.1 (the index warm) and 8.2 (the spec-required diff
+        // and broadcast) must fail independently. Forces the warm to throw via a fake IPageIndexBuilder
+        // -- PageIndex.GetCurrentAsync calls ProbeCurrentHeadShaAsync directly and has nothing of its
+        // own to catch a builder fault with -- and asserts the broadcast still happens with the correct
+        // routes regardless. Fails if the two are ever re-coupled behind one try/catch.
+        await InitializeRepositoryAsync();
+        var before = await CommitAsync("unrelated.md", "unrelated content");
+        var after = await CommitAsync("page.md", "new content");
+
+        await CreateServiceWithPageIndexBuilder(new ThrowingPageIndexBuilder())
+            .ReactAsync(before, after, CancellationToken.None);
+
+        var call = Assert.Single(_notifier.Calls);
+        var route = Assert.Single(call);
+        Assert.Equal("page", route.Value);
+    }
+
+    private sealed class ThrowingPageIndexBuilder : IPageIndexBuilder
+    {
+        public Task<string?> ProbeCurrentHeadShaAsync(CancellationToken cancellationToken) =>
+            throw new InvalidOperationException("Simulated index-warm failure.");
+
+        public Task<PageIndexSnapshot> RefreshAsync(
+            PageIndexSnapshot current, string? currentHeadSha, CancellationToken cancellationToken) =>
+            throw new InvalidOperationException("Simulated index-warm failure.");
     }
 
     private sealed class RecordingPageChangeNotifier : IPageChangeNotifier

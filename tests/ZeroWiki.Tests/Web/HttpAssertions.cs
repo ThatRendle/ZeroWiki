@@ -39,6 +39,18 @@ public static partial class HttpAssertions
     public static string StripInteractiveComponentMarkers(string html) =>
         InteractiveComponentMarker().Replace(html, string.Empty);
 
+    /// <summary>
+    /// How many <c>InteractiveServer</c> component instances a response's HTML carries — the outcome
+    /// <see cref="StripInteractiveComponentMarkers"/> strips away, counted instead of discarded. §8
+    /// remediation (supervisor findings 1 and 3): mechanism-independent, unlike a reflection check
+    /// against a component's own class — it is sensitive to a component actually being <em>mounted</em>
+    /// on a given response (delete its usage and the count drops to zero) and to <em>either</em> form of
+    /// <c>@rendermode</c> (self-declared on the component or assigned at a caller's usage site), since
+    /// both produce this same marker at render time regardless of which C# attribute or Razor directive
+    /// produced them.
+    /// </summary>
+    public static int CountInteractiveComponentMarkers(string html) => InteractiveComponentMarker().Count(html);
+
     [GeneratedRegex(@"<!--Blazor:\{[\s\S]*?\}-->")]
     private static partial Regex InteractiveComponentMarker();
 
