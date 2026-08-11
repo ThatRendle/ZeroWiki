@@ -22131,6 +22131,101 @@ worked**. Documentation of a third-party integration written from a first-hand r
 written from that third party's docs — which is exactly the distinction that produced this finding. The
 recipe has been handed to the PO; `9.1` is written after `9.2`/`9.3` are observed, not before.
 
+**[architect]** The verification recipe, posted here so it is durable rather than living only in a
+session. It was handed to the Product Owner in the session that produced `ae30ad7`; this is the same
+recipe, re-derived and with every third-party claim re-checked first-hand.
+
+**Sources, named because a brief that says "derive it from the code" silently means *our* code.** Every
+`obsidian-git` claim below was read today from `Vinzent03/obsidian-git@master` directly, not from the
+supervisor's summary of it and not from recall:
+
+- `docs/Authentication.md` — macOS §HTTPS, verbatim: *"Run the following to use the macOS keychain to
+  store your credentials. `git config --global credential.helper osxkeychain`. You have to do one
+  authentication action (clone/pull/push) after setting the helper in the terminal. After that you should
+  be able to clone/pull/push in Obsidian without any issues."* All three of the supervisor's transcriptions
+  check out verbatim.
+- `src/setting/settings.ts` — `Commit-and-sync` (`:453`, *"staging everything -> committing -> pulling ->
+  pushing"*), `Pull on commit-and-sync` (`:475`), `Push on commit-and-sync` (`:460`), `Merge strategy`
+  (`:401`), and `Custom base path (Git repository path)` (`:937`, *"only required if the Git repository is
+  **below** the vault root directory"*). Neither `Vault backup interval (minutes)` nor `Auto pull/push`
+  — the two names `README.md:107-112` gives — appears anywhere in the file.
+- **One setting the supervisor did not name, and it is load-bearing for `9.3`:** `Merge strategy on
+  conflicts` (`settings.ts:421`) — *"Decide how to solve conflicts when pulling remote changes. This can
+  be used to favor your local changes or the remote changes automatically."* Left on an automatic option
+  it would resolve the conflict `9.3` exists to observe, and the run would report success having tested
+  nothing. The recipe pins it to `None (git default)`.
+
+**Local facts the recipe depends on** (checked against the tree, not assumed): the dev content repo is
+`src/ZeroWiki/App_Data/wiki`, branch `main`, `receive.denyCurrentBranch=updateInstead`,
+`http.receivePack=true`, one page at `docs/scratch.md`. The banner is `ChangedOnDiskIndicator`, mounted
+only in `WikiPage.razor`'s rendered-body branch — so it renders on the **view** route `/wiki/<route>`,
+never in the editor. `credential.helper=osxkeychain` is already set at global scope on this machine, so
+step 2 seeds it rather than setting it.
+
+**The five open questions this run answers** — and nothing else; the round trip, the recovery, the passive
+server and the documented route are already proven by `08f970a` and must not be re-verified by hand:
+credential acquisition *through the plugin*; whether the plugin tolerates the repo root above the vault;
+commit-and-sync against a real rejection; a genuine line-level conflict inside Obsidian; and the banner
+rendering in a live circuit. Mobile is out of scope.
+
+**The recipe.**
+
+*0 — start the app.* `pkill -f ZeroWiki` first; a stale instance holding 5171 makes the new run fail to
+bind while the browser keeps talking to the old process, and the symptom looks exactly like a feature bug.
+Then `dotnet run --project src/ZeroWiki` and open **`http://localhost:5171`** — plain HTTP. The default
+profile does not bind `https://localhost:7070`. Sign in.
+
+*1 — mint a credential.* **Account** → *Generate a git access token*. It is shown once. The git username
+is the sign-in username; the token is the password. Remote URL locally: `http://localhost:5171/git`.
+
+*2 — seed the credential helper from a terminal, before touching Obsidian.* This is the ordering the
+plugin requires, and the README currently states it backwards — there is no TTY inside Obsidian to answer
+a prompt. Confirm the helper (`git config --global credential.helper` → `osxkeychain`), then clone **with
+a prompt**, not a token-in-URL, so the helper actually stores something:
+
+```sh
+git clone http://<username>@localhost:5171/git zerowiki-vault
+```
+
+Paste the token at the password prompt. Then prove it stuck, which is the whole point of the step:
+
+```sh
+printf 'protocol=http\nhost=localhost:5171\n\n' | git credential fill
+```
+
+It should print the username and token back without prompting. If it doesn't, Obsidian will not
+authenticate and everything after this is untestable.
+
+*3 — the layout question.* Open **`zerowiki-vault`** — the clone root — as the vault, with the notes
+living in its `docs/` subfolder. That is the arrangement the plugin supports by default. Then, separately,
+try the arrangement `README.md:69-70` currently documents: open `zerowiki-vault/docs` as a vault and see
+whether `obsidian-git` initialises at all. Report which worked; the README is written from that answer.
+
+*4 — configure the plugin.* Install **obsidian-git**, then: `Pull on commit-and-sync` **on** (this is what
+makes a ZeroWiki rejection recoverable rather than terminal), `Merge strategy` = *Merge*, and
+`Merge strategy on conflicts` = **None (git default)** — see above, an automatic setting here silently
+voids step 7.
+
+*5 — 9.2, server → vault.* Edit a page in the browser and save. In Obsidian run *Pull*. The text appears.
+
+*6 — 9.2, vault → server, and the banner nobody has watched.* Open the page's **view** route
+(`http://localhost:5171/wiki/<route>`, e.g. `/wiki/scratch`) in the browser and **leave it open** — the
+banner lives there, not in the editor, and needs its circuit connected. Then edit that note in Obsidian and
+run *Commit-and-sync*. Watch the browser without touching it: *"This page has changed on disk since it was
+loaded."* should appear on its own. **Whether it does is the single most important observation in this
+run** — it is the only claim in the change with no automated coverage of its rendering.
+
+*7 — 9.3, rejection and a real conflict.* Edit one line of the note in Obsidian and **do not sync**. Edit
+*the same line* of the same page in the browser, differently, and save. Now *Commit-and-sync* in Obsidian:
+the push is rejected, the pull that follows hits a line-level conflict, and what matters is what Obsidian
+shows you and how you get out of it. Resolve, commit, sync again, and confirm the browser has the resolved
+text.
+
+Report per step. A step that fails is a result, not a blocker — `9.1` is written from what actually
+happened, including the parts that didn't work.
+
+→ @product-owner
+
 ## NEXT
 
 **Resume point: §9 is OPEN and BLOCKED ON THE PRODUCT OWNER. Do not start §10 until it closes.**
@@ -22152,8 +22247,9 @@ sound and would be approved on their own.**
    inside Obsidian), `:107-112` (two setting names absent from `settings.ts`; the real ones are
    `Pull on commit-and-sync` and `Merge strategy`). **Still open.**
 
-**The Product Owner has been handed the verification recipe** (in the session that produced `ae30ad7`;
-reproduce it from the supervisor's "what remains to verify by hand" list under `## 9.` if needed). It
+**The Product Owner has been handed the verification recipe, and it is now written down** — the last
+`[architect]` post under `## 9.` carries it in full, step by step, with every `obsidian-git` claim
+re-derived first-hand from `Vinzent03/obsidian-git@master` and cited there. Do not reconstruct it. It
 covers only what no test can reach: credential acquisition **through the plugin**, whether the plugin
 tolerates the repo root sitting above the vault, commit-and-sync against a real rejection plus a
 line-level conflict, and **the "changed on disk" banner rendering in a live circuit — still never
