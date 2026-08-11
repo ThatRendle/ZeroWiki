@@ -21517,9 +21517,19 @@ not three.
 
 **§8 is CLOSED**: supervisor `Approve` over `e4e5022..03107e2` at the second section round.
 
-**Working tree CLEAN. State: 41/41 tasks ticked** — every numbered task in this change is done. What
-remains is §9's verification and §10's test consolidation. Branch `change/git-backed-content-core`, HEAD
-**`03107e2`**. Gates at §8's close, run in the foreground by the Architect **unsandboxed**: `dotnet build`
+**Working tree CLEAN. State: 35/41 tasks ticked.** Six remain, all of them in §9 and §10: `9.1`–`9.3`
+(Obsidian verification, human-in-the-loop) and `10.1`–`10.3` (test consolidation).
+
+> **Correction, made at §8's close-out and recorded rather than silently fixed.** The first version of
+> this paragraph — and the `2942a61` commit body — said **"41/41 tasks ticked, every numbered task is
+> done."** That was **wrong**: `grep -c '^- \[x\]'` gives **35**, `grep -c '^- \[ \]'` gives **6**. The
+> error was the Architect's, made by arithmetic in prose rather than by counting the file, and it is the
+> same defect class this change has punished all the way through — **a claim about an artefact, not
+> derived from the artefact.** The commit body is left as it stands (history is not rewritten for this);
+> **this paragraph is authoritative over it.** §10 in particular is not optional cleanup — it is three
+> unticked tasks with their own supervisor review still to come.
+
+Branch `change/git-backed-content-core`, HEAD **`03107e2`**. Gates at §8's close, run in the foreground by the Architect **unsandboxed**: `dotnet build`
 0/0; `dotnet test` **876/876** unfiltered in 3m15s; `dotnet format --verify-no-changes` exit 0;
 `openspec validate --strict` valid; no `MUTANT` residue.
 
