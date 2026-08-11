@@ -2,6 +2,7 @@ using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using ZeroWiki.Content;
 using ZeroWiki.Data;
+using ZeroWiki.Identity;
 using ZeroWiki.Security;
 
 namespace ZeroWiki.Tests.Web;
@@ -70,6 +71,46 @@ public sealed class GitSmartHttpRealClientTests
         await AssertServerWorkingTreeIsCleanAsync(paths);
     }
 
+    /// <summary>
+    /// 9.2's server→client direction, untested before this block: everything above this test proves
+    /// a real client's write reaches the server; nothing proved the reverse — that a save made through
+    /// the app's own write path (<see cref="PageSaveService"/>, not a hand-rolled <c>git commit</c>) is
+    /// what a real client actually pulls. If commit-on-save lands the commit but leaves the branch ref
+    /// behind (detached HEAD, wrong branch advanced, or a commit written but never referenced), a clone
+    /// still succeeds — it would just yield the file's old bytes, or no file at all. Asserting on the
+    /// pulled file's bytes, not merely that the clone succeeded, is what would actually catch that.
+    /// </summary>
+    [Fact]
+    public async Task PageSavedThroughTheApp_IsWhatARealClientClones()
+    {
+        using var factory = ZeroWikiAppFactory.WithRealServer();
+        var (account, token) = await SeedAccountWithTokenAsync(factory, Username);
+        var remoteUrl = BuildRemoteUrl(factory.RealServerAddress, Username, token.Plaintext);
+
+        const string SavedContent = "# Saved through the app\n\nwritten via PageSaveService, not git directly\n";
+        var saveService = factory.Services.GetRequiredService<PageSaveService>();
+        var saveAuthor = new AuthenticatedAccount(account.Id, account.Username, account.IsAdministrator);
+        var saveResult = await saveService.SaveAsync(
+            new RouteValue("app-saved-page"),
+            SavedContent,
+            PageBaseRevision.AbsentAtHead,
+            saveAuthor,
+            CancellationToken.None);
+        Assert.Equal(SaveOutcome.Saved, saveResult.Outcome);
+
+        using var scratch = new TempDirectory();
+        var clonePath = Path.Combine(scratch.Path, "clone");
+
+        var clone = await RunClientGitAsync(scratch.Path, ["clone", "--quiet", remoteUrl, clonePath]);
+        Assert.True(clone.Succeeded, $"clone failed: {clone.StandardError}");
+
+        var pulledPagePath = Path.Combine(clonePath, "docs", "app-saved-page.md");
+        Assert.True(
+            File.Exists(pulledPagePath),
+            "a page saved through the app's write path should have been present in the cloned working tree.");
+        Assert.Equal(SavedContent, await File.ReadAllTextAsync(pulledPagePath));
+    }
+
     [Fact]
     public async Task NonFastForwardPush_IsRejected_AndTheServersWorkingTreeIsUnchanged()
     {
@@ -107,6 +148,73 @@ public sealed class GitSmartHttpRealClientTests
         // wrote nothing, on disk or into history.
         Assert.True(File.Exists(Path.Combine(paths.WorkingTree, "winner.md")));
         Assert.False(File.Exists(Path.Combine(paths.WorkingTree, "loser.md")));
+
+        await AssertServerWorkingTreeIsCleanAsync(paths);
+    }
+
+    /// <summary>
+    /// 9.3's other half: the spec requires a rejected push to be recoverable by the client resolving
+    /// the conflict locally (pull and merge), not a dead end — and the resolution must happen entirely
+    /// at the client. This test picks up exactly where
+    /// <see cref="NonFastForwardPush_IsRejected_AndTheServersWorkingTreeIsUnchanged"/> stops: after the
+    /// rejection, the same client pulls (fetch + merge, a real three-way merge since the two clones
+    /// diverged from a common ancestor) and pushes again. Asserting on the server's final working-tree
+    /// <em>contents</em> — both files present with their own bytes — rather than just the second push's
+    /// exit code is deliberate: a stale ref, a lock not released, or a dirty tree left behind by the
+    /// first rejection could each let the second push report success while the server is still missing
+    /// one of the two edits, and only reading the tree back catches that. The server side stays on
+    /// plain <c>receive.denyCurrentBranch = updateInstead</c> throughout — no server-side setting is
+    /// relaxed and no auto-merge, force, or reset happens outside the client's own repository.
+    /// </summary>
+    [Fact]
+    public async Task NonFastForwardPush_AfterClientPullsAndMerges_SecondPushSucceedsWithBothEdits()
+    {
+        using var factory = ZeroWikiAppFactory.WithRealServer();
+        var (_, token) = await SeedAccountWithTokenAsync(factory, Username);
+        var remoteUrl = BuildRemoteUrl(factory.RealServerAddress, Username, token.Plaintext);
+        var paths = factory.Services.GetRequiredService<ContentPaths>();
+
+        using var scratch = new TempDirectory();
+        var cloneAheadPath = Path.Combine(scratch.Path, "clone-ahead");
+        var cloneStalePath = Path.Combine(scratch.Path, "clone-stale");
+
+        // Both clones start from the same initial state.
+        Assert.True((await RunClientGitAsync(scratch.Path, ["clone", "--quiet", remoteUrl, cloneAheadPath])).Succeeded);
+        Assert.True((await RunClientGitAsync(scratch.Path, ["clone", "--quiet", remoteUrl, cloneStalePath])).Succeeded);
+
+        // The "ahead" clone commits and pushes first -- a genuine fast-forward, expected to succeed.
+        await File.WriteAllTextAsync(Path.Combine(cloneAheadPath, "docs", "winner.md"), "the fast-forward push\n");
+        await RunClientGitOrThrowAsync(cloneAheadPath, ["add", "-A"]);
+        await RunClientGitOrThrowAsync(cloneAheadPath, ["commit", "-q", "-m", "winner"], ClientCommitIdentity());
+        var winningPush = await RunClientGitAsync(cloneAheadPath, ["push", "--quiet", "origin", "HEAD"]);
+        Assert.True(winningPush.Succeeded, $"the fast-forward push should have succeeded: {winningPush.StandardError}");
+
+        // The "stale" clone never fetched the winner's commit -- its own commit, on the old parent,
+        // cannot fast-forward the branch the remote is now at.
+        await File.WriteAllTextAsync(Path.Combine(cloneStalePath, "docs", "loser.md"), "the rejected push\n");
+        await RunClientGitOrThrowAsync(cloneStalePath, ["add", "-A"]);
+        await RunClientGitOrThrowAsync(cloneStalePath, ["commit", "-q", "-m", "loser"], ClientCommitIdentity());
+        var rejectedPush = await RunClientGitAsync(cloneStalePath, ["push", "--quiet", "origin", "HEAD"]);
+        Assert.False(rejectedPush.Succeeded, "the stale clone's first push must still be rejected.");
+        // Pins the reason, not merely that it failed -- matches NonFastForwardPush_IsRejected_AndTheServersWorkingTreeIsUnchanged's
+        // own assertion, so a push failing for an unrelated reason (bad URL, auth, transport) cannot pass this test.
+        Assert.Contains("rejected", rejectedPush.StandardError, StringComparison.OrdinalIgnoreCase);
+
+        // Resolution at the client (spec): pull -- fetch plus a real three-way merge, since the two
+        // clones' commits diverged from a common ancestor rather than one simply being behind the other.
+        var pull = await RunClientGitAsync(
+            cloneStalePath, ["pull", "--quiet", "--no-rebase", "origin", "HEAD"], ClientCommitIdentity());
+        Assert.True(pull.Succeeded, $"pull/merge at the client failed: {pull.StandardError}");
+
+        var secondPush = await RunClientGitAsync(cloneStalePath, ["push", "--quiet", "origin", "HEAD"]);
+        Assert.True(secondPush.Succeeded, $"the retried push after merging locally should succeed: {secondPush.StandardError}");
+
+        // The server's working tree, read directly off disk: both edits, not merely a successful exit
+        // code from the second push.
+        Assert.True(File.Exists(Path.Combine(paths.WorkingTree, "winner.md")));
+        Assert.True(File.Exists(Path.Combine(paths.WorkingTree, "loser.md")));
+        Assert.Equal("the fast-forward push\n", await File.ReadAllTextAsync(Path.Combine(paths.WorkingTree, "winner.md")));
+        Assert.Equal("the rejected push\n", await File.ReadAllTextAsync(Path.Combine(paths.WorkingTree, "loser.md")));
 
         await AssertServerWorkingTreeIsCleanAsync(paths);
     }

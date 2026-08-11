@@ -21507,6 +21507,326 @@ section's evidence that rests on a single agent's run.
 
 §8 is closed. → @architect
 
+## 9. Obsidian sync verification
+
+**[architect]** Base: `39f6d38` — proves the vault round trip: an app-side edit reaches a real git
+client, and a genuine conflict is not just rejected but *recoverable*; plus the vault setup doc.
+
+**[architect]** The carve, and why §9 is smaller than its three tasks look. Before carving I read what
+§7 and §8 already shipped, because `tasks.md` was written before either landed:
+
+- `GitSmartHttpRealClientTests.AuthenticatedClient_ClonesEditsAndPushes_AndTheServersWorkingTreeReflectsIt`
+  already drives a **real `git` CLI** through clone → edit → push against the Smart HTTP endpoint. That is
+  the *client→server* half of 9.2, already covered.
+- `GitSmartHttpRealClientTests.NonFastForwardPush_IsRejected_AndTheServersWorkingTreeIsUnchanged` already
+  covers 9.3's **rejection**. It stops there — it never resolves the conflict.
+- `PushReactionEndpointTests.RealPush_NotifiesExactlyTheChangedRoute_AndNeverAViewerOnAnUntouchedRoute`
+  already covers 9.2's **"see update and broadcast in browser"** end-to-end from a real push.
+
+So the automatable gap is exactly two things, and neither is a re-run of the above:
+
+- **Block A** — the *server→client* direction (nothing tests it today) and conflict **recovery** (9.2, 9.3).
+- **Block B** — the vault setup documentation (9.1).
+- **Then the Product Owner**, once — see the handoff note under `## NEXT`. `obsidian-git` itself, and the
+  banner appearing in a live circuit, are the only parts no test can reach.
+
+### Block A brief — the round trip closes and a conflict is recoverable (9.2, 9.3)
+
+→ @worker. Two integration tests in `tests/ZeroWiki.Tests/Web/GitSmartHttpRealClientTests.cs`, driving the
+real `git` binary against the running endpoint exactly as the existing tests in that file do. Reuse their
+fixture and `TempDirectory`; do not build a second harness.
+
+**A1 — an edit made through the app is what a client pulls.** Save a page through the app's own write path
+(`PageSaveService`, not a hand-rolled commit), then clone from the Smart HTTP endpoint with a real client
+and assert the pulled file's **bytes** are the saved content.
+
+> *The observation that fails if this is undone:* if commit-on-save does not land on the ref a client
+> fetches — a detached HEAD, an unadvanced branch, a commit written but the ref left behind — the clone
+> yields the file's **old** bytes (or no file at all) and the byte assertion fails. Assert content, never
+> that the clone merely succeeded: a clone of a stale ref succeeds perfectly.
+
+**A2 — a rejected push is recoverable, not a dead end.** Extend past the existing rejection test: after the
+non-fast-forward rejection, have the *same* client `pull`/merge, then push again. Assert the second push
+**succeeds** and the server's working tree contains **both** edits.
+
+> *The observation that fails if this is undone:* if a rejected push leaves the server unrecoverable — a
+> stale ref, a lock file not released, a working tree left dirty so `updateInstead` refuses the next push —
+> the second push fails, or it succeeds while the server tree is missing one of the two edits. Both are
+> caught only by asserting on the final tree, not on the push's exit code.
+
+**Binding constraints.** 9.3 says the conflict is resolved *at the client* — the server must not auto-merge
+or force anything; A2 asserts the server stayed passive and the client did the work. Keep to
+`receive.denyCurrentBranch = updateInstead` (spec: *Accept pushes into the checked-out branch*); if A2 only
+passes by relaxing a server setting, **stop and post here** — that is a spec question, not a test fix.
+
+**Gates:** `dotnet build` clean · `dotnet test` green **unfiltered** · `openspec validate
+git-backed-content-core --strict` · `dotnet format --verify-no-changes`. No mutation testing in this block.
+
+**[worker]** Block A (9.2, 9.3) implemented — two new tests in `GitSmartHttpRealClientTests.cs`, reusing
+the file's own fixture and `TempDirectory` helper, no second harness:
+
+- **A1** `PageSavedThroughTheApp_IsWhatARealClientClones` — saves a page via the injected
+  `PageSaveService.SaveAsync` (asserts `SaveOutcome.Saved`), then clones from the Smart HTTP endpoint with
+  the real `git` client and asserts the pulled file's bytes equal the saved content exactly. Confirms the
+  test is meaningful the way the brief asks: `SaveAsync` always advances `HEAD` on the checked-out branch
+  before returning (read `PageSaveService`'s own commit step — `git commit` then `rev-parse HEAD`, no
+  detached-HEAD path anywhere in it), so this is a genuine round trip, not a tautology.
+- **A2** `NonFastForwardPush_AfterClientPullsAndMerges_SecondPushSucceedsWithBothEdits` — picks up exactly
+  where the existing rejection test stops: same two-clone setup, winner pushes and fast-forwards, stale
+  clone's push is rejected, then the *same* stale-clone client runs `git pull --no-rebase origin HEAD`
+  (a real three-way merge — the two clones diverged from a common ancestor, this is not a fast-forward
+  pull) and pushes again. Asserts the second push succeeds AND reads both `winner.md` and `loser.md` back
+  off the server's working tree with their own bytes — not just the push's exit code, per the brief's
+  "only the final tree contents" note. No server-side git setting touched; `receive.denyCurrentBranch =
+  updateInstead` unchanged, all conflict resolution happens in the client's own repository via ordinary
+  `pull`/merge with `GitAuthor`-supplied commit identity (same env-var pattern the rest of this file uses
+  for client-side commits) for the merge commit.
+
+Both tests pass, alongside the file's existing 5. Gates: `dotnet build` clean · `dotnet test` **unfiltered,
+878/878 passed** (3m57s) · `openspec validate git-backed-content-core --strict` valid · `dotnet format
+--verify-no-changes` clean. No mutation testing run (out of scope for this block per the brief). No
+server-side setting was relaxed — A2 passed on the first attempt with `updateInstead` untouched, so no
+architect question needed.
+
+→ @reviewer
+
+**[reviewer]** Block A audited. **Approve with a nit.**
+
+Re-verified independently rather than trusting the worker's numbers: `git status --short -- src` and
+`git diff -- src` both empty (confirmed test-only), `dotnet build` clean (0/0), `dotnet test`
+**unfiltered** re-run green (878/878, 2m32s — second full-suite run agreeing with the worker's, not the
+same run reused), `dotnet format --verify-no-changes` clean, `openspec validate git-backed-content-core
+--strict` valid.
+
+Falsifiability, per the brief's own standard (§8's "a string the page renders for another reason is not
+an assertion"):
+
+- **A1** (`GitSmartHttpRealClientTests.cs:84`) — real failure modes checked: (1) `SavedContent` is
+  distinctive and the route (`app-saved-page`) doesn't exist in the fixture's seed, so a stale-ref clone
+  shows *no file at all*, not a look-alike; `Assert.True(File.Exists(pulledPagePath), …)` at line 108
+  catches that before the byte assertion even runs. (2) The byte assertion (`Assert.Equal(SavedContent,
+  …)`, line 111) is on the pulled content itself, not a side effect. Traced `PageSaveService.SaveAsync`
+  (not just read the doc comment): the commit path re-reads `git rev-parse HEAD` after a real `git
+  commit` on the checked-out branch, under the same `RepositoryWriteLock` used by the push path — no
+  detached-HEAD or queued/async path exists that could return `Saved` without the ref moving. This test
+  fails if that ever regresses.
+- **A2** (`GitSmartHttpRealClientTests.cs:170`) — assertions are on `paths.WorkingTree` read directly off
+  disk (`winner.md` and `loser.md`, both content-checked), not on `secondPush.Succeeded` alone; a server
+  tree missing either edit, or holding stale/wrong bytes, turns it red. Confirmed `paths.WorkingTree`
+  already resolves to `<repo>/docs` (`ContentPaths.cs:23`, corroborated by
+  `ContentStorageOptionsTests.cs:68` and every other call site in the suite), so the bare
+  `Path.Combine(paths.WorkingTree, "winner.md")` is correct, not a directory-mismatch bug that would
+  make the assertions pass or fail for the wrong reason. The first push's rejection
+  (`Assert.False(rejectedPush.Succeeded, …)`, line 198) does catch a silent success (it would flip
+  `Succeeded` true and fail the assertion) — see the nit below on strengthening it further. Traced that
+  the two clones' commits are genuinely divergent (both committed independently before either fetched
+  the other's push) and touch different files, so the `pull --no-rebase` is a real three-way merge, not
+  an accidental fast-forward that would let the test pass without exercising conflict recovery.
+
+**Design decisions:** `src/` diff is empty — `receive.denyCurrentBranch = updateInstead`
+(`ContentRepositoryService.cs:541`) is untouched, and nothing anywhere introduces auto-merge/force/reset
+on the server side. All conflict resolution happens in the client's own working tree (`cloneStalePath`),
+matching `git-sync/spec.md`'s "the system rejects the push so the client resolves the conflict locally."
+The server stayed passive.
+
+**Scope and redundancy:** test-only diff, strictly within 9.2/9.3, no reach into 9.1 or §10. No new
+harness — both tests reuse `TempDirectory`, `RunClientGitAsync`/`RunClientGitOrThrowAsync`,
+`ClientCommitIdentity`, `SeedAccountWithTokenAsync`, `BuildRemoteUrl`, and
+`AssertServerWorkingTreeIsCleanAsync` verbatim. No overlap with
+`AuthenticatedClient_ClonesEditsAndPushes_AndTheServersWorkingTreeReflectsIt` (client→server direction),
+`NonFastForwardPush_IsRejected_AndTheServersWorkingTreeIsUnchanged` (stops at rejection, never resolves),
+or `PushReactionEndpointTests.RealPush_NotifiesExactlyTheChangedRoute_…` (browser-side broadcast) — A1 and
+A2 genuinely cover the gap the DEVLOG carve identified.
+
+**Nit (non-blocking):** `GitSmartHttpRealClientTests.cs:198` — `Assert.False(rejectedPush.Succeeded, "the
+stale clone's first push must still be rejected.")` checks the push failed but, unlike its sibling
+`NonFastForwardPush_IsRejected_AndTheServersWorkingTreeIsUnchanged` (line 145,
+`Assert.Contains("rejected", rejectedPush.StandardError, StringComparison.OrdinalIgnoreCase)`), doesn't
+confirm *why*. It still catches a silent success (the property the brief asked about), so this doesn't
+block, but adding the same `Assert.Contains("rejected", …)` would make A2 diagnose a spurious failure
+(e.g. an unrelated transport error) instead of silently sailing into the pull/merge step and passing for
+the wrong reason.
+
+**No mutation testing performed** — correctly out of scope per the brief; nothing here needed it beyond
+the falsifiability tracing above.
+
+→ @architect
+
+**[worker]** Block A nit fixed — `GitSmartHttpRealClientTests.cs`, in
+`NonFastForwardPush_AfterClientPullsAndMerges_SecondPushSucceedsWithBothEdits`: added
+`Assert.Contains("rejected", rejectedPush.StandardError, StringComparison.OrdinalIgnoreCase)` right after
+the existing `Assert.False(rejectedPush.Succeeded, …)`, matching the sibling test's own assertion exactly
+so the two stay consistent. Only that one assertion changed; nothing else touched.
+
+Checked the real stderr rather than assuming the string: reproduced the same non-fast-forward rejection
+against a throwaway local bare repo outside this test (independent of the Smart HTTP transport, since the
+rejection message is generated client-side by `git push` itself once it detects the remote ref advanced).
+Observed:
+
+```
+! [rejected]        HEAD -> main (fetch first)
+error: failed to push some refs to '...'
+hint: Updates were rejected because the remote contains work that you do not
+hint: have locally. ...
+```
+
+Contains "rejected" case-insensitively in two places (`[rejected]`, "were rejected"), matching the
+sibling test's existing assertion, which already passes across the same git installation in this suite.
+The actual A2 test (against the real Smart HTTP endpoint) also passed with the new assertion in place —
+confirms the stderr shape is the same over Smart HTTP as over a plain local remote.
+
+Gates: `dotnet build` clean · `dotnet test` **unfiltered, 878/878 passed** · `openspec validate
+git-backed-content-core --strict` valid · `dotnet format --verify-no-changes` clean. `git status --short
+-- src` empty — test-only change, nothing else in scope touched.
+
+→ @reviewer
+
+**[reviewer]** Re-audit of the post-incident state. **Request changes — one finding, documentation
+only; the code itself is clean and I'd approve it on its own.**
+
+**1. The nit fix — confirmed, and checked as a claim, not taken on trust.** The added
+`Assert.Contains("rejected", rejectedPush.StandardError, StringComparison.OrdinalIgnoreCase)`
+(`GitSmartHttpRealClientTests.cs:200`) matches the sibling test's own assertion exactly. I didn't rely on
+the worker's reported stderr string — I ran
+`NonFastForwardPush_AfterClientPullsAndMerges_SecondPushSucceedsWithBothEdits` myself against the real
+Smart HTTP endpoint and it passed, which means the real `git push` rejection over this transport
+genuinely contains "rejected" (case-insensitively) exactly as claimed, not an assumed string. This does
+pin the *reason* for the failure, not merely that stderr is non-empty — an unrelated transport/auth
+failure would produce different stderr and fail this assertion before the test could sail on into the
+pull/merge step for the wrong reason.
+
+**2. `git diff 39f6d38` for the test file — read in full, not just the tail of it.** 108 lines added
+across two `[Fact]`s plus one `using`. No truncation, no duplicated method, no leftover fragment: grepped
+the file for both new method names and each appears exactly once, and the file's structure (7 `[Fact]`s,
+one class, existing helpers untouched) is exactly what I audited last round plus the one-line nit fix and
+its comment. A1 and A2 still hold the falsifiability properties I verified last round — nothing about the
+incident's commit/reset cycle altered the substance of either test: same distinctive `SavedContent` in
+A1, same byte-level assertions on `paths.WorkingTree` in A2, same divergent-history merge, same passive
+server (`src/` diff still empty — `receive.denyCurrentBranch = updateInstead` untouched).
+
+**3. Gates — re-run myself, unfiltered, unfiltered, unfiltered:**
+- `dotnet build`: clean, 0/0.
+- `dotnet format --verify-no-changes`: clean.
+- `openspec validate git-backed-content-core --strict`: valid.
+- `dotnet test`, full suite, no filter, run **three times** independently (capped per the mutation-testing
+  discipline's 3-run rule, since the third run's disagreement made this a flakiness question): once via
+  the context-mode sandbox (878/878), then twice via a real, unsandboxed `dotnet test` matching how
+  `dotnet test` actually runs outside this tool (**877/878** — `UnauthenticatedClone_FailsAtTheClient`
+  failed with `"fatal: Authentication failed for 'http://…'"` where it expects `"terminal prompts
+  disabled"` — then **878/878** clean again). That failing test is untouched by this diff. Isolated reruns
+  of the whole file (3/3, `dotnet test --filter`) were clean every time. Root cause, not just observed:
+  this machine has `credential.helper = osxkeychain` at global/system git config scope (confirmed via
+  `git config --system/--global --get-all credential.helper`, not present in this repo's own
+  `.git/config`) — under full parallel execution, a real git credential written to the OS keychain by one
+  concurrently-running authenticated test can apparently get offered to a different test's git process,
+  turning a pre-flight "never even tried" failure into a post-flight "tried and got rejected" one. This is
+  a pre-existing hazard in the file's established pattern (every real-git test here embeds credentials in
+  a URL, including tests approved back in §7), not something A1/A2 introduced — but it is a genuine,
+  rare, environment-linked flake, not a Claude-tool artifact, since it reproduced under an unsandboxed
+  `dotnet test` and not (in my runs) under the sandboxed one. **Architectural note, non-blocking for this
+  block:** worth a follow-on task to pin `-c credential.helper=` (empty, disabled) on every client-side
+  git invocation in this file, both to kill this flake source and to stop the suite writing real
+  credentials into the developer's OS keychain at all.
+
+**4. The DEVLOG record — incomplete against what I was asked to confirm.** The brief said the incident
+write-up would be here; it isn't. `git diff 39f6d38 -- openspec/changes/git-backed-content-core/DEVLOG.md`
+and a grep of the whole file for `mktemp`, `reset --mixed`, `c8b122a`, `850bdda`, `9ff065c`, `bogus`,
+`stray` (beyond unrelated prior incidents already in this file) turn up **nothing** — the DEVLOG jumps
+straight from the nit-fix post to `## NEXT` with no mention that a scratch script ran `git init`/`add`/
+`commit` in the real repo root, produced three stray commits, or that recovery was `git reset --mixed
+39f6d38`. This file has a strong, repeated precedent of recording exactly this kind of thing in place
+(e.g. "The `git checkout --` incident left nothing behind — checked, not assumed" earlier in this same
+file) — CLAUDE.md calls the DEVLOG "the durable record of *how* it was built, not just *what* it
+specified," append-only, committed with the block. A recovery that isn't written down here doesn't meet
+that bar, even though I independently confirmed the filesystem state is actually clean (`git status
+--short --untracked-files=all` shows only the two intended files; `git reflog` shows `39f6d38` ←
+`9ff065c` ← `850bdda` ← `c8b122a` ← `39f6d38`, consistent with the reset-and-recover the coordinator
+described). The state is fine; the record of it is missing.
+
+**Request changes: add the incident write-up to the DEVLOG** (what happened, the three commit SHAs, the
+recovery command, confirmation nothing was pushed) before this commits — then I'll re-confirm and this is
+a straight `Approve`. Everything else in this post stands; no code changes needed.
+
+→ @architect
+
+**[worker]** Incident write-up (block A) — omitted from the DEVLOG when I first reported the recovery to
+the coordinator; recorded here now, as the reviewer's finding requires.
+
+**What happened.** A scratch reproduction script, run to independently verify the reviewer's nit against
+real `git` stderr, opened with `D=$(mktemp -d)`. `mktemp` is blocked under this repo's sandbox (only
+`$TMPDIR`/`/tmp/claude-501/...` paths are writable), so the command failed and `D` was left an empty
+string. The next line, `cd "$D"`, expanded to `cd ""`, which no-ops and returns success rather than
+failing — the script had no `set -euo pipefail`, so nothing stopped it there. Every subsequent command —
+`git init`, `git add -A`, `git commit` — therefore ran with the current directory still at the real repo
+root, on branch `change/git-backed-content-core`, not in an isolated scratch directory.
+
+**What it produced.** Three real commits on that branch, each confirmed by `git show --stat`:
+- `c8b122a` "init" — staged and committed the legitimate uncommitted work-in-progress (the DEVLOG entries
+  and the two new test methods in `GitSmartHttpRealClientTests.cs`) together with junk the script had
+  just created: `remote.git/` (a bare repo), `work/f.md`.
+- `850bdda` "w" — added `winner.md` at the repo root (from the script's second clone-and-push step,
+  likewise misdirected).
+- `9ff065c` "l" — added `loser.md` at the repo root, for the same reason.
+
+**The recovery.** `git reset --mixed 39f6d38` moved the branch pointer and index back to the last
+legitimate commit while leaving the working tree untouched, which turned the three bogus commits' content
+back into ordinary uncommitted changes/untracked files. The four stray artifacts — `remote.git/`, `work/`,
+`winner.md`, `loser.md` — were then deleted directly (`rm -rf`), leaving only the two files that were
+actually meant to change: `DEVLOG.md` and `GitSmartHttpRealClientTests.cs`.
+
+**What was verified afterwards, and by whom.** Nothing was ever pushed: there is no
+`origin/change/git-backed-content-core` (`git branch -r` lists only `origin/HEAD`, `origin/main`,
+`origin/change/invite-only-authentication`, `origin/change/request-cancellation`), and the branch has
+never left this machine. The four deleted items were confirmed to be strays only — none were
+`.gitignore`d or otherwise sensitive content, and `git add -A` at the time of the bogus commit had nothing
+else uncommitted in the tree to sweep up beyond the legitimate WIP and the script's own junk. `git init`
+inside the repo root did not touch `origin`'s URL or branch tracking — `git remote -v` and `git branch -vv`
+post-recovery show `origin` still `git@github.com:ThatRendle/ZeroWiki.git` and
+`change/git-backed-content-core` still tracking nothing remote, unchanged from before the incident. This
+was not accepted on my report alone: the Architect independently verified it via `git reflog` (showing
+`39f6d38` ← `9ff065c` ← `850bdda` ← `c8b122a` ← `39f6d38`, i.e. the reset landed back exactly on the
+pre-incident commit) and a diff of the bogus tree against the post-recovery one; the reviewer separately
+confirmed the filesystem state itself (`git status --short --untracked-files=all` showing only the two
+intended files modified, nothing stray).
+
+**The lesson, as a rule.** The danger here was not `mktemp` failing — sandboxes will do that — it was that
+every guard against the failure mattering also failed, silently, in sequence: an unset variable expanded
+to an empty string rather than erroring, `cd ""` returned success instead of failing, and the script had
+no `set -euo pipefail` to stop it at the first fault. **Scratch shell scripts in this repo must**: start
+with `set -euo pipefail`; use `"$TMPDIR"` directly rather than `mktemp -d` (this sandbox's own tool
+description already says as much); verify a directory change actually landed before trusting it (e.g.
+`cd "$dir" || exit 1`, or simply never `cd` into a value that was never checked non-empty); and prefer
+passing `-C "$dir"` to `git` over relying on the shell's current directory at all, so a git command that
+runs in the wrong place fails loudly (no such repository) instead of silently succeeding in the real one.
+
+→ @reviewer
+
+**[reviewer]** Final re-check. **Approve.**
+
+Two things to confirm, both done independently rather than on the coordinator's or worker's word:
+
+**1. The code is genuinely untouched.** `git diff 39f6d38 -- tests/ZeroWiki.Tests/Web/GitSmartHttpRealClientTests.cs` is byte-for-byte identical to the diff I already certified last round — same 108 lines, same two `[Fact]`s, same nit-fix assertion at line 201. `git status --short --untracked-files=all` shows only `DEVLOG.md` and this test file, nothing else moved. No re-run of build/test/format needed on that basis, per the coordinator's scoping — the code itself was never in question this round.
+
+**2. The incident write-up is present, accurate, and doesn't contradict the code.** It is now in the
+DEVLOG (the `**[worker]**` post above this one) — what happened (`mktemp -d` blocked under sandbox, `D`
+empty, `cd ""` a silent no-op, no `set -euo pipefail` to catch any of it), the three bogus commits
+(`c8b122a`/`850bdda`/`9ff065c`) and what each swept up, the `git reset --mixed 39f6d38` recovery plus the
+four stray deletions, and a stated rule for scratch scripts going forward. I checked its factual claims
+against the repository myself rather than accepting the write-up's own "verified by" list at face value:
+`git branch -r` shows no `origin/change/git-backed-content-core` (only `origin/HEAD`, `origin/main`, the
+two other change branches) — confirms nothing was ever pushed; `git remote -v` shows `origin` still
+`git@github.com:ThatRendle/ZeroWiki.git`; `git branch -vv` shows `change/git-backed-content-core` tracking
+nothing remote; `git reflog` shows exactly `39f6d38` ← `9ff065c` ← `850bdda` ← `c8b122a` ← `39f6d38` as
+described. All of it holds. `openspec validate git-backed-content-core --strict` still valid.
+
+The `credential.helper = osxkeychain` flake finding stands as a non-blocking architectural note, already
+handed to the Product Owner as a follow-on task per the coordinator — correctly not folded into this
+verdict.
+
+**Block A of §9 (9.2, 9.3) is approved as it now stands.**
+
+→ @architect
+
 ## NEXT
 
 **Resume point: §9 (Obsidian sync verification), block A — not yet carved. ⚠️ §9 cannot be completed
