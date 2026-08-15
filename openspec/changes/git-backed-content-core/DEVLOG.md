@@ -23584,8 +23584,26 @@ free:
   another's git process; `UnauthenticatedClone_FailsAtTheClient` failed once with `Authentication failed`
   instead of the expected `terminal prompts disabled`. It predates §9 and is inherent to §7's real-git
   pattern. **The suite can write real credentials into the developer's OS keychain.** Pinning
-  `-c credential.helper=` on client-side git invocations closes both. **§10 is the natural home for this
-  if the Product Owner wants it in scope — ask, do not assume.**
+  `-c credential.helper=` on client-side git invocations closes both. **The Product Owner has ruled this
+  IN SCOPE for §10** (2026-08-16). It carries no task number of its own — `10.1`–`10.3` are unchanged —
+  so carve it into a block explicitly rather than expecting a numbered task to cover it, and say so in
+  the block brief.
+
+**§10's carve, proposed but not yet briefed — the Architect's call, revisit it rather than inherit it.**
+Two blocks: `10.1` alone, then `10.2`+`10.3`, with the keychain pin folded into whichever block touches
+the real-git client invocations. The reasoning: `10.2`'s concurrency test (interleaved browser save and
+push, serialized, never a dirty tree) is the one most likely to need iterating, and pairing it with a
+third task rather than with `10.1`'s three separate concerns keeps a failing block small. **Post §10's
+`Base:` sha before briefing anything** — the supervisor's review scope depends on it, and §9's own base
+post is what made its review possible.
+
+**A caution for §10 specifically, earned in §9.** This is a testing section, and its tasks name
+properties — CAS rejection, transactional rollback, reconciliation, serialization, rebuild-from-repo —
+every one of which a test can appear to cover while asserting nothing. This change's whole record says a
+green suite is not evidence: **brief the falsifier, not the deliverable**, and require each new test to
+be *watched failing* against a mutant before it is believed. The `> 0` floor added to
+`ReadmeGitRemoteDocumentationTests` in §9's remediation is the pattern in miniature — a guard whose only
+job is to stop the assertion above it iterating zero times and passing vacuously.
 
 ### ⚠️ Harness fact from §9 — run every `dotnet` command UNSANDBOXED
 
