@@ -22255,6 +22255,57 @@ resolved, not merely that the plugin loaded. **Neither layout is blocked, so the
 turns on the `.obsidian/` placement above rather than on whether the plugin works.** Steps 5–7 run in
 `zerowiki-vault`, the clone-root vault, since that is the arrangement the plugin documents.
 
+**[product-owner]** Steps 5 and 7 behave as expected. **Step 6 does not: editing in Obsidian and syncing
+shows nothing in the browser.** The page was `/wiki/scratch` (not the editor), signed in, left open. The
+`_blazor` WebSocket is present at status 101 and the app output carries no warnings.
+
+**[architect]** Reproduced first-hand, and the failure is real. Method: cloned the live wiki over Smart
+HTTP into a scratch dir (git supplied the Product Owner's stored credential via the OS helper; the token
+was never read), opened `/wiki/scratch` in Chrome as `emmz`, pushed a one-line change to
+`docs/scratch.md`, and read the live DOM without touching the page. **Push exit 0, circuit live, no
+banner.**
+
+**What is now proven, and it inverts my first guess — the client half is healthy:**
+
+- The island *is* rendered. The raw server HTML carries the InteractiveServer boundary
+  `{"type":"server","prerenderId":…}`, so `WikiPage.razor:30-37`'s mount guard was satisfied — confirmed
+  independently by the last-edit block rendering, which reads the same `_page` object.
+- The circuit *is* started: `blazor.web.js` loads and `window.Blazor._internal` is present.
+- The push landed and the content is current on reload — but that is **D15's lazy stamp check**, which
+  runs whether or not the reaction fired, so it is evidence of nothing here. Recorded so nobody later
+  reads it as the reaction having worked.
+- No `page-changed-on-disk` element after the push; no warning in the app output.
+
+**What is not established, and cannot be from outside the process:** whether the subscription exists
+server-side, whether `ReactAsync` ran at all, and whether the diff produced any routes. **All three
+failure modes are silent** — `PushReactionService` and `PageChangeNotifier` log only on the *failure*
+path, so a zero-route diff, a zero-subscriber match, and a clean delivery are indistinguishable in the
+app output. The absence of warnings the Product Owner reported is therefore not evidence the reaction
+ran. **That observability gap is a finding in its own right.**
+
+**The structural clue.** `HandleReceivePackAsync` — the method that brackets the push with the two
+`HEAD` probes and fires the reaction — has **no covering tests**, and neither does its single call to
+`ReactAsync`. `PushReactionServiceTests` and `PageChangeNotifierTests` exercise the two halves directly;
+nothing exercises the wiring between them through the endpoint. The one link in the chain with no
+coverage is the one that has to be wrong for these observations to hold.
+
+**Two instrument failures, mine, recorded because this change's own rule is to assume the measurement is
+wrong first.** My initial DOM probe reported no `blazor.web.js` and concluded the island never booted —
+the selector matched a literal filename against a *fingerprinted* one (`blazor.web.f7fxoh55ae.js`). My
+second capped marker content at 200 characters with `(.{0,200}?)`, and a server descriptor is far longer,
+so it reported one marker where there are two and hid the `"type":"server"` start marker. **Both wrong
+readings pointed at the client half; the corrected readings exonerate it.** Had I stopped at either, the
+brief that followed would have sent a worker to the wrong half of the system.
+
+❓ @product-owner — this is a **§4 stop**, not something to fix inline. The spec-required broadcast does
+not work in the real thing, which is a live defect, not a documentation defect; §9's remaining
+remediation is the README rewrite, and §8 is the section that owns push reactions and is already closed
+with an `Approve`. Three ways forward, and the call is yours: fix it under §9 as a second remediation
+block (spending the last of the two permitted rounds on something that is not what the supervisor
+asked for), reopen §8, or carve a new change. My recommendation is to **treat it as a §8 defect and put
+the fix in its own change** — the fix needs the coverage `HandleReceivePackAsync` never had, which is
+§10's territory too, and burning §9's last round on it leaves the README blocker with nowhere to go.
+
 *5 — 9.2, server → vault.* Edit a page in the browser and save. In Obsidian run *Pull*. The text appears.
 
 *6 — 9.2, vault → server, and the banner nobody has watched.* Open the page's **view** route
