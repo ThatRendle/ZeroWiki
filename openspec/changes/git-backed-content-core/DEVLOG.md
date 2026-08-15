@@ -22222,11 +22222,38 @@ from that answer.
 **Note the ordering, which an earlier draft got wrong:** the plugin must be installed *before* it can be
 asked whether it initialises, so the configure step comes first and the layout probe second.
 
-**One thing to observe rather than fix:** opening the clone root as a vault makes Obsidian create
-`.obsidian/` **inside the wiki repository**, so commit-and-sync will want to commit its config into
-ZeroWiki's content repo. Whether that is acceptable or wants a `.gitignore` is a README decision that this
-run settles — it is a real cost of the layout the plugin otherwise supports best, and it is exactly the
-kind of thing writing the doc from the plugin's own documentation would never have surfaced.
+**Keep the plugin fully manual for the whole run** — no backup/auto-commit interval, no auto pull, no auto
+push. *Commit-and-sync* should fire only when the Product Owner runs it, so every commit in steps 5–7 is
+attributable to a deliberate action rather than to a timer.
+
+**`.obsidian/` — observed, analysed, and deliberately left alone for this run.** Opening either folder as
+a vault makes Obsidian create `.obsidian/` inside the wiki repository. It splits two ways, and only one
+half is benign by construction:
+
+- **Serving is safe in both layouts.** `PageEnumerationService.Walk` skips any entry whose name starts
+  with `.` — directories included (`PageEnumerationService.cs:162`) — so `.obsidian/` is never enumerated
+  and can never become a page, even in the `docs`-as-vault layout where it lands *inside* the working
+  tree.
+- **Committing is not.** Startup reconciliation runs `git add -A` **unscoped at the repository root**
+  (`ContentRepositoryService.cs:792`) and the repo carries no `.gitignore`, so Obsidian's config —
+  including `workspace.json`, which rewrites itself on every pane move — becomes wiki content and is
+  pushed to every vault that clones the remote.
+
+It is noise, not a hazard, and it does **not** threaten step 7: the server only ever writes `docs/*.md`,
+so it cannot produce a competing edit to `workspace.json`. Whether the repo should ship a `.gitignore` is
+a README decision this run informs; changing it mid-run would add a variable to the thing being measured.
+
+**[product-owner]** Steps 1–4 done. Cloned to `~/tmp/zerowiki-vault`. **The plugin activates in *both*
+vaults** — sidebar icon and a `main` button in the status bar in each — so `obsidian-git` resolves the
+repository from `zerowiki-vault/docs` despite `.git` sitting above that vault.
+
+**[architect]** That answers the layout question, and it answers it against the supervisor's expectation:
+`settings.ts:937` documents `Custom base path` as being needed only when the repo is *below* the vault,
+which left the README's `docs`-as-vault arrangement unsupported on paper. In practice git's upward walk
+finds `.git` from `docs/` and the plugin rides on it — a `main` in the status bar means the branch
+resolved, not merely that the plugin loaded. **Neither layout is blocked, so the README's recommendation
+turns on the `.obsidian/` placement above rather than on whether the plugin works.** Steps 5–7 run in
+`zerowiki-vault`, the clone-root vault, since that is the arrangement the plugin documents.
 
 *5 — 9.2, server → vault.* Edit a page in the browser and save. In Obsidian run *Pull*. The text appears.
 
