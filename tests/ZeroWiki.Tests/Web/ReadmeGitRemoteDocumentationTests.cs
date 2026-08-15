@@ -16,7 +16,10 @@ namespace ZeroWiki.Tests.Web;
 /// (<see cref="ZeroWikiAppFactory"/>) and checked for exactly the <c>401</c> the git routes are
 /// documented, and independently tested (<c>GitSmartHttpAuthenticationTests</c>), to return for an
 /// unauthenticated request — not merely "not 404", so a route that starts requiring something
-/// other than basic auth (or stops requiring auth at all) also fails this test.
+/// other than basic auth (or stops requiring auth at all) also fails this test. The non-empty-match
+/// assertion is deliberately not pinned to a specific count: its only job is to guarantee the
+/// per-path assertion isn't vacuous, not to police how many times the README happens to mention
+/// the URL.
 /// </remarks>
 public sealed class ReadmeGitRemoteDocumentationTests
 {
@@ -31,9 +34,15 @@ public sealed class ReadmeGitRemoteDocumentationTests
             readme,
             @"https://(?:<username>(?::<token>)?@)?<your-host>(?<path>/[^\s`)""',]+)");
 
+        // Not pinned to a specific count — how many times the URL is documented is prose's call,
+        // not this test's. This only guards against the regex itself going quiet (a reformat, a
+        // rewrap, a placeholder change): if `matches` were empty, the `foreach` below would iterate
+        // zero times and the test would pass while asserting nothing.
         Assert.True(
-            matches.Count >= 4,
-            $"Expected at least 4 documented occurrences of the remote URL in README.md, found {matches.Count}.");
+            matches.Count > 0,
+            "No documented occurrence of the remote URL matched in README.md — the extraction regex " +
+            "may be out of sync with the document's current wording, which would make the routing " +
+            "assertion below vacuous.");
 
         var documentedPaths = matches.Select(m => m.Groups["path"].Value).Distinct();
 
