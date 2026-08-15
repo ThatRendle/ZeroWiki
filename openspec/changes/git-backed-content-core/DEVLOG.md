@@ -22159,8 +22159,9 @@ supervisor's summary of it and not from recall:
 `src/ZeroWiki/App_Data/wiki`, branch `main`, `receive.denyCurrentBranch=updateInstead`,
 `http.receivePack=true`, one page at `docs/scratch.md`. The banner is `ChangedOnDiskIndicator`, mounted
 only in `WikiPage.razor`'s rendered-body branch — so it renders on the **view** route `/wiki/<route>`,
-never in the editor. `credential.helper=osxkeychain` is already set at global scope on this machine, so
-step 2 seeds it rather than setting it.
+never in the editor. `credential.helper=osxkeychain` is already active on this machine, at **system**
+scope (`/opt/homebrew/etc/gitconfig`), so step 2 seeds it rather than setting it — see the scope trap
+recorded in that step.
 
 **The five open questions this run answers** — and nothing else; the round trip, the recovery, the passive
 server and the documented route are already proven by `08f970a` and must not be re-verified by hand:
@@ -22180,21 +22181,26 @@ is the sign-in username; the token is the password. Remote URL locally: `http://
 
 *2 — seed the credential helper from a terminal, before touching Obsidian.* This is the ordering the
 plugin requires, and the README currently states it backwards — there is no TTY inside Obsidian to answer
-a prompt. Confirm the helper (`git config --global credential.helper` → `osxkeychain`), then clone **with
-a prompt**, not a token-in-URL, so the helper actually stores something:
+a prompt. Three commands, each run once:
 
 ```sh
+git config --show-origin --get-all credential.helper
 git clone http://<username>@localhost:5171/git zerowiki-vault
-```
-
-Paste the token at the password prompt. Then prove it stuck, which is the whole point of the step:
-
-```sh
 printf 'protocol=http\nhost=localhost:5171\n\n' | git credential fill
 ```
 
-It should print the username and token back without prompting. If it doesn't, Obsidian will not
-authenticate and everything after this is untestable.
+The first confirms the helper is active; nothing needs setting. **Read it with `--show-origin` and no
+scope flag.** On this machine the helper is set at **system** scope by Homebrew git
+(`file:/opt/homebrew/etc/gitconfig  osxkeychain`), *not* at global scope — `git config --global
+credential.helper` prints **nothing** here and looks like the helper is missing when it is not. An
+earlier draft of this recipe used `--global` and sent the Product Owner looking for a fault that did not
+exist.
+
+The second must prompt for the password — clone with the username only, never a token-in-URL, or the
+helper stores nothing and step 4 onwards fails inside Obsidian with no explanation.
+
+The third is the actual gate: it should echo the username and token back with no prompt. If it prompts,
+the credential did not stick, and steps 3–7 are untestable.
 
 *3 — the layout question.* Open **`zerowiki-vault`** — the clone root — as the vault, with the notes
 living in its `docs/` subfolder. That is the arrangement the plugin supports by default. Then, separately,
