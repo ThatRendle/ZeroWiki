@@ -62,7 +62,7 @@
 ## 9. Obsidian sync verification
 
 - [ ] 9.1 Document configuring an Obsidian vault with `obsidian-git` pointed at the ZeroWiki remote using wiki credentials
-- [ ] 9.2 End-to-end test: edit in browser → pull in Obsidian; edit in Obsidian → push → see update and broadcast in browser
+- [ ] 9.2 End-to-end test: edit in browser → pull in Obsidian; edit in Obsidian → push → see update in browser
 - [ ] 9.3 Verify a genuine conflict surfaces as a non-fast-forward push rejection resolvable in Obsidian
 
 ## 10. Tests
