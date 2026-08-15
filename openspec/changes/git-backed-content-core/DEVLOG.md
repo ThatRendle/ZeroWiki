@@ -23497,75 +23497,95 @@ remediation entirely.
 
 → @architect
 
+**[architect]** Remediation landed as `9aee333`. Gates run by me on the committed tree, unsandboxed and
+in the foreground: `dotnet build` clean, `dotnet test` **879/879** with no flake, `dotnet format
+--verify-no-changes` clean, `openspec validate --strict` valid.
+
+**[product-owner]** `9.1`, `9.2` and `9.3` confirmed, against the wording as it now stands — including
+`9.2`'s amended text, from which the broadcast clause was removed.
+
+**[architect]** `9.1`–`9.3` ticked on that confirmation, and **§9 is closed**: supervisor `Approve`,
+both round-one blockers discharged, all four of F1–F4 resolved. **Recorded precisely, because a tick is
+a durable claim and this section's first blocker was a tick that outran its evidence:**
+
+- **`9.1` is ticked as "documented", not as "documented and known to work everywhere."** Only **macOS**
+  is verified against a running ZeroWiki. Windows and Linux are documented from `obsidian-git`'s own
+  authentication guide and are **labelled in the README as untested here**. The Product Owner was shown
+  that distinction explicitly and confirmed on it.
+- **`9.2` is ticked as amended.** Both sync directions were confirmed by hand. The broadcast it
+  originally promised is a **live defect**, carved out to `fix-changed-on-disk-broadcast` (`fe7ecc8`),
+  and the clause was removed from the task before ticking (`f2dc957`, supervisor F4) rather than ticked
+  over.
+- **`9.3` is ticked on a hand-run rejection and line-level conflict resolved in Obsidian**, on top of
+  A2's automated proof that the rejection is recoverable with the server passive.
+
+**What §9 cost, recorded because the number is the argument.** The section's automatable work was two
+blocks. Closing it took **six** worker passes and **five** reviewer verdicts after the supervisor's
+review, and every finding but the last was one class: **a claim about a third party that the cited
+source does not settle** — and four of the five were *introduced by the fix to the one before*. The
+loop was not malfunctioning; it caught every one. What was wrong was the writing posture. It ended only
+when the Product Owner stopped the correction cycle and changed the rule — *state what to do, not why
+the plugin does it* — which is a decision about the deliverable's shape, not about any sentence in it.
+
+**The instrument lesson, which generalises past this section.** A third party's **prose documentation
+cannot answer a question about that third party's capability** — only its source can. `README.md`'s
+false macOS claim survived a worker and three reviewer rounds because all four settled it against
+`docs/Authentication.md`, where the plugin's integrated askpass sits under a *Linux* heading while being
+platform-agnostic behaviour; the last of those rounds defended it from the macOS section's *silence*.
+The supervisor read `src/gitManager/simpleGit.ts` and found the wiring unguarded in one pass. **And the
+first-hand run could not have caught it either**: a credential was already stored, so it proved
+terminal-first *works*, never that it is *required*. A run establishes that a path works; it never
+establishes that it is the only path.
+
 ## NEXT
 
-**Resume point: §9 is OPEN. The Product Owner's verification run is DONE — the blocker now is the README
-remediation, which is yours to carve. Do not start §10 until §9 closes.**
+**Resume point: §10 — the LAST section. `10.1`–`10.3`, no block carved yet. Post its base commit to the
+DEVLOG before briefing anything (CLAUDE.md 3a); the supervisor's review scope depends on it.**
 
-**Both of §9's blocks have landed** — `08f970a` (block A, the 9.2/9.3 tests) and `daa1b3a` (block B, the
-9.1 README doc). Both passed `reviewer` Approve. **The section review returned `Request changes`**
-(`39f6d38..HEAD`), so §9 is **not closed**, and CLAUDE.md's outer loop forbids opening §10 until it is.
-That was **round one** of two; if the next round still requests changes, stop and put it to the Product
-Owner rather than carving a third.
+**§9 is CLOSED** — supervisor `Approve`, all of F1–F4 resolved, `9.1`–`9.3` ticked on the Product
+Owner's explicit confirmation (`9aee333`, ticks in the commit that follows it). **§1–§9 and §11 are all
+closed with a supervisor `Approve`.** Nothing in §9 is owed to anyone; do not reopen it.
 
-**What the supervisor blocked on — neither is an engineering defect. A1, A2 and the README test are all
-sound and would be approved on their own.**
+**Read the `[architect]` close-out post at the end of `## 9.` before starting §10.** It records what the
+three ticks do and do not assert — `9.1` is ticked as *documented*, with **only macOS verified against a
+running ZeroWiki** — and the instrument lesson that cost that section five review verdicts: **a third
+party's prose documentation cannot answer a question about that third party's capability; only its
+source can.** §10 is a testing section, so the sibling rule matters here too: **a run proves a path
+works, never that it is the only path.**
 
-1. **`9.1`–`9.3` were ticked with no Product Owner confirmation.** CLAUDE.md §4 requires waiting for it.
-   **The Product Owner directed they be unticked; `ae30ad7` did so.** This blocker is therefore
-   **discharged** — but the boxes stay open until the PO confirms their run.
-2. **The README's `obsidian-git` guidance is unsourced and contradicted by the plugin's own repo** —
-   `README.md:69-70` (vault layout), `:104-106` (the credential-prompt claim, inverted — there is no TTY
-   inside Obsidian), `:107-112` (two setting names absent from `settings.ts`; the real ones are
-   `Pull on commit-and-sync` and `Merge strategy`). **Still open.**
+**Nothing is owed to the Product Owner.** Every human-in-the-loop obligation this change carried has
+been discharged: the Obsidian round trip, the rejection and its recovery, the conflict resolved in
+Obsidian, and the vault setup are all confirmed by their own run; the clone/edit/push cycle and the
+documented route are proven by automation. **Do not ask them to re-verify any of it.**
 
-**The verification run is DONE and its results are the source for the rewrite.** The recipe and the
-Product Owner's step-by-step report are both under `## 9.`; read them rather than re-running anything.
-What it established:
+**Working tree CLEAN. State: 38/41 tasks ticked.** Three remain — `10.1`–`10.3`, the whole of §10, with
+its own section review still to come. **Count these from `tasks.md`, never from this pin**
+(`grep -c '^- \[x\]'`): a wrong figure written here once rode along through two blocks, and the
+correction is recorded below.
 
-- **Credentials work**, in the plugin's documented order only — the OS helper seeded by one terminal
-  authentication first. The README states this **backwards** and there is no TTY inside Obsidian.
-- **Both vault layouts work**, including `<clone>/docs` with `.git` above the vault, which `settings.ts`
-  gave no supported escape hatch for. The recommendation turns on **`.obsidian/` placement**, not on
-  whether the plugin functions.
-- **Real setting names**: `Auto commit-and-sync interval (minutes)` (`0` disables — turn it off),
-  `Auto pull interval (minutes)`, `Pull on commit-and-sync`, `Merge strategy`, and
-  **`Merge strategy on conflicts`**, which must be `None (git default)` or a genuine conflict is
-  auto-resolved and 9.3 tests nothing. The README names none of these.
-- **`.obsidian/` is committed into the wiki repo** (reconciliation's unscoped `git add -A`) and never
-  served (enumeration skips dot-entries). Whether to ship a `.gitignore` is now a README decision backed
-  by a run.
-- **The banner does NOT appear** — a live defect, moved **out of §9** into its own change,
-  `fix-changed-on-disk-broadcast` (`fe7ecc8`). Do not attempt to fix it here, and do not treat `9.2` as
-  blocked on it: `9.2`'s two sync directions are confirmed by hand; only its banner clause is deferred.
+**Three changes are queued behind this one's archive**, each amending code or a capability that exists
+only on this branch, and none applicable before it archives. They touch disjoint code, so their order is
+free:
 
-Mobile remains out of scope (different git implementation).
+- **`fix-changed-on-disk-broadcast`** (`fe7ecc8`) — the push→viewer broadcast does not reach a live
+  circuit. `git-sync` specifies it, so **this change is on course to archive claiming a requirement its
+  code does not satisfy.** Surface that at the archive decision; the supervisor asked for it explicitly.
+- **`ignore-obsidian-config-in-content-repo`** (`f2dc957`) — bootstrap seeds a `.gitignore` for
+  `.obsidian/`. Ignore-only by decision: untracking would delete a user's editor configuration out of
+  every vault on its next pull.
+- **`fix-reconciliation-index-blindness`** — D9's startup reconciliation verifies the tree with
+  instruments an `--assume-unchanged` index entry blinds.
 
-**Sequencing, decided deliberately — do not reverse it.** The README remediation is written **after** the
-PO's run, **from what actually worked**, not beforehand from the plugin's documentation. Documentation of
-a third-party integration written from a first-hand result beats documentation written from that third
-party's docs — which is exactly the distinction that produced blocker 2. **The first two steps are now
-done.** Remaining: remediation block rewrites the plugin half of the README from the run's results →
-re-run the supervisor on `39f6d38..HEAD` → tick `9.1`–`9.3` **only** on the Product Owner's confirmation.
+**One follow-on parked with the Product Owner, belonging to no section:**
 
-**Do NOT ask the Product Owner to re-verify these — they are proven by tests:** the clone/edit/push round
-trip, the non-fast-forward rejection *and its recovery*, the server staying passive, and the documented
-route. §7's old "clone/edit/push from a real client" debt is **discharged by automation** and should be
-struck from the owed list below.
-
-**Working tree CLEAN. State: 35/41 tasks ticked.** Six remain: `9.1`–`9.3` (open pending PO confirmation)
-and `10.1`–`10.3` (test consolidation, its own section review still to come).
-
-**Two follow-on tasks parked with the Product Owner, neither belonging to §9:**
-
-- **`credential.helper = osxkeychain` is set at global git scope on this machine.** Under the full
-  parallel suite a credential cached by one real-git test can be offered to another's git process —
-  `UnauthenticatedClone_FailsAtTheClient` failed once with `Authentication failed` instead of the expected
-  `terminal prompts disabled`. It predates §9 (inherent to §7's real-git pattern). **The suite can write
-  real credentials into the developer's OS keychain.** Pinning `-c credential.helper=` on client-side git
-  invocations closes both.
-- Eleven now-redundant `Bash(dotnet ...)` entries in `.claude/settings.local.json`, superseded by a
-  global `Bash(dotnet:*)`.
+- **`credential.helper = osxkeychain` is active on this machine at *system* scope** — Homebrew git's own
+  config, `file:/opt/homebrew/etc/gitconfig`, **not** `--global`, which prints nothing and reads as "no
+  helper set". Under the full parallel suite a credential cached by one real-git test can be offered to
+  another's git process; `UnauthenticatedClone_FailsAtTheClient` failed once with `Authentication failed`
+  instead of the expected `terminal prompts disabled`. It predates §9 and is inherent to §7's real-git
+  pattern. **The suite can write real credentials into the developer's OS keychain.** Pinning
+  `-c credential.helper=` on client-side git invocations closes both. **§10 is the natural home for this
+  if the Product Owner wants it in scope — ask, do not assume.**
 
 ### ⚠️ Harness fact from §9 — run every `dotnet` command UNSANDBOXED
 
