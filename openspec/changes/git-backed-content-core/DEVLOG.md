@@ -22219,6 +22219,26 @@ a vault nested inside one it already knows, drop `zerowiki-vault` from the vault
 return to `zerowiki-vault` — steps 5–7 all run there. Report which layout worked; the README is written
 from that answer.
 
+*5 — 9.2, server → vault.* Edit a page in the browser and save. In Obsidian run *Pull*. The text appears.
+
+*6 — 9.2, vault → server, and the banner nobody has watched.* Open the page's **view** route
+(`http://localhost:5171/wiki/<route>`, e.g. `/wiki/scratch`) in the browser and **leave it open** — the
+banner lives there, not in the editor, and needs its circuit connected. Then edit that note in Obsidian and
+run *Commit-and-sync*. Watch the browser without touching it: *"This page has changed on disk since it was
+loaded."* should appear on its own. **Whether it does is the single most important observation in this
+run** — it is the only claim in the change with no automated coverage of its rendering.
+
+*7 — 9.3, rejection and a real conflict.* Edit one line of the note in Obsidian and **do not sync**. Edit
+*the same line* of the same page in the browser, differently, and save. Now *Commit-and-sync* in Obsidian:
+the push is rejected, the pull that follows hits a line-level conflict, and what matters is what Obsidian
+shows you and how you get out of it. Resolve, commit, sync again, and confirm the browser has the resolved
+text.
+
+Report per step. A step that fails is a result, not a blocker — `9.1` is written from what actually
+happened, including the parts that didn't work.
+
+→ @product-owner
+
 **Note the ordering, which an earlier draft got wrong:** the plugin must be installed *before* it can be
 asked whether it initialises, so the configure step comes first and the layout probe second.
 
@@ -22306,29 +22326,46 @@ asked for), reopen §8, or carve a new change. My recommendation is to **treat i
 the fix in its own change** — the fix needs the coverage `HandleReceivePackAsync` never had, which is
 §10's territory too, and burning §9's last round on it leaves the README blocker with nowhere to go.
 
-*5 — 9.2, server → vault.* Edit a page in the browser and save. In Obsidian run *Pull*. The text appears.
+**[product-owner]** Carve a new change.
 
-*6 — 9.2, vault → server, and the banner nobody has watched.* Open the page's **view** route
-(`http://localhost:5171/wiki/<route>`, e.g. `/wiki/scratch`) in the browser and **leave it open** — the
-banner lives there, not in the editor, and needs its circuit connected. Then edit that note in Obsidian and
-run *Commit-and-sync*. Watch the browser without touching it: *"This page has changed on disk since it was
-loaded."* should appear on its own. **Whether it does is the single most important observation in this
-run** — it is the only claim in the change with no automated coverage of its rendering.
+**[architect]** Carved as **`fix-changed-on-disk-broadcast`** (`fe7ecc8`), validating `--strict`. It is
+a defect against a shipped requirement, not a new one — `git-sync` already specifies the broadcast — so
+its spec delta adds only the two things the existing requirement left room to satisfy vacuously: that
+the guarantee is established **through the push endpoint rather than around it**, and that a reaction
+reaching nobody is **distinguishable from a delivery**. Its design pins the method that this change's
+own record argues for: diagnose with an instrument before patching, and demonstrate the covering test
+failing against the unfixed code before the fix lands. Like `fix-reconciliation-index-blindness`, it
+**cannot be applied until this change archives** — it amends code and a capability that exist only on
+this branch.
 
-*7 — 9.3, rejection and a real conflict.* Edit one line of the note in Obsidian and **do not sync**. Edit
-*the same line* of the same page in the browser, differently, and save. Now *Commit-and-sync* in Obsidian:
-the push is rejected, the pull that follows hits a line-level conflict, and what matters is what Obsidian
-shows you and how you get out of it. Resolve, commit, sync again, and confirm the browser has the resolved
-text.
+**What this means for §9, stated plainly so it is not mis-read as closed.** The banner is **out of §9's
+scope** as of this decision, and §9's remaining obligation is unchanged and unmet: **supervisor blocker
+2, the README's `obsidian-git` guidance.** The Product Owner's run has now produced what that rewrite
+was deliberately sequenced to wait for:
 
-Report per step. A step that fails is a result, not a blocker — `9.1` is written from what actually
-happened, including the parts that didn't work.
+- **Credential acquisition works**, but only via the plugin's documented ordering — the helper seeded by
+  one terminal authentication first. The README currently states this backwards.
+- **Both vault layouts work.** `obsidian-git` resolves the repository from `<clone>/docs` despite `.git`
+  sitting above that vault, which `settings.ts:937` gave no supported escape hatch for. The
+  recommendation therefore turns on `.obsidian/` placement, not on whether the plugin functions.
+- **`Merge strategy on conflicts` must be `None (git default)`** for a genuine conflict to surface at
+  all — a setting the README never named.
+- **The rejection-and-recovery path behaves as A2 proved** (step 7 confirmed by hand).
+- **The setting names in `README.md:107-112` do not exist**; the real ones are
+  `Auto commit-and-sync interval (minutes)` (`0` disables), `Auto pull interval (minutes)`,
+  `Pull on commit-and-sync`, `Merge strategy`, and `Merge strategy on conflicts`.
+- **`.obsidian/` is committed into the wiki repo** by reconciliation's unscoped `git add -A`, and never
+  served, because enumeration skips dot-entries. Whether to ship a `.gitignore` is a README decision now
+  informed by a real run.
 
-→ @product-owner
+`9.1`–`9.3` stay unticked. `9.2` is now **partly** confirmed by hand — the vault→server and
+server→vault directions both work — with only its banner clause deferred to the new change; the Product
+Owner's tick, not a gate, is what settles that when §9's remediation lands.
 
 ## NEXT
 
-**Resume point: §9 is OPEN and BLOCKED ON THE PRODUCT OWNER. Do not start §10 until it closes.**
+**Resume point: §9 is OPEN. The Product Owner's verification run is DONE — the blocker now is the README
+remediation, which is yours to carve. Do not start §10 until §9 closes.**
 
 **Both of §9's blocks have landed** — `08f970a` (block A, the 9.2/9.3 tests) and `daa1b3a` (block B, the
 9.1 README doc). Both passed `reviewer` Approve. **The section review returned `Request changes`**
@@ -22347,20 +22384,34 @@ sound and would be approved on their own.**
    inside Obsidian), `:107-112` (two setting names absent from `settings.ts`; the real ones are
    `Pull on commit-and-sync` and `Merge strategy`). **Still open.**
 
-**The Product Owner has been handed the verification recipe, and it is now written down** — the last
-`[architect]` post under `## 9.` carries it in full, step by step, with every `obsidian-git` claim
-re-derived first-hand from `Vinzent03/obsidian-git@master` and cited there. Do not reconstruct it. It
-covers only what no test can reach: credential acquisition **through the plugin**, whether the plugin
-tolerates the repo root sitting above the vault, commit-and-sync against a real rejection plus a
-line-level conflict, and **the "changed on disk" banner rendering in a live circuit — still never
-observed by anyone.** Mobile is explicitly out of scope (different git implementation).
+**The verification run is DONE and its results are the source for the rewrite.** The recipe and the
+Product Owner's step-by-step report are both under `## 9.`; read them rather than re-running anything.
+What it established:
+
+- **Credentials work**, in the plugin's documented order only — the OS helper seeded by one terminal
+  authentication first. The README states this **backwards** and there is no TTY inside Obsidian.
+- **Both vault layouts work**, including `<clone>/docs` with `.git` above the vault, which `settings.ts`
+  gave no supported escape hatch for. The recommendation turns on **`.obsidian/` placement**, not on
+  whether the plugin functions.
+- **Real setting names**: `Auto commit-and-sync interval (minutes)` (`0` disables — turn it off),
+  `Auto pull interval (minutes)`, `Pull on commit-and-sync`, `Merge strategy`, and
+  **`Merge strategy on conflicts`**, which must be `None (git default)` or a genuine conflict is
+  auto-resolved and 9.3 tests nothing. The README names none of these.
+- **`.obsidian/` is committed into the wiki repo** (reconciliation's unscoped `git add -A`) and never
+  served (enumeration skips dot-entries). Whether to ship a `.gitignore` is now a README decision backed
+  by a run.
+- **The banner does NOT appear** — a live defect, moved **out of §9** into its own change,
+  `fix-changed-on-disk-broadcast` (`fe7ecc8`). Do not attempt to fix it here, and do not treat `9.2` as
+  blocked on it: `9.2`'s two sync directions are confirmed by hand; only its banner clause is deferred.
+
+Mobile remains out of scope (different git implementation).
 
 **Sequencing, decided deliberately — do not reverse it.** The README remediation is written **after** the
 PO's run, **from what actually worked**, not beforehand from the plugin's documentation. Documentation of
 a third-party integration written from a first-hand result beats documentation written from that third
-party's docs — which is exactly the distinction that produced blocker 2. So: PO verifies → their report
-becomes the source → remediation block rewrites the plugin half of the README → re-run the supervisor on
-`39f6d38..HEAD` → tick `9.1`–`9.3` **only** on the PO's confirmation.
+party's docs — which is exactly the distinction that produced blocker 2. **The first two steps are now
+done.** Remaining: remediation block rewrites the plugin half of the README from the run's results →
+re-run the supervisor on `39f6d38..HEAD` → tick `9.1`–`9.3` **only** on the Product Owner's confirmation.
 
 **Do NOT ask the Product Owner to re-verify these — they are proven by tests:** the clone/edit/push round
 trip, the non-fast-forward rejection *and its recovery*, the server staying passive, and the documented
