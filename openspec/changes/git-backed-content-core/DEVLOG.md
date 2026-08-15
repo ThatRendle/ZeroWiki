@@ -22202,15 +22202,31 @@ helper stores nothing and step 4 onwards fails inside Obsidian with no explanati
 The third is the actual gate: it should echo the username and token back with no prompt. If it prompts,
 the credential did not stick, and steps 3–7 are untestable.
 
-*3 — the layout question.* Open **`zerowiki-vault`** — the clone root — as the vault, with the notes
-living in its `docs/` subfolder. That is the arrangement the plugin supports by default. Then, separately,
-try the arrangement `README.md:69-70` currently documents: open `zerowiki-vault/docs` as a vault and see
-whether `obsidian-git` initialises at all. Report which worked; the README is written from that answer.
+*3 — open the vault and configure the plugin.* Obsidian → *Open folder as vault* → **`zerowiki-vault`**,
+the clone root, with the notes living in its `docs/` subfolder; that is the arrangement the plugin supports
+by default. Install and enable the community plugin **obsidian-git** here, then set `Pull on
+commit-and-sync` **on** (this is what makes a ZeroWiki rejection recoverable rather than terminal),
+`Merge strategy` = *Merge*, and `Merge strategy on conflicts` = **None (git default)** — see above, an
+automatic setting here silently voids step 7. Confirm the plugin actually found the repository (its
+source-control view shows the branch and a clean tree) before going on.
 
-*4 — configure the plugin.* Install **obsidian-git**, then: `Pull on commit-and-sync` **on** (this is what
-makes a ZeroWiki rejection recoverable rather than terminal), `Merge strategy` = *Merge*, and
-`Merge strategy on conflicts` = **None (git default)** — see above, an automatic setting here silently
-voids step 7.
+*4 — the layout question.* Now try the arrangement `README.md:69-70` currently documents: open
+`zerowiki-vault/docs` as a **separate** vault and install and enable obsidian-git **in that vault too** —
+Obsidian's community plugins are per-vault (`.obsidian/plugins/`), so a plugin enabled in the clone-root
+vault is not present here. The question is whether it finds the repository at all, with `.git` sitting
+*above* this vault; the failure to watch for is the plugin reporting no repository. If Obsidian objects to
+a vault nested inside one it already knows, drop `zerowiki-vault` from the vault switcher first. Then
+return to `zerowiki-vault` — steps 5–7 all run there. Report which layout worked; the README is written
+from that answer.
+
+**Note the ordering, which an earlier draft got wrong:** the plugin must be installed *before* it can be
+asked whether it initialises, so the configure step comes first and the layout probe second.
+
+**One thing to observe rather than fix:** opening the clone root as a vault makes Obsidian create
+`.obsidian/` **inside the wiki repository**, so commit-and-sync will want to commit its config into
+ZeroWiki's content repo. Whether that is acceptable or wants a `.gitignore` is a README decision that this
+run settles — it is a real cost of the layout the plugin otherwise supports best, and it is exactly the
+kind of thing writing the doc from the plugin's own documentation would never have surfaced.
 
 *5 — 9.2, server → vault.* Edit a page in the browser and save. In Obsidian run *Pull*. The text appears.
 
