@@ -22362,6 +22362,534 @@ was deliberately sequenced to wait for:
 server→vault directions both work — with only its banner clause deferred to the new change; the Product
 Owner's tick, not a gate, is what settles that when §9's remediation lands.
 
+### Remediation block brief — rewrite the plugin half of the README from the run (supervisor blocker 2)
+
+**[architect]** Documentation only. **No `src/` changes**, one test file may be extended. **No new `N.M`
+numbers and nothing is ticked** — every box in §9 is already accounted for, and `9.1`–`9.3` stay open
+pending the Product Owner's confirmation.
+
+**The requirement this discharges** (`specs/git-sync/spec.md`): *"The system SHALL be compatible as a git
+remote for the `obsidian-git` community plugin (Smart HTTP with basic authentication) so a laptop vault
+can sync without a bespoke plugin."* It is the one requirement in §9 with no automated test **by
+necessity**, so the README **is** the artefact discharging it and its accuracy is the requirement. That
+is why a wrong sentence here is a spec failure, not a typo.
+
+**Your source is the Product Owner's run, recorded above — not the plugin's documentation, and not
+recall.** This ordering is deliberate and was decided before the run: documentation of a third-party
+integration written from a first-hand result beats documentation written from that third party's docs.
+Where the run and the plugin's repo disagree, **the run wins and you say so**. Where neither covers a
+claim, **mark it as unverified rather than asserting it**.
+
+**What must change in `README.md:66-126`:**
+
+1. **The credential section is inverted (`:104-106`) and must be rewritten to the plugin's required
+   order**, confirmed by the run: configure the OS credential helper, then perform **one authentication
+   action in a terminal**, and only then use the plugin. There is **no TTY inside Obsidian**, so the
+   README's current "the first pull or push will ask" is not a thing that can happen. Cite
+   `docs/Authentication.md` per platform (macOS `osxkeychain`; Windows Git Credential Manager; Linux
+   `libsecret` or an askpass tool). Note that `credential.helper` may be set at **system** scope and so
+   read empty via `--global` — the run hit exactly this. Also revisit `:87-89`, which steers the reader
+   toward *"letting git prompt"* — the path that does not exist in Obsidian.
+2. **The setting names at `:107-112` do not exist.** Replace with the real ones, all verified in
+   `settings.ts` and exercised by the run: `Auto commit-and-sync interval (minutes)` (`0` disables —
+   recommend disabling), `Auto pull interval (minutes)`, `Pull on commit-and-sync`, `Merge strategy`,
+   and **`Merge strategy on conflicts`**, which must be `None (git default)` for a genuine conflict to
+   surface rather than being silently auto-resolved. Tie the last two to the rejection behaviour: the
+   `## When a push is rejected` section (`:120-126`) is correct about ZeroWiki and silent about the
+   setting that decides the recovery. Delete *"No other setting is ZeroWiki-specific."*
+3. **The vault layout (`:69-70`) is no longer unverified — both arrangements work.** The run opened
+   `<clone>/docs` as a vault with `.git` above it and `obsidian-git` resolved the repository anyway,
+   which `settings.ts:937`'s base-path setting gave no supported escape hatch for. **Document
+   `<clone>/docs` as the arrangement** (the vault is then exactly the wiki's pages), and note `<clone>`
+   as the alternative the plugin's own setting text nominally expects. *This recommendation is an
+   Architect call and the Product Owner may overturn it; if they do, the two paragraphs swap and nothing
+   else changes.*
+4. **Add the `.obsidian/` consequence, which neither our docs nor the plugin's mention.** Obsidian writes
+   `.obsidian/` into the vault; startup reconciliation stages the repository root unscoped
+   (`ContentRepositoryService.cs:792`) and the repo ships no `.gitignore`, so that config — including
+   `workspace.json`, which rewrites itself constantly — becomes wiki content and is pushed to every
+   vault. It is **never served**: enumeration skips dot-prefixed entries
+   (`PageEnumerationService.cs:162`). State the trade-off; do **not** add a `.gitignore` in this block.
+
+**Do NOT document the "changed on disk" banner as working.** It does not, it is a live defect, and it is
+tracked in its own change (`fix-changed-on-disk-broadcast`, `fe7ecc8`). If the README's prose implies a
+viewer is notified, remove that implication. Do not describe the defect in the README either — user docs
+are not a bug tracker.
+
+**Optional and cheap, take it if it is clean** (the supervisor suggested it): extend
+`ReadmeGitRemoteDocumentationTests` to all four occurrences of the remote URL (`README.md:67, 84, 88, 98`).
+It currently pins only the anchored canonical line at `:67` while its own doc comment claims to catch *"a
+route rename that leaves the prose untouched"* — and three of the four prose occurrences are exactly that
+prose.
+
+**Post to this DEVLOG as you go, and cite a source for every `obsidian-git` claim you write.** The reason
+this block exists is that the last pass verified every ZeroWiki-side claim against ZeroWiki's code and
+verified no third-party claim against anything. A brief that says "derive it from the code" silently
+means *our* code.
+
+**Gates — all four, run unsandboxed and in the foreground** (a sandboxed `dotnet` stalls ~5 minutes and
+prints `Build FAILED. 0 Error(s)`, which is the sandbox and not your code; never run build and test
+concurrently, and never pipe a gate through `tail`): `dotnet build` clean, `dotnet test` green,
+`openspec validate git-backed-content-core --strict`, `dotnet format --verify-no-changes` clean.
+
+→ @worker
+
+**[worker]** Remediation block done. `README.md:62-151` (the whole "Syncing with Obsidian" section)
+rewritten; `ReadmeGitRemoteDocumentationTests.cs` extended. **Documentation only — `git diff -- src`
+and `git status --short -- src` both empty**, confirmed before and after.
+
+**Every `obsidian-git` claim below, sourced, not recalled.** Fetched
+`Vinzent03/obsidian-git@master` directly today (`docs/Authentication.md`, `src/setting/settings.ts`)
+rather than trusting the DEVLOG's own summary of them, since a second independent read is what makes
+the source claim mean something:
+
+- **Credential ordering, per platform** (`docs/Authentication.md`) — macOS:
+  `git config --global credential.helper osxkeychain`, then "one authentication action (clone/pull/
+  push)... in the terminal", after which "clone/pull/push in Obsidian without any issues." Linux: same
+  ordering, `libsecret`. Windows: Git Credential Manager (`credential.helper` = `manager`), or leave it
+  empty and use the plugin's own prompt (Windows only — the doc names no such prompt for macOS/Linux).
+  Matches the Product Owner's run: no TTY inside Obsidian, so the credential must already be stored
+  before the plugin is touched.
+- **Real setting names** (`settings.ts`) — `Auto commit-and-sync interval (minutes)` ("0 (default) to
+  disable"), `Auto pull interval (minutes)`, `Pull on commit-and-sync`, `Merge strategy`
+  ("integrate commits from your remote branch into your local branch"), `Merge strategy on conflicts`
+  ("solve conflicts when pulling remote changes... favor your local changes or the remote changes
+  automatically"). Neither `Vault backup interval (minutes)` nor `Auto pull/push` — the README's old
+  names — appears anywhere in the file; confirmed absent, not just unfound.
+- **Vault layout** (`settings.ts`'s `Custom base path`, "only required if the Git repository path is
+  below the vault root") vs. the **Product Owner's run**, which put `.git` *above* the vault
+  (`<clone>/docs`) and had the plugin resolve it anyway. Per the brief, the run wins where they
+  disagree — documented `<clone>/docs` as the primary arrangement, `<clone>` as the alternative the
+  plugin's setting text nominally expects, exactly the swap-if-overturned framing the brief specified.
+- **`Merge strategy on conflicts` = "None (git default)"** — recommended because the setting's own
+  description says the other options resolve automatically "in favor of" one side, which is silent data
+  loss for a wiki; tied explicitly to the rejection section so the two don't read as unrelated.
+
+**The four required changes, addressed:**
+1. Credential section reordered to the plugin's required sequence (helper → one terminal
+   authentication → then Obsidian); new "Authenticating from the command line first" subsection states
+   the no-TTY constraint and the `--show-origin`/no-scope-flag note the run's own `--global` miss
+   surfaced. The old "prefer letting git prompt" phrasing (steering the reader toward a prompt that
+   doesn't exist in Obsidian) is gone — the clone/pull *is* now framed as the one terminal
+   authentication.
+2. `:107-112`'s two nonexistent settings replaced with the five real ones above;
+   `Pull on commit-and-sync` and `Merge strategy on conflicts` tied to "When a push is rejected" by
+   name. Deleted "No other setting is ZeroWiki-specific."
+3. Vault layout section rewritten per the run: `<clone>/docs` documented as the arrangement, `<clone>`
+   as the alternative — Architect's call, reversible by swapping the two paragraphs.
+4. New "Obsidian's own files end up in the repository" section: `.obsidian/`/`workspace.json` staged
+   by reconciliation's unscoped `git add -A`, never served (dot-entries skipped). No `.gitignore`
+   added, as instructed.
+
+**The banner.** Grepped the new section text for any claim a viewer sees an update — none; "When a
+push is rejected" only describes the git-level rejection/recovery, nothing about a live browser
+notification. No mention of the defect or its tracking change either.
+
+**The test.** Extended `DocumentedCloneUrlPath_IsARouteTheAppActuallyServes` (now
+`DocumentedCloneUrlPaths_AreRoutesTheAppActuallyServes`, `ReadmeGitRemoteDocumentationTests.cs`) to
+match all four occurrences of the remote URL (`:67` canonical, `:118` clone, `:123` embedded-token
+parenthetical, `:137` remote-add) via one regex handling the optional `<username>`/`<token>@` prefix,
+then drives every distinct extracted path at the real pipeline and asserts `401` on each — same
+instrument as before, wider coverage. Checked falsifiability myself rather than trusting the prior
+round's proof still held after the rewrite: changed the `:118` occurrence to `/gitwrong` (`src`
+untouched), ran the test — failed (`Expected: Unauthorized, Actual: OK`) — restored the README and
+confirmed the checksum matched the pre-mutation value byte-for-byte (`md5` `e17418c...` both times, no
+residue). Same as before: a route rename that leaves the prose untouched now fails on any of the four
+occurrences, not just the anchored canonical one.
+
+**Gates, all unsandboxed and in the foreground:** `dotnet build` clean (0/0). `dotnet test` unfiltered
+hit one failure on the first run (`GitSmartHttpRealClientTests.PageSavedThroughTheApp_IsWhatARealClientClones`,
+`Expected: Saved, Actual: RepositoryBusy`, 878/879) with `src` confirmed untouched before and after
+(`git diff`/`git status --short -- src` both empty) — a lock-contention flake under full parallel
+execution, not caused by this documentation-only diff; reran unfiltered and got **879/879 clean**.
+`openspec validate git-backed-content-core --strict` valid. `dotnet format --verify-no-changes` clean.
+No mutation-testing skill invoked — this is documentation plus one test-scope regex, not an
+auth/concurrency/data-integrity path.
+
+**Scope.** `git status --short --untracked-files=all` shows exactly `README.md`, `DEVLOG.md`, and
+`ReadmeGitRemoteDocumentationTests.cs` as my changes (`.mcp.json` was already modified before this
+block started; untouched by me). No `tasks.md` edit — nothing to tick, per the brief. No `src` change
+anywhere.
+
+→ @reviewer
+
+**[reviewer]** Remediation block audited (`README.md`, `ReadmeGitRemoteDocumentationTests.cs`, this
+DEVLOG — `.mcp.json` out of scope, untouched by this block). **Request changes — one blocker, in the
+same defect class this block exists to fix.**
+
+**Hygiene, checked before anything else.** `git diff -- src` and `git status --short --untracked-files=all -- src`
+both empty. `tasks.md` untouched (correct — no `N.M` numbers, nothing to tick). `git diff -- DEVLOG.md`
+has zero deletion lines outside the diff header — append-only, as required. `dotnet build` clean (0/0),
+`dotnet format --verify-no-changes` clean, `openspec validate git-backed-content-core --strict` valid —
+all reran myself, not accepted from the worker's report.
+
+**Gate re-run.** `dotnet test` unfiltered: **879/879 clean on the first try**, no flake this run. The
+worker's reported first-run flake (`GitSmartHttpRealClientTests…RepositoryBusy`, 878/879, clean on
+rerun) is plausible as this repo's known real-git lock-contention flake under full parallel execution —
+`GitSmartHttpRealClientTests.cs` isn't part of this block's diff (confirmed by the empty `src` diff
+above), so this documentation-only change cannot have caused it, and the worker measured under the
+correct condition (full unfiltered suite, not a filter).
+
+**Mutation re-run, independent of the worker's.** Snapshotted `README.md` (`md5 e17418c5…`, matching the
+worker's own pre-mutation checksum). Changed the `:118` clone-line occurrence of `/git` to `/gitwrong`
+(`src` untouched throughout), ran `dotnet test --filter
+FullyQualifiedName~ReadmeGitRemoteDocumentationTests` — died 1/1 with the same failure the worker
+reported (`Assert.Equal() Failure — Expected: Unauthorized, Actual: OK`,
+`ReadmeGitRemoteDocumentationTests.cs:47`). Restored from my own `cp` backup, not `git checkout`/`git
+restore` — confirmed `md5` back to `e17418c5…`, byte-for-byte, and `git status --short` shows only the
+block's real diff afterward. One run was enough: the failure mode is exactly what the mechanism
+predicts (a diverging occurrence produces a second distinct path, which then 404s instead of 401ing),
+so a second or third run would tell me nothing a flaky instrument couldn't already hide better. The
+widened test is real, not vacuous — the four occurrences all currently resolve to the same `/git` path,
+so `.Distinct()` collapses them at runtime, but the `Assert.True(matches.Count >= 4, …)` line is what
+actually gets exercised by a prose edit that leaves one occurrence's `<your-host>` literal or its
+trailing path out of sync with the other three, and I traced that this is a real, not accidental,
+property of the regex/assert pair, not one that merely happens to hold today.
+
+**ZeroWiki-side claims — checked against the code, not re-accepted from the worker's or the
+supervisor's citation:**
+- `README.md:64-71` (route, no repo-name segment) — matches `GitSmartHttpEndpoints.cs:23-33` exactly
+  (`MapGroup("/git")`, `/info/refs`, `/git-upload-pack`, `/git-receive-pack`).
+- `README.md:88` ("Git does not accept your sign-in password") — `GitBasicAuthenticationFilter.cs`'s own
+  remarks confirm `GitTokenService.VerifyAsync` only ever queries `GitTokens` rows, never
+  `Accounts.PasswordHash` — structurally no password code path exists to accept.
+- `README.md:163-169` (`.obsidian/` becomes wiki content, never served) — `git add -A` unscoped is at
+  `ContentRepositoryService.cs:792` exactly as cited; the dot-skip is at `PageEnumerationService.cs:162`
+  exactly as cited. Both line numbers still match after the section rewrite — no drift.
+- `README.md:171-182` (fast-forward-only, reject-don't-merge, recovery via pull) — matches
+  `receive.denyCurrentBranch=updateInstead` at `ContentRepositoryService.cs:541` and the binding
+  `updateInstead` design decision.
+- **The banner is not documented as working, including indirectly.** Read the whole "Syncing with
+  Obsidian" section end to end looking for any implication a viewer is notified on push — none. "When a
+  push is rejected" (`:171-182`) describes only the git-level reject/recover cycle; no browser/live-page
+  claim anywhere, no mention of the defect or `fix-changed-on-disk-broadcast` (user docs correctly
+  staying silent on a bug tracker's business).
+
+**`obsidian-git`-side claims — fetched `Vinzent03/obsidian-git@master` myself today
+(`docs/Authentication.md`, `src/setting/settings.ts`), not accepted from the worker's citation, per the
+brief's own standard that a transcription error here is the exact defect class this block exists to fix:**
+
+- **Vault layout (`README.md:75-84`) — accurate.** `settings.ts:937-941`'s "Custom base path" wording
+  confirmed verbatim ("only required if the Git repository is below the vault root directory"), and the
+  README correctly frames `<clone>/docs`-as-vault as working *despite* that, sourced to the Product
+  Owner's actual run rather than to the plugin's docs, which is exactly right per the brief's stated
+  precedence.
+- **Setting names (`README.md:145-159`) — all five confirmed present, verbatim, in `settings.ts`**: `Auto
+  commit-and-sync interval (minutes)` (`:98`, default-labelled when `differentIntervalCommitAndPush` is
+  false, which `DEFAULT_SETTINGS` at `:37` confirms is the default), `Auto pull interval (minutes)`
+  (`:203`), `Pull on commit-and-sync` (`:475`), `Merge strategy` (`:401`), `Merge strategy on conflicts`
+  (`:421`, options exactly `none: "None (git default)"`, `ours`, `theirs`). Checked `DEFAULT_SETTINGS`
+  too: `autoSaveInterval`/`autoPullInterval` both default `0` (matches "disables it"), `syncMethod`
+  defaults `"merge"` (matches "'Merge' is the safe default"), `mergeStrategy` defaults `"none"` (so
+  recommending `"None (git default)"` is reinforcing the default, not overriding it — accurate either
+  way). Neither `Vault backup interval (minutes)` nor `Auto pull/push` — the old wrong names — appears
+  anywhere in the file; confirmed absent by grep, not just unfound by me.
+- **Credential ordering for macOS (`README.md:101-104`) — verbatim match** to
+  `docs/Authentication.md`'s macOS §HTTPS, and it's the one platform the Product Owner's run actually
+  exercised, so it's both sourced and demonstrated.
+
+**Blocker — the credential section's "for every platform" framing (`README.md:93-113`) is not
+supported by its own cited source, for two of the three platforms it covers, and I traced the exact
+mechanism rather than just noting a mismatch.**
+
+The section's umbrella claim: *"`obsidian-git` has no way to show you a login prompt — there's no
+terminal inside Obsidian for git to ask a question on… primed by one real git operation run from a
+terminal first. This is the order `obsidian-git`'s own authentication guide documents for every
+platform."* Then, `:110-113`: *"Whichever helper applies, run one clone, pull, or push from a terminal
+before opening Obsidian… After that one terminal authentication, `obsidian-git` can clone, pull, and push
+without prompting, because it's reading the same stored credential."*
+
+This is verbatim-accurate for **macOS only** — the one platform actually run. It does not hold for the
+other two, per `docs/Authentication.md` itself:
+
+1. **Linux (`README.md:107-108`).** The doc's Linux §HTTPS has two independent subsections: "Storing"
+   (`libsecret`, which does require the terminal-first priming — this part of the README is right) and,
+   separately, **"SSH_PASS Tools" → "SSH_PASS integrated in Obsidian"**: *"The plugin now automatically
+   provides an integrated script for the `SSH_ASKPASS` environment variable, **if no other program is
+   set**, that opens a modal in Obsidian whenever Git asks for username or password."* That is a
+   built-in, zero-configuration fallback that prompts **inside Obsidian itself**, with no terminal step
+   at all — the exact thing the README's umbrella paragraph says doesn't exist. The README's Linux bullet
+   does mention "configure an SSH_ASKPASS tool" as an option, but then the umbrella paragraph folds it
+   into "whichever helper applies, run one clone… so it's reading the same stored credential" — which
+   is simply false for ASKPASS: there is nothing stored, it prompts live, and the plugin's own
+   integration is precisely a way for that live prompt to happen inside Obsidian. The README currently
+   tells a Linux user they must do something the plugin's own default behavior may make unnecessary.
+2. **Windows (`README.md:105-106`).** The doc's Windows §HTTPS: after confirming Git Credential Manager
+   is the helper, *"Just execute any authentication command like push/pull/clone and a pop window should
+   come up, allowing your to sign in,"* and, separately, *"you can also leave that setting empty and
+   always provide the username and password manually via the prompted modal in Obsidian."* Neither
+   sentence says this has to happen from a terminal, unlike the macOS/Linux "Storing" text, which says so
+   explicitly. Folding Windows into "there's no terminal inside Obsidian… this is the order the guide
+   documents for every platform" overstates what the source says for this platform too.
+
+Net: this isn't a transcription error — every individual quote the worker cited checks out verbatim —
+it's the same overreach class as the original blocker, one level up: a claim of **cross-platform
+uniformity** the cited source doesn't support, asserted for 2 of 3 platforms with no run and no doc
+text behind the "every platform" framing. The fix doesn't need a new Product Owner run (mark the
+Linux/Windows detail as sourced-but-unverified, per the brief's own standard, rather than folding it
+into a uniform instruction): scope the "no terminal inside Obsidian, prime it first" claim to what's
+actually demonstrated (macOS, by the run) and documented that way (macOS's "Storing" text, Linux's
+"Storing" subsection specifically — not its "SSH_PASS Tools" alternative); either drop the ASKPASS
+mention from the Linux bullet or describe it accurately as a live-prompt alternative that skips the
+terminal step; and soften "documents for every platform" since it doesn't, uniformly.
+
+**Nits (non-blocking):**
+- `README.md:105-106` — even setting the "every platform" framing aside, the Windows bullet doesn't
+  mention the doc's "leave `credential.helper` empty, use the plugin's own modal" alternative at all;
+  worth a line for the same reason the Linux ASKPASS alternative is worth naming.
+
+**Everything else is sound and I would approve it standing alone.** The vault-layout, setting-name, and
+macOS credential-ordering corrections are exactly what supervisor blocker 2 asked for, correctly sourced
+and correctly attributed to the run vs. the docs per the brief's stated precedence. The test widening is
+real (mutation-confirmed, byte-for-byte restore confirmed). Scope, hygiene, and gates are all clean.
+
+→ @worker
+
+**[worker]** Fixed. `README.md:93-131` ("Authenticating from the command line first") no longer
+claims a single terminal-first ordering "for every platform" — it now says plainly it's
+**verified against a running ZeroWiki on macOS only**, and states Windows and Linux separately, each
+scoped to what `obsidian-git`'s own docs actually say for that platform, not what I generalised from
+one of them.
+
+**Re-checked the source myself before writing new text**, per the instruction not to spend a round
+re-verifying the finding but to verify whatever I wrote fresh — fetched
+`Vinzent03/obsidian-git@master`'s `docs/Authentication.md` again today:
+
+- **macOS** — unchanged, still verbatim-sourced and still the one platform the Product Owner's run
+  exercised: *"You have to do one authentication action (clone/pull/push) after setting the helper in
+  the terminal."* No in-Obsidian prompt is described for this platform anywhere in the doc.
+- **Windows** — now marked **(unverified here)**. Quoted directly: *"Just execute any authentication
+  command like push/pull/clone and a pop window should come up, allowing your to sign in"* (Git
+  Credential Manager, no terminal step stated) and, separately, *"you can also leave that setting
+  empty and always provide the username and password manually via the prompted modal in Obsidian"* —
+  the reviewer's nit about this second sentence being missing entirely is fixed by including it.
+- **Linux** — now marked **(unverified here)** and split into the two paths the doc itself treats as
+  independent, rather than folded into one: the `libsecret`-stored path (*"You have to do one
+  authentication action... in the terminal"* — same requirement as macOS, correctly kept as
+  terminal-first), and, separately, the built-in `SSH_ASKPASS` fallback (*"The plugin now
+  automatically provides an integrated script for the `SSH_ASKPASS` environment variable, if no other
+  program is set, that opens a modal in Obsidian whenever Git asks for username or password"*) — no
+  terminal step, nothing stored, explicitly called out as not the same mechanism as the stored-helper
+  path. The doc doesn't say which one wins when both could apply, so I said that too rather than
+  picking one.
+
+**Downstream universality claims fixed too, not just the umbrella paragraph.** Two other sentences
+that inherited the "for every platform" framing without the finding calling them out by number: the
+"Cloning a fresh vault" section said the clone "doubles as the terminal authentication above" and "the
+plugin can't show that prompt itself" — both now scoped to macOS/Linux-stored-path only, with Windows
+and Linux-ASKPASS readers told the plugin *can* prompt them directly, and terminal-first framed as
+"still the safest way to confirm a credential works," not as a requirement for platforms where it
+isn't one. Same fix in "Pointing an existing vault at ZeroWiki," which had the same "this pull is also
+your one terminal authentication" line.
+
+**Falsifiability re-checked after the rewrite**, not assumed to still hold: snapshotted
+`README.md` (`md5 7f526625…`), changed the `:136` clone-line occurrence of `/git` to `/gitwrong` (`src`
+untouched), ran `dotnet test --filter FullyQualifiedName~ReadmeGitRemoteDocumentationTests` — died 1/1
+with the same failure as before the rewrite (`Assert.Equal() Failure — Expected: Unauthorized, Actual:
+OK`). Restored via `cp` from a pre-mutation backup and confirmed the checksum matched
+(`7f526625…` both times) — no residue.
+
+**Gates, all unsandboxed and in the foreground:** `dotnet build` clean (0/0). `dotnet test`
+unfiltered, **879/879 passed** (2m12s), no flake this run. `openspec validate
+git-backed-content-core --strict` valid. `dotnet format --verify-no-changes` clean.
+
+**Scope.** `git diff -- src` and `git status --short -- src` both empty throughout. `.mcp.json`
+untouched by me — its modification predates this block. Only `README.md` and this DEVLOG entry
+changed; the test file is unchanged from the prior round (the finding was documentation-only). No
+`tasks.md` edit, nothing ticked.
+
+→ @reviewer
+
+**[reviewer]** Re-audit. **Request changes — one blocker, introduced by this round's own fix rather
+than surviving from the last one.**
+
+**Hygiene, rechecked from scratch, not carried over from last round's trust.** `git diff -- src` and
+`git status --short --untracked-files=all -- src` both empty. `tasks.md` untouched. `.mcp.json` still
+out of scope. Diffed the current `README.md` against the exact text I reviewed last round (saved a
+copy before this round started) rather than reading only the worker's description of what changed —
+the diff touches exactly `:93-131` and the two downstream sentences the worker named, nothing else;
+"Vault layout," "Getting a credential," "Configuring the plugin," `.obsidian/`, and "When a push is
+rejected" are byte-identical to what I already approved.
+
+**Gates, all rerun myself, unsandboxed:** `dotnet build` clean (0/0). `dotnet test` unfiltered —
+**879/879, no flake this run.** `dotnet format --verify-no-changes` clean. `openspec validate
+git-backed-content-core --strict` valid.
+
+**Mutation re-run, independent of the worker's, since the README changed substantially enough to be
+worth re-confirming rather than trusting the prior falsifiability check still holds:** snapshotted
+`README.md` (`md5 7f526625…`, matches the worker's own cited checksum). Mutated the `:136` clone-line
+`/git` → `/gitwrong` (`src` untouched throughout), ran `dotnet test --filter
+FullyQualifiedName~ReadmeGitRemoteDocumentationTests` — died 1/1, same failure as both prior runs
+(`Assert.Equal() Failure — Expected: Unauthorized, Actual: OK`, `:47`). Restored from my own `cp`
+backup, not `git checkout`/`git restore` — `md5` back to `7f526625…`, byte-for-byte. One run sufficient;
+the failure mode is exactly what the mechanism predicts and a second run tells me nothing new. Test
+file itself is unchanged from last round (confirmed by checksum comparison against what I read then),
+consistent with the worker's report — nothing new to review there.
+
+**Point 1 — was the macOS instruction weakened while the universal claim was removed? No; if
+anything it's stronger.** `:100-114` keeps every original detail (the Homebrew system-scope
+`--show-origin` quirk, the exact terminal-priming sequence) and *adds* two things: "the plugin's docs
+describe no in-Obsidian prompt for this platform" (checked — true, the macOS section of
+`docs/Authentication.md` mentions no ASKPASS/modal alternative anywhere, unlike Linux) and "This is
+the sequence the Product Owner's own run confirmed" (checked against the run — accurate; the PO's
+step 2 was exactly clone-with-username-only, prompted, token pasted). Not hedged into uselessness.
+
+**Point 4 — is "(unverified here)" honest, not a hedge over wrong content? Checked every quote in the
+Windows and Linux paragraphs against `docs/Authentication.md` myself, fetched fresh, not accepted from
+the worker's citation:** the Windows quotes (`:116-120`, GCM's own popup; leaving the helper empty for
+the plugin's in-Obsidian modal) and the Linux quotes (`:122-131`, the `libsecret` terminal-first path;
+the `SSH_ASKPASS`-integrated-modal fallback, verbatim "if no other program is set... opens a modal in
+Obsidian") all check out word-for-word against the source. "The docs don't specify which takes
+precedence" (`:130-131`) is itself an accurate description of the source's silence, not a hedge
+covering an actual error — `docs/Authentication.md` genuinely never says whether the stored-helper
+path or the built-in ASKPASS fallback wins when both are configured. This paragraph is the strongest
+part of the fix: it states real uncertainty as uncertainty.
+
+**Point 2/3 — the downstream sentences, reviewed for the first time (they were not in my finding).
+This is where the fix breaks its own honesty.** `README.md:139-144` ("Cloning a fresh vault"):
+
+> "On macOS, and on Linux via the stored-credential path, do this before opening Obsidian; **nothing
+> in the plugin can show that prompt itself on those platforms.** On Windows, and on Linux via the
+> built-in `SSH_ASKPASS` fallback, `obsidian-git` can prompt you directly instead…"
+
+This asserts a clean, mutually-exclusive split — a Linux user is either "on the stored-credential
+path" (no in-app prompt possible) or "on the built-in fallback path" (in-app prompt available) — as if
+picking `libsecret` turns the ASKPASS fallback off. But the source doesn't support that, and the
+Linux paragraph forty lines above already says so correctly: the doc's own text is "if no other
+`SSH_ASKPASS` program is set" — a condition about what else has claimed the `SSH_ASKPASS` env var, not
+about whether `credential.helper` is configured. Nothing in `docs/Authentication.md` suggests
+configuring `libsecret` disables or supersedes the plugin's own ASKPASS script; by ordinary git
+credential-resolution behaviour (try `credential.helper` first, fall back to askpass when it has
+nothing cached and there's no tty), a Linux user who has set `libsecret` but hasn't yet primed it
+would very plausibly still see the plugin's own modal on first use — the opposite of "nothing in the
+plugin can show that prompt itself." `:122-131` gets this right by refusing to pick a winner;
+`:139-144` picks one anyway, and picks the more restrictive answer. `README.md:154-156` ("Pointing an
+existing vault") inherits the same "stored-credential path" framing but doesn't repeat the absolute
+negative claim, so it's lower-risk — worth tightening in the same pass but not a second blocker.
+
+**Why this matters enough to block on:** it's the same defect class as both prior rounds — a claim of
+settled interaction where the cited source is explicitly silent — just relocated from the umbrella
+paragraph (fixed) to a downstream sentence the worker wrote fresh this round and that nobody has yet
+checked against the source. The fix is small: either drop the negative claim ("nothing in the plugin
+can show that prompt itself") and replace it with the same honest framing as `:130-131` ("which one
+wins on Linux isn't documented"), or scope the "Cloning a fresh vault" sentence to macOS only, where
+the negative claim is actually supported, and let the Linux nuance live only in the paragraph that
+already states it correctly rather than being re-asserted (wrongly) downstream.
+
+**Everything else holds.** The macOS section, the Windows section, and the Linux section's own
+"which one wins isn't documented" framing are all sound, sourced, and honestly scoped. Gates green,
+scope clean, mutation-testing claim independently reproduced.
+
+→ @worker
+
+**[worker]** Fixed by deletion, not rewrite, per the instruction to stop stating the settled
+interaction rather than find a better way to state it. **Every sentence I touched, listed in
+full** (nothing else in the file changed):
+
+1. `README.md:139-142` ("Cloning a fresh vault"). Was: *"On macOS, and on Linux via the
+   stored-credential path, do this before opening Obsidian; nothing in the plugin can show that
+   prompt itself on those platforms. On Windows, and on Linux via the built-in `SSH_ASKPASS`
+   fallback, `obsidian-git` can prompt you directly instead — but cloning from a terminal first is
+   still the safest way to confirm a credential works before Obsidian is involved at all."* Now:
+   *"On macOS, do this before opening Obsidian; nothing in the plugin can show that prompt itself
+   on that platform. For Windows and Linux, see 'Authenticating from the command line first'
+   above."* The negative claim now applies to macOS only, where it's sourced (the macOS section of
+   `docs/Authentication.md` mentions no in-Obsidian alternative). The Linux/Windows sentence is
+   deleted outright, not reworded — the doubt the reviewer found (does configuring `libsecret`
+   exclude the `SSH_ASKPASS` modal? not stated) isn't resolved here or restated in softer language;
+   it's removed, and the reader is pointed at the paragraph that already states the real
+   uncertainty (`:130-131`, unchanged) instead of a second paraphrase of it.
+2. `README.md:153` ("Pointing an existing vault at ZeroWiki"). Was: *"…from a terminal — on
+   macOS, and on Linux via the stored-credential path, this pull is also your one terminal
+   authentication, above:"* Now: *"…from a terminal — on macOS, this pull is also your one
+   terminal authentication, above:"* Same treatment, applied to the sentence the reviewer flagged
+   as lower-risk but worth tightening in the same pass — the Linux clause is deleted, not
+   rephrased, so there's nothing new here for the next round to find.
+
+**No other sentence in the file changed.** Diffed the current `README.md` against the copy this
+round started from before touching anything — the diff is exactly those two edits.
+
+**Falsifiability re-checked, restored via `cp`, not `git checkout`/`git restore`** (per the
+instruction — those would discard this uncommitted block): snapshotted `README.md`
+(`md5 8855176b…`), mutated the `:136` clone-line `/git` → `/gitwrong` (`src` untouched), ran
+`dotnet test --filter FullyQualifiedName~ReadmeGitRemoteDocumentationTests` — died 1/1, same
+failure as every prior round (`Assert.Equal() Failure — Expected: Unauthorized, Actual: OK`,
+`:47`). Restored from my own `cp` backup and confirmed `md5 8855176b…` byte-for-byte, no residue.
+
+**Gates, all unsandboxed and in the foreground, never concurrent, never piped through `tail`:**
+`dotnet build` clean (0/0). `dotnet test` unfiltered, **879/879 passed** (2m29s), no flake this
+run. `openspec validate git-backed-content-core --strict` valid. `dotnet format
+--verify-no-changes` clean.
+
+**Scope.** `git diff -- src` and `git status --short -- src` both empty. `.mcp.json` untouched by
+me. Only `README.md` and this DEVLOG entry changed; the test file is unchanged from prior rounds.
+No `tasks.md` edit, nothing ticked.
+
+→ @reviewer
+
+**[reviewer]** Re-audit. **Approve.**
+
+**Hygiene, rechecked from scratch:** `git diff -- src` and `git status --short --untracked-files=all
+-- src` both empty. `tasks.md` untouched. `.mcp.json` still out of scope. `git diff --
+DEVLOG.md` has zero deletion lines outside the diff header — append-only.
+
+**Gates, all rerun myself, unsandboxed:** `dotnet build` clean (0/0). `dotnet test` unfiltered —
+**879/879, no flake this run.** `dotnet format --verify-no-changes` clean. `openspec validate
+git-backed-content-core --strict` valid.
+
+**Mutation re-run, independent of the worker's:** snapshotted `README.md` (`md5 8855176b…`, matches
+the worker's own cited checksum). Mutated the `:136` clone-line `/git` → `/gitwrong` (`src` untouched
+throughout), ran `dotnet test --filter FullyQualifiedName~ReadmeGitRemoteDocumentationTests` — died
+1/1, same failure as every prior round (`Assert.Equal() Failure — Expected: Unauthorized, Actual:
+OK`, `:47`). Restored from my own `cp` backup, not `git checkout`/`git restore` — `md5` back to
+`8855176b…`, byte-for-byte.
+
+**Point 3 — "no other text touched," verified myself, not accepted.** Diffed the current
+`README.md` against the exact copy I saved at the start of the previous round. The diff is exactly
+the two edits the worker listed — `:139-142` and `:153` — and nothing else. Every section I'd
+already approved (`Vault layout`, `Getting a credential`, `Authenticating from the command line
+first` including the macOS block and the `:122-131` Linux paragraph, the plugin settings, `.obsidian/`,
+`When a push is rejected`) is byte-identical to what I signed off on before.
+
+**Point 1 — sourced content survived the deletion.** The macOS instruction (`:100-114`) and the
+Linux paragraph stating the real, undocumented uncertainty (`:122-131`) are both untouched. Nothing
+sourced was collateral damage of removing the unsourced inference.
+
+**Point 2 — the pointer resolves to something real, not a shrug.** `:141-142`'s "For Windows and
+Linux, see 'Authenticating from the command line first' above" points at a section heading that
+exists verbatim (`:93`) and, once there, a reader gets actual per-platform instructions, not just an
+admission of doubt: Windows (`:116-120`) — configure Git Credential Manager, or leave the helper
+empty for the plugin's own in-app modal; Linux (`:122-131`) — the `libsecret` terminal-first path,
+or the built-in `SSH_ASKPASS` fallback, correctly flagged as undocumented which one wins if both
+apply. A reader following the pointer is not left with less than they need to authenticate.
+
+**Point 4 — read the whole section end to end as a reader on each platform, not just the diffed
+lines.** Traced all three:
+- **macOS** — "Authenticating from the command line first" gives the full recipe (keychain helper,
+  the `--show-origin` gotcha, one terminal action); "Cloning a fresh vault" reinforces it with the
+  actual clone command and restates the negative claim, now correctly scoped and sourced. Complete.
+- **Windows** — gets the GCM-popup-or-empty-helper choice from `:116-120`, then a terminal clone
+  recipe in `:133-147` that works regardless of which credential path they took — the clone command
+  itself is universal git, not platform-gated. Nothing is missing; the deleted sentence was
+  editorializing ("still the safest way") on top of already-complete instructions, not the
+  instructions themselves.
+- **Linux** — same: `:122-131` gives both paths, the clone recipe below works either way. The
+  deleted sentence's specific claim (does `libsecret` suppress the `SSH_ASKPASS` fallback or not)
+  was never something the reader needed answered to proceed — either path gets them to a working
+  clone.
+
+The document did not stop being usable. The three deletions removed recommendations layered on top
+of already-sufficient instructions, not the instructions themselves — every platform still has a
+complete, actionable path to a cloned, authenticated vault. Supervisor blocker 2 is discharged: the
+plugin-side claims are now sourced, honestly scoped to what's actually verified vs. carried over from
+the plugin's own docs, and the one place three rounds of tightening could plausibly have broken
+something (leaving a reader stranded) does not show that failure on inspection.
+
+**Nothing further from me on this block.** `9.1`–`9.3` remain correctly unticked pending the Product
+Owner's confirmation — unaffected by this remediation, as before.
+
+→ @architect
+
 ## NEXT
 
 **Resume point: §9 is OPEN. The Product Owner's verification run is DONE — the blocker now is the README

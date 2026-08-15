@@ -68,8 +68,20 @@ https://<your-host>/git
 ```
 
 (`/info/refs`, `/git-upload-pack`, `/git-receive-pack` — no repository-name segment; ZeroWiki
-serves exactly one repository.) The pages themselves live in the `docs/` subdirectory of that
-repository, so an Obsidian vault should be opened at `<clone>/docs`, not at the clone's root.
+serves exactly one repository.)
+
+### Vault layout
+
+Open **`<clone>/docs`** as the vault — the pages live there, so the vault ends up being exactly
+the wiki's content and nothing else. This works even though it's the opposite of what the
+`obsidian-git` plugin's own settings describe as the arrangement it expects (its "Custom base
+path (Git repository path)" setting is documented as needed only when the git repository sits
+*below* the vault root — here it sits above); in practice the plugin's repository discovery walks
+upward from the vault and finds `.git` above it without any extra configuration. Opening the
+clone's root, **`<clone>`**, as the vault instead also works, and matches what the plugin's
+setting text nominally expects — use this if you'd rather the vault and the repository be the
+same folder. Either way, the notes live in a `docs/` subfolder of the repository; that part
+doesn't change.
 
 ### Getting a credential
 
@@ -78,20 +90,67 @@ token — it's shown once, so copy it immediately. Your git username is the same
 in with. Revoking a token (also on the Account page) does not touch your sign-in password or
 anything else about the account.
 
+### Authenticating from the command line first
+
+**Verified against a running ZeroWiki on macOS only.** The Windows and Linux instructions below
+are carried over from [`obsidian-git`'s own authentication
+guide](https://github.com/Vinzent03/obsidian-git/blob/master/docs/Authentication.md) — they
+haven't been exercised against this app, so treat them as a starting point, not a tested recipe.
+
+**macOS.** There's no terminal inside Obsidian for git to ask a question on, and the plugin's
+docs describe no in-Obsidian prompt for this platform, so the credential has to already be stored
+by the OS keychain helper *before* you touch the plugin:
+
+```sh
+git config --global credential.helper osxkeychain
+```
+
+or confirm one is already configured with `git config --show-origin --get-all credential.helper`
+— use `--show-origin` and no scope flag, not `--global` alone: a helper installed by Homebrew's
+git is commonly set at **system** scope and prints nothing under `--global` even though it's
+active. Then run one clone, pull, or push from a terminal before opening Obsidian — the clone
+below is enough — and enter the username and access token when it prompts. After that one
+terminal authentication, `obsidian-git` can clone, pull, and push without prompting, because it's
+reading the same stored credential. This is the sequence the Product Owner's own run confirmed.
+
+**Windows (unverified here).** The plugin's docs describe Git Credential Manager popping its own
+window on the first authenticated command (`git config credential.helper` should print `manager`;
+set it with `git config --global credential.helper manager` if not) — no terminal step described
+as required. The docs also say you can leave `credential.helper` empty and always supply the
+username and access token through a modal the plugin shows inside Obsidian itself.
+
+**Linux (unverified here).** The plugin's docs describe two independent paths, and they are not
+the same thing:
+- A stored-credential path, terminal-first like macOS: `git config --global credential.helper
+  libsecret` (install `libsecret` first if it isn't already), then one authentication action from
+  a terminal before opening Obsidian.
+- A separate, built-in fallback: if no other `SSH_ASKPASS` program is set, the plugin's docs say
+  it automatically provides its own script for that environment variable, which opens a modal
+  *inside Obsidian* whenever git asks for a username or password — no terminal step, and nothing
+  stored beforehand. Which one applies on a given install depends on what else is already
+  configured; the docs don't specify which takes precedence.
+
 ### Cloning a fresh vault
 
 ```sh
 git clone https://<username>@<your-host>/git zerowiki
 ```
 
-Git will prompt for the password; paste the access token there. (Embedding the token directly in
-the URL, `https://<username>:<token>@<your-host>/git`, also works but leaves the token sitting in
-your shell history and in `.git/config` — prefer letting git prompt, or use a credential helper.)
-Open `zerowiki/docs` as the vault in Obsidian.
+This clone doubles as the terminal authentication above — git prompts for the password; paste the
+access token there. On macOS, do this before opening Obsidian; nothing in the plugin can show that
+prompt itself on that platform. For Windows and Linux, see "Authenticating from the command line
+first" above.
+(Embedding the token directly in the URL, `https://<username>:<token>@<your-host>/git`, also works
+but leaves the token sitting in your shell history and in `.git/config` — the prompt is what lets
+the credential helper store it instead.)
+
+Open `zerowiki/docs` as the vault in Obsidian (see "Vault layout" above).
 
 ### Pointing an existing vault at ZeroWiki
 
-If you already keep a vault under git, add ZeroWiki as a remote and pull:
+If you already keep a vault under git, its own folder must be the repository's `docs/` directory —
+either move the vault's contents there first, or clone fresh (above) and copy your notes in. Then,
+from a terminal — on macOS, this pull is also your one terminal authentication, above:
 
 ```sh
 cd /path/to/your/vault
@@ -99,28 +158,45 @@ git remote add origin https://<username>@<your-host>/git
 git pull origin HEAD --allow-unrelated-histories
 ```
 
-The vault's own folder must be the repository's `docs/` directory — either move the vault's
-contents there first, or clone fresh (above) and copy your notes in.
-
 ### Configuring the `obsidian-git` plugin
 
-Install the community plugin **obsidian-git**, then in its settings:
+Install the community plugin **obsidian-git**. In its settings:
 
-- Leave **Vault backup interval (minutes)**, **Auto pull/push** etc. at whatever cadence you
-  want — the plugin talks to the remote exactly like the `git` CLI above, over the same Smart
-  HTTP endpoint with the same basic-auth credential.
-- The first pull or push will ask for the git username and access token from the previous
-  section. Most git credential helpers (macOS Keychain, Windows Credential Manager) will offer
-  to remember it after the first prompt.
-- No other setting is ZeroWiki-specific — `obsidian-git` speaks plain Smart HTTP, which is all
-  this remote is.
+- **Auto commit-and-sync interval (minutes)** — `0` (the default) disables it. Leave it at `0`
+  unless you want edits synced on a timer rather than by your own action.
+- **Auto pull interval (minutes)** — the same idea for pulling; `0` disables it.
+- **Pull on commit-and-sync** — turn this **on**. Without it, "commit-and-sync" only commits and
+  pushes, so a push this repository rejects (below) has no automatic way back.
+- **Merge strategy** — how your local branch is updated when a pull brings in commits from the
+  wiki; "Merge" is the safe default.
+- **Merge strategy on conflicts** — set this to **"None (git default)"**. The other options
+  resolve a genuine conflict automatically, in favour of one side or the other, without showing it
+  to you. "None" is what makes a real conflict visible in Obsidian so you resolve it yourself,
+  instead of one side's edit being silently discarded.
+
+(Earlier drafts of this document named settings — "Vault backup interval (minutes)", "Auto
+pull/push" — that don't exist in the plugin. The five above are the plugin's actual setting
+names.)
+
+### Obsidian's own files end up in the repository
+
+Obsidian writes a `.obsidian/` folder into whichever directory you open as the vault. ZeroWiki's
+startup reconciliation stages the whole repository (`git add -A` at the repository root,
+unscoped) and the repository ships no `.gitignore`, so `.obsidian/` — including `workspace.json`,
+which rewrites itself on nearly every pane change — becomes wiki content and is pushed to every
+vault that syncs. It's harmless to read: page rendering skips any dot-prefixed entry, so
+`.obsidian/` is never served as a page. It's still noise in the repository's history; a future
+change may add a `.gitignore` for it, but expect to see it for now.
 
 ### When a push is rejected
 
 The server accepts a push only if it fast-forwards the branch it has checked out; if the vault's
 history and the wiki's history have both moved on since the vault last pulled, the push is
 **rejected** outright. The server does not attempt to merge or resolve anything — that is
-deliberate, so it never guesses at intent. Resolve it the same way you would with any other git
-remote: pull (Obsidian's "Pull" command, or `git pull`) to merge the remote changes into the
-vault locally, resolve any conflicting lines if Obsidian or git can't merge them automatically,
-then push again.
+deliberate, so it never guesses at intent. With **Pull on commit-and-sync** turned on (above), a
+rejected commit-and-sync pulls automatically and merges, so you can commit-and-sync again; if
+**Merge strategy on conflicts** is left on anything other than "None", that merge resolves a real
+conflict for you without asking, rather than showing it to you. Resolve a genuine conflict the
+same way you would with any other git remote: pull (Obsidian's "Pull" command, or `git pull`) to
+merge the remote changes into the vault locally, fix any conflicting lines Obsidian or git
+couldn't merge automatically, then push (or commit-and-sync) again.
