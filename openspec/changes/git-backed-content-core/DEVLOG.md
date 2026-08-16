@@ -23838,6 +23838,53 @@ evidence gets re-examined rather than the conclusion reused.
 
 ## NEXT
 
+### ⚠️ The workflow changed on 2026-08-16 — read this before briefing anything
+
+A retrospective with the Product Owner (after block A) changed how blocks are briefed, reported and
+audited. **These are live now and bind the next block, `10.2`+`10.3`.** All are committed; this is the
+index, the files are authoritative.
+
+- **Claims carry an instrument.** `e5844c9` — any report that something is complete, exhaustive,
+  covered, the only one or unaffected states **claim / instrument / blind spot** as three labelled
+  lines, and "blind spot: none" is never correct. The reviewer must re-run the instrument rather than
+  read the argument. *Why this shape:* block A's brief already said "derived from the harness, not the
+  two tests that flaked" and still came back file-scoped — **an instruction in a brief does not work
+  where a required field does.**
+- **Tasks get classified before implementing.** `80edc57` — the worker calls each task **build / audit
+  / finish** and posts the call before writing code, stopping with `❓ @architect` if it disagrees with
+  the brief. `tasks.md` was written before any code existed; `10.1` read as "write these tests" over 73
+  existing ones. The reviewer judges that call, and **must not treat an empty diff as an absent
+  deliverable** when the analysis is the deliverable.
+- **Verdicts name the state they certify.** `5de9c4f` + `9025a78` — every verdict ends with
+  `Reviewed-state: <hash>`, and `CLAUDE.md` §3b **step 6** (new; steps renumbered) has the Architect
+  recompute it before ticking or committing. `git diff HEAD` alone is blind to untracked files, so the
+  fingerprint includes `ls-files --others` content. **Block A predates this** — `4dc6de0` carries no
+  fingerprint, which is expected, not drift.
+- **Briefs name the falsifier.** `d7a517c` — `CLAUDE.md` §3b.1: alongside "build X", name the
+  observation that fails if X is undone.
+- **Unreachable code is swept for.** `d7a517c` — reviewer runs `find_uncovered_symbols` over new
+  symbols, supervisor across the whole section. Neither tests nor mutation can see code nothing
+  reaches; that is exactly how §12's defect shipped.
+- **Mutation runs go through `.claude/skills/mutation-testing/mutate.sh`** — `d7a517c`. Revert in a
+  `trap` an interruption cannot skip, content-checksum before and after, no-op refused, unique search
+  string required, full unfiltered suite, no pipe. Exit `0` killed / `1` survived / `2` harness fault.
+  Verified end to end against the CAS compare. **The caps are still yours to obey — the script cannot
+  hold them.**
+- **`##` is reserved for section headings; posts start at `###`** — `233997a`. ~40 existing posts break
+  this; they are left alone because the DEVLOG is append-only.
+
+**Also decided: Stryker.NET is rejected, with measurements.** The `.slnx`/net10.0 disqualifier *passed*
+and the instrumented baseline is green, but `src/` yields **1631 mutants** each needing a full suite,
+and **Safe Mode removes every mutation in `HandleReceivePackAsync`** (CS0165 under schemata injection),
+along with `AcceptRepositoryAsync`, `CollectNestedGitEntries` and `Walk`. **§12's target method is the
+one Stryker cannot mutate.** Do not reach for it there.
+
+**Owed at the §10 close, before §12:** distil this pin. It is over 1,000 lines — longer than five of the
+twelve sections — against a stated target of ~80. The rule is now in `CLAUDE.md`: NEXT holds only what
+the next session needs *before* reading anything else; everything else already lives permanently in the
+section threads. Deliberately deferred rather than done mid-section, so nothing block B still needs gets
+cut.
+
 ### ⚠️ Scheduled at the §10 boundary — migrate the dmons scaffold before opening §12
 
 **Product Owner decision, 2026-08-16.** When §10 closes (supervisor `Approve`) and **before §12 opens**,
