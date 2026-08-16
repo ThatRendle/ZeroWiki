@@ -1,19 +1,7 @@
 {
   "permissions": {
     "allow": [
-      "mcp__codegraph__*"
-    ]
-  },
-  "hooks": {
-    "UserPromptSubmit": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "codegraph prompt-hook"
-          }
-        ]
-      }
+      "mcp__roslyn-codelens__*"
     ]
   }
 }
