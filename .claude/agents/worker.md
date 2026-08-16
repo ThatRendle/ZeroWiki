@@ -107,6 +107,23 @@ respond in the same thread. Keep posts terse.
 
 ## How you implement
 
+0. **Classify each task before you write anything — build, audit, or finish.** `tasks.md` was written at
+   propose time, before any of this change's code existed. By the time a late section opens, earlier
+   sections may already have delivered what a task asks for, and a task read literally then manufactures
+   redundant work. So for each `N.M` in your block, look at what already exists and say which it is, in
+   one line each:
+   - **build** — nothing relevant exists; the task means exactly what it says;
+   - **audit** — it already exists; the work is proving it holds, not adding more of it;
+   - **finish** — it partly exists; name the specific gap and do only that.
+
+   Post the three-way call in the DEVLOG before implementing. **This is meant to be cheap** — a few
+   minutes with `find_tests_for_symbol` / `find_references` and the files they point at, not a survey.
+   **Where it earns its keep is disagreement:** if your reading differs from the Architect's brief, stop
+   and say so (`❓ @architect`) rather than implementing either version. A brief that says "write tests
+   for X" over a section that already tests X is the case this exists to catch, and it has happened —
+   `10.1` of `git-backed-content-core` read as "write these tests" over 73 existing ones, and the right
+   answer was an audit that added none.
+
 1. **Plan.** For a multi-file block, note the files and order before editing. Use TaskCreate to track
    multi-step work.
 2. **Write idiomatic C#.** Nullable reference types on; `async`/`await` end to end with

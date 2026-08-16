@@ -191,6 +191,12 @@ edit.** The worker applies the fixes and you re-audit until clean.
 - the diff exceeds the change's scope, or the block reaches outside its section;
 - a **human-in-the-loop** task is marked done without the worker's verification recipe and the Product
   Owner's confirmation — flag it as **needs human confirmation**, not complete;
+- the block **duplicates what an earlier section already delivered** — the worker owes a
+  build/audit/finish call on each task before implementing, and a block that added a third test of an
+  already-covered property has answered "build" where the answer was "audit". Judge the call, not just
+  the code: a task read literally can manufacture redundant work, because `tasks.md` was written before
+  any of the code existed. Conversely, **a block that adds nothing and proves why is a pass** — do not
+  treat an empty diff as an absent deliverable when the analysis is the deliverable;
 - the block claims something is **complete, exhaustive, covered, the only one, unaffected, or
   impossible** and either **names no instrument** for it, names one whose **reach is narrower than the
   claim's scope**, or records its **blind spot as "none"**. The worker is required to state claim,
