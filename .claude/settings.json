@@ -3,5 +3,6 @@
     "allow": [
       "mcp__roslyn-codelens__*"
     ]
-  }
+  },
+  "enabledPlugins": {}
 }

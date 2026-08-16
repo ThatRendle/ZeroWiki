@@ -23838,12 +23838,49 @@ evidence gets re-examined rather than the conclusion reused.
 
 ## NEXT
 
-**Resume point: §10. `10.1`–`10.3`, no block carved yet. Post its base commit to the DEVLOG before
-briefing anything (CLAUDE.md 3a); the supervisor's review scope depends on it.**
+### ⚠️ Scheduled at the §10 boundary — migrate the dmons scaffold before opening §12
+
+**Product Owner decision, 2026-08-16.** When §10 closes (supervisor `Approve`) and **before §12 opens**,
+run `/dmons:update-scaffold`. This repo is stamped **`0.3.0`** in all three `.claude/agents/*.md` and in
+`CLAUDE.md`; the plugin is **`0.5.1`** — **four migrations** behind (`0.3.1`, `0.4.0`, `0.5.0`, `0.5.1`).
+The newer templates route every gate through a `Makefile` ("the only way you run a gate", never the
+underlying command) and ship `dmons-guard.sh` / `dmons-tripwire.sh`, none of which exist here. That is
+the durable fix for this change's recurring shell hazards — the sandboxed `dotnet`, the piped `tail`
+whose exit code is `tail`'s — which have been prose warnings that the Architect itself broke while
+quoting them.
+
+**Two conditions on the run, both load-bearing:**
+
+- **Verify which version of the skill actually loaded.** `/dmons:update-scaffold` has been observed
+  loading an *older cached copy of itself* and reporting "already current" — its `migrations/` stopped at
+  the version the repo was stamped with, so the failure presented as success and the repo's own stamps
+  agreed, both coming from the same stale source. Check the skill's base directory against
+  `ls ~/.claude/plugins/cache/dmon-dev/dmons/`. If it loads stale, read `0.5.1`'s `SKILL.md` and
+  `migrations/*.md` from the cache and follow those by hand — following a newer migration note is not the
+  same as inventing a migration.
+- **Confirm each of the four migrations individually, and re-check `e5844c9` survived.** That commit
+  hand-edited all three agent definitions (the claim/instrument/blind-spot field). The skill claims to
+  preserve hand edits; four versions of migration over freshly hand-edited files is exactly where that
+  claim gets tested. Clean tree before starting, so it is trivially revertible.
+
+**Resume point: §10. `10.2`–`10.3`, block B not yet carved. `10.1` landed in `4dc6de0`.**
+
+§10's `Base:` post is `59db4dd` and is already in the `## 10.` thread — do **not** post another; the
+supervisor's review scope for the whole section runs from it.
+
+**Block A landed in `4dc6de0`** — `10.1` plus the credential-helper pin (no task number, Product Owner
+ruled it into §10). `10.1` is a **gap analysis that deliberately added no test**: the 7 spec scenarios
+behind *Optimistic concurrency on save*, *Transactional save* and the working-tree-clean invariant (D9)
+were each stated as a one-line `src/` falsifier and the existing test it kills, and all 7 held. Reviewer
+`Approve` after independently re-running the instruments. **Do not re-open `10.1` by writing tests over
+it.**
+
+**Block B is `10.2` + `10.3`, not yet carved or briefed.** `10.2`'s concurrency test (interleaved browser
+save and push, serialized, never a dirty tree) is the one most likely to need iterating.
 
 **§10 is no longer the last section — §12 was added 2026-08-16 by Product Owner decision** (`12.1`–`12.4`,
 the push→viewer broadcast; the full reasoning and its escape hatch are in the `## 12.` thread above, read
-it before opening that section). **41 → 45 tasks; 38 ticked, 7 open.** Count from `tasks.md`, never from
+it before opening that section). **41 → 45 tasks; 39 ticked, 6 open.** Count from `tasks.md`, never from
 this pin. §12 runs *after* §10: §10 is bounded and carved, §12's root cause is not isolated, so keeping
 §10 first means the change is never more than one bounded section from releasable.
 
