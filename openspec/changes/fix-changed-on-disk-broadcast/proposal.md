@@ -1,3 +1,12 @@
+> **STATUS — SUPERSEDED UNLESS THE ESCAPE HATCH FIRES (Product Owner, 2026-08-16).** This work has been
+> folded into `git-backed-content-core` as **§12**, because `git-sync` is a capability *that change
+> introduces*: archiving it would promote a spec whose broadcast requirement the code does not satisfy,
+> and this change could not be applied until that had happened. **Do not apply this change while §12 is
+> live.** It survives on disk as the fallback: if §12's root cause proves deeper than a bounded fix, 0.1
+> ships with a known-issue note, §12 is struck from `tasks.md`, and this change is applied after the
+> archive as originally written. **Escape-hatch trigger:** the root cause is not isolated by the end of
+> the first worker block — that is a stop-and-ask (CLAUDE.md §4), not an Architect call.
+
 ## Why
 
 `git-sync`'s **Re-index and broadcast on received push** requirement is not met by the shipped code: a

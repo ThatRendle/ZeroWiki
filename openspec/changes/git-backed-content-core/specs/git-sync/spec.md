@@ -42,6 +42,11 @@ The system SHALL, after a push updates the working tree, re-index the changed fi
 - **WHEN** a push updates one or more pages in the working tree
 - **THEN** the system re-indexes the changed files and signals open viewers of those pages that the content changed on disk
 
+#### Scenario: The reaction to a push is observable
+
+- **WHEN** the system reacts to a received push
+- **THEN** it records the outcome of that reaction — the routes it diffed, the subscribers it matched, and the callbacks it invoked — so that a broadcast reaching no viewer is distinguishable from a delivered one
+
 ### Requirement: Obsidian vault sync compatibility
 
 The system SHALL be compatible as a git remote for the `obsidian-git` community plugin (Smart HTTP with basic authentication) so a laptop vault can sync without a bespoke plugin.

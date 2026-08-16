@@ -23537,10 +23537,52 @@ first-hand run could not have caught it either**: a credential was already store
 terminal-first *works*, never that it is *required*. A run establishes that a path works; it never
 establishes that it is the only path.
 
+## 12. Push → viewer broadcast
+
+**[architect]** Scope decision, Product Owner, 2026-08-16 — **the broadcast fix comes into this change as
+§12** (`12.1`–`12.4`), and `fix-changed-on-disk-broadcast` is superseded rather than queued. No base
+commit yet; this section is not open.
+
+**Why it moved in.** The other two queued changes are robustness gaps — nothing in the specs this change
+promotes claims otherwise. This one is different in kind: `git-sync`'s **Re-index and broadcast on
+received push** is a requirement *this change introduces* and the shipped code does not satisfy. Archiving
+would promote a spec known to be false, and the queued change's own sequencing note made that circular —
+it could not be applied until the false spec had been promoted. Folding it in also means the observability
+scenario is amended into this change's own `git-sync` delta in place, rather than filed as a MODIFIED
+capability one commit after the ADDED one.
+
+**The escape hatch, and it is the Product Owner's, not the Architect's.** The root cause is not isolated.
+If §12 proves deeper than a bounded fix, **0.1 ships with a known-issue note**, §12 is struck from
+`tasks.md`, and `fix-changed-on-disk-broadcast` is applied after the archive as originally written — its
+proposal now carries a STATUS banner saying exactly this and stays on disk as the fallback. **Trigger: the
+root cause is not isolated by the end of the first worker block.** That is a stop-and-ask (CLAUDE.md §4),
+not an Architect call — do not carve a second exploratory block to keep digging.
+
+**Task order is deliberate and is not the order the queued proposal wrote.** `12.1` (observability) comes
+*first* because it is the diagnostic instrument: today a zero-route diff, a zero-subscriber match, and a
+correct delivery are indistinguishable in the app's output, which is why the absence of warnings was read
+as evidence the reaction ran. `12.2` (the endpoint-level test) comes before `12.3` (the fix) because this
+change's whole record says so — **the test must be watched failing against the current code**, and a fix
+landed first makes that impossible to demonstrate. `12.4` is the live-circuit confirmation and is owed to
+the Product Owner; no agent can discharge it.
+
+**What §12 must not assume.** The client half is *proven healthy* by first-hand evidence — the
+`InteractiveServer` boundary is in the server-rendered HTML and the circuit starts — so the break is
+server-side, between `HandleReceivePackAsync` and `PageChangeNotifier`. But per §9's closing lesson: that
+run establishes the client path works, never that it is the only path that must work. If the server side
+comes back clean, `ChangedOnDiskIndicator.razor` is exonerated by evidence, not by assumption, and the
+evidence gets re-examined rather than the conclusion reused.
+
 ## NEXT
 
-**Resume point: §10 — the LAST section. `10.1`–`10.3`, no block carved yet. Post its base commit to the
-DEVLOG before briefing anything (CLAUDE.md 3a); the supervisor's review scope depends on it.**
+**Resume point: §10. `10.1`–`10.3`, no block carved yet. Post its base commit to the DEVLOG before
+briefing anything (CLAUDE.md 3a); the supervisor's review scope depends on it.**
+
+**§10 is no longer the last section — §12 was added 2026-08-16 by Product Owner decision** (`12.1`–`12.4`,
+the push→viewer broadcast; the full reasoning and its escape hatch are in the `## 12.` thread above, read
+it before opening that section). **41 → 45 tasks; 38 ticked, 7 open.** Count from `tasks.md`, never from
+this pin. §12 runs *after* §10: §10 is bounded and carved, §12's root cause is not isolated, so keeping
+§10 first means the change is never more than one bounded section from releasable.
 
 **§9 is CLOSED** — supervisor `Approve`, all of F1–F4 resolved, `9.1`–`9.3` ticked on the Product
 Owner's explicit confirmation (`9aee333`, ticks in the commit that follows it). **§1–§9 and §11 are all

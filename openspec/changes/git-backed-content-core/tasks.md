@@ -76,3 +76,10 @@
 - [x] 11.1 Tighten `CredentialPolicy.UsernamePattern` to `^[A-Za-z0-9](([A-Za-z0-9_-]|\.[A-Za-z0-9_-]){0,125}([A-Za-z0-9]|\.[A-Za-z0-9]))?\z` so the first and last characters are alphanumeric and consecutive dots are refused (D11)
 - [x] 11.2 Add `MinimumUsernameLength = 3` with its rule description, enforced at the service boundary as `MinimumPasswordLength` is
 - [x] 11.3 Tests for the boundary cases: leading/trailing `.`/`-`/`_` refused, 2 characters refused as a length fault, 3 and 64 accepted, 65 refused, trailing newline refused
+
+## 12. Push → viewer broadcast
+
+- [ ] 12.1 Make each push reaction's outcome observable — routes diffed, subscribers matched, callbacks invoked — so a broadcast that reaches nobody is distinguishable from a delivery in the app's own output
+- [ ] 12.2 Endpoint-level test driving a real push through `git-receive-pack` and asserting a subscriber registered under the pushed page's route is invoked; watched failing against the current code before the fix
+- [ ] 12.3 Fix the break between `HandleReceivePackAsync` and `PageChangeNotifier` so a push that touches a page notifies open viewers of that page
+- [ ] 12.4 Confirm the "changed on disk" banner appears in a live browser circuit without a reload (human-in-the-loop; Product Owner)

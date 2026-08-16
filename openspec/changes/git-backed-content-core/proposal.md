@@ -12,6 +12,7 @@ ZeroWiki is a zero-config Markdown wiki: point it at a folder and it Just Works,
 - Expose the repo as a **Smart HTTP git remote** behind wiki authentication (via `git http-backend`), so `obsidian-git` on a laptop can clone/pull/push using wiki credentials — no bespoke sync engine, no SSH.
 - Accept pushes into the checked-out branch via `receive.denyCurrentBranch = updateInstead`; a `post-receive` hook re-indexes changed files and broadcasts a "changed on disk" signal to open viewers. Genuine conflicts surface as non-fast-forward push rejections resolved in Obsidian.
 - Map incoming commit identities (git email) back to ZeroWiki accounts so push-originated edits attribute correctly.
+- Make the push reaction **observable** — each reaction records the routes it diffed, the subscribers it matched, and the callbacks it invoked — so a broadcast that reaches no viewer is visible in the app's own output rather than silent.
 - **Startup reconciliation** + transactional saves guarantee the working-tree-clean invariant survives crashes, so pushes never bounce on a dirty tree.
 
 ## Capabilities
