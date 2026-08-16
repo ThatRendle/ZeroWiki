@@ -183,6 +183,13 @@ could not have made.
 - dead scaffolding from a superseded block is still shipping;
 - `git diff -- src` shows mutation residue — an interrupted run has left a live mutant in production
   code before, and a section review is the last look before the next section builds on it;
+- a block in this section **shipped code that no reviewer verdict covers** — every `Approve` carries a
+  `Reviewed-state:` fingerprint of the tree it was shown, and anything added afterwards is uncertified
+  unless an `[architect]` post says what was verified and how. The visible symptom is a dangling
+  `→ @reviewer` with no verdict beneath it, or a verdict whose fingerprint predates the block's final
+  commit. This has happened twice in one change and a supervisor caught it both times; the code was fine
+  both times, so what you are protecting is the **record**, which is archived as the account of how this
+  was built;
 - a **human-in-the-loop** task in this section was ticked without the Product Owner's recorded
   confirmation in the DEVLOG;
 - the section rests on a **completeness claim whose instrument is narrower than the claim** — the

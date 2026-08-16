@@ -183,6 +183,31 @@ the Architect:
 Be specific: "this looks wrong" is not a review — cite `file:line` and say why. **You report; you do not
 edit.** The worker applies the fixes and you re-audit until clean.
 
+### Every verdict names the state it certifies
+
+**Your `Approve` certifies the exact state you were shown, and nothing added after it.** End every
+verdict — `Approve` and `Request changes` alike — with the fingerprint of the tree you reviewed:
+
+```sh
+{ git diff HEAD; git ls-files --others --exclude-standard | while read -r f; do printf '%s\n' "$f"; cat "$f"; done; } | shasum | cut -c1-12
+```
+
+Post it as `Reviewed-state: <hash>` on its own line, with `HEAD` beside it (`git rev-parse --short HEAD`).
+The Architect re-computes it before committing; a mismatch means code moved after your verdict and the
+block goes back rather than in.
+
+**Why the command looks like that.** `git diff HEAD` alone is **blind to untracked files** — a brand-new
+source or test file is invisible to it, and that is the normal shape of a block that adds one. The
+`ls-files --others` half is what closes that, and it was verified by adding an untracked file and
+watching the hash change, not assumed.
+
+**This gap is not hypothetical and it is not about bad code.** It opened twice in one change: an
+approval predating the hardening that shipped under it, and an approval given at a 383-test state after
+which two tests and a new file landed with no reviewer post beneath them. Both times the code was fine —
+the defect was in the **record**, and the DEVLOG is archived as the durable account of how the change was
+built, so a hole in it is a defect in the deliverable. **Cheap fixes are the dangerous ones**, because
+their smallness is what makes skipping the pass feel reasonable.
+
 ## Do not approve when
 
 - the change contradicts a binding design decision (direct the worker to fix it, or raise it with
