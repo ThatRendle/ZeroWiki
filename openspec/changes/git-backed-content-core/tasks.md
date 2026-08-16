@@ -67,7 +67,7 @@
 
 ## 10. Tests
 
-- [ ] 10.1 Unit/integration tests for CAS rejection, transactional rollback, and startup reconciliation
+- [x] 10.1 Unit/integration tests for CAS rejection, transactional rollback, and startup reconciliation
 - [ ] 10.2 Concurrency test: interleaved browser save and push are serialized and never leave a dirty tree
 - [ ] 10.3 Index rebuild-from-repo test
 

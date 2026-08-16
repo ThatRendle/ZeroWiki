@@ -351,7 +351,20 @@ public sealed class GitSmartHttpRealClientTests
             ["GIT_TERMINAL_PROMPT"] = "0",
         };
 
-        return await _clientGit.RunAsync(workingDirectory, arguments, env, cancellation.Token);
+        // Disable credential caching for every real client-side git invocation this file makes. Without
+        // this, a real credential -- the URL-embedded token this file's own authenticated tests use --
+        // gets offered to `git credential-<helper>`, which on this developer's machine resolves (via
+        // Homebrew's *system*-scope gitconfig, not `--global`, so a `--global`-only probe reads this as
+        // "no helper set") to `osxkeychain`: under the full parallel suite one authenticated test's
+        // cached credential has been observed offered to a different test's git process, and the suite
+        // has no business writing real credentials into the developer's OS keychain at all. `-c
+        // credential.helper=` (empty) overrides every configured helper for this one invocation without
+        // touching the developer's git config. Every real client-side git process this suite starts goes
+        // through this one method -- see the class remarks for why that makes this the complete set.
+        var pinnedArguments = new List<string>(arguments.Count + 2) { "-c", "credential.helper=" };
+        pinnedArguments.AddRange(arguments);
+
+        return await _clientGit.RunAsync(workingDirectory, pinnedArguments, env, cancellation.Token);
     }
 
     private async Task RunClientGitOrThrowAsync(

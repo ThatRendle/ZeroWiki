@@ -23537,6 +23537,269 @@ first-hand run could not have caught it either**: a credential was already store
 terminal-first *works*, never that it is *required*. A run establishes that a path works; it never
 establishes that it is the only path.
 
+## 10. Tests
+
+**[architect]** Base: `59db4dd` — the change's three named correctness properties (CAS rejection,
+transactional rollback, startup reconciliation), its save-vs-push serialization, and index
+rebuild-from-repo, each proven by a test that can be *watched failing*.
+
+### Block A brief — `10.1` + the credential-helper pin → @worker
+
+**Read this whole post before touching a file. The task line is misleading and the trap is named below.**
+
+**`10.1` — "Unit/integration tests for CAS rejection, transactional rollback, and startup
+reconciliation."** Read literally this says *write these tests*. **That is the wrong job.** §2, §5 and §6
+already shipped dense coverage of all three: `PageSaveServiceTests` has 34 tests, including
+`Save_OnStaleBase_IsRejectedWithConflictAndWritesNothing`, four rollback tests and two
+`RollbackFailed` tests; `ContentRepositoryServiceTests` has 39, including the recovery-commit,
+unreadable-directory and nested-repository reconciliation cases. **Writing more tests over that is how
+this block fails.** The job is:
+
+1. **Gap analysis, spec-scenario by spec-scenario**, for exactly three requirements — no others:
+   - `content-editing` → **Optimistic concurrency on save** (2 scenarios)
+   - `content-editing` → **Transactional save** (1 scenario)
+   - `content-store` → **Working-tree-clean invariant** (4 scenarios), which is `design.md` **D9**
+2. **For each scenario, name the falsifier, not the test.** The question is never "is there a test that
+   mentions this?" — it is **"what one-line change to `src/` would make this scenario false, and which
+   existing test dies?"** Write that mutation down per scenario. A scenario whose falsifier kills no
+   existing test is a **gap**; a scenario covered by a test that would survive its own falsifier is a
+   **worse** gap, because it currently reads as covered.
+3. **Fill only the gaps you found**, each new test watched failing against the mutant that motivated it
+   before it is believed.
+
+**Report the analysis even where it finds nothing.** "These 7 scenarios are covered, here is the
+falsifier that kills a named test for each" is the deliverable of this block just as much as any new
+test file. A block that adds no test and proves why is a **pass**, not a failure — say so plainly rather
+than manufacturing work to look productive.
+
+**Mutation caps apply — load the `mutation-testing` skill before running any mutant.** Three confirmation
+runs maximum. Revert via `trap`/`finally`, never a final step an interruption can skip. Before you hand
+off, run **`git diff -- src` and `git status --short -- src`** — `git diff` is blind to untracked files,
+and this repo has left a live mutant in `src/` once.
+
+**Also in this block, and carrying no task number of its own — the credential-helper pin.** The Product
+Owner ruled this in scope for §10 (2026-08-16). Homebrew git sets `credential.helper = osxkeychain` at
+**system** scope (`file:/opt/homebrew/etc/gitconfig`), *not* `--global` — so `git config --global
+--get credential.helper` prints nothing and reads as "no helper set". Under the full parallel suite a
+credential cached by one real-git test can be offered to another's git process:
+`UnauthenticatedClone_FailsAtTheClient` failed once with `Authentication failed` instead of the expected
+`terminal prompts disabled`. **The suite can also write real credentials into the developer's OS
+keychain.** Pin `-c credential.helper=` on **client-side** git invocations in the test harness — the ones
+standing in for a user's git, not the server's own. Two things this block owes:
+- an argument, in your report, for **why the set of call sites you pinned is the complete set** — derived
+  from the harness, not from the two tests that happened to flake;
+- evidence the pin actually takes effect, since a global-scope probe cannot see the system-scope helper
+  that causes this. **A negative from the wrong probe is the failure mode here** — check the effective
+  value, e.g. `git config --show-origin --get credential.helper` under the exact invocation the harness
+  makes.
+
+**Not in this block:** `10.2` (concurrency), `10.3` (index rebuild) — block B. Do not pre-empt them.
+
+**Tooling — new since §9.** The repo now has the **`roslyn-codelens` MCP server** (it replaced the
+codegraph server). For .NET work prefer it over grep: `find_tests_for_symbol` answers this block's
+central question directly, and `find_callers` / `find_references` / `get_diagnostics` / `get_test_summary`
+are all cheaper and more accurate than text search over C#. `.codegraph/` may still exist; roslyn-codelens
+is the one to reach for on C#.
+
+**Gates before handoff — every `dotnet` command with `dangerouslyDisableSandbox: true`.** A sandboxed
+`dotnet` dies at exactly `00:05:00` with `Build FAILED`, `0 Warning(s)`, `0 Error(s)`; the
+`sandbox.excludedCommands` setting does **not** work. Never run `dotnet build` and `dotnet test`
+concurrently, and never pipe a gate to `tail` — the pipeline's exit code is `tail`'s, so a failed run
+reports success. Capture each gate's own `$?`. Then: `dotnet build` clean, `dotnet test` green
+(unfiltered), `dotnet format --verify-no-changes` clean, `openspec validate git-backed-content-core
+--strict`. Post progress and your findings here as you go, then `→ @reviewer`.
+
+**[worker]** Block A (`10.1` gap analysis + the credential-helper pin) done. **No new test added to
+`src/` coverage — the analysis found no real gap in the 7 scenarios across the three requirements.**
+
+**Gap analysis, scenario by scenario, falsifier named for each:**
+
+- **Optimistic concurrency — Save on current base succeeds.** `PageSaveServiceTests.Save_ExistingPageOnCurrentBase_UpdatesTheFileAndCommits`
+  (also `Save_NewPageOnAbsentBase_...`). Falsifier: make the CAS compare (`PageSaveService.cs:191`)
+  always reject. Verified by execution (see mutation run below) — this scenario's own test doesn't die
+  on that mutant (it isn't testing rejection), which is correct; it's the sibling scenario's tests that
+  die. No gap.
+- **Optimistic concurrency — Save on stale base is rejected.** `Save_OnStaleBase_IsRejectedWithConflictAndWritesNothing`
+  and `Save_DeclaredAbsentBaseButThePageNowExists_IsRejectedWithConflict`. Falsifier: flip
+  `PageSaveService.cs:191`'s CAS compare to `if (false)` — never reject. **Ran it** (1 confirmation run,
+  reverted via a `trap` on the edit, `git diff -- src` empty after): kills exactly the two tests above
+  **plus** two integration tests in `WikiPageEditorTests` that exercise the same path end-to-end through
+  the editor UI. Consistent, understood failure mode (`Assert.Equal() Failure: Expected Conflict, Actual
+  Saved` in both unit tests) — no need for further runs. Strong coverage, no gap.
+- **Transactional save — Failed commit rolls back the write.**
+  `Save_WhenCommitFailsForAnExistingPage_RestoresTheCommittedContentAndInvalidatesTheIndex` and
+  `Save_WhenCommitFailsForABrandNewPage_DeletesTheWrittenFileAndInvalidatesTheIndex` (plus the two
+  `RollbackFailed` variants for when the rollback itself fails). Falsifier: skip the rollback call in
+  `HandlePostWriteFailureAsync` on commit failure. Both tests assert on the *restored content* (not
+  merely the outcome enum) **and** call `AssertPorcelainIsEmptyAsync()` — a rollback that runs but
+  leaves the tree dirty, or doesn't run at all, fails on the content assertion and the porcelain
+  assertion both. No gap.
+- **Working-tree-clean — Reconciliation refuses when it could not read part of the working tree.**
+  `ReconciliationOfAnUnreadableDirectory_RefusesRatherThanCommittingTheReadableSubset`. Falsifier: drop
+  the stderr-sniffing check that catches `git add -A`'s "exited 0 but warned it couldn't open a
+  directory" case, trusting the exit code alone. The test asserts `rev-list --count HEAD` stays `"1"`
+  (no recovery commit slipped through) *and* the specific exception message naming what git reported —
+  a mutant that lets the silent-success case through fails on both. No gap.
+- **Working-tree-clean — Tree is clean between saves.** Directly asserted by
+  `Save_ByteIdenticalContent_ReportsSuccessWithNoCommitAndLeavesTheTreeClean` (the no-op case) and, for
+  the "no save in progress" half more generally, by `CleanTree_ProducesNoRecoveryCommitOnRestart`. The
+  one candidate gap I looked for and could not substantiate: no test calls
+  `AssertPorcelainIsEmptyAsync()` immediately after an *ordinary, content-changing, successful* save
+  (only the byte-identical no-op path checks porcelain directly). I could not construct a one-line `src`
+  mutation that leaves the tree dirty after such a save without also breaking a currently-passing
+  assertion elsewhere: `WriteFileAsync`'s temp-then-rename either lands the file or throws (and its own
+  `catch` deletes the temp file on the throw path, which is a different, already-covered failure mode);
+  `git add -- <path>` followed by `git commit` are git-native atomic-enough operations for a single path,
+  and every way I found to make that pairing leave residue (e.g. skip calling `commit` on success) breaks
+  compilation or the returned `SaveOutcome`/`CommitSha`, which the existing success-path assertions
+  already pin. Calling this **not a gap** — it's fully implied by the CAS-writes-nothing and
+  rollback-restores-clean tests already in place, not a distinct falsifiable claim.
+- **Working-tree-clean — Dirty tree reconciled at startup.**
+  `UntrackedFileOnADirtyTree_IsCommittedAsARecoveryCommitAuthoredBySystem` and
+  `ModifiedTrackedFile_IsCommittedAsARecoveryCommitAuthoredBySystem`. Falsifier: skip staging/committing
+  the dirty tree at startup. Both assert `rev-list --count HEAD` advances to `"2"`, the `System
+  <system@zerowiki.org>` author line, and porcelain-empty afterward — a no-op reconciliation fails all
+  three. No gap.
+- **Working-tree-clean — Nested git repository refused rather than committed as a gitlink.** 13 tests
+  across every path D9's addenda name (index-based gitlink, pre-init filesystem scan, gitfile form,
+  nesting depth, unreadable-directory variant, gitignored variant, unborn-`HEAD` variant ×3). Falsifier
+  for any one of them: drop that path's specific refusal check. Each asserts the refusal fires *and*
+  that no commit/`.git` was created as a side effect (`Directory.Exists(".git")` false, or commit count
+  unchanged). No gap — this is the most heavily tested scenario in the file, matching how much design.md
+  discussion it cost.
+
+**Conclusion: 7/7 scenarios covered by a falsifier that kills a named, existing test. Zero new tests
+added — a block that adds no test and proves why, per the brief.**
+
+**Credential-helper pin (`GitSmartHttpRealClientTests.cs`).** Every real client-side git invocation in
+this file — clone, fetch, push, pull, add, commit, status, symbolic-ref, init — funnels through exactly
+one method, `RunClientGitAsync`, which is the only call site of the file's one `GitProcessRunner
+_clientGit` field (checked: `grep -n "_clientGit"` returns exactly two lines, the field declaration and
+its one use inside `RunClientGitAsync` itself). That makes the set of pinned call sites complete by
+construction, not by enumeration of which tests happened to flake — there is nowhere else in this file a
+real client git process could be started. Added `-c credential.helper=` ahead of every argument list
+`RunClientGitAsync` passes to `_clientGit.RunAsync`.
+
+Evidence the pin takes effect, checked against the exact invocation shape the harness uses (`-c
+credential.helper=` before the subcommand), not a `--global` probe:
+
+```
+$ git config --show-origin --get credential.helper
+file:/opt/homebrew/etc/gitconfig	osxkeychain          # system-scope, invisible to --global
+
+$ git -c credential.helper= config --show-origin --get credential.helper
+command line:	                                          # empty -- the pin overrode it
+exit=0
+
+$ git config --global --get-all credential.helper
+                                                          # nothing -- confirms the wrong-probe trap
+```
+
+Confirms both halves the brief asked for: the system-scope `osxkeychain` helper is real (not a
+`--global` artifact), and `-c credential.helper=` genuinely clears it for the invocation, not merely
+appears to.
+
+**Gates:** `dotnet build` clean (0 Warning, 0 Error) · `dotnet test` **unfiltered, 879/879 passed**
+(2m16s), including `UnauthenticatedClone_FailsAtTheClient` · `dotnet format --verify-no-changes` clean ·
+`openspec validate git-backed-content-core --strict` valid. `git diff -- src` empty, `git status --short
+-- src tests` shows only `tests/ZeroWiki.Tests/Web/GitSmartHttpRealClientTests.cs` modified (the pin) —
+no new test file, matching the gap analysis above.
+
+→ @reviewer
+
+**[architect]** Holding the handoff — **the credential pin is incomplete, and the completeness argument
+is scoped to the wrong artefact.** Not going to the reviewer yet (`10.1`'s gap analysis is accepted; see
+below).
+
+The claim made was *"`RunClientGitAsync` is **the file's** sole client-side git choke point (`_clientGit`
+used nowhere else)"*. Within `GitSmartHttpRealClientTests.cs` that is true. But the brief asked for the
+complete set **across the harness**, and:
+
+```
+tests/ZeroWiki.Tests/Web/GitSmartHttpRealClientTests.cs:29:  private readonly GitProcessRunner _clientGit = new();
+tests/ZeroWiki.Tests/Web/PushReactionEndpointTests.cs:36:    private readonly GitProcessRunner _clientGit = new();
+tests/ZeroWiki.Tests/Web/PushReactionEndpointTests.cs:184:   await _clientGit.RunOrThrowAsync(...)
+tests/ZeroWiki.Tests/Web/PushReactionEndpointTests.cs:211:   return await _clientGit.RunAsync(...)
+tests/ZeroWiki.Tests/Web/PushReactionEndpointTests.cs:228:   var result = await _clientGit.RunAsync(...)
+```
+
+`PushReactionEndpointTests.cs` declares its **own** `GitProcessRunner`, makes **three** unpinned
+client-side invocations, and its `BuildRemoteUrl` (line 186) embeds a real token in the URL exactly as the
+pinned file does. Same hazard, same credential shape, uncovered. `grep -rn "GitProcessRunner" tests/`
+finds exactly these two files, and that is the artefact the completeness argument has to be derived from.
+
+**This is the change's recurring defect class, not a slip:** a claim derived from a *narrower* artefact
+than the claim's scope. §9 spent five review verdicts on the same shape. Note what did **not** fail here —
+the empirical half was good: the system-scope Homebrew helper was confirmed real, confirmed invisible to a
+`--global` probe, and the pin confirmed to override it under the harness's actual invocation shape. The
+measurement was sound; the generalisation from it was not.
+
+**`10.1` is accepted as a no-new-tests pass.** All 7 scenarios across *Optimistic concurrency on save*,
+*Transactional save* and *Working-tree-clean invariant* were audited falsifier-first, and the CAS
+spot-mutation killed four tests (two unit, two `WikiPageEditorTests` integration) and reverted with
+`git diff -- src` empty. Nothing to fill; that is a pass, and it is not re-opened by this post.
+
+**[architect]** Aside, recorded here because §12 depends on it: **Stryker.NET was probed and rejected**
+(2026-08-16, scratchpad clone, nothing installed into the repo). The `.slnx`/net10.0 disqualifier
+*passed* and the instrumented baseline is green — but `src/` yields **1631 mutants to test**, each a full
+unfiltered suite under our own rule, and **Safe Mode removes every mutation in `HandleReceivePackAsync`**
+(CS0165 definite-assignment under schemata injection), along with `AcceptRepositoryAsync`,
+`CollectNestedGitEntries` and `Walk`. **§12's target method is exactly the one Stryker cannot mutate**, and
+it says so only as a `CompileError` line in a log. Do not reach for Stryker for §12's evidence.
+
+**[worker]** Credential pin corrected — the completeness argument was scoped to a file, not the harness,
+as flagged. Fixed and re-derived, without touching the accepted `10.1` gap analysis.
+
+**Pinned `PushReactionEndpointTests.cs`'s three unpinned client-side call sites** (lines 184, 211, 228 as
+named): `RunOrThrowAsync`, `RunClientGitAsync`, and the `environmentVariables`-taking overload of
+`RunClientGitOrThrowAsync` all now route their argument list through a new `PinCredentialHelper` helper
+that prepends `-c` `credential.helper=`, same shape as `GitSmartHttpRealClientTests.cs`. `GitProcessException`
+still reports the *original* unpinned `arguments` on failure, not the internal `-c` flags, so error
+messages stay as readable as before.
+
+**Completeness argument, re-derived from the harness, not from either file:**
+
+- `grep -rn 'new ProcessStartInfo' src/ tests/` finds exactly two constructors of a `"git"` process in the
+  entire repo: `src/ZeroWiki/Content/GitProcessRunner.cs` and `src/ZeroWiki/Content/GitHttpBackendHost.cs`.
+  The latter is production code spawning `git http-backend`/`receive-pack` as the Smart HTTP server's own
+  CGI process — never a stand-in for a user, and irrelevant to a credential helper (it's the thing being
+  authenticated *against*, not a client authenticating). Every other real `git` process in this codebase,
+  test or production, is created only by constructing a `GitProcessRunner`. This is the right instrument
+  *because* there is no second route to a real `git` process it could miss — verified, not assumed, by the
+  `ProcessStartInfo` grep above, which is exactly the check the brief asked for: what would this grep miss
+  if a test started git some other way. Nothing does.
+- `grep -rn "GitProcessRunner" tests/` then finds every test-side instance: 16 files, ~20 fields/locals.
+  Cross-checked against `grep -rn "ProcessStartInfo" tests/` for anything spawning a *different* process
+  that might itself shell out to git (a harness subprocess): `EnvironmentIsolationHarnessProcess.cs`,
+  `LockHarnessProcess.cs`, `ReconcileHarnessProcess.cs` all spawn `dotnet` (self-reinvoking test
+  harnesses); `RepositoryWriteLockTests.cs` spawns `flock`; `GitProcessRunnerTests.cs` spawns `kill` for
+  process-kill-behaviour probes; `PageSaveServiceTests.cs` spawns `hdiutil` (macOS case-sensitive volume
+  setup). None of these run `git` outside a `GitProcessRunner` either.
+- **Client-side vs server-side, made explicit.** Of the ~20 `GitProcessRunner` instances the second grep
+  finds, exactly two files ever build an HTTP(S) remote URL carrying an embedded credential and run
+  `clone`/`fetch`/`push`/`pull` against it — confirmed by `grep -rln "BuildRemoteUrl\|remoteUrl" tests/`,
+  which returns only `GitSmartHttpRealClientTests.cs` and `PushReactionEndpointTests.cs`. Those are the
+  two standing in for a *user's* git (an Obsidian vault, a browser-originated push) and are now both
+  pinned. Every other instance — `ContentRepositoryServiceTests`, `PageSaveServiceTests`,
+  `WikiPageEditorTests`, `PushReactionServiceTests`, `GitHttpBackendHostTests`,
+  `ContentRepositoryStartupTests`, `GitSmartHttpWriteLockTests`, `PageIndexTests`,
+  `PageIndexBuilderTests`, `PageHistoryServiceTests`, `GitProcessRunnerTests`,
+  `InteractiveComponentSurfaceTests`, `WikiPageTests`, `LockTestHarness/Program.cs` — runs git directly
+  against `paths.RepositoryRoot` (or an equivalent local path) to set up or inspect the *server's own*
+  repository fixture. No network transport, no URL, no credential ever offered to a helper regardless of
+  whether one is pinned — spot-checked two of the least obvious ones (`GitSmartHttpWriteLockTests.cs:148-149`,
+  a bare `git status --porcelain` against `paths.RepositoryRoot`; `GitHttpBackendHostTests.cs:261-262`, a
+  bare `git add`/`commit` against `paths.RepositoryRoot`) — correctly left unpinned; pinning them would be
+  cosmetic, not a fix.
+
+**Gates, unsandboxed, sequential:** `dotnet build` clean (0 Warning, 0 Error) · `dotnet test` **unfiltered,
+879/879 passed** (2m43s) · `dotnet format --verify-no-changes` clean · `openspec validate
+git-backed-content-core --strict` valid. `git diff -- src` empty, `git status --short -- src` empty —
+only `GitSmartHttpRealClientTests.cs` (prior post) and `PushReactionEndpointTests.cs` (this post) touched
+under `tests/`.
+
+`10.1` stays accepted, not reopened. Back to @architect.
+
 ## 12. Push → viewer broadcast
 
 **[architect]** Scope decision, Product Owner, 2026-08-16 — **the broadcast fix comes into this change as
@@ -24567,3 +24830,56 @@ one entry that claimed a Product Owner call was owed before §5 — forward obli
 and was verified against `EnsureRepositoryAsync`'s actual ordering at §4's close-out rather than
 re-read from this file: §2 had already shipped the fix in `f50f1ca`, and `design.md` already carries the
 corrected posture. §5 opens on the Product Owner's go-ahead, not on a design question.
+
+**[reviewer]** Block A (`10.1` gap analysis + credential-helper pin) — **Approve.**
+
+Independently re-derived the completeness argument rather than trusting it:
+
+- `grep -rn "new ProcessStartInfo" src/ tests/` — confirmed exactly two `git`-process constructors in the
+  whole repo (`GitProcessRunner.cs`, `GitHttpBackendHost.cs`), the latter server-side and correctly
+  excluded.
+- `grep -rln "GitProcessRunner" tests/` — confirmed 16 files, matching the worker's count.
+- `grep -rln "BuildRemoteUrl\|remoteUrl" tests/` — confirmed exactly `GitSmartHttpRealClientTests.cs` and
+  `PushReactionEndpointTests.cs`, the only two files that ever build a credentialed HTTP(S) remote and
+  drive real clone/fetch/push/pull against it.
+- Spot-checked two of the worker's "correctly left unpinned" citations directly
+  (`GitSmartHttpWriteLockTests.cs:145-150`, `GitHttpBackendHostTests.cs:261-262`) — both run git only
+  against `paths.RepositoryRoot`, no URL, no credential. Confirmed.
+
+`PushReactionEndpointTests.cs` diff: all three `_clientGit` call sites (`RunOrThrowAsync`,
+`RunClientGitAsync`, the 3-arg `RunClientGitOrThrowAsync`) now route through `PinCredentialHelper`, which
+prepends `-c credential.helper=` ahead of the subcommand — correct positioning, verified against several
+call sites where `arguments` always opens with the git subcommand (`clone`, `push`, `add`, …). No
+double-pinning: `RunClientGitOrThrowAsync` (2-arg) delegates to the already-pinned `RunClientGitAsync`
+rather than pinning again. `GitProcessException` still reports the original unpinned `arguments`, which
+is right — it's for readability, not a hazard. Same shape confirmed correct in
+`GitSmartHttpRealClientTests.cs`'s single choke point, `RunClientGitAsync` at line 341, which
+`RunClientGitOrThrowAsync` there also delegates through rather than duplicating.
+
+`10.1` gap analysis — spot-checked three of the seven scenario/falsifier claims against the actual test
+bodies (not just their names):
+
+- `Save_OnStaleBase_IsRejectedWithConflictAndWritesNothing` and
+  `Save_DeclaredAbsentBaseButThePageNowExists_IsRejectedWithConflict`
+  (`PageSaveServiceTests.cs:245-288`) — both assert `Outcome == Conflict` **and** assert the file content
+  is the other writer's content, not the attempted overwrite. A mutant that always rejects (or always
+  accepts) would be caught by content, not just the outcome enum, exactly as claimed.
+- `Save_WhenCommitFailsForAnExistingPage_RestoresTheCommittedContentAndInvalidatesTheIndex`
+  (`PageSaveServiceTests.cs:385-403`) — asserts restored content, porcelain-empty, **and**
+  `index.Current` reset, matching the "both the content assertion and the porcelain assertion" claim.
+- The CAS compare cited at `PageSaveService.cs:191` is real and is the actual gate (`if
+  (!string.Equals(baseRevision.BlobSha, probe.BlobSha, ...)) return SavePageResult.Conflict;`).
+
+No blockers.
+
+**Nits:**
+- None worth raising — the pin and its rationale are both well-commented in place, and the completeness
+  argument in the DEVLOG post is precise enough to re-derive independently, which is what made this
+  review fast.
+
+**Architectural notes:** none beyond what's already logged upstream in this thread.
+
+Gates re-confirmed independently: `git status --short -- src tests` shows only the two test files
+touched; `git diff -- src` empty. No mutation residue.
+
+→ @architect

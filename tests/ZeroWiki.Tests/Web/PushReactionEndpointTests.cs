@@ -180,11 +180,26 @@ public sealed class PushReactionEndpointTests
         }
     }
 
+    // `-c credential.helper=` (empty) is prepended to every argument list this file hands to `_clientGit`
+    // below, on all three call sites — this file builds a real remote URL with an embedded token
+    // (BuildRemoteUrl) and drives a real git client against it exactly as GitSmartHttpRealClientTests.cs
+    // does, so it carries the same hazard that file's own pin exists to close: Homebrew's *system*-scope
+    // gitconfig (not `--global`) sets `credential.helper = osxkeychain`, and under the full parallel
+    // suite a credential cached by one authenticated test has been observed offered to a different test's
+    // git process. Disabling the helper for these invocations stops that, and stops this suite writing
+    // real credentials into the developer's OS keychain at all.
     private async Task<GitProcessResult> RunOrThrowAsync(string workingDirectory, IReadOnlyList<string> arguments) =>
-        await _clientGit.RunOrThrowAsync(workingDirectory, arguments);
+        await _clientGit.RunOrThrowAsync(workingDirectory, PinCredentialHelper(arguments));
 
     private static string BuildRemoteUrl(Uri baseAddress, string credential) =>
         $"{baseAddress.Scheme}://{Uri.EscapeDataString(Username)}:{Uri.EscapeDataString(credential)}@{baseAddress.Authority}/git";
+
+    private static List<string> PinCredentialHelper(IReadOnlyList<string> arguments)
+    {
+        var pinned = new List<string>(arguments.Count + 2) { "-c", "credential.helper=" };
+        pinned.AddRange(arguments);
+        return pinned;
+    }
 
     /// <summary>
     /// <see cref="ZeroWikiAppFactory.CreateHttpClient"/> pins its base address to the fixed
@@ -208,7 +223,7 @@ public sealed class PushReactionEndpointTests
     {
         using var cancellation = new CancellationTokenSource(ClientTimeout);
         var env = new Dictionary<string, string> { ["GIT_TERMINAL_PROMPT"] = "0" };
-        return await _clientGit.RunAsync(workingDirectory, arguments, env, cancellation.Token);
+        return await _clientGit.RunAsync(workingDirectory, PinCredentialHelper(arguments), env, cancellation.Token);
     }
 
     private async Task RunClientGitOrThrowAsync(string workingDirectory, IReadOnlyList<string> arguments)
@@ -225,7 +240,7 @@ public sealed class PushReactionEndpointTests
     {
         using var cancellation = new CancellationTokenSource(ClientTimeout);
         var env = new Dictionary<string, string>(environmentVariables) { ["GIT_TERMINAL_PROMPT"] = "0" };
-        var result = await _clientGit.RunAsync(workingDirectory, arguments, env, cancellation.Token);
+        var result = await _clientGit.RunAsync(workingDirectory, PinCredentialHelper(arguments), env, cancellation.Token);
         if (!result.Succeeded)
         {
             throw new GitProcessException(arguments, result.ExitCode, result.StandardError);
