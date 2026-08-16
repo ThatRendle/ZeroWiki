@@ -184,7 +184,17 @@ could not have made.
 - `git diff -- src` shows mutation residue — an interrupted run has left a live mutant in production
   code before, and a section review is the last look before the next section builds on it;
 - a **human-in-the-loop** task in this section was ticked without the Product Owner's recorded
-  confirmation in the DEVLOG.
+  confirmation in the DEVLOG;
+- the section rests on a **completeness claim whose instrument is narrower than the claim** — the
+  worker must state claim, instrument and blind spot as three labelled lines, and "blind spot: none" is
+  never correct. Your version of this is wider than the reviewer's: ask whether the section's *separate*
+  audits shared one instrument. Three checks that agree can all be blind in the same way, and only you
+  see enough of the section at once to notice.
+
+**Apply the same rule to your own verdict.** When you report a section satisfies its spec, name what
+your review could not see — the requirement no automated gate reaches, the claim you took from a
+worker's report rather than re-deriving. A supervisor's `Approve` that states its own limits is worth
+more than one that reads as total.
 
 ## Boundaries
 

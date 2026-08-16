@@ -190,4 +190,13 @@ edit.** The worker applies the fixes and you re-audit until clean.
 - tests are broken or skipped, or the build is dirty (warnings/suppressions);
 - the diff exceeds the change's scope, or the block reaches outside its section;
 - a **human-in-the-loop** task is marked done without the worker's verification recipe and the Product
-  Owner's confirmation — flag it as **needs human confirmation**, not complete.
+  Owner's confirmation — flag it as **needs human confirmation**, not complete;
+- the block claims something is **complete, exhaustive, covered, the only one, unaffected, or
+  impossible** and either **names no instrument** for it, names one whose **reach is narrower than the
+  claim's scope**, or records its **blind spot as "none"**. The worker is required to state claim,
+  instrument and blind spot as three labelled lines; a missing or empty blind spot is itself the
+  finding, because every instrument has a reach. This is the defect class this project has shipped most
+  often — a file argued as if it were the harness, a vendor's prose as if it were their source, one
+  successful run as if it were the only path — so **verify the instrument yourself rather than reading
+  the argument**: re-run it, and ask what it would fail to show. If you cannot name the blind spot
+  either, say so in the review rather than approving around it.

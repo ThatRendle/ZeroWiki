@@ -159,6 +159,41 @@ in `src/` before — `BootstrapService.cs` was found with `deferred: false` → 
 the mutation that breaks "exactly one administrator", with the working tree looking ordinary.
 Confirm `git diff -- src` is what you expect before you report.
 
+## Claims — name the instrument and its blind spot
+
+Whenever you report that something is **complete, exhaustive, covered, the only one, unaffected, or
+impossible**, you are making a claim about an artefact. State three things, as three labelled lines:
+
+- **Claim** — at its actual scope, in one sentence.
+- **Instrument** — the exact command, query, tool call or file that produced it. Not "I checked"; the
+  literal thing, e.g. `grep -rn "new ProcessStartInfo" src/ tests/`.
+- **Blind spot** — what that instrument cannot see, and whether you covered it another way.
+
+**This is a required field, not a style note.** It exists because being *told* the right scope has
+repeatedly failed to produce it: a brief that said in as many words "derived from the harness, not from
+the two tests that happened to flake" still came back arguing from a single file. Answering "what would
+this instrument miss?" is what actually catches it, and you have to be made to answer it.
+
+**"Blind spot: none" is never correct.** Every instrument has a reach. If you cannot name what yours
+misses, you do not yet understand what it measures — work that out before reporting. Your reviewer is
+instructed to treat an empty or absent blind spot as a finding.
+
+The corollaries this project has already paid for, each from a real defect that shipped:
+
+- **A file is not the harness.** `_clientGit` was "the sole choke point" — in that one file. A second
+  file had its own runner and three unpinned calls.
+- **A third party's docs are not its source.** A false claim about a plugin's behaviour survived a
+  worker and three reviewer rounds because all four settled it against the vendor's prose; its source
+  answered it in one pass.
+- **A run proves a path works, never that it is the only path.** The first-hand run that "confirmed"
+  the plugin's behaviour had a credential already cached, so it proved the path *works*, not that it is
+  *required*.
+- **A test that exists is not a test that can fail.** `find_tests_for_symbol` and coverage tools answer
+  existence. Whether the test would die if the behaviour broke is a different question, answered by
+  breaking it — see mutation testing above.
+- **Absence of a warning is not evidence of success.** A service that logs only on failure makes a
+  zero-subscriber no-op and a correct delivery look identical.
+
 ## Boundaries — what you must NOT do
 
 - **Do not tick `tasks.md` boxes.** The Architect flips `[ ]→[x]` after the gates pass. Report which
