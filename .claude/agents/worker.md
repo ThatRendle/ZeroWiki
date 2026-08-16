@@ -87,7 +87,9 @@ If a task seems to require breaking one of these, **stop and surface it** — do
 The change keeps a shared **`DEVLOG.md`** (`openspec/changes/<slug>/DEVLOG.md`) that you, the
 Architect, the reviewer, and the supervisor all write to — an attributed thread grouped by `## N.`
 section. **Read the thread before you start** (the Architect's brief and any prior discussion live there). As you work the
-block, post under its section, prefixing each post with **`[worker]`**:
+block, post under its section, prefixing each post with **`[worker]`**. **`##` is reserved for section
+headings — start any heading inside your post at `###`**, or it becomes a section indistinguishable from
+`## 6. Commit-on-save`:
 
 - what you implemented (briefly) and any notable decision;
 - a **question** when you're blocked or unsure, addressed to whoever can answer:

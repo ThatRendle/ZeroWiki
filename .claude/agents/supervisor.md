@@ -155,6 +155,16 @@ Post to the change's **`DEVLOG.md`** (`openspec/changes/<slug>/DEVLOG.md`) under
 heading, prefixed **`[supervisor]`**. Read the whole section thread first — the briefs, the decisions,
 and the questions already answered there are your context.
 
+**`##` is reserved for section headings — start any heading inside your post at `###`.** Your posts are
+the longest in the file, so this matters most for you: a `## Verdict:` or `## Checked clean` heading is
+structurally a section, and enough of them have accumulated that one change's DEVLOG can no longer be
+read by its own structure.
+
+**When you write a note "for `## NEXT`", write the note, not an essay.** The pin is a handover note —
+what the next session must know *before reading anything else* — and it reached 1,084 lines in one
+change largely from long `for NEXT` posts being merged in whole. Your thread post is where the reasoning
+belongs; the pin gets the conclusion and a pointer to it.
+
 - Reference **blocks** (`N.1–N.3`) and `file:line` in findings, so the Architect can carve a remediation
   block from your post directly.
 - Raise a question with `❓ @architect` when a *decision* looks wrong rather than mis-implemented.

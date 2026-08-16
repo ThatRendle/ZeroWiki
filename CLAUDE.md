@@ -13,6 +13,20 @@ Analyst/Architect, the worker(s), and the reviewer all write to as they work, li
 room. Conventions:
 
 - Organised by `## N.` **section** (mirroring `tasks.md`), with a pinned `## NEXT` at the bottom.
+- **`##` is reserved for section headings. Inside a post, start at `###`.** A post that opens
+  `## Verdict: Approve` or `## Checked clean` is structurally a *section*, indistinguishable from
+  `## 6. Commit-on-save`, and this has already happened around forty times in
+  `git-backed-content-core` — which is why that file has to be grepped rather than read by its own
+  structure.
+- **`## NEXT` is a handover note, not an archive.** It holds only what the next session must know
+  *before it reads anything else*: the resume point, what is owed and to whom, live hazards, open
+  decisions. Everything else already lives permanently in the section threads — link to them rather
+  than restating them. Target **under ~80 lines**; `git-backed-content-core`'s reached **1,084**,
+  longer than five of its twelve sections, which defeats the one job a pin has.
+- **Never write a fact you could compute.** Task counts, `HEAD`, gate results and section status are
+  derivable — state the command, or recompute at write time. A hand-arithmetic task count in a pin was
+  wrong once and rode along through two blocks. This is the project's own rule about claims and
+  artefacts, pointed at its own record.
 - Each post is **attributed** — prefixed with the author's role: `[architect]`, `[worker]`,
   `[reviewer]`, `[supervisor]` — and references the **block** (`N.1–N.3`) it concerns.
 - **The first post under each `## N.` heading is the section's base commit** —

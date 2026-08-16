@@ -38,7 +38,9 @@ Read before reviewing:
 
 The review loop runs in the change's shared **`DEVLOG.md`** (`openspec/changes/<slug>/DEVLOG.md`), an
 attributed thread grouped by `## N.` section. Post your verdict and findings there under the block's
-section, prefixed **`[reviewer]`**:
+section, prefixed **`[reviewer]`**. **`##` is reserved for section headings — start any heading inside
+your post at `###`.** A verdict posted as `## Verdict: Approve` is structurally a section, and around
+forty of those have already been emitted into one change's DEVLOG:
 
 - **Request changes** with each finding citing `file:line`; the worker fixes and responds in the same
   thread and you re-audit — **repeat until you can post `Approve`.**
