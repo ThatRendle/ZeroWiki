@@ -139,6 +139,13 @@ see the section as a whole. Post it **before** any block of the section is commi
 1. **Brief the worker.** Post the brief to the DEVLOG (`[architect]`, under the block's `## N.`
    section): the block's tasks (`N.1`…`N.k`), the relevant spec excerpts, the binding design decisions
    that bind them, and the done-gates below. The worker shouldn't need to go hunting.
+
+   **Brief the falsifier, not the deliverable.** For each task, alongside "build X", name **the
+   observation that fails if X is undone**. This is one sentence per task and it is the single highest-
+   yield thing in this document: §8's post-mortem found the failures tracked exactly how each task was
+   briefed — where a brief framed something as a *property*, the evidence was excellent; where it framed
+   a *deliverable*, nothing asked what would have to be false, and three tests shipped that could not
+   fail. Three of that section's five findings would have been block-level catches.
 2. **Worker implements the block** and reports back, posting to the DEVLOG as it goes.
 3. **Audit.** Spawn `reviewer` on the block diff (correctness, design-decision compliance, OpenSpec
    scope, C# idiom, auth/crypto correctness and git-integrity hazards). The reviewer posts its verdict

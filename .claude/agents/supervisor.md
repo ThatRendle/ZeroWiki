@@ -180,7 +180,10 @@ could not have made.
 - a requirement the section claims to deliver is **not actually satisfied**, however green the tasks;
 - the blocks contradict each other, or a later block silently changed an earlier block's contract;
 - a binding design decision was eroded across the section even though no single block broke it;
-- dead scaffolding from a superseded block is still shipping;
+- dead scaffolding from a superseded block is still shipping — check it with `find_uncovered_symbols`
+  (roslyn-codelens) across the whole section rather than per block, since the shape you are looking for
+  is a type built in one block whose only caller a later block removed, which no block-level review can
+  see. Ask of each: **what fails if I delete its usage, not its implementation?**;
 - `git diff -- src` shows mutation residue — an interrupted run has left a live mutant in production
   code before, and a section review is the last look before the next section builds on it;
 - a block in this section **shipped code that no reviewer verdict covers** — every `Approve` carries a

@@ -65,6 +65,17 @@ section, prefixed **`[reviewer]`**:
   EF Core / SQLite contexts and connections not leaked.
 - Tests cover the change and **assert behaviour**, not just that code runs.
 - Build is clean: no warnings, no analyzer suppressions added.
+- **Does anything reach the new code at all?** Run `find_uncovered_symbols` (roslyn-codelens) over the
+  block's new types and members, and for each one ask: **what fails if I delete its *usage*, not its
+  *implementation*?** If the answer is "nothing", the block shipped scaffolding — a resolver nobody
+  calls, a component no test reaches, an endpoint wired to nothing.
+
+  **Tests structurally cannot catch this**: they test what exists, not whether anything reaches it, and
+  a suite stays green either way. This project has shipped it repeatedly — the zero-consumer shape
+  appeared three times in one section, and the `git-sync` push→viewer broadcast reached production
+  unnoticed because `HandleReceivePackAsync` had *no* test rather than a weak one. **Mutation testing
+  cannot catch it either** — mutating code nothing reaches kills nothing, which is indistinguishable
+  from a surviving mutant. This check is the only instrument that answers the question.
 
 ### Binding design decisions — do not contradict (blockers if violated)
 

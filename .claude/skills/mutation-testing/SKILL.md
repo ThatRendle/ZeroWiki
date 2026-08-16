@@ -5,6 +5,19 @@ description: ZeroWiki's mutation-testing discipline — the caps that keep a run
 
 # Mutation testing — capped and scoped
 
+> **Run mutants through `mutate.sh` in this directory, not by hand.**
+> `.claude/skills/mutation-testing/mutate.sh <file> <search> <replace> ["label"]`
+> Every mutation failure this repo has had was a *harness* failure, never a code failure, so the two
+> rules that kept being broken are now mechanical rather than advisory: the revert runs in a `trap` that
+> an interruption cannot skip, and the target is verified by **content checksum** before and after —
+> which is the only thing that works, since no git command can verify a mutant inside an untracked file.
+> It also refuses a no-op substitution, requires the search string to be unique, and runs the full
+> unfiltered suite with no pipe. Exit `0` = killed, `1` = survived (a finding), `2` = harness fault —
+> and a harness fault is never a result.
+>
+> The script cannot hold the rules below for you: the cap of three runs, the restriction to
+> auth/concurrency/data-integrity paths, and not expanding to other files are still yours to obey.
+
 Mutation testing is this project's evidence standard: a green suite is not proof a security property
 holds, so break the property and check a test dies. It has earned its place — it has caught a live
 concurrency defect, a `BootstrapConcurrencyTests` that only half-worked, an assertion that compared
