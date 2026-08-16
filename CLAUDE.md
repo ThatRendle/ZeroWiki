@@ -110,7 +110,7 @@ OUTER — for each ## N. section, in order
   ├─ post the section's base commit to the DEVLOG
   ├─ INNER — for each block in the section
   │    brief worker → worker implements → reviewer audits → loop until Approve
-  │    → gates pass → tick boxes → commit
+  │    → gates pass → verify the reviewed state → tick boxes → commit
   └─ SECTION REVIEW — supervisor audits the whole section
        Approve → next section
        Request changes → carve a remediation block, re-enter INNER
@@ -154,8 +154,20 @@ see the section as a whole. Post it **before** any block of the section is commi
    red test a later block in the same section turns green), that is a deliberate Architect call — state
    the reason in the DEVLOG **and** the commit body. Otherwise a failed gate sends you back to step 4,
    not to a commit.
-6. **Tick the boxes.** Mark every `- [x] N.M` in the block in `tasks.md`.
-7. **Commit — one conventional commit per block:**
+6. **Verify the reviewer certified what you are about to commit.** An `Approve` certifies the exact
+   state the reviewer was shown; anything added after it is uncertified. Every verdict ends with a
+   `Reviewed-state:` fingerprint — recompute it and compare:
+   ```sh
+   { git diff HEAD; git ls-files --others --exclude-standard | while read -r f; do printf '%s\n' "$f"; cat "$f"; done; } | shasum | cut -c1-12
+   ```
+   (`git diff HEAD` alone is blind to untracked files, so a brand-new source or test file would not
+   change a naive hash — the `ls-files --others` half is what closes that.) **A mismatch sends the block
+   back to step 3, not on to a commit** — unless you post an `[architect]` note saying exactly what
+   changed after the verdict and how you verified it. Either is fine; silently committing is not. This
+   gap has opened twice in one change, both times with correct code — what it damages is the DEVLOG,
+   which is archived as the account of how the change was built.
+7. **Tick the boxes.** Mark every `- [x] N.M` in the block in `tasks.md`.
+8. **Commit — one conventional commit per block:**
    ```
    feat(<change-name>): <block summary> (N.1–N.3)
 
