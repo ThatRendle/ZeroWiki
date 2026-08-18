@@ -18,6 +18,11 @@ namespace ZeroWiki.Tests.Web;
 /// <see cref="ZeroWikiAppFactory.RestartedFrom"/> gives a new DI container — hence a new, empty
 /// <see cref="PageIndex"/> — over the same data root, so the repository it must rebuild from is one
 /// this test built with the app's own write path rather than hand-rolled <c>git commit</c>s.
+/// <b>This test's validity rests on that unasserted premise:</b> nothing anywhere pins "the index is
+/// never persisted", so if a later change writes a snapshot to disk, this test keeps passing while
+/// silently measuring a cache read instead of a rebuild-from-repository. Whoever gives
+/// <see cref="PageIndex"/> a persisted snapshot must re-establish the absent-index case here
+/// explicitly — the restart alone will no longer be it.
 /// </para>
 /// <para>
 /// <b>Why this asserts on <see cref="PageIndex.Current"/> and not on a rendered page.</b>

@@ -132,13 +132,16 @@ public sealed class GitSmartHttpRealClientTests
     /// startup can overwrite it: the shipped hook is a permanent no-op (D19).
     /// </para>
     /// <para>
-    /// The 300ms non-completion check is not the proof and is not load-bearing on its own — a
-    /// fixed-delay probe means less the more loaded the machine is, this project's own recorded
-    /// lesson. What proves serialization is that the save's result and the final tree are read
-    /// <em>after</em> the push has been released and has completed: with either side's lock removed
-    /// the save commits while <c>receive-pack</c> is still mid-transaction, and the push that follows
-    /// can no longer fast-forward from the sha it advertised. The check is kept because it names the
-    /// failure at the moment it happens rather than three assertions later.
+    /// The 300ms pause before the push is released is <b>pacing, not evidence</b>, and asserts
+    /// nothing. It once carried a non-completion check; that check was removed because it could not
+    /// do the job its own comment claimed — under the mutant that actually removed the push side's
+    /// lock, it <em>passed</em>, so it never named the failure early, and under correct code it can
+    /// never fail at all. What proves serialization is that the save's result and the final tree are
+    /// read <em>after</em> the push has been released and has completed: with either side's lock
+    /// removed the save commits while <c>receive-pack</c> is still mid-transaction, and the push that
+    /// follows can no longer fast-forward from the sha it advertised. The pause survives only so the
+    /// save has reached the lock before the push is let go, which is what makes the interleaving the
+    /// one this test means to exercise.
     /// </para>
     /// </remarks>
     [Fact]
@@ -180,11 +183,10 @@ public sealed class GitSmartHttpRealClientTests
             saveAuthor,
             CancellationToken.None);
 
+        // Pacing, not proof: give the save time to reach the write lock before the push is released,
+        // so that the interleaving this test is about actually occurs. Nothing is asserted here --
+        // see this test's remarks for why a non-completion check would be measuring the machine's load.
         await Task.Delay(TimeSpan.FromMilliseconds(300));
-        Assert.False(
-            saveTask.IsCompleted,
-            "The browser save completed while a push was parked in pre-receive, so the two were not " +
-            "serialized against each other.");
 
         await File.WriteAllTextAsync(releaseMarker, string.Empty);
 

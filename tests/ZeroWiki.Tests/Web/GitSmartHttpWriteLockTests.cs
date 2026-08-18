@@ -1,7 +1,9 @@
 using System.Net;
 using System.Net.Http.Headers;
+using System.Reflection;
 using System.Text;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Options;
 using ZeroWiki.Content;
 using ZeroWiki.Data;
 using ZeroWiki.Identity;
@@ -51,13 +53,21 @@ public sealed class GitSmartHttpWriteLockTests : IDisposable
                 "/git/git-receive-pack",
                 new ByteArrayContent("not a valid pack, only proving the lock is respected"u8.ToArray()));
 
-            // Held well past any bounded timeout anywhere in this codebase (PageSaveService's own
-            // SaveWriteLockTimeout defaults to 5s) before releasing -- not asserted on directly (a
-            // fixed-delay "has it completed yet" check is exactly the kind of instrument that reports
-            // success under a lightly-loaded filtered run and silently stops meaning anything under the
-            // real parallel suite, this project's own recorded lesson); what actually proves the wait
-            // was unbounded is the response this test checks below, once it finally arrives.
-            await Task.Delay(TimeSpan.FromSeconds(1));
+            // The hold is what gives this test its power, so it is derived from the configured
+            // ContentStorageOptions rather than written as a number: every TimeSpan bound in
+            // ContentStorageOptions, as the running app has it configured, plus a margin -- not every
+            // bound in the application, which this neither reads nor needs. Any bounded wait the push
+            // could have been given
+            // instead of UnboundedWait has therefore already expired by the time the lock is released,
+            // which is the difference between a test that distinguishes "unbounded" from "bounded" and
+            // one that merely observes a wait shorter than the shortest bound. No "has it completed
+            // yet" probe is taken during the hold -- not because that shape is untrustworthy in general
+            // (BrowserSave below depends on it, and says why), but because it would add nothing here:
+            // the response status this test already checks distinguishes a wait that gave up from one
+            // that did not, so the probe would be a second, weaker witness to a fact the first one
+            // already carries.
+            var hold = LongerThanEveryConfiguredBound();
+            await Task.Delay(hold);
 
             writeLock.Dispose();
             pushResponse = await pushTask.WaitAsync(TimeSpan.FromSeconds(10));
@@ -73,10 +83,11 @@ public sealed class GitSmartHttpWriteLockTests : IDisposable
             // The only two ways this fails: the wait gave up early (an unbounded-but-mutated-bounded
             // wait surfaces as an unhandled RepositoryLockTimeoutException -- nothing in this pipeline
             // catches it -- which UseExceptionHandler turns into a 500) or authentication itself failed
-            // (401, checked as a sanity guard against a broken test setup). Either status is reachable
-            // regardless of how long this test held the lock, so this check -- not the timing above --
-            // is what actually proves HandleReceivePackAsync only reached the CGI subprocess once the
-            // lock was genuinely free.
+            // (401, checked as a sanity guard against a broken test setup). The hold above and this
+            // check are one instrument, not two: the hold guarantees that any bounded wait would have
+            // given up, and this status is where that giving-up would surface. Together they establish
+            // that HandleReceivePackAsync waited without a ceiling and reached the CGI subprocess only
+            // once the lock was genuinely free.
             Assert.NotEqual(HttpStatusCode.Unauthorized, pushResponse.StatusCode);
             Assert.NotEqual(HttpStatusCode.InternalServerError, pushResponse.StatusCode);
         }
@@ -101,6 +112,17 @@ public sealed class GitSmartHttpWriteLockTests : IDisposable
             saveAuthor,
             CancellationToken.None);
 
+        // Load-bearing, and the only assertion in this test that is. Everything below passes whether
+        // the save waited for the lock or ignored it and completed straight away: SaveOutcome.Saved is
+        // the outcome either way, and the tree is clean either way. This check is what separates those
+        // two, so unlike the decorative uses of the same shape elsewhere in this section it is not
+        // removable -- delete it and the test still passes against a save path with no lock at all.
+        // Its known weakness is the one that makes a fixed delay a poor instrument in general: a
+        // sufficiently loaded machine can leave the save incomplete for reasons that have nothing to do
+        // with the lock, so it can pass for the wrong reason. It cannot pass while the property is
+        // broken, which is the direction that matters here, and the unit-level test in
+        // PageSaveServiceTests (a held lock yields RepositoryBusy and writes nothing) is the
+        // timing-independent witness backstopping it.
         await Task.Delay(TimeSpan.FromMilliseconds(300));
         Assert.False(
             saveTask.IsCompleted,
@@ -132,6 +154,28 @@ public sealed class GitSmartHttpWriteLockTests : IDisposable
 
         using var readResponse = await readTask;
         Assert.Equal(HttpStatusCode.OK, readResponse.StatusCode);
+    }
+
+    /// <summary>
+    /// The longest bounded wait the running application is configured with, plus a margin -- read off
+    /// <see cref="ContentStorageOptions"/> by reflection rather than naming <c>WriteLockTimeout</c> and
+    /// <c>SaveWriteLockTimeout</c>, so that a bound added or re-defaulted later is covered without this
+    /// test being edited. <see cref="TimeSpan.MaxValue"/> is excluded because it is the encoding of
+    /// "no bound" (<c>GitSmartHttpEndpoints.UnboundedWait</c> itself), not a bound to outlast; including
+    /// it would hang the test rather than strengthen it.
+    /// </summary>
+    private TimeSpan LongerThanEveryConfiguredBound()
+    {
+        var options = _app.Services.GetRequiredService<IOptions<ContentStorageOptions>>().Value;
+        var bounds = typeof(ContentStorageOptions)
+            .GetProperties(BindingFlags.Public | BindingFlags.Instance)
+            .Where(property => property.PropertyType == typeof(TimeSpan) && property.CanRead)
+            .Select(property => (TimeSpan)property.GetValue(options)!)
+            .Where(bound => bound != TimeSpan.MaxValue)
+            .ToList();
+
+        Assert.NotEmpty(bounds);
+        return bounds.Max() + TimeSpan.FromSeconds(1);
     }
 
     private HttpClient AuthenticatedClient((Guid Id, string Plaintext) token)

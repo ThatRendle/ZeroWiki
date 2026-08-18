@@ -24349,6 +24349,594 @@ verdict is still caught. The record's own integrity was never what a hash-in-the
 it rests on the DEVLOG being append-only and committed with its block, which is a separate mechanism with
 no instrument of its own. That gap is real and is not closed by this decision.
 
+**[supervisor]** Section review — `git diff 59db4dd..HEAD`, HEAD `d8a3ce0`, 11 commits (`4dc6de0`
+block A, `3e22b8f` block B, `d8a3ce0` the `Reviewed-state` amendment, the rest agent/workflow docs).
+
+### Verdict: Request changes
+
+One blocker. It is not in either block's diff — it is in what the two blocks, *together*, decided not to
+look at, which is the only place a section review can find anything a block review could not.
+
+### Blocker S1 — the *Single per-repo write lock* requirement never got §10's own instrument, and one of its scenarios is witnessed by a test that cannot fail for the property it names
+
+§10's base post commits the section to "its save-vs-push serialization … proven by a test that can be
+*watched failing*". The contract for that is `content-editing` → **Single per-repo write lock**, four
+scenarios. Trace what each block was asked to do with them:
+
+- **Block A's brief** scoped the falsifier-first audit to "exactly three requirements — **no others**":
+  *Optimistic concurrency on save*, *Transactional save*, *Working-tree-clean invariant*. The lock
+  requirement is deliberately not among them. 7 scenarios audited, 7 held — that part is sound.
+- **Block B** built one test covering *Push waits for an in-progress save* / *Save waits for an
+  in-progress push* (the two directions collapse into `PushAndBrowserSaveInterleaved_…`), and measured
+  it with M1.
+
+Nobody owned the remaining two. *Save's bounded wait for the lock expires* survives inspection —
+`PageSaveServiceTests.cs:426–441` asserts `RepositoryBusy` **and** `File.Exists == false`, so deleting
+`PageSaveService.cs:120`'s acquisition returns `Saved` and writes the file, and the test dies. Fine.
+
+***Push's wait for the lock has no ceiling* does not.** Its only witness is
+`GitSmartHttpWriteLockTests.cs:39–85`. That test holds the lock for **1 second** (`Task.Delay(TimeSpan.FromSeconds(1))`,
+line 60) and then asserts the response is neither 401 nor 500. Its own comment at lines 54–59 states the
+proof:
+
+> Held well past any bounded timeout anywhere in this codebase (PageSaveService's own
+> `SaveWriteLockTimeout` defaults to 5s) before releasing
+
+**1 second is not past 5 seconds.** The arithmetic in the test's stated justification is wrong, and the
+consequence is exactly what it was written to prevent: replace `GitSmartHttpEndpoints.cs:120`'s
+`UnboundedWait = TimeSpan.MaxValue` with either of the two bounds already sitting in
+`ContentStorageOptions` — `SaveWriteLockTimeout` (5s, `ContentStorageOptions.cs:86`) or
+`WriteLockTimeout` (10s, `ContentStorageOptions.cs:51`) — and this test still passes, because the lock is
+released at 1s and the wait never reaches the ceiling. The spec scenario is witnessed by argument. This
+is the one instrument in the section's territory that *reads* as a falsifier and is not one.
+
+The test is pre-existing (§7), which is precisely why no block review could have caught it: neither
+block's diff touches that file. It is in scope for §10 because §10 is where this change decided which of
+its correctness properties are *witnessed* rather than merely true, and this one is not.
+
+**Suggested remediation shape** — one fix block, no new `N.M` numbers:
+
+1. Make the hold in `GitSmartHttpWriteLockTests.cs:39–85` exceed every bound in `ContentStorageOptions`
+   (the larger of `WriteLockTimeout`/`SaveWriteLockTimeout`, read from options rather than hard-coded, so
+   a future default change cannot silently re-open this) — or replace the fixed hold with a probe that
+   does not depend on wall-clock arithmetic at all. Correct the comment either way; it currently asserts
+   something false.
+2. **Confirming observation:** one mutant, `UnboundedWait` → `_options.Value.SaveWriteLockTimeout`, run
+   through `mutate.sh` against the full unfiltered suite. Today it survives. The fix is done when it is
+   killed, and by that test. That is one run, well inside the cap for a fresh block.
+
+### Not blockers — judged, and the reasoning recorded
+
+**A1 (carried in from `@reviewer`) — D15's "one bulk history walk, not one `git log` per page" is
+unasserted. Agreed, and I am not asking for it to be pinned.** It is a cost decision, not a correctness
+or safety invariant; the spec scenario it sits under names "working tree **and** history", which is
+mechanism-agnostic, and the only instrument that would pin it is an assertion on process-spawn counts —
+a brittle test that would fight every legitimate refactor. M3 already proves the walk is load-bearing.
+Recording it as a known-unpinned decision is the right resting place. → `## NEXT`.
+
+**A1 is mis-attributed, twice, and the DEVLOG is the archive.** "One bulk history walk, not one `git log`
+per page" is **D15** (`design.md:255`); **D14** (`design.md:178`) is *Frontmatter is parsed behind
+`IFrontmatterParser`*. Both `@reviewer`'s A1 and the architect's carry-forward name D14. The citation in
+`PageIndexStartupRebuildTests.cs:10–11` — "(D6, D14, D15)" — is *correct*, since that test does assert a
+frontmatter title; only the two DEVLOG posts are wrong. Worth correcting in the fix block's post, since
+this file is what the change is archived as.
+
+**A1's siblings — I looked, and found one that matters more than A1 itself.** D15's *"the index is never
+persisted"* is unasserted, and `10.3`'s proof **silently depends on it**: the test's whole premise
+(`PageIndexStartupRebuildTests.cs`, "a fresh process *is* the absent-index case, exactly and without
+simulation") holds only while no snapshot is written to disk. Persist the index in some later change and
+that test keeps passing while no longer testing rebuild-from-repository at all — it would be reading back
+a cache. That is a stronger version of the shape A1 describes: not merely a true-but-unasserted decision,
+but an *instrument whose validity rests on an unasserted premise*. Not a §10 blocker — nothing in this
+change persists anything — but it belongs in `## NEXT` as a hazard for whoever touches `PageIndex`
+next, and one sentence in that test's remarks naming the dependency would cost nothing.
+
+D3, D6, D16 I checked and found adequately pinned, and one of them by this section specifically: block
+B's `10.2` test is the **only** test in the suite that proves the two writers share *one* lock. Every
+other lock test races a lock the test process took at a path it was handed, so a refactor giving save and
+push separate lock files would pass all of them. That is real, section-level value and I want it on the
+record alongside the blocker.
+
+### The evidence asymmetry (`10.2`) — acceptable, but the record understates its own evidence
+
+The section says the save-side lock is "argued, not measured" against M1's measured push side. That
+undersells it. `Save_WhenTheWriteLockIsHeldByAnotherWriter_ReturnsRepositoryBusyAndWritesNothing`
+(`PageSaveServiceTests.cs:426–441`) is a dying test for save-side acquisition, on both an outcome and a
+filesystem assertion. The honest characterisation is **measured at the integration seam (push) vs.
+measured at the unit seam (save)**, not measured vs. argued. I am not asking for a fourth mutant; I am
+asking that the record not describe its own evidence as weaker than it is, because that is the kind of
+sentence a later section reads and acts on.
+
+### N1's shape is a pattern, not a nit — and this is why S1 exists
+
+`@reviewer`'s N1 (the 300ms non-completion probe at `GitSmartHttpRealClientTests.cs:183`, which passed
+*under* M1) is the third instance of one instrument in this suite, and the three do not agree with each
+other:
+
+| site | 300ms `Task.Delay` + `Assert.False(IsCompleted)` | is it load-bearing? |
+|---|---|---|
+| `GitSmartHttpWriteLockTests.cs:54–60` | **refused** — a paragraph explains why the shape must not be trusted, proof moved to the response status | no, by explicit decision |
+| `GitSmartHttpWriteLockTests.cs:104–107` | used | **yes** — it is the only assertion separating "the save waited" from "the save ignored the lock"; `Saved` + clean tree pass either way |
+| `GitSmartHttpRealClientTests.cs:183–186` (new, `10.2`) | used | no — and the worker *measured* that it does not fire, then said so |
+
+The same file argues against the instrument at line 54 and depends on it at line 104. The section did not
+introduce that, and I am not blocking on it — `10.2`'s own use is correctly documented as decoration, and
+line 104's claim is backstopped by the unit test above. But it is the same failure mode as S1 one storey
+down, and if the fix block is open anyway, line 104's comment should say what it actually proves.
+
+### Checks that found nothing, and what they could not see
+
+Gates re-run by me, unsandboxed and sequential, never piped, each with its own exit code: `dotnet build`
+exit 0 / **0 Warning(s), 0 Error(s)** · `dotnet test` **unfiltered** exit 0 / **Passed: 881, Failed: 0,
+Skipped: 0** (2m09s) · `openspec validate git-backed-content-core --strict` exit 0 / "is valid" ·
+`dotnet format --verify-no-changes` exit 0.
+
+- **Mutation residue** — `git diff -- src` and `git status --short -- src` both empty; full
+  `git status --short` empty; no `*.mutant*`/`*.bak`/`*.orig` anywhere. Clean.
+- **Dead scaffolding** — the section added no `src/` symbols at all, so the sweep is over test helpers.
+  All five new members have a live caller: `InstallStallingPreReceiveHookAsync` and
+  `WaitForPreReceiveToParkAsync` (both `10.2`), `SaveOrThrowAsync` and the `_git` field (both `10.3`),
+  `PinCredentialHelper` (three call sites in `PushReactionEndpointTests.cs`). The parked-hook fixture
+  writes its markers into the test's own temp tree and the hook is a `GitHookInstaller` no-op being
+  overwritten, so nothing outlives the test. No orphans.
+- **Cross-block coherence** — block A added no test and block B added two, and they do compose: A's
+  7-falsifier analysis covers three requirements, B's two tests cover two scenarios of two others, and
+  neither re-covers the other's ground. One honest wrinkle already self-reported by the worker: M3
+  showed `10.3`'s history half was *already* covered at the builder-unit level, so B's second test is a
+  coarser second witness there rather than first coverage. The worker flagged that against its own
+  posted classification instead of letting it read as confirmation. That is the standard this change
+  says it holds and it was met.
+- **Uncertified code** — every block in this section has a reviewer verdict beneath its handoff, and no
+  `→ @reviewer` in this thread dangles. The `Reviewed-state` rule's self-reference was hit, escalated,
+  and resolved by the Product Owner in `d8a3ce0` rather than worked around silently. Noted, not
+  re-litigated.
+- **Human-in-the-loop** — §10 has none; nothing here was ticked that needed the Product Owner.
+
+**What this review could not see.** My instrument for S1 was *reading* the test and the two option
+defaults; I did not run the surviving mutant, so "it survives" is derived from `1s < 5s` and the release
+at line 62, not observed — which is exactly why the remediation's confirming observation is a mutant and
+not another reading. I took M1/M2/M3's kill results from the worker's report and the reviewer's
+re-derivation rather than re-running them. And the whole of block A is an *argument* about coverage: I
+spot-checked its conclusions against the named tests, but a falsifier analysis is only ever as good as
+the mutants nobody ran, and 7 of its 7 falsifiers were reasoned rather than executed. If §10 is wrong in
+a way none of us saw, that is the most likely place.
+
+Reviewed-state: `da39a3ee5e6b` · HEAD `d8a3ce0` (clean tree — the empty-input SHA-1, as `d8a3ce0`'s own
+post notes)
+
+---
+
+**[architect]** Remediation block for §10 — `@supervisor`'s S1 plus three carried items. **Round one of
+the two permitted** (`CLAUDE.md` §3c.4). **No new `N.M` numbers and nothing to tick** — every box in §10
+is already ticked; this block's record *is* the fix.
+
+### R1 (the blocker) — *Push's wait for the lock has no ceiling* is witnessed by a test that cannot fail
+
+`GitSmartHttpWriteLockTests.cs:39–85` holds the write lock for **1 second** while its comment at 54–59
+claims the hold is "well past any bounded timeout anywhere in this codebase" and names
+`SaveWriteLockTimeout`'s 5s default in the same sentence. **1s is not past 5s.** The scenario the test
+exists for is the *absence* of a ceiling; a 1s hold never reaches one, so the test passes identically
+whether `GitSmartHttpEndpoints.cs:120`'s `UnboundedWait = TimeSpan.MaxValue` is unbounded or is either
+bound already sitting in `ContentStorageOptions` (`SaveWriteLockTimeout` 5s, line 86; `WriteLockTimeout`
+10s, line 51).
+
+**Fix:** make the hold exceed **every** bound in `ContentStorageOptions`, **derived from the options
+rather than hard-coded**, so that a future default change cannot silently re-open this. Correct the
+comment to state what the hold actually establishes.
+
+**Falsifier — ranked first of two, and the only one that needs a mutation run.** `UnboundedWait` →
+`SaveWriteLockTimeout`, through `.claude/skills/mutation-testing/mutate.sh` on the full unfiltered suite.
+**It survives today — run it before your fix and confirm that, or the fix is unmeasured.** The work is
+done when the same mutant is killed. One run; the block's cap is 3.
+
+Note what this does *not* ask for: a longer sleep as such. A hold hard-coded to 11s would pass the mutant
+today and rot the moment a default moves, which is the same defect wearing a bigger number.
+
+### R2 — D14/D15 attribution, corrected
+
+A1 was posted as D14 twice in this thread, by me. **"One bulk history walk, not one `git log` per page"
+is D15** (`design.md:255`); **D14 is `IFrontmatterParser`/SharpYaml** (`design.md:178`). The test file's
+own `(D6, D14, D15)` citation was already correct — only my posts were wrong.
+
+**Post a correction; do not edit the earlier posts.** The DEVLOG is append-only, and this file is the
+archive: a silently-corrected record is worth less than a visibly-corrected one.
+
+### R3 — `10.3`'s proof depends on the index never being persisted, and says so nowhere
+
+D15's *"the index is never persisted"* is unasserted anywhere, and `PageIndexStartupRebuildTests`'s
+argument silently rests on it — persist the snapshot in a later change and that test goes on passing while
+reading back a cache instead of a rebuild. **Add one sentence to the test's remarks** naming the
+dependency. Not a new test: `@supervisor` judged the property itself not worth pinning here, and I agree —
+what is missing is that the dependency is invisible to whoever next touches the index.
+
+### R4 — the decorative 300ms probe
+
+`GitSmartHttpRealClientTests.cs:183` carries a 300ms non-completion probe whose doc-comment claims more
+than it delivers: under M1 — the one time the property was actually broken — **the probe passed**, and
+under correct code it can never fail. The same instrument appears three times in this section with three
+different statuses (*refused* at `GitSmartHttpWriteLockTests.cs:54–60`, *load-bearing* at line 104,
+*decorative* here). **Either delete it or make its comment tell the truth** — your call, argued in the
+thread. What is not acceptable is a comment asserting a proof the code does not perform; that is R1's
+failure mode one storey down, and this section is where we are supposed to be noticing it.
+
+### Falsifier ranking against the cap (new rule, and it is mine because I broke it last block)
+
+Cap is 3 runs. **R1's mutant is rank 1 and is the only one required.** R2–R4 are record and comment
+fixes with no property to break — if you find yourself wanting a mutant for one of them, that is a signal
+to ask me first, not to spend a run. **Expected unmeasured: none** — R1 is the only claim in this block
+that a mutant could falsify.
+
+### Gates and handoff
+
+`dotnet build` clean · `dotnet test` green, unfiltered (881 at `d8a3ce0`; count it, don't quote it) ·
+`openspec validate git-backed-content-core --strict` · `dotnet format --verify-no-changes`. Unsandboxed,
+sequential, unpiped. Then → `@reviewer`, and **do not touch the tree after handing off** — the
+`Reviewed-state:` fingerprint now excludes the DEVLOG (`d8a3ce0`), so your own posts no longer perturb it,
+but a code change after the verdict still sends the block back.
+
+---
+
+**[worker]** §10 remediation block, round one — R1–R4 done. Nothing ticked (no `N.M` numbers); `src/`
+untouched, all four edits are in `tests/`.
+
+### R1 — the hold now outlasts every configured bound, derived from the options
+
+`GitSmartHttpWriteLockTests.ReceivePack_WaitsForTheWriteLockAlreadyHeldElsewhere_ThenProceedsOnceItIsReleased`:
+the fixed `Task.Delay(1s)` is replaced by `LongerThanEveryConfiguredBound()`, which reads
+`IOptions<ContentStorageOptions>` off the running app and takes `Max()` over **every** `TimeSpan`
+property found by reflection, plus a 1s margin. Reflection rather than naming `WriteLockTimeout` and
+`SaveWriteLockTimeout`: a bound added or re-defaulted later is covered without anyone editing this test,
+which is the failure mode the brief warned about (an 11s hard-coded hold is the same defect wearing a
+bigger number). `TimeSpan.MaxValue` is excluded — it is the encoding of *no bound*
+(`UnboundedWait` itself), and including it would hang the test rather than strengthen it; that exclusion
+is stated in the helper's own doc-comment. `Assert.NotEmpty(bounds)` guards the degenerate case where
+reflection finds nothing and the hold silently collapses to 1s. At today's defaults the hold is 11s and
+the test runs in ~13s.
+
+Two comments rewritten to say what the code establishes rather than what it intends. The old one claimed
+the hold was "well past any bounded timeout anywhere in this codebase" while naming 5s in the same
+sentence as a 1s hold; the old assertion comment went further the other way and said the timing was *not*
+load-bearing ("this check — not the timing above — is what actually proves…"). Both are wrong, and in
+opposite directions. The hold and the status check are **one instrument**: the hold guarantees any
+bounded wait would have expired, the status is where that expiry surfaces (an uncaught
+`RepositoryLockTimeoutException` → 500). Neither half proves anything alone.
+
+**Mutant (rank 1, the only one the brief required) — `UnboundedWait` → `SaveWriteLockTimeout`'s default.**
+Applied at the field initialiser, not the call site: `UnboundedWait` is a `private static readonly` field
+and no `_options` is in scope there, so `TimeSpan.MaxValue` → `TimeSpan.FromSeconds(5)` is the faithful
+form. 2 runs used of the block's 3, both through `.claude/skills/mutation-testing/mutate.sh` on the full
+unfiltered suite, both with the same before/after checksums (`da1fecb987fa` → `bf9c02fc2447`), both
+reverted by the harness with the checksum verified:
+
+| | result | suite |
+|---|---|---|
+| **before the fix** | **SURVIVED** (exit 1) | `Failed: 0, Passed: 881` — 2m36s |
+| **after the fix** | **KILLED** (exit 0) | `Failed: 1, Passed: 880` — 2m29s |
+
+The kill is the intended test failing for the intended reason, not collateral:
+`ReceivePack_WaitsForTheWriteLockAlreadyHeldElsewhere_ThenProceedsOnceItIsReleased [13 s]` —
+`Assert.NotEqual() Failure … Expected: Not InternalServerError, Actual: InternalServerError`. Exactly one
+test failed, so nothing else in the suite was silently depending on the wait being unbounded.
+
+### R2 — correction: A1's decision is D15, not D14
+
+Correcting the record, as a new post rather than an edit. **"One bulk history walk, not one `git log` per
+page" is D15** (`design.md:255`). **D14** (`design.md:178`) is *Frontmatter is parsed behind
+`IFrontmatterParser`*. `@reviewer`'s A1 and the architect's carry-forward both said D14; the citation in
+`PageIndexStartupRebuildTests.cs:10–11` — `(D6, D14, D15)` — was already correct, because that test does
+assert a frontmatter title, so D14 belongs there on its own merits. No code change.
+
+### R3 — `10.3`'s premise is now visible in the file that depends on it
+
+One paragraph added to `PageIndexStartupRebuildTests`'s remarks, in the "Why a restart is *the index is
+deleted or absent*" para where the premise is actually used: nothing pins "the index is never persisted",
+so a later change that writes a snapshot leaves this test passing while measuring a cache read, and
+whoever does that must re-establish the absent-index case explicitly. No new test — `@supervisor` judged
+the property itself not worth pinning here.
+
+### R4 — I deleted the probe's assertion and kept its delay, which is not quite either option offered
+
+`GitSmartHttpRealClientTests.cs:183`. The brief said delete it or make its comment true; my answer is that
+the 300ms delay and the `Assert.False(saveTask.IsCompleted, …)` are two different things wearing one line,
+and they have opposite fates.
+
+- **The assertion is deleted.** Its stated justification was that it "names the failure at the moment it
+  happens rather than three assertions later" — and that was *measured false*: under M1, the one mutant
+  that actually removed the push side's lock, the probe **passed**. It cannot name a failure it does not
+  detect, and under correct code it can never fail. Worse, its message asserted a conclusion it could not
+  reach ("so the two were not serialized against each other"), which is R1's exact shape one storey down.
+- **The delay stays, re-labelled as pacing.** Deleting it outright would have been a real regression, and
+  this is why I didn't take the brief's first option: with the release marker written immediately, the
+  save may not have reached the write lock before the push is let go, so the push completes first and the
+  interleaving the test is named for never occurs — while every assertion still passes. The delay is
+  load-bearing for *setup*; it was never load-bearing for *proof*. The comment now says exactly that, and
+  the remarks paragraph records why the assertion was removed rather than leaving it looking like tidying.
+
+Net: the instrument's three sites in this section drop to two, and the survivor
+(`GitSmartHttpWriteLockTests.cs:104`) is the one that is genuinely load-bearing.
+
+**A correction to the brief, recorded because the archive should carry it.** R4 was framed as
+delete-or-fix, and neither is right: the delay does real work at that site even though the assertion does
+not. `@architect` has accepted this and asked that the correction be stated rather than left implicit —
+the two options offered both assumed the line was one thing.
+
+### R5 — `GitSmartHttpWriteLockTests.cs:104`, added mid-block on `@architect`'s ruling
+
+Answering my own question below: the ruling is that N1 is a *pattern* across three sites in one file's
+worth of section, so fixing two of three leaves the file still arguing against the instrument at line 54
+and depending on it at line 104. Comment-only at that site, per the ruling — timing, assertion and
+structure untouched, and no mutant spent (it is a comment edit with no property to break, and the probe's
+load-bearing status is `@supervisor`'s finding, not a fresh claim of mine).
+
+Two comments, written to be consistent with each other:
+
+- **At 104 the probe is named load-bearing, with its weakness stated.** Everything else in that test
+  passes whether the save waited or ignored the lock — `SaveOutcome.Saved` either way, clean tree either
+  way — so this is the only assertion separating them; delete it and the test passes against a save path
+  with no lock at all. Its weakness is the generic one: a loaded machine can leave the save incomplete
+  for reasons unrelated to the lock, so it can pass *for the wrong reason*. What it cannot do is pass
+  while the property is broken, which is the direction that matters, and
+  `PageSaveServiceTests:426` (`…ReturnsRepositoryBusyAndWritesNothing`) is the timing-independent
+  backstop. Verified that test exists by name rather than citing it from the thread.
+- **At 54 the refusal is narrowed from "this shape is untrustworthy" to "it would add nothing here".**
+  That was the actual source of the file's self-contradiction: the old wording condemned the instrument
+  in general while the test below depends on it. It now says the response status already distinguishes a
+  wait that gave up from one that did not, so a probe would be a second, weaker witness to a fact the
+  first one carries — and points at 104 for the case where it is the only witness.
+
+### Review nits — one fixed, one declined on `@architect`'s ruling
+
+**Nit 1, fixed.** `GitSmartHttpWriteLockTests.cs:57` claimed the hold covers "every `TimeSpan` bound
+**the running app is configured with**". False as written: `Program.cs:56` configures the auth cookie's
+`ExpireTimeSpan`, and the reflection never sees it — it enumerates `ContentStorageOptions`, nothing else.
+Now reads "every `TimeSpan` bound in `ContentStorageOptions`, as the running app has it configured …
+**not** every bound in the application, which this neither reads nor needs", which is what the helper's
+own doc-comment already said. Worth the round trip precisely because it is small: this block exists
+because a comment stated a proof the code did not perform, and shipping that fix with a fresh instance of
+the same thing inside it is the one defect the archive should never have to explain.
+
+**Nit 2, declined — a decision, not an oversight.** The observation is correct: `LongerThanEveryConfiguredBound()`
+has no *upper* guard, so a `WriteLockTimeout` configured to 10 minutes turns this into a 10-minute test
+rather than a fast failure. `@architect`'s ruling, and I agree with the reasoning: any guard must name a
+ceiling, and there is no basis for one — a threshold invented to satisfy a review nit becomes a number
+someone later has to justify or re-fit, which is §9's `>= 4` floor problem arriving through a different
+door. A 10-minute lock timeout is itself a misconfiguration, and a test that visibly takes 10 minutes is a
+reasonable way to find that out. Recorded so the absence reads as chosen.
+
+### Gates — unsandboxed, sequential, unpiped, each with its own exit code
+
+Re-run in full after nit 1 (a comment edit still recompiles the assembly, so build and test both had to go
+again — these are the final figures, superseding the post-R5 ones):
+
+`dotnet build` exit 0 / **0 Warning(s), 0 Error(s)** · `dotnet test` **unfiltered** exit 0 /
+**Failed: 0, Passed: 881, Skipped: 0, Total: 881** (3m30s) ·
+`openspec validate git-backed-content-core --strict` exit 0 / "is valid" ·
+`dotnet format --verify-no-changes` exit 0.
+
+Neither R5 nor nit 1 changed any code, so the R1 mutant's kill was not re-measured against them; that
+result stands on the run recorded above. The block's 3-run cap is now fully spent — my two plus
+`@reviewer`'s third (the 10s `WriteLockTimeout` substitution) — so nothing further here is measurable
+without going back to `@architect`.
+
+### Claims
+
+**Claim** — after both mutation runs, `src/` is byte-identical to `HEAD`; every change in the working
+tree is in `tests/` (3 files) and this DEVLOG.
+**Instrument** — `git diff --stat -- src` (empty), `git status --short -- src` (empty), `git status
+--short` (4 entries: the DEVLOG plus `GitSmartHttpWriteLockTests.cs`, `GitSmartHttpRealClientTests.cs`,
+`PageIndexStartupRebuildTests.cs`), `find` for `*.mutant*`/`*.bak`/`*.orig` (nothing), and the harness's
+own before/after checksums on `GitSmartHttpEndpoints.cs` (`da1fecb987fa` both times). Re-run after R5,
+which touched no file not already in that list.
+**Blind spot** — `git diff` is blind to untracked files, which is why `git status --short` is run beside
+it; but neither can verify *content* inside an untracked file, and no file was untracked here to check.
+The checksum covers only the one mutated file — a second file altered during a run would be caught by
+`git status`, not by the checksum. And none of this sees the build outputs under `obj/`/`bin/`.
+
+**Claim** — the mutant's kill is attributable to R1's test alone.
+**Instrument** — the post-fix run's failure list: exactly one `Failed` line, naming
+`ReceivePack_WaitsForTheWriteLockAlreadyHeldElsewhere_ThenProceedsOnceItIsReleased`, with the
+`Not InternalServerError` assertion in its message.
+**Blind spot** — a single run cannot separate "this test reliably kills it" from "this test kills it on
+this machine's timing". The 11s hold against a 5s mutant bound is a 6s margin, so I judge the risk low,
+but I have one observation, not a distribution — and I did not spend the third run to get a second,
+because the brief ranks this mutant as the only one worth running. If the reviewer wants the margin
+characterised rather than argued, that is the run to spend.
+
+**Claim** — R1's fix covers every bound in `ContentStorageOptions`, not just the two named.
+**Instrument** — reflection over `typeof(ContentStorageOptions).GetProperties(Public | Instance)`
+filtered to `TimeSpan`, evaluated against the app's configured instance at run time.
+**Blind spot** — it sees only `TimeSpan`-typed *public instance properties on that one type*. A bound
+expressed as an `int` of milliseconds, a field rather than a property, a `const`, or one living on a
+different options type would be invisible to it, and so would a timeout hard-coded in
+`RepositoryWriteLock` itself. I checked the current type by hand and it has exactly two
+(`WriteLockTimeout` 10s, `SaveWriteLockTimeout` 5s), both properties, both `TimeSpan` — so the filter is
+exhaustive *today*; it is the future shape it cannot promise. Nit 1 above is this blind spot's other
+half caught in the comment rather than the code: the reflection's reach is `ContentStorageOptions`, and
+the prose had widened it to the whole application.
+
+→ `@reviewer` — fingerprint re-issue only. Nit 1 is a one-line comment change; nit 2 changed nothing.
+
+---
+
+**[reviewer]** Audit of the §10 remediation block (R1–R5) — working tree vs `d8a3ce0`. Three files under
+`tests/`, plus this DEVLOG. **`src/` untouched, verified rather than accepted**: `git diff --stat -- src`
+and `git status --short -- src` both empty, and full `git status --short` shows exactly the four expected
+entries.
+
+### Verdict: Approve with nits
+
+The blocker is genuinely fixed, and I confirmed it with the block's third mutation run rather than
+re-reading the worker's argument. Two nits below, both wording, neither blocking.
+
+### R1 — confirmed, and confirmed harder than the worker measured it
+
+I spent the block's **third and final** mutation run, and I am recording why: the worker's blind spot
+explicitly invited it ("if the reviewer wants the margin characterised rather than argued, that is the run
+to spend"), and there was a specific unmeasured case. The hold is `Max(bounds) + 1s` = 11s. Against the
+worker's mutant (`SaveWriteLockTimeout`, 5s) the margin is 6s — comfortable. Against the **other** bound
+the supervisor named as an equally valid substitution (`WriteLockTimeout`, 10s) the margin is **1s**, and
+the kill then depends on the push reaching the lock acquisition within 1s of the POST being issued. That
+is the case that could have made the fix look stronger than it is, and nobody had run it.
+
+`UnboundedWait` → `TimeSpan.FromSeconds(10)`, at the field initialiser, through `mutate.sh` on the full
+unfiltered suite:
+
+| | result | suite |
+|---|---|---|
+| **worst-case bound (10s), post-fix** | **KILLED** (exit 0) | `Failed: 1, Passed: 880` — 2m18s |
+
+Harness checksums `da1fecb987fa` (before) → `a92320ecc4ba` (live) → `da1fecb987fa` (reverted, verified).
+Attribution is not inferred: exactly one test failed, and it is R1's own —
+`ReceivePack_WaitsForTheWriteLockAlreadyHeldElsewhere_ThenProceedsOnceItIsReleased`,
+`Assert.NotEqual() Failure … Expected: Not InternalServerError` at `GitSmartHttpWriteLockTests.cs:line 90`,
+the assertion R1 rewrote. So the scenario now has an instrument that dies against **both** bounds the
+supervisor identified, not just the softer one. **S1 has moved**: *Push's wait for the lock has no
+ceiling* is witnessed by a test that can be watched failing.
+
+Judging the reflection on its merits, since it is the clever part:
+
+- **Reach.** I swept every `TimeSpan` in `src/` (excluding `bin`/`obj`). `ContentStorageOptions` has
+  exactly two, both public instance `TimeSpan` properties — so the filter is exhaustive over its stated
+  target today. Everything else is `static readonly` and unconfigured (`InvitationPolicy.Lifetime`,
+  `EditDraftStore.Ttl`, two `PostKillWaitTimeout`s, `RepositoryWriteLock.PollInterval`), i.e. not a bound
+  the push could have been given.
+- **`TimeSpan.MaxValue` exclusion is correct.** It is the encoding of "no bound", so there is nothing to
+  outlast; and if a bound were legitimately configured as `MaxValue` it would *be* unbounded, making its
+  exclusion right rather than a lost case. `Timeout.InfiniteTimeSpan` is negative and loses to `Max()`
+  harmlessly.
+- **`Assert.NotEmpty` is weaker than "guards a silent collapse", but its gap is benign.** It catches only
+  *total* collapse. A partial collapse passes it — however, since the hold takes the `Max()`, losing a
+  *smaller* bound cannot weaken the instrument, and only losing the largest one could. Worth stating
+  precisely; not worth changing.
+
+### Nit 1 — the one clause in this block that claims more than its instrument reaches
+
+`GitSmartHttpWriteLockTests.cs:57` reads "**every TimeSpan bound the running app is configured with**".
+The instrument is one options type. Read literally the claim is false: `Program.cs:56` configures the auth
+cookie's `ExpireTimeSpan` (14 days) on the running app, and reflection over `ContentStorageOptions` never
+sees it. It is harmless — a cookie lifetime is not a wait the push could have been given, and the very
+next sentence states the operative claim correctly — but this block was carved because a comment asserted
+a proof the code does not perform, and this is that shape in miniature. Suggest scoping the clause:
+"every `TimeSpan` bound **in `ContentStorageOptions`**". The helper's own doc-comment at 158–163 already
+gets this right, which is why it is a nit and not a blocker.
+
+### Nit 2 — the hold has no upper guard
+
+`LongerThanEveryConfiguredBound` excludes `MaxValue` because it "would hang the test", but any other large
+finite value is honoured silently: configure `WriteLockTimeout` to 10 minutes and this becomes a
+10-minute test rather than a fast failure. Consider asserting an upper sanity bound so the failure mode is
+a clear assertion rather than a suite that appears to hang.
+
+### R2–R5 — checked
+
+- **R2.** Correct on the facts (D15 = the bulk history walk, `design.md:255`; D14 = `IFrontmatterParser`,
+  `design.md:178`), and **genuinely append-only** — `git diff --numstat` on this file is `384 0`, zero
+  removed lines, so no earlier post was edited.
+- **R3.** The paragraph lands in the para where the premise is actually used and names the consequence
+  concretely (a later snapshot leaves the test measuring a cache read). It claims a dependency, not a
+  proof — correctly scoped.
+- **R4.** I agree with the worker over the brief. The assertion was measured non-detecting under M1, so
+  deleting it loses no coverage; the delay does independent setup work, and the comment now says exactly
+  that ("Pacing, not proof … Nothing is asserted here"). It no longer claims what it cannot show.
+- **R5.** Both comments verified against the code they describe. At 104 the "delete it and the test passes
+  against a save path with no lock at all" claim holds by inspection — `SaveOutcome.Saved` and a clean
+  tree arise either way — and the named backstop exists (`PageSaveServiceTests.cs:431`). At 54 the refusal
+  is now narrowed to "adds nothing *here*", which resolves the file arguing against an instrument it
+  depends on 50 lines below.
+
+### Gates — re-run myself, unsandboxed, sequential, unpiped, each with its own exit code
+
+`dotnet build` exit 0 / **0 Warning(s), 0 Error(s)** · `dotnet test` **unfiltered** exit 0 /
+**Failed: 0, Passed: 881, Skipped: 0, Total: 881** (2m23s) ·
+`openspec validate git-backed-content-core --strict` exit 0 / "is valid" ·
+`dotnet format --verify-no-changes` exit 0.
+
+Post-mutation residue re-checked after my run: `git diff -- src` and `git status --short -- src` empty, no
+`*.mutant*`/`*.bak`/`*.orig` anywhere, harness revert checksum-verified.
+
+### What I could not see
+
+My mutation result is **one observation of the worst case, not a distribution** — it establishes that the
+1s margin held on this machine under the full parallel suite, not that it always will. The margin is the
+instrument's weakest point and it is now measured rather than argued, which is the improvement; it is not
+a guarantee. Separately, I audited the three files in this diff and the claims they make — I did not
+re-audit §10's blocks A and B, which the supervisor already covered.
+
+Reviewed-state: `e15235515e72` · HEAD `d8a3ce0`
+
+---
+
+**[reviewer]** Fingerprint re-issue after nit 1's fix. My previous `Approve with nits` certified
+`e15235515e72`; this is a different state, so that verdict does not carry over to it.
+
+### Verdict: Approve — re-issued over the current tree
+
+### What changed since `e15235515e72` — verified, not taken on description
+
+Comment-only, in `GitSmartHttpWriteLockTests.cs`. The instrument: filter the whole `tests/` diff down to
+its **non-comment** changed lines and compare against the state I reviewed —
+
+```
+git diff HEAD -- tests/ | grep -E '^[+-]' | grep -v '^[+-][+-]' \
+  | grep -vE '^[+-][[:space:]]*(//|///|\*|/\*)' | grep -vE '^[+-][[:space:]]*$'
+```
+
+That list is **byte-identical** to the one behind my first verdict: R4's four deleted `Assert.False`
+lines, the two added `using`s, `var hold = LongerThanEveryConfiguredBound(); await Task.Delay(hold);`
+replacing `Task.Delay(1s)`, and the twelve-line helper. No line added, none removed, none reordered. So
+no behavioural change, and `src/` remains untouched (`git diff --stat -- src` and
+`git status --short -- src` both empty; full status still the four expected entries). The DEVLOG is still
+purely additive — `git diff --numstat` reads `515 0`, zero removed lines.
+
+**Blind spot of that check**, since it is the one I am resting the "comment-only" claim on: it proves no
+*non-comment line* changed, not that a comment edit is semantically inert. A comment can still break
+compilation (an unterminated block, malformed XML doc), which is why I re-ran `dotnet build` rather than
+reasoning that comments cannot matter: exit 0 / **0 Warning(s), 0 Error(s)**, and
+`dotnet format --verify-no-changes` exit 0. I did **not** re-run the 881-test suite — a change with no
+non-comment lines cannot alter test behaviour, and `@architect` re-ran it in full (881 unfiltered). That
+figure is theirs, not mine, and I am marking it as such rather than restating it as if I had observed it.
+
+**No mutation run.** The cap is fully spent (my 10s substitution was the third), and nothing here would
+warrant a fourth: the mutated property is untouched, and R1's kill was measured against this exact code.
+
+### Nit 1 — discharged, and here is the residue so it is not found a third time
+
+The overclaim I raised is gone. It read "every TimeSpan bound **the running app is configured with**"
+(scope: the whole application, against an instrument that reads one options type). It now reads "every
+`TimeSpan` bound **in `ContentStorageOptions`**, as the running app has it configured … **not** every
+bound in the application, which this neither reads nor needs." That is narrower than the instrument's
+reach, not wider — the failure mode you asked me to watch for — and it now explicitly negates the
+reading that was wrong, which is stronger than merely omitting it.
+
+The residue, stated plainly rather than left implicit: the code performs *public instance readable
+`TimeSpan` **properties*** on that type, so "every `TimeSpan` bound in `ContentStorageOptions`" is still a
+shade wider than the literal mechanism — a public `TimeSpan` **field**, a `static` one, or a `TimeSpan?`
+would not be seen. I am not asking for another pass on it, for a reason rather than out of fatigue:
+`ContentStorageOptions` is configuration-bound, and the options binder itself only populates public
+instance settable properties, so a "bound" outside that set could not be configured in the first place.
+The gap is therefore closed by the type's purpose rather than by the comment's wording — and the worker's
+third Claim already records the precise mechanism, which is where a reader who needs the exact reach will
+land. Tying the comment back to that Claim was the right call: it is the same blind spot in prose and in
+code, and it now reads that way in both.
+
+Cosmetic only, no action needed: the rewrite left a ragged wrap mid-paragraph ("Any bounded wait the push
+/ could have been given / instead of UnboundedWait"), where one line is a few words long. `dotnet format`
+does not rewrap comments, so it is invisible to the gate.
+
+### Nit 2 — declined, and I agree with the decline
+
+You asked me to argue rather than approve around it. I don't think you are wrong, and the reasoning that
+persuades me is the one I did not have when I raised it: **a guard needs a ceiling, and we have no
+principled basis for one.** An invented threshold would be §9's `>= 4` floor arriving through a different
+door — a number with no derivation, which this change has already paid to learn about once. My nit was
+about failure *legibility* (an assertion message beats a slow suite), not correctness, and legibility is
+not worth buying with a fabricated constant. I'll note only that if a 10-minute `WriteLockTimeout` ever
+does land, the symptom is a suite that appears to hang rather than one that says why — the helper's
+doc-comment already flags the hang shape for `MaxValue`, so that is where someone would look. Recorded as
+a deliberate decision, not an outstanding item.
+
+Reviewed-state: `1371dbef73cc` · HEAD `d8a3ce0`
+
 ## 12. Push → viewer broadcast
 
 **[architect]** Scope decision, Product Owner, 2026-08-16 — **the broadcast fix comes into this change as
