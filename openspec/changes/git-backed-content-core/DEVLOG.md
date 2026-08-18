@@ -24312,6 +24312,43 @@ Gates at commit (reviewer's independent re-run): build 0/0 · **881 passed / 0 f
 `openspec validate --strict` · `dotnet format --verify-no-changes`. §10's blocks are all landed; the
 section review (`git diff 59db4dd..HEAD`) is next.
 
+---
+
+**[architect]** `Reviewed-state` — resolved. **Product Owner decision, 2026-08-18: pathspec exclusion.**
+
+The rule could not be satisfied as written: the verdict is written into the DEVLOG, the DEVLOG is inside
+`git diff HEAD`, so the hash covered the file the value was written in and no value reproduced itself.
+`@reviewer` hit it on the first verdict to carry a fingerprint and improvised a `PENDING` round-trip to
+post one at all.
+
+The fingerprint now excludes the DEVLOG **at the pathspec level**, in both halves:
+
+```sh
+{ git diff HEAD -- ':/' ':(top,exclude,glob)**/DEVLOG.md'
+  git ls-files --others --exclude-standard -- ':/' ':(top,exclude,glob)**/DEVLOG.md' \
+    | while read -r f; do printf '%s\n' "$f"; cat "$f"; done
+} | shasum | cut -c1-12
+```
+
+Landed in `CLAUDE.md` §3b step 6 and `.claude/agents/reviewer.md`, with the reasoning at both sites.
+
+**Run, not asserted** — the same standard the rule is about. Appending to the DEVLOG left the value
+unchanged; adding an untracked file under `tests/` changed it and removing it restored it; running from
+`src/ZeroWiki/` gave the same value as from the root, which is what `:/` is there for. A clean tree hashes
+to `da39a3ee5e6b`, the empty-input SHA-1 — worth knowing, since it is what you get if you point the
+command at nothing.
+
+**Why not a stream-level exclusion**, which is the obvious cheaper fix: `git diff HEAD` emits an
+`index <blob>..<blob>` header per modified file, so stripping the `Reviewed-state:` line from the stream
+still leaves the DEVLOG's blob hash in the diff. `@reviewer` established this by running its own first
+attempt rather than reasoning about it, and it produced a hash matching nothing.
+
+**What this check now certifies, stated plainly so the archive does not over-read it:** the *code* the
+reviewer saw. `tasks.md`, `src/` and `tests/` stay covered, so a box ticked or a line added after a
+verdict is still caught. The record's own integrity was never what a hash-in-the-record could establish —
+it rests on the DEVLOG being append-only and committed with its block, which is a separate mechanism with
+no instrument of its own. That gap is real and is not closed by this decision.
+
 ## 12. Push → viewer broadcast
 
 **[architect]** Scope decision, Product Owner, 2026-08-16 — **the broadcast fix comes into this change as
@@ -24373,7 +24410,13 @@ index, the files are authoritative.
   fingerprint includes `ls-files --others` content. **Block A predates this** — `4dc6de0` carries no
   fingerprint, which is expected, not drift.
 - **Briefs name the falsifier.** `d7a517c` — `CLAUDE.md` §3b.1: alongside "build X", name the
-  observation that fails if X is undone.
+  observation that fails if X is undone. **And rank them against the mutation cap** — block B's brief
+  named five falsifiers against a cap of three, leaving the allocation to be discovered by the worker.
+  When they outnumber the cap, the brief says which are expected to go unmeasured.
+- **The `Reviewed-state` fingerprint excludes the DEVLOG**, at the pathspec level — the rule was
+  self-referential and unsatisfiable as written. Product Owner decision, 2026-08-18; the command and its
+  reasoning are in `CLAUDE.md` §3b step 6 and `.claude/agents/reviewer.md`. It certifies the **code** the
+  reviewer read, not the record.
 - **Unreachable code is swept for.** `d7a517c` — reviewer runs `find_uncovered_symbols` over new
   symbols, supervisor across the whole section. Neither tests nor mutation can see code nothing
   reaches; that is exactly how §12's defect shipped.

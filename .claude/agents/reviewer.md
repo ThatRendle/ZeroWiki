@@ -202,17 +202,33 @@ edit.** The worker applies the fixes and you re-audit until clean.
 verdict — `Approve` and `Request changes` alike — with the fingerprint of the tree you reviewed:
 
 ```sh
-{ git diff HEAD; git ls-files --others --exclude-standard | while read -r f; do printf '%s\n' "$f"; cat "$f"; done; } | shasum | cut -c1-12
+{ git diff HEAD -- ':/' ':(top,exclude,glob)**/DEVLOG.md'
+  git ls-files --others --exclude-standard -- ':/' ':(top,exclude,glob)**/DEVLOG.md' \
+    | while read -r f; do printf '%s\n' "$f"; cat "$f"; done
+} | shasum | cut -c1-12
 ```
 
 Post it as `Reviewed-state: <hash>` on its own line, with `HEAD` beside it (`git rev-parse --short HEAD`).
 The Architect re-computes it before committing; a mismatch means code moved after your verdict and the
-block goes back rather than in.
+block goes back rather than in. **Run the command; do not reason out what it would print** — a rule about
+hashes that is asserted rather than executed is exactly the kind that turns out not to hold.
 
 **Why the command looks like that.** `git diff HEAD` alone is **blind to untracked files** — a brand-new
 source or test file is invisible to it, and that is the normal shape of a block that adds one. The
 `ls-files --others` half is what closes that, and it was verified by adding an untracked file and
 watching the hash change, not assumed.
+
+**Why the DEVLOG is excluded (Product Owner decision, 2026-08-18).** You write your verdict *into* the
+DEVLOG, so a fingerprint that covered it would cover the file the value is written in — writing `V`
+changes what the hash is taken over, and no value reproduces itself. Excluding it *in the pipe* does not
+work either: `git diff HEAD` emits an `index <blob>..<blob>` header per modified file, so stripping the
+`Reviewed-state:` line from the stream leaves the DEVLOG's own blob hash in the diff. The pathspec
+excludes it before the diff exists; `:/` anchors both halves to the repository root, so the value does not
+depend on which directory you run it from. **What you are certifying is the code you read** — `tasks.md`,
+`src/` and `tests/` all remain covered, so anything added under them after your verdict is still caught.
+Post your verdict first, then compute the fingerprint: with the DEVLOG excluded, the order no longer
+changes the value, but a clean tree hashes to `da39a3ee5e6b` (the empty input), which is a useful sanity
+check that you pointed the command at something.
 
 **This gap is not hypothetical and it is not about bad code.** It opened twice in one change: an
 approval predating the hardening that shipped under it, and an approval given at a 383-test state after

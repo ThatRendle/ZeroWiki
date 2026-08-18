@@ -179,7 +179,10 @@ see the section as a whole. Post it **before** any block of the section is commi
    state the reviewer was shown; anything added after it is uncertified. Every verdict ends with a
    `Reviewed-state:` fingerprint — recompute it and compare:
    ```sh
-   { git diff HEAD; git ls-files --others --exclude-standard | while read -r f; do printf '%s\n' "$f"; cat "$f"; done; } | shasum | cut -c1-12
+   { git diff HEAD -- ':/' ':(top,exclude,glob)**/DEVLOG.md'
+     git ls-files --others --exclude-standard -- ':/' ':(top,exclude,glob)**/DEVLOG.md' \
+       | while read -r f; do printf '%s\n' "$f"; cat "$f"; done
+   } | shasum | cut -c1-12
    ```
    (`git diff HEAD` alone is blind to untracked files, so a brand-new source or test file would not
    change a naive hash — the `ls-files --others` half is what closes that.) **A mismatch sends the block
@@ -187,6 +190,21 @@ see the section as a whole. Post it **before** any block of the section is commi
    changed after the verdict and how you verified it. Either is fine; silently committing is not. This
    gap has opened twice in one change, both times with correct code — what it damages is the DEVLOG,
    which is archived as the account of how the change was built.
+
+   **Why the DEVLOG is excluded, and why at the pathspec level (Product Owner decision, 2026-08-18).**
+   The reviewer writes its verdict *into* the DEVLOG, so an unexcluded fingerprint covers the very file
+   the value is written in: writing `V` changes what the hash is taken over, and no value reproduces
+   itself. The first verdict to carry a fingerprint hit this immediately and had to improvise a
+   round-trip to post one at all. **Excluding it in the pipe does not work** — `git diff HEAD` emits an
+   `index <blob>..<blob>` header per modified file, which moves when the DEVLOG moves, so stripping the
+   `Reviewed-state:` line from the stream leaves the DEVLOG's fingerprint in the diff anyway. The
+   exclusion has to happen before the diff is generated, which is what the pathspec does; `:/` anchors
+   both halves to the repository root so the value does not depend on the working directory, and
+   `**/DEVLOG.md` covers archived changes as well as active ones. `tasks.md`, `src/` and `tests/` all
+   stay covered, so a box ticked or a line added after the verdict is still caught — **what this check
+   certifies is the code the reviewer read, not the record.** The record's integrity rests on the
+   DEVLOG being append-only and committed with its block, which is a different mechanism; do not read
+   this fingerprint as evidence for it.
 7. **Tick the boxes.** Mark every `- [x] N.M` in the block in `tasks.md`.
 8. **Commit — one conventional commit per block:**
    ```
