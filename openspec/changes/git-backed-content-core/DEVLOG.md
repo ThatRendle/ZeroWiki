@@ -23800,6 +23800,518 @@ under `tests/`.
 
 `10.1` stays accepted, not reopened. Back to @architect.
 
+---
+
+**[architect]** Block B brief — `10.2` + `10.3`, the last two tasks of §10. Working tree clean at
+`b21af80`; §10's `Base:` is `59db4dd` (top of this thread), so the supervisor's scope at the close is
+`git diff 59db4dd..HEAD`.
+
+### Classify before you build
+
+`tasks.md` was written before any of this code existed, so **neither task is presumed to be a "write
+these tests" task.** Per the rule that landed in `80edc57`, call each of `10.2` and `10.3`
+**build / audit / finish** and post the call *before* writing code, with `❓ @architect` if you disagree
+with anything below. `10.1` was legitimately an *audit* that added no test and was approved as one; that
+outcome is available to you here too, and so is the opposite. What is **not** available is deciding by
+feel — the call has to be evidenced by the falsifiers below actually being run.
+
+**Do not reopen `10.1`.** CAS rejection, transactional rollback and startup reconciliation (D9) were
+gap-analysed against 7 spec scenarios in block A and all 7 held. If your work touches those paths, say
+what it adds *beyond* `10.1`, rather than re-covering it.
+
+### `10.2` — Concurrency test: interleaved browser save and push are serialized and never leave a dirty tree
+
+**Spec — `content-editing/spec.md`, Requirement: Single per-repo write lock:**
+
+> The system SHALL serialize all repository writes — browser commits and git push receipt — through a
+> single cross-process lock so that no two writers mutate the repository concurrently and **the working
+> tree is never left dirty by an interleaving.** The system SHALL bound how long a browser save waits to
+> acquire this lock, and SHALL fail the save cleanly — without writing anything — if that bound is
+> exceeded. The system SHALL NOT apply any such bound to a git push's wait for the same lock.
+
+Its four scenarios: *Push waits for an in-progress save* · *Save waits for an in-progress push* ·
+*Save's bounded wait for the lock expires* (distinct `RepositoryBusy`, not the CAS conflict result, and
+nothing written) · *Push's wait for the lock has no ceiling*. Also in scope as the outcome the task
+names: `content-store/spec.md`, **Working-tree-clean invariant** — the tree equals `HEAD` at all times
+except the brief lock-protected window of an in-progress save.
+
+**Binding design:** **D3** (one `flock`, taken by the app's commit path directly and by the app wrapping
+the whole `git http-backend` invocation — *not* by the `pre-receive`/`post-receive` hooks, which must not
+take it at all, on pain of deadlock) and **D16** (`flock(2)` on a raw POSIX fd via `P/Invoke`, not
+`FileStream`/`FileShare`, not shelling out to `flock(1)`). The racer the lock exists to exclude is a
+**second OS process**, which is why an in-process primitive would not do — a test that only demonstrates
+in-process mutual exclusion is not testing this decision.
+
+**What already exists — audit it before adding anything.** `Content/RepositoryWriteLockTests.cs`
+(6 tests: no-contention acquire/release, non-blocking attempt fails while held, bounded wait gives up on
+real elapsed time, waits-then-acquires, and both directions against the shell's own `flock(1)`) and
+`Web/GitSmartHttpWriteLockTests.cs` (3: `receive-pack` waits then proceeds, browser save waits then
+succeeds, `info/refs`+`upload-pack` never wait). My reading — **not a finding, a hypothesis for you to
+confirm or refute** — is that these assert *waiting behaviour against a lock held by an external
+process*, and that no test drives a **genuine interleaving of the two real writers** and asserts the
+outcome the task actually names: tree clean, both writes present, neither lost. Refute it if it is
+covered; if it is covered, say by which test and prove it with the falsifier below rather than by
+reading.
+
+**The falsifier — the observation that fails if `10.2` is undone.** Remove the lock acquisition from
+*one* side (the save path, then separately the `http-backend` wrapper) and the interleaved run must
+produce an observable defect that a test reports: a dirty working tree, a lost update, or a push
+rejected for a tree it should have been able to update. **If the lock can be removed from either side
+and the suite stays green, there is no `10.2`** — that is the whole task, and it is a
+`mutation-testing`-skill run, not an argument. Concurrency is squarely inside the skill's scope, so the
+budget applies: **at most 3 confirmation runs for this whole block**, through
+`.claude/skills/mutation-testing/mutate.sh` (load the skill first), never a hand-edited `src/` file.
+
+Second falsifier, for the bounded-wait scenario: make the save's wait unbounded (or make the bound
+expiry return the CAS conflict result instead of `RepositoryBusy`) and a test must die. `RepositoryBusy`
+is a distinct `SaveOutcome` with its own editor message — a test that only checks "the save failed"
+cannot see that difference.
+
+### `10.3` — Index rebuild-from-repo test
+
+**Spec — `content-store/spec.md`, Requirement: Derived index rebuildable from the repository:**
+
+> …SHALL be able to **rebuild that index from the repository alone**. The index SHALL record the commit
+> it was built from, and the system SHALL serve page metadata from the index only while that commit is
+> the repository's current commit — refreshing it otherwise, including when the commit was advanced by a
+> writer that never notified the application.
+
+Scenario this task names: *Index rebuilt from repository* — **WHEN** the index is deleted or absent at
+startup, **THEN** the system rebuilds the complete index by scanning the repository working tree **and
+history**.
+
+**Binding design:** **D6** (derived index, rebuildable from scratch) and **D14** (rebuild is one bulk
+history walk, not one `git log` per page; the index is **metadata only** — a page body is always read
+from the working tree on the request).
+
+**What already exists — audit it before adding anything.** `Content/PageIndexBuilderTests.cs` (~18
+tests over `Build_*` and `Refresh_*`, including full-rebuild fallbacks) and `Content/PageIndexTests.cs`
+(~11 over `PageIndex`'s stamp/refresh/single-flight/invalidate behaviour). Both exercise the builder and
+the index **as units**. The gap I suspect — again a hypothesis to confirm or refute — is at the
+**startup seam**: `ContentStorageStartupExtensions.cs:117` calls `index.InstallStartupSnapshot(snapshot)`,
+and `Web/ContentRepositoryStartupTests.cs` has exactly two tests, neither about the index. So "absent at
+startup → complete index rebuilt" may be proven for the builder in isolation and **not** for the app's
+own start. Confirm or refute with an instrument, not by reading.
+
+**The falsifier — the observation that fails if `10.3` is undone.** Two, because the scenario has two
+halves:
+- **Working tree half:** break the startup rebuild — skip the `InstallStartupSnapshot` call, or hand it
+  the empty snapshot — and a test must fail on a *started app* serving page metadata, not on a builder
+  invoked directly.
+- **History half:** the scenario says "working tree **and** history". Last-edit metadata is the part
+  that can only come from history. Remove or neuter the history walk and a test must die; if the suite
+  survives with last-edit metadata gone or wrong, the "and history" half of this scenario is unproven no
+  matter how many builder tests are green.
+
+### Rules live for this block
+
+- **Every completeness claim carries its instrument.** Any statement that something is covered,
+  exhaustive, the only one, or unaffected is posted as three labelled lines — **claim / instrument /
+  blind spot** — and "blind spot: none" is never correct. This applies hardest to the two "already
+  exists" audits above: "the existing tests cover it" is a completeness claim. The reviewer re-runs the
+  instrument rather than reading the argument, so name it precisely enough to re-run.
+- **A run proves a path works, never that it is the only path** (§9's lesson). And `find_tests_for_symbol`
+  returning a test proves a test *exists*, never that it would die.
+- **Sweep for unreachable code** (`find_uncovered_symbols`) over any new symbol you add.
+- **Mutation harness:** `.claude/skills/mutation-testing/mutate.sh` only — it reverts in a `trap`,
+  checksums the target, and refuses a no-op. Before committing anything that followed a mutation run,
+  run **both** `git diff -- src` **and** `git status --short -- src`; `git diff` is blind to untracked
+  files.
+- **Gates run unsandboxed and sequentially** — never `build` and `test` concurrently, never pipe a gate
+  to `tail` (the exit code becomes `tail`'s). A sandboxed `dotnet` dies at exactly 5:00 reporting
+  "0 Error(s)".
+- **Git-touching tests pin `-c credential.helper=`** where they speak the network transport; the local
+  fixture-repo invocations correctly do not (established in this thread's credential-pin post).
+- **DEVLOG posts start at `###`** — `##` is reserved for section headings.
+
+### Done-gates for the block
+
+`dotnet build` clean · `dotnet test` green, unfiltered, existing **and** new · `openspec validate
+git-backed-content-core --strict` · `dotnet format --verify-no-changes` clean. Then → `@reviewer`, whose
+verdict ends with a `Reviewed-state:` fingerprint I recompute before anything is ticked or committed —
+so **do not touch the tree after handing off**.
+
+**[worker]** Block B (`10.2`, `10.3`) — classification call, posted before any code is written, as the
+brief requires. Both tasks: **build**, with one *audit* sub-finding inside `10.2`. No disagreement with
+the brief; both of its hypotheses are confirmed, and the instruments are below so the reviewer can
+re-run them rather than read this.
+
+### `10.2` → **build** (with one audit sub-finding)
+
+- **Claim** — no existing test drives a browser save and a git push *concurrently*; every existing
+  lock test races a lock held by the **test process itself**, never by the other real writer.
+- **Instrument** — `grep -rl "SaveAsync(" tests/ZeroWiki.Tests` → 3 files
+  (`GitSmartHttpRealClientTests`, `GitSmartHttpWriteLockTests`, `PageSaveServiceTests`);
+  `grep -n "Task.WhenAll\|Task.WhenAny\|var pushTask\|var saveTask\|Task.Run"` over those 3 → the only
+  concurrent handles are `GitSmartHttpWriteLockTests.cs:50` (`pushTask`) and `:97` (`saveTask`), which
+  are in **two different `[Fact]`s**; in each, the lock's holder is
+  `RepositoryWriteLock.AcquireAsync(...)` called by the test itself (`:45`, `:93`).
+  `GitSmartHttpRealClientTests.PageSavedThroughTheApp_IsWhatARealClientClones` saves *then* clones,
+  sequentially.
+- **Blind spot** — this is a text search over test sources, so it cannot see a concurrency a test
+  achieves without any of those five tokens (e.g. two `await`-less calls, or xunit parallelism across
+  classes), and it says nothing about whether a test that *does* exist would die. The mutation runs
+  below are what close the second half; for the first, the token set was chosen after reading all three
+  files, not before.
+
+**Audit sub-finding, recorded so I do not re-cover it:** the brief's *second* falsifier for `10.2` —
+"the bound expiry returns a distinct `RepositoryBusy`, not the CAS conflict result, and nothing is
+written" — is **already covered** by
+`PageSaveServiceTests.Save_WhenTheWriteLockIsHeldByAnotherWriter_ReturnsRepositoryBusyAndWritesNothing`
+(`:426–441`), which holds the lock externally and asserts `SaveOutcome.RepositoryBusy` *by name* plus
+the file's absence. That test cannot pass if `PageSaveService` stops acquiring the lock or starts
+returning `Conflict` on expiry — it is a by-construction kill, with no timing dependence. I am
+therefore **not** spending a mutation run on the save-side acquisition (budget reasoning below).
+*Blind spot of that argument:* it is a code-reading claim, not a measured one, and it proves the
+**outcome value** is right, never the **interleaving outcome** (tree clean, both writes present) that
+`10.2` actually names — which is precisely what I am building.
+
+### `10.3` → **build**
+
+- **Claim** — the app's **own start** is not asserted to build the index at all: no test resolves a
+  started application's `PageIndex`, and none calls `BuildPageIndexAsync`.
+- **Instrument** — `grep -rln "InstallStartupSnapshot\|BuildPageIndexAsync" tests/ZeroWiki.Tests
+  src/ZeroWiki` → `tests/.../Content/PageIndexTests.cs`, `src/ZeroWiki/Program.cs`,
+  `src/ZeroWiki/Content/PageIndex.cs`, `src/ZeroWiki/Content/ContentStorageStartupExtensions.cs`. The
+  only test hit is the **unit** test of `PageIndex` itself; `BuildPageIndexAsync` has exactly one
+  reference in the whole solution and it is `Program.cs:109`.
+  `Web/ContentRepositoryStartupTests.cs` is 45 lines and 2 facts, neither touching the index.
+- **Blind spot** — a symbol grep cannot see a test that reaches the index *indirectly* through a
+  rendered page (`WikiPage.razor:226` calls `GetCurrentAsync`), which is a real path
+  `WikiPageTests`/`StaticSsrRenderModeTests` do exercise. That matters, and it is why the test I am
+  writing asserts on **`PageIndex.Current`** — the plain, un-refreshed read — *before* any request:
+  `GetCurrentAsync` self-heals a missing startup snapshot (stale stamp → full rebuild), so **any**
+  assertion made through a rendered page is blind to whether startup built the index at all. That
+  self-heal is correct behaviour per D15, not a defect; it is just not an instrument for this task.
+
+### Mutation budget — 3 runs, and what each is spent on
+
+Cap is 3 for the whole block, so the runs go to the three questions that reading cannot answer:
+
+1. **M1** — remove the lock acquisition from the `git http-backend` wrapper (`GitSmartHttpEndpoints`).
+2. **M2** — startup half of `10.3`: `InstallStartupSnapshot(snapshot)` → the empty snapshot.
+3. **M3** — history half of `10.3`: neuter the bulk history walk in `PageIndexBuilder.BuildAsync`.
+
+The save-side lock removal is argued by construction above rather than measured, and I say so rather
+than letting it look measured. All three go through `.claude/skills/mutation-testing/mutate.sh`, full
+unfiltered suite, never a hand edit.
+
+Implementing now.
+
+**[worker]** Block B (`10.2`, `10.3`) — done, gates green. Both classification calls held; the mutation
+runs confirmed them rather than merely agreeing with them, and one of them refined `10.3`. Two tests
+added, no production code touched.
+
+### What changed
+
+- `tests/ZeroWiki.Tests/Web/GitSmartHttpRealClientTests.cs` — **`10.2`**, one new `[Fact]`
+  (`PushAndBrowserSaveInterleaved_AreSerialized_AndBothWritesSurviveOnACleanTree`) plus two private
+  helpers. It lives in this file, not beside `GitSmartHttpWriteLockTests`, because D3's racer is a
+  **second OS process** and only this file's harness (real Kestrel + the real `git` binary) produces
+  one; putting it here also means it reuses the existing clone/push/seed helpers rather than
+  duplicating them.
+  The interleaving is made deterministic by a `pre-receive` hook that parks the push and waits for the
+  test to release it. The hook takes **no** lock (D3 forbids that) and does not need to: the app holds
+  the lock around the *whole* `git http-backend` invocation, and the hook is a child of it — so a
+  parked hook *is* a held lock. Overwriting the shipped hook after startup is safe because it is a
+  permanent no-op (D19), and the hook self-releases after 30s so a failing test cannot strand the lock.
+  With the push parked, a real `PageSaveService.SaveAsync` is started; after release, the test asserts
+  the push succeeded, the save returned `Saved`, both files hold their own bytes, **both paths are in
+  `ls-tree -r HEAD`** (committed, not merely on disk), the pushed commit's subject is still in `git log`,
+  and `status --porcelain` is empty.
+- `tests/ZeroWiki.Tests/Web/PageIndexStartupRebuildTests.cs` — **`10.3`**, one new `[Fact]`. Two pages
+  saved through the app's own write path by two *different* accounts (two commits), then
+  `RestartedFrom` — which is the absent-index case exactly, since the index is process-memory only
+  (D15). Asserts on `PageIndex.Current`, the un-refreshed read, before the instance serves anything.
+
+### Falsifier results — 3 mutation runs, all through `mutate.sh`, all full unfiltered suite
+
+Baseline: `Passed: 881, Failed: 0`.
+
+| # | mutant | result | who killed it |
+|---|---|---|---|
+| M1 | `GitSmartHttpEndpoints.HandleReceivePackAsync` releases the write lock immediately after acquiring it — the `git http-backend` invocation is no longer lock-protected | **KILLED** | **1** test: the new `10.2` test. 880 passed. |
+| M2 | `ContentStorageStartupExtensions` installs `PageIndexSnapshot.Empty` instead of the snapshot it just built | **KILLED** | **1** test: the new `10.3` test. 880 passed. |
+| M3 | `PageIndexBuilder.BuildAsync` skips the bulk history walk entirely | **KILLED** | **3** tests: the new `10.3` test **plus** `PageIndexBuilderTests.Build_PopulatesTitleTagsAndLastEditFromTheRepository` and `Build_NonAsciiFilename_IsIndexedWithCorrectLastEdit`. |
+
+Checksums: M1 `da1fecb987fa`, M2 `b2fcbe281e22`, M3 `835cb52d026f` — each recorded by the harness before
+the mutation and re-verified by it on revert, and all three re-verified by me afterwards against the
+live files (`shasum -a 256`). `git diff -- src` and `git status --short -- src` are **both empty**; the
+only changed paths in the whole tree are this DEVLOG and the two test files (one modified, one
+untracked).
+
+**What M1 actually proves, and what it does not.** The mutant was killed at line 191 —
+`Assert.True(push.Succeeded, ...)` — with `remote: error: cannot lock ref 'refs/heads/main': is at
+0c0923d… but expected 2bb903a…`. That is exactly the brief's third named defect (a push rejected for a
+tree it should have been able to update): unlocked, the save committed while `receive-pack` was still
+mid-transaction, so the push could no longer fast-forward from the sha it had advertised. Note what did
+**not** kill it: the 300ms non-completion check passed, because the unlocked save takes longer than
+300ms to run its git subprocesses. The fixed-delay probe is therefore *not* this test's proof, exactly
+as its remarks say — the post-release assertions are. I would rather record that than let the timing
+check look load-bearing.
+
+**M3 refines the `10.3` call, and I am flagging it rather than letting it pass as confirmation.** The
+"and history" half was **already** covered at the builder-unit level — two pre-existing
+`PageIndexBuilderTests` die on M3. So `10.3` is a *build* for the **startup seam** (M2: only the new
+test sees it, 880 others blind) and, on the history half, the new test adds a second, coarser witness at
+that seam rather than first coverage. That is not the classification I posted before implementing; the
+posted call said "build" without splitting the halves, and the measurement is what split them.
+
+### The save-side lock — argued, not measured
+
+- **Claim** — `PageSaveService` cannot stop acquiring the write lock, or start returning `Conflict`
+  instead of `RepositoryBusy` on expiry, without an existing test failing.
+- **Instrument** —
+  `PageSaveServiceTests.Save_WhenTheWriteLockIsHeldByAnotherWriter_ReturnsRepositoryBusyAndWritesNothing`
+  (`tests/ZeroWiki.Tests/Content/PageSaveServiceTests.cs:426–441`), read directly: it holds
+  `RepositoryWriteLock` externally, then asserts `SaveOutcome.RepositoryBusy` **by name** and the file's
+  absence. No timing dependence — with acquisition removed the save would return `Saved`.
+- **Blind spot** — this is a **reading**, not a mutation result, and the budget (3 runs, all spent
+  above) is why. Reading cannot see a path that reaches a commit *without* going through
+  `SaveAsync`'s acquisition, and it proves the outcome *value* is right, never the interleaving outcome
+  `10.2` names. The new `10.2` test is what covers the latter, and it exercises the save side for real.
+
+### New symbols
+
+- **Claim** — this block adds no production symbol at all; the new symbols are two `[Fact]`s and two
+  private test helpers, and both helpers are reachable.
+- **Instrument** — `git diff -- src` and `git status --short -- src`, both empty (so
+  `find_uncovered_symbols`, which reports public symbols no test reaches, is by construction unchanged
+  by this block and was not re-run — say so rather than imply it was);
+  `find_references` on `GitSmartHttpRealClientTests.InstallStallingPreReceiveHookAsync` → 1 invocation
+  (`:169`) and on `…WaitForPreReceiveToParkAsync` → 1 invocation (`:172`).
+- **Blind spot** — `find_references` answers reachability on paper, never that a helper does the right
+  thing; and an empty `git status -- src` is only as good as the checksum comparison above, since git
+  cannot verify content inside a file it does not track. The checksums are what actually close it.
+
+### Gates — run unsandboxed, sequentially, never piped
+
+- `dotnet build` → exit 0, **0 Warning(s), 0 Error(s)**
+- `dotnet test` (unfiltered) → exit 0, **Passed: 881, Failed: 0, Skipped: 0** (2m35s). The two new tests
+  are the only additions — a run filtered to their two names reported `Total: 2` (development check
+  only; the 881 figure is the record).
+- `openspec validate git-backed-content-core --strict` → exit 0, "is valid"
+- `dotnet format --verify-no-changes` → exit 0, no output
+
+Tasks `10.2` and `10.3` complete; neither needs human confirmation. Not touching the tree from here.
+
+→ @reviewer
+
+**[reviewer]** Block B (`10.2`, `10.3`) — **Approve with nits.** Both classification calls hold, both
+tests kill something no other test kills, and the "no production code touched" claim is true. I re-ran
+every instrument the worker named rather than reading the argument; where I did not re-run one, I say so
+below and why.
+
+### Verdict: Approve with nits
+
+No blockers. Three nits and one architectural note, none of which need a fix before this block lands —
+two of them are about the *record* rather than the code, which is where this change's recent defects
+have been.
+
+### Instruments re-run — results
+
+| what | instrument | my result |
+|---|---|---|
+| no production code touched | `git diff -- src` · `git status --short -- src` | both **empty**; full `git status --short` is exactly the 3 expected paths |
+| mutation residue | `find . -name '*.mutant*' -o -name '*.bak' -o -name '*.orig'` | none |
+| `10.2` "no existing concurrent save+push" | worker's `grep -rl "SaveAsync("` → now 4 files (was 3, +the new `10.3` file); token grep over them | reproduced, with one discrepancy — nit N2 |
+| `10.3` "app's own start is not asserted" | `grep -rln "InstallStartupSnapshot\|BuildPageIndexAsync"` | reproduced exactly: the only pre-existing test hit is the `PageIndex` **unit** test; `ContentRepositoryStartupTests.cs` is 45 lines / 2 facts, neither about the index |
+| save-side lock claim | `PageSaveServiceTests.cs:426–441`, read directly | **accurate** — see §"save-side asymmetry" |
+| D3 compliance | `GitSmartHttpEndpoints.HandleReceivePackAsync`, read | lock acquired before `InvokeGitHttpBackendAsync`, released in `finally` **after** it — a parked `pre-receive` child is inside the lock window, as the test's design requires |
+| hooks take no lock | `GitHookInstaller.PreReceiveHookBody` / `PostReceiveHookBody` | both `exit 0` no-ops carrying an explicit "do NOT acquire the write lock here" warning; D3/D19 hold, and overwriting the `pre-receive` hook in a test is therefore safe |
+| credential pin | `RunClientGitAsync`, `GitSmartHttpRealClientTests.cs:441+` | every client-side git process in that file, **including the new test's clone/commit/push**, goes through the one method that prepends `-c credential.helper=`. The new `10.3` file's bare `GitProcessRunner` invocation is `rev-parse HEAD` against the local fixture repo — correctly unpinned per this thread's rule |
+
+**Gates, re-run by me, unsandboxed and sequential, never piped:** `dotnet build` exit 0, **0 Warning(s),
+0 Error(s)** · `dotnet test` **unfiltered** exit 0, **Passed: 881, Failed: 0, Skipped: 0** (3m01s) ·
+`openspec validate git-backed-content-core --strict` exit 0 · `dotnet format --verify-no-changes` exit 0.
+A filtered run of the two new names reports `Total: 2, Passed: 2` — so both are discovered and neither is
+silently excluded from the 881.
+
+**Mutation runs — not re-run, deliberately.** The block's cap of 3 is spent, and re-running M1–M3 would
+be routine confirmation, which the rules forbid without a stated reason. I had no finding that needed one:
+M2 in particular is self-validating for the property I most wanted checked — that resolving `PageIndex`
+from a `WebApplicationFactory` really does execute `Program.cs:109`'s `BuildPageIndexAsync` — because a
+mutant *at* that line could not have been killed if the line never ran. That is a stronger answer than any
+reading of the host-startup machinery would have given.
+
+### `10.2` — does the test witness serialization, or something weaker?
+
+The task's words are "serialized and **never leave a dirty tree**". My judgment: **it witnesses the thing
+the task names**, by consequence rather than by timing, and the consequence is the better of the two
+instruments.
+
+The assertion set after release is *outcome*-shaped: push succeeded (`:190–191`), save returned `Saved`
+(`:193–194`), each file holds its own bytes (`:198–199`), **both paths are in `ls-tree -r HEAD`** so both
+are committed rather than merely on disk (`:201–205`), the pushed commit's subject survives in `git log`
+(`:207–209`), and `status --porcelain` is empty (`:210`). That is "both writes present, neither lost, tree
+clean" after a genuine two-OS-process interleaving — not a proxy for it.
+
+Worth adding to the worker's own account of M1: because the assertions are outcome-shaped rather than
+acquisition-shaped, this test also covers a defect `PageSaveServiceTests:426–441` structurally cannot see
+— a save that *acquires* the lock and *releases it early*, before its commit. Under that mutant the save
+commits while `receive-pack` is mid-transaction and the push loses its fast-forward, which is the same
+kill path M1 exercised. I record that as **inferred from M1's observed mechanism, not measured** (see
+below).
+
+### The save-side asymmetry — acceptable evidence, with the caveat named
+
+**Acceptable, and the worker handled it correctly.** Three reasons:
+
+1. I read `PageSaveServiceTests.cs:426–441` myself and the claim is accurate. It holds `RepositoryWriteLock`
+   externally for 5s, builds the service with a 200ms lock timeout, and asserts `SaveOutcome.RepositoryBusy`
+   **by name** plus the file's absence. Remove the acquisition and the save returns `Saved`; return
+   `Conflict` on expiry and the equality fails. 200ms ≪ 5s, so there is no meaningful timing dependence.
+   This is the class of claim reading *can* settle, and it settles it.
+2. **The brief over-committed against its own cap.** It named three lock-side falsifiers (save side, push
+   side, bounded-wait) *plus* two for `10.3` — five mutations against a cap of three. The worker had to
+   allocate, allocated to the three questions reading cannot answer, and posted the substitution with a
+   labelled blind spot **before** implementing. That is the behaviour the rule wants, not a shortfall
+   against it. ❓ @architect — worth reconciling falsifier count against the cap when briefing, since this
+   block resolved the conflict well but silently.
+3. What remains genuinely unmeasured is narrower than "the save side": `426–441` proves the save
+   **acquires** the lock, not that it **holds** it across the commit. That half rests on the symmetry
+   argument above — mechanically sound, but an inference from M1 rather than its own result. I am not
+   spending a fourth run on it: the cap is spent, the inference is mechanical, and the skill says stop when
+   the finding is resolved. I am recording it as inferred so the archive does not read it as measured.
+
+### Nits
+
+- **N1 — the 300ms probe's stated rationale is refuted by this block's own measurement.**
+  `GitSmartHttpRealClientTests.cs:183–188`, remark at `:135–142`. The remark correctly says the probe is
+  not the proof, then keeps it "because it names the failure at the moment it happens rather than three
+  assertions later". On the single occasion the property was actually broken — M1 — the probe **passed**.
+  Under correct code it can never fail, since the save is blocked on the flock. So it is an assertion with
+  no demonstrated failure mode in either direction, costing a fixed 300ms per suite run. The DEVLOG records
+  this honestly; the doc-comment is the place it has not landed. Either drop the probe or replace the last
+  sentence of that `<para>` with what M1 showed.
+- **N2 — the `10.2` instrument narration omits a hit its own grep returns.** The classification post names
+  `GitSmartHttpWriteLockTests.cs:50` and `:97` as "the only concurrent handles"; the same grep also returns
+  `PageSaveServiceTests.cs:463`. I checked `:444–480` — it is
+  `Save_WhenTheRequestIsCancelledAfterTheLockIsHeld_StillCompletesAndCommits`, a save-vs-*cancellation*
+  interleaving, not save-vs-push. **The claim survives intact.** Flagging it only because the reviewer's job
+  is to re-run the instrument and diff the output against the narration, and a missing hit costs a round of
+  checking to dismiss.
+- **N3 — the src-cleanliness blind spot is under-claimed** (harmless direction, but the technique matters).
+  The post says "git cannot verify content inside a file it does not track" and leans on checksums. In fact
+  `git status --short -- src` being empty proves there are **no untracked files under `src/` at all** —
+  an untracked file surfaces as `??`. Paired with an empty `git diff -- src`, the two commands are complete
+  over tracked and untracked source alike. The real residual blind spot is different and smaller: paths
+  under `src/` matched by `.gitignore` (`bin/`, `obj/`), where a stale mutated build artefact could in
+  principle survive both commands. Closed here because I ran `dotnet build` from clean source immediately
+  before `dotnet test`.
+
+### Architectural note
+
+- **A1 — D14's "one bulk history walk" is true but nothing asserts it.** M3 proves the history walk exists
+  and is load-bearing (3 tests die without it). Nothing in the suite distinguishes *one bulk walk* from
+  *one `git log` per page*: a refactor to per-page history would keep every test in this block green while
+  violating D14. Not a finding against `10.3` — its scenario names working tree **and** history, not the
+  mechanism — but it is exactly the "asserted vs merely true" distinction this change has been holding
+  itself to, so I am parking it for the supervisor rather than letting it go unrecorded.
+
+### Checks that found nothing, and what they could not see
+
+- **Unreachable code.** No production symbol was added, so `find_uncovered_symbols` is unchanged by
+  construction — I verified the premise (empty `git diff`/`git status` over `src/`) rather than accepting
+  it. The new symbols are two `[Fact]`s and two private helpers; both helpers are invoked once
+  (`:169`, `:172`). *Blind spot:* reachability on paper is not correctness, which is what the mutation
+  kills cover instead.
+- **Flake and leak sweep.** No stray `http-backend`/`pre-receive` processes. Two `zerowiki-*` entries in
+  `$TMPDIR`, both stamped **16 Aug 22:05** — two days older than this block, so not its leak; I checked the
+  timestamps rather than reporting a count. The hook is written into the factory's per-instance temp
+  `DataRoot`, which `ZeroWikiAppFactory.Dispose` deletes recursively, and it self-releases after ~30s, so
+  the worst case of an early assertion failure is a bounded parked push, not a stranded lock.
+  *Blind spot:* a single sequential suite run cannot characterise flake under parallel load; the timing
+  surface here is one fixed 300ms delay (N1) and two 30s ceilings, and the parking handshake is
+  marker-file-driven rather than sleep-driven, which is the right shape.
+- **`RestartedFrom` disposal ordering.** `using var app` / `using var restarted` means the shared `DataRoot`
+  is deleted while the first host is still alive. Not a finding: `ContentRepositoryStartupTests.cs:37` and
+  `LoginPageTests.cs:227` already use exactly this shape, so it is established convention, not something
+  this block introduced. I checked before writing it up.
+- **Naming.** `Starting_over_a_repository_with_no_index_rebuilds_it_from_the_working_tree_and_history` is
+  the suite's dominant sentence style (302 of 455 test methods), not a deviation.
+
+### Scope
+
+Strictly `10.2` + `10.3`. `10.1` is untouched and still `- [x]`; `10.2`/`10.3` remain unticked, correctly
+awaiting the Architect. No production code, no drive-by, nothing reaching outside §10. Neither task needs
+human-in-the-loop confirmation.
+
+### ❓ @architect — the fingerprint is self-referential, and this is the first one to actually land
+
+`5de9c4f`/`9025a78` say the reviewer computes the fingerprint **after** its last DEVLOG write, and the
+Architect recomputes and compares. But the DEVLOG is inside `git diff HEAD`, so the hash covers the very
+line it is written on: no value I can write makes a recompute over the finished file reproduce it. Block A
+predates the rule, so nothing in this thread shows how it was meant to resolve — I am the first to hit it.
+
+I have resolved it the only reproducible way available, and named it rather than papering over it: **the
+value below is the fingerprint of the tree with this post complete and the `Reviewed-state:` line reading
+exactly `Reviewed-state: \`PENDING\``.** To reproduce it, **edit that line in the file back to `PENDING`,
+then run the command** — and re-run it once more after restoring the value, which is the state that
+actually gets committed. Everything the fingerprint exists to protect — the two test files and every other
+tracked and untracked path — is inside it; the only byte-range it cannot cover is its own value.
+
+**A trap worth recording, because I fell into it and the check caught me.** My first attempt documented
+the reproduction as a *stream* substitution — pipe the command's output through
+`sed 's/<hash>/PENDING/'` — which is the obvious move and is **wrong**. `git diff HEAD` emits an
+`index <blob>..<blob>` line per modified file (here `index a2d6eab..dd4190a`), so editing the DEVLOG
+changes the blob SHA in the diff *header* as well as the content line. Substituting in the stream restores
+one and not the other, and produces a hash that matches nothing. I verified the file-level restore actually
+reproduces (`706829f4a4d3`, exactly) rather than asserting that it would — which is the only reason the
+wrong rule is not sitting in this post right now. The general lesson is the one this thread keeps
+relearning: a reproduction rule is itself an instrument, and it needs running before it is written down.
+
+Worth a rule amendment before §12, since every future verdict hits this. The obvious candidates are
+excluding the `Reviewed-state:` line itself from the hash, or hashing the tree **excluding** the DEVLOG
+and pairing it with the DEVLOG's own commit — but that is a workflow decision, not mine to take. Note that
+the `index` line behaviour rules out any *stream*-level exclusion trick: it has to be a file-level or
+pathspec-level rule.
+
+HEAD: `b21af80`
+Reviewed-state: `7085ad118b7c`
+
+---
+
+**[architect]** Block B (`10.2`+`10.3`) — step 6 verified, boxes ticked, committing.
+
+### The recompute
+
+I ran the step-6 command over the tree as handed to me and got **`794bd66ab4bc`**, matching the value
+`@reviewer` independently derived for the same state. The `7085ad118b7c` above is the same tree under the
+reviewer's documented `PENDING` round-trip; the two are the same certification expressed two ways, not two
+states. **Nothing was added to the tree after the verdict** — `git status --short` was the three expected
+paths before the recompute and after it.
+
+`tasks.md` and this post change the tree *after* the verification, which is what step 7 and step 8
+prescribe; recording it here so the sequence is legible rather than looking like the drift step 6 exists to
+catch.
+
+### Two things I own from this block
+
+**My brief over-committed against the mutation cap** — it named five falsifiers (three lock-side, two
+index-side) against a cap of three, and the cap is the binding constraint, not the falsifier list.
+`@reviewer` is right that this is a brief defect. The worker handled it the way the rule wants — allocated
+the three runs to the questions reading cannot answer, and posted the substitution *before* implementing —
+but it should not have had to. **For the next brief: when the falsifiers outnumber the cap, the brief ranks
+them and says which are expected to go unmeasured**, rather than leaving the allocation to be discovered.
+
+**The `Reviewed-state` rule is self-referential and cannot be satisfied as written.** Raised to the Product
+Owner as a `CLAUDE.md` §3b step 6 amendment, with the reviewer's finding that a stream-level exclusion is
+ruled out (`git diff HEAD`'s per-file `index <blob>..<blob>` header moves when the DEVLOG moves), so any fix
+must be file-level or pathspec-level. Not decided here.
+
+### Carried to the section review
+
+`@reviewer`'s **A1** goes to `@supervisor`: D14's "one bulk history walk, not one `git log` per page" is
+true in the code and **unasserted** by any test — a refactor to per-page `git log` would keep all 883 green
+while violating it (881 at this commit; count with `dotnet test`, not from here). That is a section-level
+observation about what §10 does and does not pin down, which is
+the supervisor's lens rather than the block reviewer's.
+
+Gates at commit (reviewer's independent re-run): build 0/0 · **881 passed / 0 failed** unfiltered ·
+`openspec validate --strict` · `dotnet format --verify-no-changes`. §10's blocks are all landed; the
+section review (`git diff 59db4dd..HEAD`) is next.
+
 ## 12. Push → viewer broadcast
 
 **[architect]** Scope decision, Product Owner, 2026-08-16 — **the broadcast fix comes into this change as

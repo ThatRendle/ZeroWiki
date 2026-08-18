@@ -68,8 +68,8 @@
 ## 10. Tests
 
 - [x] 10.1 Unit/integration tests for CAS rejection, transactional rollback, and startup reconciliation
-- [ ] 10.2 Concurrency test: interleaved browser save and push are serialized and never leave a dirty tree
-- [ ] 10.3 Index rebuild-from-repo test
+- [x] 10.2 Concurrency test: interleaved browser save and push are serialized and never leave a dirty tree
+- [x] 10.3 Index rebuild-from-repo test
 
 ## 11. Username form (`user-accounts` amendment)
 

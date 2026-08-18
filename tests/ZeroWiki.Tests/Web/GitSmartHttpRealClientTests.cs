@@ -111,6 +111,106 @@ public sealed class GitSmartHttpRealClientTests
         Assert.Equal(SavedContent, await File.ReadAllTextAsync(pulledPagePath));
     }
 
+    /// <summary>
+    /// Task 10.2: the interleaving itself. Every other lock test in this suite races a lock held by
+    /// the <em>test process</em> — <see cref="GitSmartHttpWriteLockTests"/> holds
+    /// <see cref="RepositoryWriteLock"/> directly and proves each route waits on it. That establishes
+    /// each side's discipline separately; it never puts the two real writers in flight at once, so it
+    /// cannot see the outcome `10.2` actually names: after a genuine interleaving, both writes are
+    /// present, neither is lost, and the working tree is clean. This test lives in this file rather
+    /// than beside those because D3's racer is a <b>second OS process</b>, and only this file's
+    /// harness (a real Kestrel listener and the real <c>git</c> binary) produces one.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The interleaving is made deterministic by a <c>pre-receive</c> hook that parks the push at a
+    /// known point and waits for this test to release it. The hook takes no lock itself (D3 forbids
+    /// that, on pain of deadlock) — it does not have to: the app holds the write lock around the
+    /// <em>whole</em> <c>git http-backend</c> invocation (§7.5), and the hook runs as a child of that
+    /// invocation, so a parked hook means a held lock. Overwriting
+    /// <see cref="GitHookInstaller.PreReceiveHookName"/> after startup is safe for the same reason
+    /// startup can overwrite it: the shipped hook is a permanent no-op (D19).
+    /// </para>
+    /// <para>
+    /// The 300ms non-completion check is not the proof and is not load-bearing on its own — a
+    /// fixed-delay probe means less the more loaded the machine is, this project's own recorded
+    /// lesson. What proves serialization is that the save's result and the final tree are read
+    /// <em>after</em> the push has been released and has completed: with either side's lock removed
+    /// the save commits while <c>receive-pack</c> is still mid-transaction, and the push that follows
+    /// can no longer fast-forward from the sha it advertised. The check is kept because it names the
+    /// failure at the moment it happens rather than three assertions later.
+    /// </para>
+    /// </remarks>
+    [Fact]
+    public async Task PushAndBrowserSaveInterleaved_AreSerialized_AndBothWritesSurviveOnACleanTree()
+    {
+        const string PushedContent = "# From a push\n\nwritten by a real git client, mid-interleaving\n";
+        const string SavedContent = "# From the browser\n\nwritten by PageSaveService, mid-interleaving\n";
+        const string PushCommitSubject = "add a page by push, parked in pre-receive";
+
+        using var factory = ZeroWikiAppFactory.WithRealServer();
+        var (account, token) = await SeedAccountWithTokenAsync(factory, Username);
+        var remoteUrl = BuildRemoteUrl(factory.RealServerAddress, Username, token.Plaintext);
+        var paths = factory.Services.GetRequiredService<ContentPaths>();
+
+        using var scratch = new TempDirectory();
+        var clonePath = Path.Combine(scratch.Path, "clone");
+        await RunClientGitOrThrowAsync(scratch.Path, ["clone", "--quiet", remoteUrl, clonePath]);
+
+        await File.WriteAllTextAsync(Path.Combine(clonePath, "docs", "from-push.md"), PushedContent);
+        await RunClientGitOrThrowAsync(clonePath, ["add", "-A"]);
+        await RunClientGitOrThrowAsync(
+            clonePath,
+            ["commit", "-q", "-m", PushCommitSubject],
+            ClientCommitIdentity());
+
+        var reachedMarker = Path.Combine(scratch.Path, "pre-receive-reached");
+        var releaseMarker = Path.Combine(scratch.Path, "pre-receive-release");
+        await InstallStallingPreReceiveHookAsync(paths.RepositoryRoot, reachedMarker, releaseMarker);
+
+        var pushTask = RunClientGitAsync(clonePath, ["push", "--quiet", "origin", "HEAD"]);
+        await WaitForPreReceiveToParkAsync(reachedMarker, pushTask);
+
+        var saveService = factory.Services.GetRequiredService<PageSaveService>();
+        var saveAuthor = new AuthenticatedAccount(account.Id, account.Username, account.IsAdministrator);
+        var saveTask = saveService.SaveAsync(
+            new RouteValue("from-browser"),
+            SavedContent,
+            PageBaseRevision.AbsentAtHead,
+            saveAuthor,
+            CancellationToken.None);
+
+        await Task.Delay(TimeSpan.FromMilliseconds(300));
+        Assert.False(
+            saveTask.IsCompleted,
+            "The browser save completed while a push was parked in pre-receive, so the two were not " +
+            "serialized against each other.");
+
+        await File.WriteAllTextAsync(releaseMarker, string.Empty);
+
+        var push = await pushTask;
+        Assert.True(push.Succeeded, $"push failed: {push.StandardError}");
+
+        var saveResult = await saveTask.WaitAsync(ClientTimeout);
+        Assert.Equal(SaveOutcome.Saved, saveResult.Outcome);
+
+        // Neither write lost: each file's own bytes on disk, and both paths committed at HEAD rather
+        // than merely sitting in the working tree.
+        Assert.Equal(PushedContent, await File.ReadAllTextAsync(Path.Combine(paths.WorkingTree, "from-push.md")));
+        Assert.Equal(SavedContent, await File.ReadAllTextAsync(Path.Combine(paths.WorkingTree, "from-browser.md")));
+
+        var tracked = await RunClientGitAsync(paths.RepositoryRoot, ["ls-tree", "-r", "--name-only", "HEAD"]);
+        Assert.True(tracked.Succeeded, $"ls-tree failed: {tracked.StandardError}");
+        Assert.Contains("docs/from-push.md", tracked.StandardOutput);
+        Assert.Contains("docs/from-browser.md", tracked.StandardOutput);
+
+        var subjects = await RunClientGitAsync(paths.RepositoryRoot, ["log", "--format=%s"]);
+        Assert.True(subjects.Succeeded, $"log failed: {subjects.StandardError}");
+        Assert.Contains(PushCommitSubject, subjects.StandardOutput);
+
+        await AssertServerWorkingTreeIsCleanAsync(paths);
+    }
+
     [Fact]
     public async Task NonFastForwardPush_IsRejected_AndTheServersWorkingTreeIsUnchanged()
     {
@@ -402,6 +502,84 @@ public sealed class GitSmartHttpRealClientTests
             paths.RepositoryRoot,
             ["commit", "-q", "-m", "adopted content"],
             GitAuthor.System.ToEnvironmentVariables());
+    }
+
+    /// <summary>
+    /// Overwrites the repository's <c>pre-receive</c> hook with one that parks every push until
+    /// <paramref name="releaseMarkerPath"/> appears, announcing its arrival by creating
+    /// <paramref name="reachedMarkerPath"/> first. The hooks directory is resolved with
+    /// <c>git rev-parse --git-path hooks</c>, the same way <see cref="GitHookInstaller"/> resolves it,
+    /// rather than assumed to be <c>.git/hooks</c>.
+    /// </summary>
+    /// <remarks>
+    /// The hook drains stdin (git feeds <c>pre-receive</c> the ref updates there) and gives up after
+    /// 30 seconds regardless, so a test that fails before releasing it cannot leave a push — or the
+    /// write lock the app is holding around it — parked indefinitely.
+    /// </remarks>
+    private async Task InstallStallingPreReceiveHookAsync(
+        string repositoryRoot,
+        string reachedMarkerPath,
+        string releaseMarkerPath)
+    {
+        var hooksPath = await RunClientGitAsync(repositoryRoot, ["rev-parse", "--git-path", "hooks"]);
+        Assert.True(hooksPath.Succeeded, $"rev-parse --git-path hooks failed: {hooksPath.StandardError}");
+
+        var hooksDirectory = hooksPath.StandardOutput.Trim();
+        if (!Path.IsPathRooted(hooksDirectory))
+        {
+            hooksDirectory = Path.Combine(repositoryRoot, hooksDirectory);
+        }
+
+        Directory.CreateDirectory(hooksDirectory);
+        var hookPath = Path.Combine(hooksDirectory, GitHookInstaller.PreReceiveHookName);
+        await File.WriteAllTextAsync(
+            hookPath,
+            $"""
+            #!/bin/sh
+            cat > /dev/null
+            touch '{reachedMarkerPath}'
+            waited=0
+            while [ ! -e '{releaseMarkerPath}' ] && [ "$waited" -lt 300 ]; do
+                sleep 0.1
+                waited=$((waited + 1))
+            done
+            exit 0
+
+            """);
+
+        if (!OperatingSystem.IsWindows())
+        {
+            File.SetUnixFileMode(
+                hookPath,
+                UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute |
+                UnixFileMode.GroupRead | UnixFileMode.GroupExecute |
+                UnixFileMode.OtherRead | UnixFileMode.OtherExecute);
+        }
+    }
+
+    /// <summary>
+    /// Waits until the stalling <c>pre-receive</c> hook reports it is running — i.e. the push is
+    /// genuinely inside the lock-held <c>git http-backend</c> invocation — failing fast, and with the
+    /// client's own stderr, if the push instead finished or died before ever reaching the hook.
+    /// </summary>
+    private static async Task WaitForPreReceiveToParkAsync(
+        string reachedMarkerPath,
+        Task<GitProcessResult> pushTask)
+    {
+        var deadline = DateTime.UtcNow + ClientTimeout;
+        while (!File.Exists(reachedMarkerPath))
+        {
+            if (pushTask.IsCompleted)
+            {
+                var finished = await pushTask;
+                Assert.Fail(
+                    "The push completed without ever reaching the stalling pre-receive hook " +
+                    $"(exit {finished.ExitCode}): {finished.StandardError}");
+            }
+
+            Assert.True(DateTime.UtcNow < deadline, "The push never reached the stalling pre-receive hook.");
+            await Task.Delay(TimeSpan.FromMilliseconds(25));
+        }
     }
 
     private async Task AssertServerWorkingTreeIsCleanAsync(ContentPaths paths)
