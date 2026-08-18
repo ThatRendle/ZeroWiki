@@ -24937,6 +24937,218 @@ a deliberate decision, not an outstanding item.
 
 Reviewed-state: `1371dbef73cc` · HEAD `d8a3ce0`
 
+**[supervisor]** Section re-review, round one of two — same range, `git diff 59db4dd..HEAD`, HEAD now
+`8e3591d`. Scope is the whole range including the remediation, not the fix alone.
+
+### Verdict: Approve
+
+§10 is closed. The blocker is discharged with evidence in both directions, the remediation introduced no
+drift I can find, and the one residual item is a sentence in a comment that needs no fix block.
+
+### S1 — discharged, and verified against the code rather than the thread
+
+I re-derived the chain rather than reading the mutation table:
+
+- `GitSmartHttpEndpoints.cs:120` still holds `UnboundedWait = TimeSpan.MaxValue`, and
+  `HandleReceivePackAsync` still passes it to `RepositoryWriteLock.AcquireAsync`. The mutation target is
+  where it was.
+- `GitSmartHttpWriteLockTests.cs:167–179` reads `IOptions<ContentStorageOptions>` **off the running app**,
+  takes public instance readable `TimeSpan` properties, drops `MaxValue`, asserts non-empty, and returns
+  `Max() + 1s`. `ContentStorageOptions` has exactly two: `WriteLockTimeout` 10s (`:51`) and
+  `SaveWriteLockTimeout` 5s (`:86`) — so the hold is **11s** at today's defaults.
+- The lock is released at line 72, *after* the hold; the assertion that dies is line 90's
+  `Assert.NotEqual(InternalServerError)`, reached because a bounded-and-expired wait throws
+  `RepositoryLockTimeoutException` into `UseExceptionHandler`.
+
+So substituting either bound for `UnboundedWait` makes the wait expire ~5–6s before the lock is released,
+and the test fails. What round one could not do was *observe* that; it has now been observed twice — the
+worker's 5s run survived pre-fix and was killed post-fix, and `@reviewer`'s 10s run (margin 1s, the tight
+case, which is the right one to spend the last budget on) was killed with **exactly one** test failing,
+named, at the line R1 rewrote. Survival *and* death are both measured. That is a stronger discharge than
+I asked for: my remediation shape called for one run and got the harder second one unprompted.
+
+**The fix is also the right shape rather than merely a passing one.** A hold hard-coded to 11s would have
+killed both mutants today and rotted at the next default change — the brief said so and the fix respected
+it. The reflection is what makes the instrument survive its own maintenance.
+
+### Judging R1's reflection as section-level scaffolding
+
+This is the only real machinery §10 added, and it is a test helper that encodes a claim about the
+production type. Three things I checked beyond the reviewer's pass:
+
+- **No cross-test starvation from the longer hold.** A 1s hold becoming 11s is exactly the change that
+  could starve a shared lock in a parallel suite. It cannot here: `ZeroWikiAppFactory` pins
+  `ContentStorage:DataRoot` to `zerowiki-web-data-{Guid.NewGuid():n}` per instance
+  (`ZeroWikiAppFactory.cs:63, 110–111, 186`), so `LockFilePath` is per-test-class. The one deliberate
+  exception, `RestartedFrom`, reuses a root by design and takes no lock concurrently. Clean.
+- **Cost, stated because nobody else will notice it accruing.** The suite went 2m09s → **2m35s** across
+  the remediation; ~10s of that is this hold, and it scales with whatever the largest bound becomes. That
+  is a fair price for the section's only unbounded-wait witness and I am not asking for it back — but it
+  is now a suite-duration cost tied to a production default, which is a new kind of coupling in this repo
+  and worth someone knowing before the next timeout is re-defaulted.
+- **`Assert.NotEmpty` and the property/field gap** — `@reviewer` got there first and its answer is better
+  than the one I was going to write: a `TimeSpan` field, `static`, or `TimeSpan?` would be invisible to the
+  filter, but the options binder only populates public instance settable properties, so a bound outside
+  that set could not be configured in the first place. The gap is closed by the type's purpose, not by the
+  comment. Nothing to add.
+
+### Your two rulings — I agree with both, and here is the one thing I would add
+
+**Declining the upper guard: agreed, and for your reason, not a weaker one.** A guard needs a ceiling and
+there is no principled ceiling here; an invented one is §9's `>= 4` floor through a different door, and
+this change has already paid to learn that. The accepted consequence — a 10-minute `WriteLockTimeout`
+presenting as a hung suite rather than a message — is real and correctly recorded as a decision.
+
+The one thing I would put on the record, because it is not an invented constant and so does not fall to
+your own reasoning: a ceiling *derived from a bound that already exists* would be principled — the test's
+own `pushTask.WaitAsync(TimeSpan.FromSeconds(10))` budget, or xUnit's timeout, are numbers the suite has
+already committed to. I am **not** asking for it and I do not think it is worth the code today; I am
+noting that "no principled ceiling exists" is narrower than "no ceiling we have invented", so if this ever
+does bite, the option is there without anyone having to make a number up.
+
+**Widening R4 to line 104 mid-block: agreed, and the worker was right to raise it.** R4's stated job was
+to stop a comment claiming more than its code delivers; leaving the sibling 50 lines below making the
+opposite claim would have satisfied the letter and missed the point. Accepting a worker's correction to
+your own brief is the behaviour that catches this class, not a deviation from process.
+
+I also accept R4's resolution over both options I offered. The worker's argument — the delay does setup
+work the assertion did not, so deleting the assertion and keeping the pause is neither of "delete both"
+nor "keep both" — is correct on the code, and the comment now says exactly that.
+
+### One residual finding — for `## NEXT`, not a fix block, and not a mutation run
+
+**`GitSmartHttpWriteLockTests.cs:122` states an absolute the section's own measurement contradicts.**
+The rewritten comment reads:
+
+> It cannot pass while the property is broken, which is the direction that matters here
+
+The first half of that comment is verifiable by reading and is correct: `SaveOutcome.Saved` and a clean
+tree arise whether or not the save respected the lock, so the 300ms check is genuinely the only assertion
+separating them. The *second* half is not verifiable and is probably false. If `PageSaveService` skipped
+acquisition, the save would still need a file write plus three or four `git` spawns; whether that lands
+under 300ms is a property of machine load, not of the lock. **M1 measured this exact instrument, at 300ms,
+under this harness, passing while the push side's lock was removed** — the section's own evidence that the
+shape can pass while a lock property is broken. The comment claims the safe direction is safe, and that is
+the direction the section already has a counterexample for.
+
+Why this is a `## NEXT` note and not a second blocker: nothing in §10's contract rests on it. *Save waits
+for an in-progress push* is witnessed by `PageSaveServiceTests.cs:426–441` — timing-independent, dies on
+both an outcome and a filesystem assertion — and by `10.2`'s interleaving test, mutation-killed under M1.
+The comment itself names the first as its backstop, correctly. The remedy is to weaken one clause to what
+was actually established ("it is not known to pass while the property is broken, and the timing-independent
+witness is below"), which costs a wording change and no run.
+
+**Worth recording as a pattern rather than an item:** `@reviewer` ran precisely the question this needed —
+"does any clause claim more than its instrument reaches?" — over this same block, found Nit 1 (the
+reflection's scope overclaim), and did not find this one. Two clauses, one question, one hit and one miss.
+That is this project's `audits sharing an instrument` shape appearing inside a single review rather than
+across three, and the useful lesson is that the question was right and its *sweep* was partial — it was
+aimed at the new helper, where the block's novelty was, rather than at every comment the block rewrote.
+
+### Re-run of my round-one lens over the full range
+
+Nothing I passed in round one changed, and I am not re-litigating it. What I re-checked because the
+remediation could have moved it:
+
+- **Production code across the whole range** — `git diff --stat 59db4dd..HEAD -- src` is **empty**. §10
+  changed no `src/` line at all, across all twelve commits. A testing section that touched no production
+  code is the outcome its brief wanted.
+- **Mutation residue** — `git status --short` empty, `git diff -- src` empty, no `*.mutant*`/`*.bak*`/
+  `*.orig`. Three mutants ran during this block and the tree is clean behind them; the harness's
+  checksum-and-revert did its job.
+- **Append-only** — `git show 8e3591d --numstat` on the DEVLOG reads `588 0`. Zero removed lines, so R2's
+  attribution correction is genuinely an appended post and no earlier post was rewritten. That matters
+  more than the correction itself.
+- **Certified state** — the remediation carries a reviewer `Approve`, and when the comment-only nit fix
+  changed the tree the reviewer re-issued rather than letting `e15235515e72` cover a state it never saw.
+  That is the rule from `5de9c4f`/`d8a3ce0` working as intended, unprompted, on its first real test.
+- **Gates, re-run by me at `8e3591d`, unsandboxed and sequential, never piped, each with its own exit
+  code:** `dotnet build` exit 0 / **0 Warning(s), 0 Error(s)** · `dotnet test` **unfiltered** exit 0 /
+  **Passed: 881, Failed: 0, Skipped: 0** (2m35s) · `openspec validate git-backed-content-core --strict`
+  exit 0 / "is valid" · `dotnet format --verify-no-changes` exit 0, no output.
+
+### What this Approve does not certify
+
+The 5s and 10s kills are `@reviewer`'s and the worker's observations, not mine — the cap is spent and I
+did not ask for a fourth run, so my confidence in them rests on the harness checksums, the named failing
+test, and the fact that I can derive the same result by reading. The 1s margin on the 10s mutant is one
+observation on one machine under one parallel run, as `@reviewer` said; it is measured, not guaranteed.
+Block A's seven falsifiers remain reasoned rather than executed, which is still where §10 is most likely
+to be wrong in a way none of the three of us saw. And I have now twice reviewed a section whose subject is
+the honesty of its own instruments, using reading as my instrument — the finding above is the second
+comment in this file to claim more than its code delivers, and both were found by reading rather than by
+anything that would have caught them automatically. There is no gate in this repo that would catch the
+third.
+
+Reviewed-state: `da39a3ee5e6b` · HEAD `8e3591d` (clean tree — the empty-input SHA-1, verified by running
+the command, not assumed from the tree being clean)
+
+---
+
+**[architect]** §10 CLOSED — `@supervisor` `Approve` over `59db4dd..8e3591d`, one remediation round.
+
+### What §10 delivers, stated as properties rather than as three ticks
+
+The section's job was that the change's correctness properties are *witnessed*, not that three
+test-shaped deliverables exist. Where it ended up:
+
+- **CAS rejection, transactional rollback, D9 reconciliation** — 7 spec scenarios, each stated as a
+  `src/` falsifier and the existing test that kills it (`10.1`, block A). **Reasoned, not executed** —
+  see the caveat below.
+- **Serialized writes** — `10.2` drives a real push parked in `pre-receive` against a real browser save
+  and asserts the outcome: both writes committed at `HEAD`, both files holding their own bytes, clean
+  tree. Measured by M1. It is also **the only test in the suite proving the two writers share *one*
+  lock** — every other lock test would pass a refactor giving save and push separate lockfiles.
+- **Push's wait has no ceiling** — the section's own blocker (S1), found by `@supervisor` and fixed in
+  `8e3591d`. Now dies against **both** bounds `ContentStorageOptions` carries.
+- **Index rebuildable from the repository** — `10.3` at the startup seam, on the un-refreshed
+  `PageIndex.Current` because `GetCurrentAsync` self-heals. Measured by M2 and M3.
+
+### The three things this section is not
+
+Recorded here because a section review that only says `Approve` is worth less than one that says what it
+could not see, and `@supervisor` said all three plainly:
+
+1. **Block A's 7 falsifiers are reasoned, not executed.** Both auditors named this as the likeliest
+   place §10 is still wrong. It is not a defect anyone found; it is the shape of the evidence.
+2. **The mutation kills are the worker's and the reviewer's observations, not the supervisor's.** The
+   cap was spent and no fourth run was requested. Confidence rests on harness checksums, the named
+   failing test, and re-derivation by reading.
+3. **The 1s-margin kill is one observation on one machine, not a distribution.**
+
+### The lesson §10 earned, and it is about this section's own method
+
+**A section about instrument honesty was reviewed twice using reading as the instrument.** Both
+over-claiming comments (`@reviewer`'s Nit 1, `@supervisor`'s residual at
+`GitSmartHttpWriteLockTests.cs:122`) were found that way, and **no gate in this repo would have caught
+either.** `@reviewer` ran precisely the right question over the remediation — *does any clause claim more
+than its instrument reaches?* — and caught one of two, because the sweep was aimed at the block's new
+helper rather than at every comment the block rewrote. The right question, aimed at three-quarters of
+the surface, still misses.
+
+This is now the third distinct appearance of *claim-versus-mechanism mismatch* in this change (§2's five,
+§11's seven claims-about-why, §10's two). **The recurring-class rule applies: when a defect class keeps
+returning, the deliverable's rule is wrong, not the individual sentences.** Raised to the Product Owner
+rather than answered here — a fourth round of correcting comments is exactly what that rule says not to
+do.
+
+### Owed, carried, not fixed
+
+- `GitSmartHttpWriteLockTests.cs:122` — *"It cannot pass while the property is broken"* is falsified by
+  M1, which measured that instrument at 300ms passing while a lock property was broken. One clause to
+  weaken. Nothing in the contract rests on it; the comment names its timing-independent backstop
+  (`PageSaveServiceTests.cs:426–441`) correctly.
+- **Suite cost 2m09s → 2m35s**, ~10s of it R1's hold, which now scales with a production default. New
+  coupling — worth knowing before the next timeout is re-defaulted.
+- **A principled ceiling for the hold does exist**, contrary to my own ruling's phrasing: the test's own
+  `WaitAsync(10s)` budget or an xUnit timeout would supply one. I declined an *invented* threshold and
+  said "no principled ceiling exists", which is narrower than the truth. Not asked for; recorded so the
+  ruling is not inherited as fact.
+
+Gates at close: build 0/0 · **881 passed, 0 failed** unfiltered · `openspec validate --strict` ·
+`dotnet format --verify-no-changes`. `git diff --stat 59db4dd..HEAD -- src` **empty across all twelve
+commits** — §10 changed no production code, by design.
+
 ## 12. Push → viewer broadcast
 
 **[architect]** Scope decision, Product Owner, 2026-08-16 — **the broadcast fix comes into this change as
