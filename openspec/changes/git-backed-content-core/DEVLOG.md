@@ -25265,7 +25265,32 @@ quoting them.
   preserve hand edits; four versions of migration over freshly hand-edited files is exactly where that
   claim gets tested. Clean tree before starting, so it is trivially revertible.
 
-**Resume point: §10. `10.2`–`10.3`, block B not yet carved. `10.1` landed in `4dc6de0`.**
+**Resume point: §12 — `12.1`–`12.4`, not carved. §10 is CLOSED** (`@supervisor` `Approve` over
+`59db4dd..8e3591d`, one remediation round; close-out post at the end of `## 10.`). **§1–§11 are now all
+closed with a supervisor `Approve`; §12 is the only open section.** Count tasks from `tasks.md`
+(`grep -c '^- \[x\]'`), never from this pin.
+
+**⚠️ Two things are owed BEFORE §12 opens, both Product Owner-scheduled:**
+
+1. **Run `/dmons:update-scaffold`** — the migration described further down this pin, with both of its
+   conditions (verify the skill is not a stale cached copy of itself; confirm each of the four
+   migrations, and that `e5844c9`'s hand edits survived).
+2. **Distil this pin — and it cannot be done as the rule describes.** `CLAUDE.md` says NEXT holds only
+   the handover and everything else "already lives permanently in the section threads". **That is false
+   here.** The three ledgers below — *Forward obligations* (26 live), *Close-out items before archive*
+   (F1, F2) and *Standing rules earned in §0–§11* (18) — were parked **in this pin**, not in threads, so
+   there is nothing to link them to and cutting to ~80 lines would delete them. **Open question with the
+   Product Owner, 2026-08-18:** relocate the ledgers verbatim to a permanent home (a `##` heading that
+   is not a task section, or a sibling `LEDGER.md` archived alongside) and let NEXT become a real
+   handover. **Do not distil until that is settled** — the pin being too long is a legibility problem;
+   deleting 26 live obligations is a correctness one.
+
+**Also open with the Product Owner, raised at §10's close:** §10 was the **third** appearance of
+claim-versus-mechanism mismatch in this change (§2's five, §11's seven claims-about-why, §10's two).
+Both of §10's were found by *reading*, in a section about instrument honesty, and no gate in this repo
+would catch a third. The recurring-class rule says the deliverable's rule is wrong rather than the
+sentences — so a fourth round of correcting comments is precisely what not to do. Not answered; see the
+`[architect]` close-out under `## 10.`
 
 §10's `Base:` post is `59db4dd` and is already in the `## 10.` thread — do **not** post another; the
 supervisor's review scope for the whole section runs from it.
@@ -25277,12 +25302,13 @@ were each stated as a one-line `src/` falsifier and the existing test it kills, 
 `Approve` after independently re-running the instruments. **Do not re-open `10.1` by writing tests over
 it.**
 
-**Block B is `10.2` + `10.3`, not yet carved or briefed.** `10.2`'s concurrency test (interleaved browser
-save and push, serialized, never a dirty tree) is the one most likely to need iterating.
+**§10 landed in three commits:** block A `4dc6de0` (`10.1` gap analysis + credential pin), block B
+`3e22b8f` (`10.2`+`10.3`), remediation `8e3591d` (the supervisor's S1 — a spec scenario witnessed by a
+test that could not fail). Its `Base:` was `59db4dd`.
 
 **§10 is no longer the last section — §12 was added 2026-08-16 by Product Owner decision** (`12.1`–`12.4`,
 the push→viewer broadcast; the full reasoning and its escape hatch are in the `## 12.` thread above, read
-it before opening that section). **41 → 45 tasks; 39 ticked, 6 open.** Count from `tasks.md`, never from
+it before opening that section). **41 → 45 tasks.** Count from `tasks.md`, never from
 this pin. §12 runs *after* §10: §10 is bounded and carved, §12's root cause is not isolated, so keeping
 §10 first means the change is never more than one bounded section from releasable.
 
@@ -25302,10 +25328,9 @@ been discharged: the Obsidian round trip, the rejection and its recovery, the co
 Obsidian, and the vault setup are all confirmed by their own run; the clone/edit/push cycle and the
 documented route are proven by automation. **Do not ask them to re-verify any of it.**
 
-**Working tree CLEAN. State: 38/41 tasks ticked.** Three remain — `10.1`–`10.3`, the whole of §10, with
-its own section review still to come. **Count these from `tasks.md`, never from this pin**
-(`grep -c '^- \[x\]'`): a wrong figure written here once rode along through two blocks, and the
-correction is recorded below.
+**Working tree CLEAN. State: 41/45 tasks ticked** — the four open are §12's `12.1`–`12.4`. **Count from
+`tasks.md`, never from this pin** (`grep -c '^- \[x\]'`): a wrong figure written here once rode along
+through two blocks, and this pin has been wrong about its own resume point three times.
 
 **Three changes are queued behind this one's archive**, each amending code or a capability that exists
 only on this branch, and none applicable before it archives. They touch disjoint code, so their order is
