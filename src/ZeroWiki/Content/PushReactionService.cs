@@ -1,3 +1,4 @@
+using System.Linq;
 using Microsoft.Extensions.Logging;
 
 namespace ZeroWiki.Content;
@@ -189,6 +190,17 @@ public sealed class PushReactionService
     /// (no circuit ever subscribed) versus "diffed X, subscribed Y" (subscribed, just not under X). A
     /// healthy delivery never carries this; <see cref="PageChangeNotifier"/> never computes it for one.
     /// </remarks>
+    /// <remarks>
+    /// <b>§12 correction.</b> Both route lists are rendered through <see cref="FormatRoutes"/> rather
+    /// than interpolated directly: <c>Microsoft.Extensions.Logging</c>'s default placeholder formatter
+    /// enumerates an <see cref="IEnumerable{T}"/> argument and joins the items with no wrapping
+    /// delimiter, so a 0-element list and a 1-element list holding <c>default(EncodedRoute)</c> (whose
+    /// <see cref="EncodedRoute.Value"/> is <see langword="null"/> -- see that type's own remarks) both
+    /// render as the empty string; measured directly against this logger, not assumed. The explicit
+    /// <c>{SubscribedRouteCount}</c> placeholder is a plain <see langword="int"/>, so it renders
+    /// correctly regardless of what the list contains and a reader is never left to infer a count from
+    /// parsing the rendered list text.
+    /// </remarks>
     private void LogReactionOutcome(
         string beforeSha,
         string afterSha,
@@ -200,15 +212,16 @@ public sealed class PushReactionService
             _logger.LogInformation(
                 "Push reaction for HEAD {BeforeSha} -> {AfterSha} diffed {DiffedRouteCount} route(s) " +
                 "{DiffedRoutes}, matched {SubscribersMatched} subscriber(s), and invoked " +
-                "{CallbacksInvoked} callback(s); the subscription table held {SubscribedRoutes} at that " +
-                "moment.",
+                "{CallbacksInvoked} callback(s); the subscription table held {SubscribedRouteCount} " +
+                "route(s) {SubscribedRoutes} at that moment.",
                 beforeSha,
                 afterSha,
                 changedRoutes.Count,
-                changedRoutes,
+                FormatRoutes(changedRoutes),
                 result.SubscribersMatched,
                 result.CallbacksInvoked,
-                subscribedRoutes);
+                subscribedRoutes.Count,
+                FormatRoutes(subscribedRoutes));
             return;
         }
 
@@ -219,10 +232,53 @@ public sealed class PushReactionService
             beforeSha,
             afterSha,
             changedRoutes.Count,
-            changedRoutes,
+            FormatRoutes(changedRoutes),
             result.SubscribersMatched,
             result.CallbacksInvoked);
     }
+
+    /// <summary>
+    /// §12 correction: a bracket-delimited, comma-joined, quoted rendering of a route list -- so the
+    /// text a reader (or log-scraping tool) sees cannot collapse two different states to the same bytes
+    /// the way <c>Microsoft.Extensions.Logging</c>'s bare placeholder interpolation did (see
+    /// <see cref="LogReactionOutcome"/>'s own remarks). An empty table renders <c>[]</c>; a table
+    /// holding one route with an empty <see cref="EncodedRoute.Value"/> renders <c>[""]</c> -- visibly
+    /// distinct from <c>[]</c> because the quotes are always present; a table holding one
+    /// <c>default(EncodedRoute)</c> renders <c>[&lt;null&gt;]</c>, an unquoted sentinel because
+    /// <see langword="null"/> cannot itself sit inside quotes without becoming indistinguishable from
+    /// the empty-string case, and is itself distinguishable from a real route whose text happens to be
+    /// the seven characters <c>&lt;null&gt;</c> -- that renders <c>["&lt;null&gt;"]</c>, quoted, never
+    /// bare.
+    /// </summary>
+    /// <remarks>
+    /// <b>§12 second correction -- <see cref="FormatRoute"/> escapes its content (reviewer finding).</b>
+    /// Quoting alone only disambiguates a value from the list structure around it if the quote character
+    /// itself cannot appear unescaped inside the value -- and <see cref="PageRouteCodec.EncodeSegment"/>
+    /// leaves <c>"</c> (and <c>&lt;</c>, <c>&gt;</c>) unescaped, so a real, <c>Encode</c>-reachable route
+    /// <see cref="EncodedRoute.Value"/> can contain one (verified: <c>Encode("a\",\"b.md").Value ==
+    /// "a\",\"b"</c>). <see cref="FormatRoute"/> therefore backslash-escapes before quote-escaping --
+    /// the same two-character scheme C and JSON string literals use, and total for the same reason
+    /// theirs is: scanning a rendered value left to right, the first <c>"</c> preceded by an <i>even</i>
+    /// number of consecutive <c>\</c> (zero included) is unambiguously the closing delimiter, because
+    /// every <c>\</c> that originated in the raw value was itself doubled first, so a real <c>\"</c> pair
+    /// from the source can never masquerade as escaped-backslash-then-bare-quote. That makes the mapping
+    /// from raw value to escaped-and-quoted text injective over <i>every</i> string a <see langword="string"/>
+    /// can hold, not merely the ones <see cref="PageRouteCodec.Encode"/> happens to produce today --
+    /// <see cref="EncodedRoute"/>'s own contract promises nothing beyond "default has a null Value" (see
+    /// its remarks), so this method does not lean on <c>Encode</c>'s specific transform (which, as it
+    /// happens, never lets a raw space or backslash survive into <see cref="EncodedRoute.Value"/> at all
+    /// -- checked, not assumed) as its only line of defence.
+    /// </remarks>
+    private static string FormatRoutes(IReadOnlyCollection<EncodedRoute> routes) =>
+        "[" + string.Join(", ", routes.Select(FormatRoute)) + "]";
+
+    private static string FormatRoute(EncodedRoute route) =>
+        route.Value is null ? "<null>" : $"\"{EscapeForRendering(route.Value)}\"";
+
+    private static string EscapeForRendering(string value) =>
+        value
+            .Replace("\\", "\\\\", StringComparison.Ordinal)
+            .Replace("\"", "\\\"", StringComparison.Ordinal);
 
     /// <summary>
     /// D19 §2's diff, in the same shape <see cref="PageIndexBuilder.RefreshAsync"/> already uses for its

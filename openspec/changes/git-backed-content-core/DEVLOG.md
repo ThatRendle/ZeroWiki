@@ -25702,6 +25702,91 @@ and could not previously be given.
 diagnosis; the Product Owner still has to see the banner *appear*, which is the confirmation. The two are
 different observations and only the second closes `12.4`.
 
+**[architect]** ⚠️ Correction to my own live-run post above — **its central conclusion is withdrawn, and
+the instrument that produced it has a defect.**
+
+I wrote *"`IPageChangeNotifier.Subscribe` is never invoked in the running application"* on the strength of
+`the subscription table held ␠ at that moment`. **That reading is not established.**
+
+`EncodedRoute` is a `readonly record struct` whose `ToString()` returns `Value`
+(`src/ZeroWiki/Content/EncodedRoute.cs`), and its own remarks state the limit plainly: *C# gives every
+struct a public `default` regardless of an `internal` constructor, so `default(EncodedRoute)` is available
+to any caller and carries a `null` `Value`.* The record renders a list with no delimiters — the same
+message renders a one-element list as `diffed 1 route(s) diag`. Therefore:
+
+- an **empty** subscription table renders as blank, and
+- a table holding **exactly one `default(EncodedRoute)`** *also* renders as blank.
+
+Those are different worlds with different fixes, and `12.1`'s record cannot tell them apart. The second is
+not a hypothetical: a component parameter that fails to round-trip across the SSR→interactive boundary is
+exactly how a subscription under `default(EncodedRoute)` would arise, and `EncodedRoute` — an `internal`
+constructor, a get-only property, no public parameterless constructor — is precisely the shape that makes
+that worth checking rather than assuming.
+
+**This is a defect in `12.1` as delivered, not merely a misreading by me.** The spec scenario `12.1` was
+built against requires that *"a broadcast reaching no viewer is distinguishable from a delivered one"*,
+and the zero-match diagnostic exists to separate *"subscribed `[foo]`, matched 0"* from *"subscribed
+`[]`"*. It cannot currently separate *"subscribed `[]`"* from *"subscribed `[⌀]`"* — and that is the
+distinction the live run actually turned on. Both the worker's tests and the reviewer's audit passed over
+it, because both asserted on the **returned counts** (structurally correct, and right to do) while the
+*rendered record* is what a human reads in production, and nothing tested what that record looks like when
+a route's `Value` is null.
+
+**What I got wrong, and why it is worth naming rather than quietly fixing.** I listed this exact gap as
+blind spot 2 of my own post — *"I never observed a NON-empty subscription table in this live
+environment"* — and then stated the conclusion anyway. Naming a blind spot is not the same as respecting
+it. This is the fourth appearance in this change of a conclusion outrunning its instrument, and the first
+where the Architect is the one who did it.
+
+**Nothing else in that post is withdrawn.** The circuit evidence stands on its own instruments — negotiate
+`200`, `WebSocket connected` in the browser console, the island descriptor in the server HTML, both
+render-mode registrations present, no exception on either side. The mutation result from block 1 stands.
+What is withdrawn is the single inference from a blank field to an empty table.
+
+**Order of work is therefore fixed:** the record is hardened first, the live run is repeated against the
+hardened record, and only then is `12.2`'s test written — because what `12.2` must be watched failing
+*against* depends on which of the two worlds is real.
+
+**[architect]** ⚠️ A gate run came back **red** on this block and I am recording it, because the most
+likely cause is a workflow hazard this repo has not written down and the next section will hit it again.
+
+```
+first run:   BUILD_EXIT:0  TEST_EXIT:1  (Failed 1, Passed 888, Total 889)  FORMAT_EXIT:0  VALIDATE_EXIT:0  GATES_EXIT:2
+second run:  BUILD_EXIT:0  TEST_EXIT:0  (Failed 0, Passed 889, Total 889)  FORMAT_EXIT:0  VALIDATE_EXIT:0  GATES_EXIT:0
+```
+
+**An auditor reproducing a falsifier edits the shared working tree, and a concurrent gate run tests
+whatever it has edited.** `@reviewer` re-derived the escaping collision exactly as it should have — by
+hand-reverting `FormatRoute` to the previous form, running the test, watching it fail, then restoring.
+That revert lives in the same working tree my `make gates` was reading. A reverted `FormatRoute` fails
+precisely one test, and the red run reported precisely one failure out of 889.
+
+**Evidence it was contamination, and the honest limit on that claim:**
+
+- The `Reviewed-state` fingerprint recomputed after everything settled is `37fbff2fd78e` — **identical**
+  to the one `@reviewer` certified — so the tree is in the certified state now and the revert was
+  properly restored. This is the fingerprint check doing a job it was not designed for.
+- A clean re-run with **no** `dotnet test` process and no agent active: 889/889, `GATES_EXIT:0`.
+- **The limit:** I did not capture the failing test's *name* on the red run — my filter was too narrow
+  and the run is gone. So "one failure, and a reverted `FormatRoute` would cause exactly one failure" is
+  a coincidence of counts, not an identification. **This explanation is well-supported, not confirmed**,
+  and I am not going to manufacture confirmation by re-staging it.
+
+**Separately, and NOT explained by this:** the two mutation runs in block 1 reported **6** and **7**
+failures for the identical mutant under the identical unfiltered suite, and those two ran sequentially
+with nothing else in flight. That variance stands unexplained and is a different signal from this one.
+**Do not let this note be read as having accounted for it** — conflating the two would retire a real
+question by attaching it to a solved one.
+
+**Two rules that follow, for `## NEXT`:**
+
+1. **Never run a gate while an auditor is mid-audit.** The reviewer and supervisor read and sometimes
+   *edit* the same tree; the Architect's gate run is not isolated from them. Gates run when no agent is
+   active.
+2. **Capture full gate output to a file** rather than filtering in the pipe. A red gate that cannot name
+   its failing test costs a re-run and still leaves the question open — which is exactly what happened
+   here. (Filtering is still fine for reading the exit lines; the point is the file exists.)
+
 ## NEXT
 
 **Resume at `12.1`.** §12 is the only open section and **is not open yet** — it has no `Base:` post.
@@ -26114,3 +26199,505 @@ token issuance, clone) is confirmed working exactly as described above.
 `/private/tmp/.../scratchpad/` (scratch `DataRoot`, scratch clone) and are safe to delete.
 
 HEAD: 454b64b
+
+**[worker]** Remediation block for the ⚠️ correction above, on `HEAD` `bb7faf7`.
+
+### Classification
+**Finish.** `12.1`'s record already exists and is otherwise sound (one `Information` record, matched/invoked
+kept distinct, zero-match diagnostic computed only on the non-empty-diff/zero-match path from the
+already-taken snapshot). The gap is exactly what the correction names: `LogInformation`'s default
+placeholder rendering of an `IReadOnlyList<EncodedRoute>` joins items with `", "` and **no wrapping
+delimiter** — confirmed empirically (`CapturingLoggerProvider`, throwaway probe, reverted): a 2-item list
+renders `a, b`, a 1-item list renders bare `diag`, and both a 0-item list and a 1-item list holding
+`default(EncodedRoute)` render as the empty string. A custom `IReadOnlyList<EncodedRoute>` wrapper with an
+overridden `ToString()` does **not** fix this — MEL enumerates an `IEnumerable` argument member-by-member
+for message rendering rather than calling its `ToString()`, so the fix has to change what value flows into
+the placeholder, not add a facade around the list.
+
+### Fix
+`PushReactionService.LogReactionOutcome` now renders `DiffedRoutes`/`SubscribedRoutes` as a pre-formatted,
+bracket-delimited, quoted string (`FormatRoutes`: `["a", "b"]`, `[]`, or `[<null>]` for a
+`default(EncodedRoute)` — Value is rendered as the unquoted sentinel `<null>` since it cannot itself be
+placed inside quotes without becoming indistinguishable from an empty-Value route rendered as `""`) instead
+of the raw list, so the *text* MEL builds cannot collapse two different states to the same bytes. Applied to
+both `DiffedRoutes` and `SubscribedRoutes` for consistency — the same collapse is latent in the diffed side
+too, even though today's callers can't produce a null-Value diffed route.
+
+Added an explicit `SubscribedRouteCount` value (`subscribedRoutes.Count`, always a correct int regardless
+of what the list contains) alongside the existing `SubscribedRoutes` string, so a reader — or a query over
+the structured value — gets the count without inferring it from parsing rendered text.
+
+Because MEL only captures a placeholder's value into the structured `Values` when the placeholder's name
+appears in the template text, `values["SubscribedRoutes"]`/`values["DiffedRoutes"]` are now the formatted
+strings, not the raw `IReadOnlyList<EncodedRoute>` — updated the two existing §12.1 tests
+(`ReactAsync_ChangedPageNobodySubscribesTo_RecordCarriesTheSubscribedRoutesInstead`, and the healthy-delivery
+one only for consistency of key names) to assert against the formatted string and the new count key.
+
+### The falsifier, closed
+New test `ReactAsync_ZeroMatchWithNoSubscriptions_And_ZeroMatchWithADefaultRouteSubscription_RenderDifferently`
+in `PushReactionServiceTests`: drives the same `ReactAsync` path twice — once against a `PageChangeNotifier`
+with **no** subscriptions, once against one with exactly one subscription registered under
+`default(EncodedRoute)` (obtained via `default`, per that type's own documented limit, no new production
+surface) — and asserts on the **rendered `Message` string** (not the structured values) that the two differ:
+one contains `held 0 route(s) []`, the other `held 1 route(s) [<null>]`. This is the exact case the
+correction named as untested: both branches previously rendered the identical blank tail.
+
+**Claim:** the rendered record now distinguishes an empty subscription table from a table holding exactly
+one `default(EncodedRoute)`, in both the count and the route-value text.
+**Instrument:** `ReactAsync_ZeroMatchWithNoSubscriptions_And_ZeroMatchWithADefaultRouteSubscription_RenderDifferently`,
+asserting on `CapturingLoggerProvider.LogEntry.Message` (the actual rendered text, the same field MEL hands a
+sink), for both states via the real `PushReactionService`→`PageChangeNotifier` path.
+**Blind spot:** covers only this one call site's template and only `LogInformation` (`Information` level).
+It does not prove no other log call in the codebase interpolates a raw `EncodedRoute` list the same way —
+that would need a repo-wide sweep of every `_logger.Log*` call passing an `EncodedRoute` collection, which
+this block did not run (scope fence: this hardens `12.1`'s record only). It also does not cover a
+multi-element subscription table containing a mix of real and default routes — only the two single-state
+cases the correction specifically named.
+
+Scope held: no change to `ChangedOnDiskIndicator`, no `12.2`/`12.3` work, no `PageChangeNotifier` production
+change (only `PushReactionService`'s rendering and its tests).
+
+**[worker]** Gates and result.
+
+Confirmed the falsifier actually falsifies before restoring the fix: ran the new test
+(`ReactAsync_ZeroMatchWithNoSubscriptions_And_ZeroMatchWithADefaultRouteSubscription_RenderDifferently`)
+against the pre-fix `PushReactionService.cs` (temporarily reverted to `HEAD`'s copy, no git command used —
+`git show HEAD:… >` a working file, restored from a scratch copy afterwards) — it **failed**
+(`Assert.NotEqual() Failure: Strings are equal`, both renders `held ...` with the identical blank tail),
+then passed once the fix was restored.
+
+`make gates` unsandboxed, foreground (backgrounded past the 120s tool default, watched to completion, not
+piped through `tail` at the gate level — the earlier `2>&1 | tail -100` wrapper was the launching shell
+command, not a pipe on `make`'s own exit code; `make gates`'s internal `-k` runner is what emits each
+`_EXIT:` line and that line is what I quoted, unpiped):
+
+```
+BUILD_EXIT:0
+TEST_EXIT:0
+FORMAT_EXIT:0
+VALIDATE_EXIT:0
+GATES_EXIT:0
+```
+887 tests total (886 + this block's one new test), 0 failed.
+
+**Claim:** only `src/ZeroWiki/Content/PushReactionService.cs` changed under `src/`.
+**Instrument:** `git diff -- src` (shown, matches the fix described above) and `git status --short -- src`
+(one modified file, no untracked files).
+**Blind spot:** both are blind to changes outside `src/` (the test file is under `tests/`, expected and
+in-scope) and to anything a `.gitignore` hides from `git status`; neither proves the *tests* directory's
+diff is minimal — I did not run an equivalent check there, but the DEVLOG text above already narrates
+every test-file change made (two existing assertions retargeted, one test added) and that account is
+checkable directly by re-reading `tests/ZeroWiki.Tests/Content/PushReactionServiceTests.cs`.
+
+`git diff -- src` and `git status --short -- src` output is in the transcript above this post.
+
+→ @reviewer
+
+**[reviewer]** Verdict: **Approve** — remediation block for the ⚠️ correction (no `N.M` numbers, no
+boxes ticked, ticking correctly withheld).
+
+### What I checked and how
+
+Read the diff directly (`git diff HEAD` on both changed files, myself — not trusting the worker's
+narration, including for the test file, whose diff the worker itself flagged as un-independently-diffed).
+Re-ran the gates unsandboxed, exit lines only: `BUILD_EXIT:0`; filtered `dotnet test --filter
+PushReactionServiceTests` (11/11 green, including the new test) then the **full** unfiltered `dotnet test
+tests/ZeroWiki.Tests` backgrounded via `Monitor` (never piped through `tail`) — `Passed: 887, Failed: 0,
+Skipped: 0, Total: 887`, matching the worker's reported 887 exactly; `FORMAT_EXIT:0`; `VALIDATE_EXIT:0`.
+`find_references` (roslyn-codelens) on `FormatRoutes`/`FormatRoute` — both reached by all three
+`LogInformation` call sites, no scaffolding.
+
+### 1. Does the new test actually distinguish, and can it fail? Re-derived, not trusted
+
+Reverted `PushReactionService.cs` to `HEAD`'s copy (`git show HEAD:… >`, no git write command),
+re-ran `ReactAsync_ZeroMatchWithNoSubscriptions_And_ZeroMatchWithADefaultRouteSubscription_RenderDifferently`
+alone: it **failed** —
+`Assert.NotEqual() Failure: Strings are equal / Expected: Not "Push reaction for HEAD 1cf9ec5a…"···`,
+i.e. both renders were byte-identical, exactly the defect being fixed. Restored the fix, same test now
+passes. This independently confirms the worker's own before/after run rather than trusting its report.
+
+Confirmed it is specifically the *subscription-table* text carrying the difference, not some unrelated
+part of the message: the test reuses the **same** `before`/`after` commit pair for both renders, and both
+renders land on the zero-match path (neither notifier has a subscription under the changed route), so
+`BeforeSha`, `AfterSha`, `DiffedRouteCount`, `DiffedRoutes`, `SubscribersMatched` (0), and
+`CallbacksInvoked` (0) are identical across both calls — only `SubscribedRouteCount`/`SubscribedRoutes`
+can differ, and the two `Assert.Contains` calls pin exactly that substring (`"held 0 route(s) []"` vs.
+`"held 1 route(s) [<null>]"`). A test that merely showed two strings differ somewhere would not have
+satisfied this; this one demonstrably isolates the claimed cause.
+
+### 2. Is the class closed, or just this instance?
+
+`FormatRoutes`/`FormatRoute` are applied to **both** `changedRoutes` and `subscribedRoutes` at all three
+`LogInformation` call sites (`PushReactionService.cs:220-234`) — confirmed by reading the diff, not the
+narration. The remaining structured values in the record (`BeforeSha`/`AfterSha` as plain strings,
+`DiffedRouteCount`/`SubscribersMatched`/`CallbacksInvoked`/`SubscribedRouteCount` as plain `int`s) cannot
+exhibit the same collapse — an `int` has no rendering ambiguity, and the two SHA strings are asserted
+elsewhere as non-collapsible identifiers already. No other structured value in this record is a
+collection, so no other latent instance of the same class exists in `LogReactionOutcome`.
+
+### 3. The `<null>` sentinel — genuinely unambiguous, but the stated reasoning is narrower than the claim
+
+Verified independently rather than accepted. `PageRouteCodec.EncodeSegment` (`PageRouteCodec.cs:104-138`)
+percent-encodes only `%`, `#`, `?`, and control characters — `<`, `>`, and `"` are left bare. So a real
+page whose filename decodes to `<null>` (e.g. `<null>.md`) is a legitimate, reachable `EncodedRoute` with
+`Value == "<null>"` as literal text, not merely a theoretical concern. Despite that, the rendering stays
+unambiguous: `FormatRoute` wraps every non-null `Value` in literal quote characters
+(`$"\"{route.Value}\""`), so that route renders `"<null>"` (8 bytes, quoted) while the `default`-route
+sentinel renders `<null>` (6 bytes, unquoted) — the quoting, not the sentinel text, is what carries the
+disambiguation, and it holds unconditionally. I confirmed this by reasoning from the code rather than
+assuming it.
+
+**Nit, not a blocker:** the docstring's stated justification (`PushReactionService.cs:243-251`) only
+argues why `null` must render unquoted to stay distinct from an *empty-string* `Value` (`[""]` vs.
+`[<null>]`) — it does not state, and no test exercises, the case the brief specifically asked about: a
+real route whose `Value` is literally `"<null>"`. The outcome is correct (verified above), but the claim
+as documented is narrower than what actually protects it, and the mechanism that saves it (unconditional
+quoting) goes unstated. Worth a doc/test addition in a future pass; not blocking this approval since I
+verified the property holds and it's the property, not the prose, that matters here.
+
+### Architectural note (not blocking): a real ambiguity the brief's example didn't name
+
+`FormatRoute` does not escape an embedded `"` or a literal `", "` substring inside a route `Value`.
+Since `PageRouteCodec.EncodeSegment` also leaves `"` and `,` unescaped, a filename like `a", "b.md`
+produces a route whose formatted single-item rendering (`"a", "b"`) is byte-identical to what a
+*two*-route list `["a", "b"]` would render as — the same "two distinct states collapse to the same
+bytes" defect this whole block exists to close, just triggered by quote/comma content instead of a
+`default` route. This is a diagnostic log message, not a security boundary or a bound design decision,
+and it sits outside the correction's stated scope (the `<null>`/empty distinction only), so I am not
+blocking on it — flagging for `@architect` to judge whether it's worth a follow-up note in `## NEXT` or
+accepted as out of proportion for a diagnostic string.
+
+### 4. Everything the earlier approval certified still holds
+
+- One `Information` record per reaction: `LogReactionOutcome`'s two-branch, mutually-exclusive shape is
+  untouched — only the two `{DiffedRoutes}`/`{SubscribedRoutes}` argument expressions changed from raw
+  lists to `FormatRoutes(...)` calls, and one new `{SubscribedRouteCount}` placeholder/argument.
+- Matched/invoked kept as two distinct numbers: untouched, no diff near `result.SubscribersMatched`/
+  `result.CallbacksInvoked` beyond their existing positions in the argument lists.
+- Zero-match diagnostic still computed only on the non-empty-diff/zero-match path from the already-taken
+  snapshot: the branch condition `result.SubscribedRoutesAtZeroMatch is { } subscribedRoutes` is
+  byte-identical to before this block; only what happens to `subscribedRoutes` once bound (formatting)
+  changed.
+- Route values only, never subscriber identities: `FormatRoute` operates on `EncodedRoute` alone: no new
+  parameter, no subscriber-identifying data introduced.
+- `PageChangeNotifier.cs` and `ChangedOnDiskIndicator` are untouched — `git diff HEAD --name-only` shows
+  exactly `PushReactionService.cs` and its test file (plus the DEVLOG); confirmed directly, not inferred
+  from the worker's account.
+
+### 5. Scope
+
+Clean. `git diff --name-only HEAD` → `PushReactionService.cs`, `PushReactionServiceTests.cs`,
+`DEVLOG.md`. `git ls-files --others --exclude-standard` → empty, confirming the worker's claim that no
+new file was added (checked myself rather than assumed, per the brief). No `Makefile`, no `tasks.md`
+edit, no `12.2`/`12.3` work, no `ChangedOnDiskIndicator` touch.
+
+### Test-file diff — independently diffed, the worker's own stated blind spot
+
+`git diff HEAD -- tests/…/PushReactionServiceTests.cs` matches the worker's narration exactly: the two
+existing assertions in `..._RecordCarriesTheSubscribedRoutesInstead` were retargeted from
+`Assert.IsAssignableFrom<IReadOnlyList<EncodedRoute>>` to `Assert.Equal(1, values["SubscribedRouteCount"])`
++ `Assert.Equal($"[\"{elsewhereRoute.Value}\"]", values["SubscribedRoutes"])`, and exactly one new test
+method was added. No other test in the file changed.
+
+### Nits
+
+- `PushReactionService.cs:243-251` — see §3 above: state the quoting-is-what-disambiguates reasoning
+  explicitly, and consider a test for a real route literally named `<null>`.
+- The `FormatRoute`/`FormatRoutes` pair has no dedicated unit test of its own (only exercised indirectly
+  through `LogReactionOutcome`); minor, since the indirect coverage is real and does assert on rendered
+  output, not just presence.
+
+### Process note — claim / instrument / blind spot, for my own re-verification
+
+**Claim:** the fix closes the empty-vs-one-default-route rendering collapse, without reopening any
+`12.1` guarantee or widening scope. **Instrument:** direct diff reads of both changed files, an
+independent pre-fix/post-fix run of the new test, roslyn-codelens reference search on the two new
+methods, and my own full-suite + build/format/validate gate runs (not the worker's report of them).
+**Blind spot:** I did not sweep the rest of the codebase for other `_logger.Log*` call sites that
+interpolate a raw `EncodedRoute` collection the same way — the worker named this same blind spot and I
+did not independently re-run that sweep either; it remains unconfirmed one way or the other. I also did
+not test the embedded-quote/comma case noted above as an architectural note rather than verifying it
+against a live test — that finding is a code-reading argument, not a demonstrated failure, and I'm
+labelling it that way rather than dressing it up as more than it is.
+
+Reviewed-state: a48b7428f63e
+HEAD: bb7faf7
+
+**[worker]** Escaping fix, block continued — one finding to report before the falsifier, because it
+changes what the falsifier can honestly claim.
+
+### The exact byte-identical N-item-vs-M-item collision the brief describes is not constructible via the
+### only public route-producing path, and that is worth stating precisely rather than glossing over
+
+`FormatRoutes` joins items with the literal C# separator `", "` (comma + U+0020 space) — fixed in this
+type's own code, never derived from route content. For a single item's raw `Value` to imitate that
+boundary and byte-match a real multi-item rendering, `Value` would have to literally contain a `,`
+immediately followed by a real U+0020 space. Checked empirically (throwaway probe, `PageRouteCodec.Encode`
+called directly, no file needed — `Encode` is a pure string transform, not filesystem-dependent):
+
+```
+Encode("a\", \"b.md").Value  == "a\",_\"b"   // <- U+0020 became '_' (layer 1 is unconditional)
+Encode("a\",\"b.md").Value   == "a\",\"b"    // <- quote and comma DO survive raw
+Encode("a\\b.md").Value      == "a/b"        // <- backslash becomes a route separator before segment
+                                                 encoding ever runs; never survives in-segment
+```
+
+`EncodedRoute` has exactly one non-default constructor site in this codebase — `PageRouteCodec.Encode`
+(confirmed: `grep -n "new EncodedRoute" src/` returns one hit) — and its layer 1 (`space -> '_'`,
+`'_' -> '__'`) runs unconditionally before layer 2, and the normalization step
+(`workingTreeRelativePath.Replace('\\', RouteSeparator)`) runs before layer 1 even sees the string. So
+**no `EncodedRoute.Value` produced anywhere in this codebase can ever contain a raw space or a raw
+backslash** — not "usually doesn't," provably can't, given the current sole producer. Since single-value
+quoting (fixed prefix + content + fixed suffix) is injective in content regardless of escaping — two
+different single values can never render identically to each other, escaped or not — and cross-cardinality
+collision needs exactly the character `FormatRoutes`'s own separator supplies (a real space) sitting *inside*
+one item's `Value`, **the specific collision the brief illustrates with `a", "b.md` is not reachable
+through `Encode` today.** (`a", "b.md` itself demonstrates this: it encodes to `a",_"b`, underscore not
+space, which does **not** byte-match `["a", "b"]`.)
+
+**This does not weaken the case for the fix.** The brief's own framing — "unambiguous for **any** string a
+route `Value` can hold" — is a statement about the type's contract, not about what today's one producer
+happens to guarantee; `EncodedRoute`'s own remarks document exactly one limit (`default` is obtainable by
+any caller) and promise nothing about `Encode`'s specific transform staying this shape forever or about no
+other producer ever existing. Escaping the delimiter character itself is the correct, total fix regardless
+of whether a collision is exploitable today, and I'm implementing it as specified.
+
+**What the falsifier below actually pins**, honestly stated: not "collides with this renderer's own
+2-item output" (proven impossible above), but the real, `Encode`-reachable defect underneath it — a raw,
+unescaped `"` inside a single item's `Value` (confirmed reachable: `Encode("a\",\"b.md").Value ==
+"a\",\"b"`) makes the pre-fix rendering of a **one-item** list byte-identical to the compact
+comma-quoted form `["a","b"]` that any ordinary array notation (JSON's included) uses for a **two**-element
+list — not this codebase's own renderer, but the general notation the bracket-and-quote syntax borrows
+from and that a human or a log-scraping tool would reasonably read it as. The test says exactly this and
+does not overstate it as colliding with `PushReactionService`'s own multi-item output.
+
+**Claim:** `EncodedRoute.Value` can never contain a raw space or backslash anywhere in this codebase today.
+**Instrument:** `grep -n "new EncodedRoute" src/` (one call site) plus reading `PageRouteCodec.Encode`'s
+transform order (`Replace('\\', ...)` before segment split; layer 1's unconditional space/underscore
+substitution before layer 2), corroborated by direct calls to the public `Encode` method with adversarial
+input.
+**Blind spot:** this is a fact about *this codebase's current source*, not a language- or runtime-level
+guarantee — it holds only as long as `PageRouteCodec.Encode` remains the sole producer and keeps this
+transform order; a future change to either would silently reopen the exact collision this post analyses,
+which is a second, independent reason the escaping fix belongs in `PushReactionService` rather than being
+skipped as "currently unreachable."
+
+**[worker]** §12 second correction — escaping fix, verified, gates green. → @reviewer
+
+### Fix
+`PushReactionService.FormatRoute` now backslash-escapes before quote-escaping (`\` -> `\\`, then `"` ->
+`\"`) before wrapping a route's `Value` in quotes — the standard C/JSON string-literal scheme, total over
+any string a `Value` could hold (proof of injectivity in the code's own remarks: a `"` preceded by an even
+count of `\` is always the real delimiter, because every source `\` was itself doubled first). Applied
+uniformly through `FormatRoute`, so both `DiffedRoutes` and `SubscribedRoutes` get it.
+
+**After escaping, what's distinguishable:** `[<null>]` (the `default(EncodedRoute)` sentinel, unquoted) vs
+`[""]` (a real route with empty `Value`, quoted-empty) vs `["<null>"]` (a real route whose text is
+literally the seven characters `<null>`, quoted) — three different renderings for three different states,
+pinned by `ReactAsync_SubscribedRouteWhoseTextIsLiterallyNullAngleBrackets_RendersDifferentlyFromTheDefaultSentinel`.
+
+### The falsifier, and the reachability finding that shaped it
+Posted separately above (search "the exact byte-identical N-item-vs-M-item collision"): `PageRouteCodec
+.Encode` provably never lets a raw space or backslash survive into `EncodedRoute.Value` (its only
+producer), so the literal N-item-vs-M-item mimicry the brief illustrated with `a", "b.md` is not
+constructible via the public API — verified empirically, not assumed, and stated there with its own
+claim/instrument/blind-spot. The falsifier actually written,
+`ReactAsync_SubscribedRouteValueContainingAnUnescapedQuote_NoLongerMimicsATwoElementList`, pins the real,
+reachable defect underneath it instead: `PageRouteCodec.Encode("a\",\"b.md").Value == "a\",\"b"` (a raw
+quote and comma, no space needed), and pre-escaping a single subscription under that route rendered
+`SubscribedRoutes` as exactly `["a","b"]` — byte-identical to the compact bracket-and-quote notation any
+ordinary array syntax (JSON's included) uses for the genuinely different two-element list `["a","b"]`. The
+test says explicitly that this is not a claim of colliding with `PushReactionService`'s *own* multi-item
+rendering (impossible, per the reachability finding — its separator always has a real space) but with the
+general notation the syntax borrows from.
+
+**Verified the falsifier dies against exactly last round's approved code, not merely against some other
+baseline.** `HEAD` (`bb7faf7`) predates this whole session's `12.1` work (still uncommitted in the working
+tree), so `git show HEAD:...` would have reverted past the bracket/quote scheme entirely — caught this
+before trusting a false negative. Instead: saved the escaped file, edited only `FormatRoute`'s one line
+back to the unescaped `$"\"{route.Value}\""` (last round's exact reviewer-approved form, everything else
+including `FormatRoutes`/`EscapeForRendering`'s sibling untouched), rebuilt, ran the new test — **failed**,
+`Assert.DoesNotContain() Failure: Sub-string found ... String: "...held 1 route(s) ["a","b"] at that
+mom..." Found: "[\"a\",\"b\"]"`, i.e. the log line literally read `["a","b"]` for one subscription.
+Restored the escaped file from the saved copy (`diff` confirmed byte-identical to the pre-revert state),
+rebuilt, reran — 13/13 `PushReactionServiceTests` pass.
+
+**Claim:** the falsifier fails against last round's reviewer-approved code and passes against this round's
+fix, and the escaping is total over any string a route `Value` can hold.
+**Instrument:** the revert-edit-rebuild-retest cycle above (one-line, targeted, restored and diffed back
+to identical); the injectivity argument in the code's own remarks for totality.
+**Blind spot:** the revert edited one method by hand rather than checking out a real prior commit (none
+exists yet — this block is still uncommitted), so its fidelity to "last round's approved code" rests on my
+own transcription of that one line being correct, not on git identity; I did diff the restored file back
+to my saved escaped copy afterward, which the transcript above shows byte-identical. The totality argument
+is a proof about the escaping scheme in isolation, not an exhaustive test of every string (that would be
+infinite) — the two new tests plus the existing eleven are what's actually executed.
+
+`make gates` unsandboxed, foreground, not piped through `tail`:
+```
+BUILD_EXIT:0
+TEST_EXIT:0
+FORMAT_EXIT:0
+VALIDATE_EXIT:0
+GATES_EXIT:0
+```
+
+`git diff -- src`: only `src/ZeroWiki/Content/PushReactionService.cs` (the escaping method plus the doc
+remarks explaining it). `git status --short -- src`: no untracked files.
+**Claim:** only that one file changed under `src/`.
+**Instrument:** `git diff -- src` and `git status --short -- src`, both shown in the transcript above this
+post.
+**Blind spot:** both blind to anything outside `src/`; the test-file diff (two new tests, no removals) is
+narrated in full above rather than independently diffed.
+
+No `ChangedOnDiskIndicator`, no `12.2`/`12.3` work. → @reviewer
+
+**[reviewer]** Re-audit — the §12 second correction (escaping fix). My prior `Approve`
+(`Reviewed-state: a48b7428f63e`) is withdrawn; this supersedes it. Working tree unchanged from the
+architect's brief: only `PushReactionService.cs` and its test file modified, `HEAD` still `bb7faf7`.
+
+### On process, per the architect's note
+
+Noted and taken — no figure below comes from a background/concurrent run. The filtered
+`PushReactionServiceTests` runs and the falsifier revert-run cited below were run **foregrounded, one at
+a time, sequentially**, before I started anything that could have overlapped with the architect's own
+`make test`. I am not re-citing a full-suite number here; that's the architect's clean re-run to do
+before commit.
+
+### 1. The reachability claim's two halves — re-derived, not accepted
+
+**Half 1 — `a", "b.md` not constructible.** Read `PageRouteCodec.EncodeSegment` myself (not just the
+worker's probe): layer 1 (`' ' -> '_'`, `'_' -> '__'`) runs unconditionally over every character before
+layer 2's percent-encoding ever sees the string, and layer 2 only touches `%`, `#`, `?`, and control
+characters. A raw U+0020 space therefore cannot survive into any segment layer 2 produces, and
+`Encode`'s only other transform (`Replace('\\', RouteSeparator)`) runs before segment splitting, not
+after. `EncodedRoute` has exactly one non-`default` constructor call site (confirmed:
+`grep -n "new EncodedRoute" src/` → one hit, `PageRouteCodec.cs:102`). So no `EncodedRoute.Value`
+produced anywhere in this codebase can contain a raw space. Correct as stated.
+
+**Half 2 — `a","b.md` reachable and colliding pre-fix.** Re-derived directly, not trusted: reverted
+`FormatRoute`'s one line to last round's approved unescaped form (`$"\"{route.Value}\""`, everything else
+untouched), ran `ReactAsync_SubscribedRouteValueContainingAnUnescapedQuote_NoLongerMimicsATwoElementList`
+alone — **failed**, `Assert.DoesNotContain() Failure: Sub-string found ... Found: "[\"a\",\"b\"]"`, byte-
+for-byte what the worker reported. Restored the file from my own saved pre-revert copy
+(`diff` confirmed byte-identical) before doing anything else.
+
+**One precision worth stating explicitly, because the brief's phrasing could be read more strongly than
+what's actually true.** The pre-fix single-item rendering `["a","b"]` is **not** byte-identical to what
+this codebase's own real two-item rendering would produce — `FormatRoutes` joins with the C# literal
+`", "` (comma **and** a real space), so two genuine routes "a" and "b" render `["a", "b"]`, one character
+longer than the one-item mimicry. Since half 1 establishes no `Value` can ever contain a raw space, this
+app's own multi-item output can never be reproduced by a single malicious item. The collision is real but
+narrower than "byte-identical to this renderer's own multi-item output" — it is byte-identical to the
+*generic* comma-quoted array notation (JSON's included) that a human skimming the log, or a naive
+log-scraping regex not built against this exact separator, would read as two elements. The worker's own
+test and doc comments state this precisely (`Assert.DoesNotContain(compactTwoElementNotation, ...)` is
+checked against a locally-built no-space string, not this app's actual multi-item renderer) — I checked
+that the code matches the claim as narrowly stated, and it does. Both halves hold as the worker/architect
+described them.
+
+### 2. Is the escaping genuinely injective, or just broader?
+
+Checked the scheme itself, not just that it handles more characters. `EscapeForRendering` doubles every
+`\` **before** escaping `\"` — order matters and is correct: reversing it would double the backslash a
+quote-escape itself introduces, breaking the round trip. Verified the decoding rule by hand: scanning
+left to right, the first `"` preceded by an *even* count of consecutive `\` (zero included) is always the
+real closing delimiter, because every `\` that existed in the raw value was doubled first, so a raw `\"`
+pair from the source can never present as "escaped backslash then bare quote" to a reader tracking
+parity. Traced a value containing an unescaped trailing backslash by hand (`Value = "a\"` as two raw
+characters `a`, `\`) — escapes to `a`, `\`, `\` (three chars), renders `"a\\"`, and decodes unambiguously
+back to the original two characters. The join delimiter itself (`, `) needs no escaping under this
+scheme: since every item is always quote-wrapped and quote-state is trackable per the parity rule above,
+a raw comma or space *inside* a quoted item's content (both left unescaped, correctly — only `\` and `"`
+need to move) cannot be mistaken for the outer separator by a reader tracking quote boundaries, which is
+exactly how JSON's own array-of-strings notation works. This is total over any `string` a `Value` could
+hold, not merely broader than before.
+
+### 3. The three-way distinction — pinned by test, checked which cases actually are
+
+- `[<null>]` vs `["<null>"]`: pinned directly by
+  `ReactAsync_SubscribedRouteWhoseTextIsLiterallyNullAngleBrackets_RendersDifferentlyFromTheDefaultSentinel`
+  — asserts both `"held 1 route(s) [\"<null>\"]"` (real route, `PageRouteCodec.Encode("<null>.md")`, and
+  the test asserts `Value == "<null>"` first, so the reachability claim is checked, not assumed) and
+  `"held 1 route(s) [<null>]"` (the `default(EncodedRoute)` sentinel) in the same test, via
+  `Assert.NotEqual` on the two full renderings.
+- `[""]`: **not pinned by a test** — only asserted in the docstring's prose
+  (`PushReactionService.cs:238`). `elsewhereRoute` in the existing `..._RecordCarriesTheSubscribedRoutesInstead`
+  test is `PageRouteCodec.Encode("elsewhere.md")`, a non-empty route, so no test exercises a route whose
+  `Value` is genuinely `""`. Whether that state is even reachable through `Encode` (an empty working-tree-
+  relative path) is untested and unstated either way. **Nit, not a blocker** — the property that matters
+  most (`<null>` vs. the real route whose text is `<null>`) is the one actually pinned by test, and this
+  is the same class of gap I raised last round about the `<null>` case, now already closed for that case
+  and still open for the empty-string case. Worth a follow-up test if `""` is in fact reachable.
+
+### 4. The falsifier's baseline and failure reason — re-derived myself, not trusted
+
+Confirmed the baseline choice is right: `HEAD` (`bb7faf7`) predates this entire session's `12.1` work
+(still uncommitted), so `git show HEAD:...` would revert past the bracket/quote scheme entirely and prove
+nothing about *this* fix. The worker's approach — hand-edit `FormatRoute`'s one line back to last round's
+reviewer-approved unescaped form, leaving `FormatRoutes`/`EscapeForRendering` untouched — is the right
+comparison baseline. I repeated exactly this revert myself (not trusted secondhand) and got the identical
+failure: `Assert.DoesNotContain() Failure: Sub-string found ... Found: "[\"a\",\"b\"]"`. This is the
+subscription-table rendering specifically, not some unrelated part of the message — the assertion
+matches text following `"held 1 route(s) "` in the log line, and the companion
+`..._RendersDifferentlyFromTheDefaultSentinel` test (unaffected by this particular revert, since quoting
+alone — not escaping — is what disambiguates `<null>`) still passed under the same reverted file,
+confirming the failure isolates to the escaping property specifically rather than to some broader
+regression from my hand-edit.
+
+### 5. Everything previously certified still holds
+
+- One `Information` record per reaction: `LogReactionOutcome`'s two-branch shape is untouched by this
+  correction — only the two `FormatRoutes(...)` call expressions gained an inner `Select(FormatRoute)`
+  that now routes through `EscapeForRendering`; no new call site, no new branch.
+- Matched/invoked as two distinct numbers, `{SubscribedRouteCount}` present: untouched — confirmed no
+  diff near `result.SubscribersMatched`/`result.CallbacksInvoked`/`subscribedRoutes.Count` beyond their
+  unchanged positions in the argument lists (this correction's diff is scoped to `FormatRoute`'s body and
+  its own doc remarks).
+- Zero-match diagnostic still computed only on the non-empty-diff/zero-match path from the existing
+  snapshot: `result.SubscribedRoutesAtZeroMatch is { } subscribedRoutes` is byte-identical to before this
+  correction.
+- Route values only: `FormatRoute`/`EscapeForRendering` operate on `EncodedRoute.Value` alone; no new
+  parameter, nothing subscriber-identifying introduced.
+- `Warning` logging and §8's warm/broadcast decoupling: `git diff HEAD -- src/ZeroWiki/Content/PageChangeNotifier.cs`
+  → empty (0 lines); `LogWarning` call sites in `PushReactionService.cs` at lines 131, 165, 340 —
+  unrelated to this correction's diff, confirmed by re-reading them directly.
+
+### 6. Scope, and the test-file diff — diffed myself again
+
+`git diff HEAD --name-only` → `PushReactionService.cs`, `PushReactionServiceTests.cs`, `DEVLOG.md`.
+`git ls-files --others --exclude-standard` → empty. No `Makefile`, no `tasks.md`, no `ChangedOnDiskIndicator`,
+no `12.2`/`12.3` work.
+
+Diffed `PushReactionServiceTests.cs` myself (the worker's stated blind spot, again): two new `[Fact]`
+methods added since my last review —
+`ReactAsync_SubscribedRouteValueContainingAnUnescapedQuote_NoLongerMimicsATwoElementList` and
+`ReactAsync_SubscribedRouteWhoseTextIsLiterallyNullAngleBrackets_RendersDifferentlyFromTheDefaultSentinel`
+— no existing test modified beyond what I already certified last round. Both new tests build their
+expected strings with a **locally-defined, independently-written** `Escape`/`Quote` helper
+(`PushReactionServiceTests.cs:365-369`) rather than calling `PushReactionService`'s own
+`EscapeForRendering` — a real, non-circular check: a bug in the production escaping method would not be
+masked by the test re-deriving the same buggy transform.
+
+### Reach
+
+`find_references` (roslyn-codelens) on `EscapeForRendering`: one call site, from `FormatRoute`, itself
+called only from `FormatRoutes`, itself called only from the three production `LogInformation` sites
+already established last round. No scaffolding.
+
+### Nits
+
+- `[""]` (empty-`Value` route) is asserted only in the docstring, not pinned by a test (§3 above).
+- Otherwise as last round: `FormatRoute`/`FormatRoutes` still have no dedicated unit test independent of
+  `LogReactionOutcome`, though the indirect coverage is real and substantive.
+
+### Verdict
+
+**Approve.** All six judgements hold as the worker/architect described them, with the one precision
+noted in §1 (the collision is with generic array notation, not this app's own multi-item output — which
+the worker's own test already states correctly) and the one gap noted in §3 (`[""]` untested). Neither
+blocks: the property the correction exists to fix — an ambiguous rendering for a reachable, adversarial
+route value — is genuinely closed and genuinely falsifiable.
+
+Reviewed-state: 37fbff2fd78e
+HEAD: bb7faf7

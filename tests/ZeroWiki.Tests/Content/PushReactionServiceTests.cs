@@ -290,9 +290,130 @@ public sealed class PushReactionServiceTests : IDisposable
 
         Assert.Equal(0, values["SubscribersMatched"]);
         Assert.Equal(0, values["CallbacksInvoked"]);
-        var subscribedRoutes = Assert.IsAssignableFrom<IReadOnlyList<EncodedRoute>>(values["SubscribedRoutes"]);
-        var namedRoute = Assert.Single(subscribedRoutes);
-        Assert.Equal(elsewhereRoute, namedRoute);
+        Assert.Equal(1, values["SubscribedRouteCount"]);
+        Assert.Equal($"[\"{elsewhereRoute.Value}\"]", values["SubscribedRoutes"]);
+    }
+
+    /// <summary>
+    /// §12 correction's own falsifier: an empty subscription table and a table holding exactly one
+    /// <c>default(EncodedRoute)</c> (obtainable from any caller regardless of that type's
+    /// <see langword="internal"/> constructor -- see its own remarks) must render as different text, not
+    /// merely as different structured values a reader would have to already know to query for. Both
+    /// states are driven through the same real <see cref="PushReactionService"/> -&gt;
+    /// <see cref="PageChangeNotifier"/> path and asserted on <see cref="CapturingLoggerProvider.LogEntry.Message"/>
+    /// -- the actual text a human or a log sink reads -- because that is exactly the field the withdrawn
+    /// live-run conclusion was drawn from and where the previous round's tests never looked.
+    /// </summary>
+    [Fact]
+    public async Task ReactAsync_ZeroMatchWithNoSubscriptions_And_ZeroMatchWithADefaultRouteSubscription_RenderDifferently()
+    {
+        await InitializeRepositoryAsync();
+        var before = await CommitAsync("unrelated.md", "unrelated content");
+        var after = await CommitAsync("page.md", "new content");
+
+        async Task<string> RenderedMessageAsync(PageChangeNotifier notifier)
+        {
+            var loggerProvider = new CapturingLoggerProvider();
+            await CreateService(notifier, loggerProvider.CreateLogger<PushReactionService>())
+                .ReactAsync(before, after, CancellationToken.None);
+            return Assert.Single(loggerProvider.Entries, e => e.Level == LogLevel.Information).Message;
+        }
+
+        var noSubscriptions = await RenderedMessageAsync(new PageChangeNotifier(NullLogger<PageChangeNotifier>.Instance));
+
+        var defaultRouteNotifier = new PageChangeNotifier(NullLogger<PageChangeNotifier>.Instance);
+        using var subscription = defaultRouteNotifier.Subscribe(default, () => Task.CompletedTask);
+        var oneDefaultRouteSubscription = await RenderedMessageAsync(defaultRouteNotifier);
+
+        Assert.NotEqual(noSubscriptions, oneDefaultRouteSubscription);
+        Assert.Contains("held 0 route(s) []", noSubscriptions);
+        Assert.Contains("held 1 route(s) [<null>]", oneDefaultRouteSubscription);
+    }
+
+    /// <summary>
+    /// §12 second correction's own falsifier (reviewer finding: <see cref="PageRouteCodec.EncodeSegment"/>
+    /// leaves <c>"</c> unescaped, so a real route <see cref="EncodedRoute.Value"/> can contain one).
+    /// Reachable without a raw space -- see the §12 second correction post's own reachability finding:
+    /// <c>PageRouteCodec.Encode("a\",\"b.md").Value == "a\",\"b"</c>, a raw unescaped quote and comma,
+    /// with no space needed. Pre-escaping, a single subscription under that route rendered the
+    /// <c>SubscribedRoutes</c> field as <c>["a","b"]</c> -- byte-identical to the compact, no-space
+    /// bracket-and-quote notation (JSON's included) for a genuinely different <em>two</em>-element list
+    /// <c>["a","b"]</c>. This is not a claim that it collides with <em>this codebase's own</em>
+    /// <see cref="PushReactionService"/> multi-item rendering, which always separates items with a real
+    /// space (<c>Encode</c> can never produce one -- see the same post) and therefore never renders this
+    /// exact text for two items; it is a claim about the general notation the syntax borrows from, which
+    /// is what a human skimming the log or a naive log-scraping tool reads it as.
+    /// </summary>
+    [Fact]
+    public async Task ReactAsync_SubscribedRouteValueContainingAnUnescapedQuote_NoLongerMimicsATwoElementList()
+    {
+        await InitializeRepositoryAsync();
+        var before = await CommitAsync("unrelated.md", "unrelated content");
+        var after = await CommitAsync("page.md", "new content");
+
+        async Task<string> RenderedMessageAsync(PageChangeNotifier notifier)
+        {
+            var loggerProvider = new CapturingLoggerProvider();
+            await CreateService(notifier, loggerProvider.CreateLogger<PushReactionService>())
+                .ReactAsync(before, after, CancellationToken.None);
+            return Assert.Single(loggerProvider.Entries, e => e.Level == LogLevel.Information).Message;
+        }
+
+        var mimicryRoute = PageRouteCodec.Encode("a\",\"b.md");
+        var notifier = new PageChangeNotifier(NullLogger<PageChangeNotifier>.Instance);
+        using var subscription = notifier.Subscribe(mimicryRoute, () => Task.CompletedTask);
+
+        var rendered = await RenderedMessageAsync(notifier);
+
+        static string Quote(string s) => "\"" + s + "\"";
+        static string Escape(string raw) => raw
+            .Replace("\\", "\\\\", StringComparison.Ordinal)
+            .Replace("\"", "\\\"", StringComparison.Ordinal);
+
+        var compactTwoElementNotation = "[" + Quote("a") + "," + Quote("b") + "]";
+        var theOneEscapedItemThatIsActuallyThere = "[" + Quote(Escape(mimicryRoute.Value)) + "]";
+
+        Assert.DoesNotContain(compactTwoElementNotation, rendered);
+        Assert.Contains(theOneEscapedItemThatIsActuallyThere, rendered);
+    }
+
+    /// <summary>
+    /// §12 second correction: pins the reviewer's other reachable case -- a real route whose text
+    /// happens to be the seven characters <c>&lt;null&gt;</c> (<c>PageRouteCodec.EncodeSegment</c>
+    /// leaves <c>&lt;</c>/<c>&gt;</c> unescaped too) must still render distinguishably from
+    /// <c>default(EncodedRoute)</c>'s sentinel -- the quotes around a real value are what carry that
+    /// distinction (<c>["&lt;null&gt;"]</c> vs <c>[&lt;null&gt;]</c>), not anything this correction adds,
+    /// but the reviewer established it is reachable, so it is pinned rather than left to accident.
+    /// </summary>
+    [Fact]
+    public async Task ReactAsync_SubscribedRouteWhoseTextIsLiterallyNullAngleBrackets_RendersDifferentlyFromTheDefaultSentinel()
+    {
+        await InitializeRepositoryAsync();
+        var before = await CommitAsync("unrelated.md", "unrelated content");
+        var after = await CommitAsync("page.md", "new content");
+
+        async Task<string> RenderedMessageAsync(PageChangeNotifier notifier)
+        {
+            var loggerProvider = new CapturingLoggerProvider();
+            await CreateService(notifier, loggerProvider.CreateLogger<PushReactionService>())
+                .ReactAsync(before, after, CancellationToken.None);
+            return Assert.Single(loggerProvider.Entries, e => e.Level == LogLevel.Information).Message;
+        }
+
+        var literalTextRoute = PageRouteCodec.Encode("<null>.md");
+        Assert.Equal("<null>", literalTextRoute.Value);
+
+        var literalTextNotifier = new PageChangeNotifier(NullLogger<PageChangeNotifier>.Instance);
+        using var literalSubscription = literalTextNotifier.Subscribe(literalTextRoute, () => Task.CompletedTask);
+        var literalTextRendering = await RenderedMessageAsync(literalTextNotifier);
+
+        var defaultRouteNotifier = new PageChangeNotifier(NullLogger<PageChangeNotifier>.Instance);
+        using var defaultSubscription = defaultRouteNotifier.Subscribe(default, () => Task.CompletedTask);
+        var defaultSentinelRendering = await RenderedMessageAsync(defaultRouteNotifier);
+
+        Assert.NotEqual(literalTextRendering, defaultSentinelRendering);
+        Assert.Contains("held 1 route(s) [\"<null>\"]", literalTextRendering);
+        Assert.Contains("held 1 route(s) [<null>]", defaultSentinelRendering);
     }
 
     private sealed class ThrowingPageIndexBuilder : IPageIndexBuilder
