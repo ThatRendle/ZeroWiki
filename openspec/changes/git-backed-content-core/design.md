@@ -1090,9 +1090,9 @@ most dangerous, because it *sounded* like the kind of reasoning this change asks
 argument is not self-certifying — its premises are claims about the code and have to be traced like any
 other.**
 
-**Fourth pass (§12 supervisor review, "the section's most important finding" — the third pass above is now
-materially false, and this records why and what the guarantee actually is.** `12.3`'s second pass
-(DEVLOG, `## 12.`) added a second in-assembly construction site for `EncodedRoute`:
+**Fourth pass (§12 supervisor review, remediation round one)** — the third pass above is now
+materially false, and this records why and what the guarantee actually is.
+`12.3`'s second pass (DEVLOG, `## 12.`) added a second in-assembly construction site for `EncodedRoute`:
 
 - `ChangedOnDiskIndicator.razor`'s `OnInitialized`: `_route = new EncodedRoute(Route);`, where `Route` is
   a `[Parameter] string` fed across the Static SSR→circuit boundary from `WikiPage.razor`'s

@@ -3,10 +3,11 @@
 > and confirmed the fix in a live browser circuit (`## 12.` `12.4`). The escape hatch this banner
 > originally left open — "if §12's root cause proves deeper than a bounded fix" — **did not fire**: the
 > Product Owner ruled on it directly (`## 12.` thread, *"1. The escape hatch is NOT triggered — §12
-> continues"*), so supersession is no longer conditional on anything. **Do not apply this change.** Its
-> `## Why` below states three first-hand findings §12 went on to disprove; they are struck rather than
-> deleted, with what replaced them, because this document is the record of a wrong diagnosis and should
-> read as one. See `openspec/changes/git-backed-content-core/DEVLOG.md`, `## 12.`, for the disproof —
+> continues"*), so supersession is no longer conditional on anything. **Do not apply this change.**
+> Three first-hand findings §12 went on to disprove sit one each in `## Why`, `## What Changes` and
+> `## Impact`; all four struck claims are struck rather than deleted, with what replaced them, because
+> this document is the record of a wrong diagnosis and should read as one. See
+> `openspec/changes/git-backed-content-core/DEVLOG.md`, `## 12.`, for the disproof —
 > `PushReactionServiceTests` and `PushReactionEndpointTests` (§8/§10) for the coverage — and `design.md`
 > D19 for the shipped mechanism.
 

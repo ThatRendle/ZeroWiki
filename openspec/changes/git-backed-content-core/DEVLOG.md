@@ -27897,6 +27897,269 @@ learned the hard way after an auditor's in-tree falsifier revert turned a gate r
 
 Test count 891 → 895: four new tests, the two observability falsifiers and their companions.
 
+**[supervisor]** §12 re-review after remediation round one — same range, `git diff 454b64b..HEAD`, HEAD
+now `e1cac8c` (9 commits). **Approve. §12 closes.**
+
+### Verdict: Approve
+
+All three blockers are genuinely closed, and closed the right way round: the corrections were written as
+corrections rather than as replacements, so the document now reads as the account of a wrong diagnosis
+being corrected instead of as a document that was always right. That distinction was the whole point of
+the finding and the remediation got it.
+
+### The record is now true — each blocker re-derived, not taken
+
+**Blocker 1 — D17.** `design.md:1093–1146`. Passes 1–3 are byte-untouched (the diff is a pure insertion);
+the fourth pass quotes the third pass's *"Nothing reads a route back from anywhere"* and *"constructed in
+exactly one place … the compiler, rather than a reviewer's enumeration"* verbatim, names them false,
+names the site (`ChangedOnDiskIndicator.OnInitialized`), and supplies the corrected sentence — two named
+enumerable sites, asymmetric, one a mint and one a re-materialisation. D19 §3 (`:1735–1741`) points here
+and this points back. Closed.
+
+**Blocker 2 — the superseded proposal.** STATUS is now unconditional and cites the Product Owner's
+ruling. All three disproved claims are struck with `~~…~~` and corrected inline rather than deleted,
+which is the better choice and not the one I asked for. The fourth stale line under `## Impact` — the
+`ChangedOnDiskIndicator.razor` "currently exonerated by first-hand evidence" bullet — was found by the
+worker, not by me; it is the sharpest of the four, since it names the exact file `12.3` changed and says
+it is exonerated. Closed.
+
+**Blocker 3 — `tasks.md:83`.** The instrument clause now describes the round-trip falsifier that shipped,
+and says why it was re-amended. Closed.
+
+### Does the D17 fourth pass honour the design's own method, or merely append a caveat?
+
+**It honours it, and in one respect exceeds the three passes before it.** The method D17 states about
+itself is that each pass records what the previous one got wrong and why the error was tempting. The
+fourth pass does all of that, and then does something none of the earlier passes did: it separates the
+**recording** failure from the **security** judgement, accepts the second on stated merits, and then
+names the limit of its own acceptance — *"neither tampered with a live marker to observe the result, so
+this remains one argument made twice, not two independent checks."* That is the third pass's closing
+lesson (*"a property argument is not self-certifying"*) applied to the pass that is making the argument.
+A caveat would have said "note: there is now a second site." This says why tracing could not have found
+it, because the site did not exist when the tracing was done — which is the honest reason and the one
+that generalises.
+
+Two defects in it, both cosmetic, both worth fixing before archive because this pass is specifically
+about a document telling the truth:
+
+- **A quotation attributed to me that I did not write.** `design.md:1093` opens
+  *"Fourth pass (§12 supervisor review, **"the section's most important finding"** — …"*. That phrase
+  appears nowhere in my review (`grep -c` over this DEVLOG returns 0); the nearest thing said was the
+  architect's, in the remediation brief, and it was worded differently. A quoted phrase attributed to a
+  named source that the source does not contain is the same defect class this pass exists to correct,
+  at one-hundredth the size. Drop the quotation marks or drop the phrase.
+- **Unbalanced parenthesis** on the same line — the `(` after "Fourth pass" never closes.
+
+And one in the proposal: its banner says *"Its `## Why` below states three first-hand findings"*, but the
+three strikes are one each in `## Why`, `## What Changes` and `## Impact`. Say "below" rather than naming
+one section.
+
+### Question 5, asked again now that four tests exist — the gap is unchanged, and it is narrower than you think
+
+Plainly, as you asked: **the four new tests do not touch it.** They are good falsifiers —
+`PushWithZeroRefUpdates_ReachesTheServer_AndStillEmitsAnObservableRecord` in particular is the best test
+in the section, because it refuses the easy version (it establishes that a real client short-circuits
+before sending, then hand-builds a bare `0000` flush-pkt to reach the branch a real client cannot) — but
+every one of them pins the **remediation's** additions. The evidence I flagged last round is exactly as it
+was.
+
+What that gap actually reduces to, after tracing it again:
+
+- **The two live browser runs and `12.4` are not the gap, and I would not spend effort there.** No gate in
+  this repo can observe a circuit; `12.4` is a designated human-in-the-loop task, confirmed and ticked
+  correctly, with its healthy record preserved in commit `223d930`'s message. That is the right evidence
+  form for that claim, not a compromise.
+- **The gap is one artefact: block 1's mutation, recorded as counts rather than test names.** And it is
+  the single most load-bearing artefact in §12. Everything downstream of it — the re-aiming of `12.2` and
+  `12.3` away from the server span, the Product Owner's escape-hatch ruling, the whole second half of the
+  section — rests on reading 2 of your ⚠️ post rather than reading 1, and the *only* thing that decided
+  between them was "the mutant killed a test." A count cannot distinguish "the mutant killed the right
+  test" from "the mutant killed a different test and the right one was already red." The conclusion is
+  almost certainly correct and is corroborated by outcome (the fix was elsewhere, and the banner now
+  appears live), but corroboration-by-outcome is not the thing the mutation was run to establish.
+
+**If you want to close it, that is one confirmation run, well inside the cap** — re-run the same mutant
+against `PushReactionEndpointTests.RealPush_NotifiesExactlyTheChangedRoute_AndNeverAViewerOnAnUntouchedRoute`
+and record the **failing test names**, not the count. Your call whether that belongs before the archive or
+in `## NEXT`; I would not hold the section for it, and I am not holding the section for it. But you asked
+me to say plainly whether it is still a gap, and it is, and it is the last one.
+
+### Your two scope rulings — both correct, and one for a reason you did not state
+
+- **Unborn-`HEAD` left at `LogDebug`.** Agree. An unborn `HEAD` means no prior servable state existed, so
+  no viewer could have been watching — there is nothing to have been silent *about* in the sense that
+  produced §12. And it is not silence, it is a level choice on a first-run condition. Correct to leave.
+- **Partial-delivery falsified at the service layer, not end-to-end.** Agree, and the stronger reason is
+  one your ruling did not give: the property under test is `LogReactionOutcome`'s rendering **as a
+  function of** `PageChangeNotificationResult`, and an end-to-end multi-file push adds `git diff`,
+  `Encode` and the endpoint to the path without adding any discriminating power over that function. It
+  also would not have been a weaker test if it used a stub — and it does not: `PushReactionServiceTests`
+  drives a **real** repo and a **real** `PageChangeNotifier`, so the diff→route half is genuinely
+  exercised on the way in. The constructed two-route case is the right instrument, not the cheap one.
+
+### Both collapses I named — re-derived closed, and I checked for a new one
+
+I traced all four states of the reordered `LogReactionOutcome` (`PushReactionService.cs:216–270`) rather
+than reading the branch labels:
+
+| state | branch | record |
+|---|---|---|
+| every diffed route matched | `UnmatchedRoutes.Count == 0` | counts only — correct, this is health |
+| no route matched | `SubscribedRoutesAtZeroMatch is { }` | unmatched routes **and** the subscription table |
+| some matched, some not | fallthrough | unmatched routes named — **the collapse that is now closed** |
+| empty diff (`routes.Count == 0`) | `Count == 0` | `diffed 0 route(s) []` — distinguishable by the count |
+
+`unmatchedRoutes = routeSet.Where(r => !matchedRoutes.Contains(r))` is computed against the same
+`HashSet` the match loop used, and `matchedRoutes.Add(route)` sits **before** the callback `try`, so a
+route whose subscriber matched and then threw is correctly *matched, not invoked, not unmatched* — the
+three-way distinction §12 built earlier still holds through the new field. No new collapse: I looked
+specifically for one at the branch reorder, which is where a reordered guard chain usually introduces
+one, and there is none.
+
+The endpoint record (`GitSmartHttpEndpoints.cs:110–121`) closes the "reacted and had nothing to do" vs
+"never fired" identity at the layer that owns the decision. The `CS0718` workaround is right and the
+category string is the one `ILogger<T>` would have produced.
+
+### Anything the remediation broke or drifted — nothing broke; three things to carry
+
+The blast radius was wider than a remediation usually has, so I checked it as a change rather than as a
+fix. `PageChangeNotificationResult` gained a fourth positional member and **all four** construction sites
+moved with it (`PageChangeNotifier.cs:43,111`; the two stubs at `PushReactionServiceTests.cs:486` and
+`InteractiveComponentSurfaceTests.cs:199`). `InteractiveComponentMarkerParameters.cs` is deleted, not
+orphaned, and its diagnostics survive verbatim in the inlined copy. `git status --short -- src` and
+`git diff -- src` are both empty at `e1cac8c`. For `## NEXT`, not a fix block:
+
+1. **`ArgumentException.ThrowIfNullOrEmpty(Route)` has no falsifier.** It is a new production guard added
+   at my request in a remediation round, and nothing in the suite fails if it is deleted — the exact
+   shape §8 shipped three of, arriving through the one door that is hardest to watch. I traced its
+   reachability and I think it is unreachable today (`_page.Route.Value` comes from the index, built from
+   enumerated files, and dot-prefixed names are excluded, so `""` has no producer), which is also why it
+   is untestable without new machinery and why I am not blocking on it. But note the second-order effect:
+   it runs during the **static SSR prerender** pass too, so if a producer ever appears, this converts a
+   page that renders fine minus its banner into a 500 on a read path. That is "fail fast, never degrade"
+   applied correctly — I only want it recorded that the trade was made, because the code comment argues
+   the guard and not the trade.
+2. **`PushReactionService.ReactAsync`'s own `before == after` early return (`:81`) still logs nothing.**
+   The remediation closed the hole at `GitSmartHttpEndpoints`, which is the only production caller, so
+   the observable property holds. It does not hold at the type that owns the reaction, so a second caller
+   of `ReactAsync` would reintroduce it silently.
+3. **`SubscribedRoutesAtZeroMatch` remains global-only**, so the partial branch names which routes were
+   missed but not what the table held. Defensible — in a partial delivery you already know the table is
+   non-empty — and I am recording it only so the asymmetry is a choice on the record rather than a
+   leftover.
+
+### Spec closure
+
+`specs/git-sync/spec.md`, *Re-index and broadcast on received push*:
+
+- ***Viewers notified after a push*** — satisfied, by `12.4`'s live confirmation, joined to three test-
+  covered segments. Unchanged by this round and correctly evidenced.
+- ***The reaction to a push is observable*** — satisfied, and now **more** than the words require: the
+  spec asks that a broadcast reaching **no** viewer be distinguishable from a delivered one, and the
+  record now also distinguishes a broadcast reaching **some** viewers, plus a reaction that correctly did
+  nothing. Both of those were mine to find and neither is in the spec; if the Product Owner wants the
+  stronger property to be the promise rather than an implementation detail, that is a spec amendment for
+  a later change, not a §12 task.
+
+### What this review could not see
+
+Unchanged from my first pass and still worth restating, because an `Approve` that reads as total is worth
+less than one that states its limits:
+
+- **I ran nothing.** `GATES_EXIT:0` and 895/895 I read from your post; the reviewer's `516053a4e870` I did
+  not recompute.
+- **My agreement with the reviewer on `12.3`'s security is still one argument made twice.** Neither of us
+  tampered with a live marker. The D17 fourth pass now records this limit in the design itself, which is
+  the right place for it — but recording a shared blind spot does not make it two checks.
+- **I verified the quotation defect above by grep**, which proves the phrase is not in this DEVLOG. It
+  does not prove it is not somewhere else I did not look.
+- **My "nothing broke" claim is scoped to `223d930..HEAD` plus the four construction sites I traced.** I
+  did not run a whole-solution unused-symbol pass, and the two live browser runs remain outside every
+  instrument available to me.
+
+**§12 closes.** Roll the three carry items and the mutation-record gap into `## NEXT`; the two cosmetic
+defects in D17's fourth pass and the one in the proposal banner are a close-out edit, not a block.
+
+**[architect]** §12 close-out — `@supervisor` `Approve` over `454b64b..e1cac8c`, one remediation round.
+**All 45 tasks ticked; §1–§12 all closed. The change is complete.** Three close-out edits and one
+evidence gap, all handled here rather than carried.
+
+### The fabricated quotation — the sharpest finding of the whole section
+
+`design.md:1093` opened D17's fourth pass with `**Fourth pass (§12 supervisor review, "the section's
+most important finding"` — a phrase attributed to `@supervisor` **as a quotation**, in the pass whose
+entire subject is a document that told the truth in three passes and then stopped. `@supervisor` grepped
+its own review for it and found nothing.
+
+**I can name the source, and it is me.** That phrase is from my remediation brief to `@worker` — *"1.
+`design.md` D17 is now materially false — the section's most important finding"* — which lives in the
+agent prompt and **not** in this DEVLOG. The worker lifted my emphasis into `design.md` and attributed
+it upstream to the review that prompted the brief. No one lied; a phrase migrated one step up its own
+chain of custody and acquired an author on the way.
+
+**This is worth more than its one-line fix.** §12's recurring defect was claims outrunning their
+instruments, and the last instance is a *citation* outrunning its source — in the document being
+corrected for exactly that. It also names a real gap in this workflow: **briefs are not in the DEVLOG.**
+Everything else here is quotable because it is committed; a brief is not, so anything an agent lifts
+from one enters the record unfalsifiable. Fixed by attributing the pass to the review round rather than
+to a quotation, and the unbalanced parenthesis on the same line is gone with it.
+
+Also corrected: `fix-changed-on-disk-broadcast`'s banner claimed its three disproved findings sit in
+`## Why`; they are one each in `## Why`, `## What Changes` and `## Impact`, and there are **four** struck
+claims, not three.
+
+### The mutation record — the one evidence gap, now closed
+
+`@supervisor` was right that this was the section's most load-bearing artefact and its weakest record:
+block 1's mutation survived as **counts**, and the whole re-aiming of §12 rests on it. A count cannot
+separate *"killed the right test"* from *"killed a different test while the right one was already red."*
+
+**Run 3 of 3** — the last permitted by the cap — same mutant, recording **names**:
+
+```
+target    src/ZeroWiki/Content/PageChangeNotifier.cs
+mutant    if (!routeSet.Contains(route))  ->  if (true)
+checksum  3963c2e97326 before, restored and matching after; git diff -- src empty
+suite     FULL, UNFILTERED: Failed 11, Passed 884, Total 895
+harness   KILLED
+```
+
+The eleven, by name — `PageChangeNotifierTests`: `..._DeliveredRun_AndZeroMatchRun_AreDistinguishableByTheReturnedCounts`,
+`..._EveryRouteMatched_UnmatchedRoutesIsEmpty`, `..._InvokesOnlySubscribersOfTheNotifiedRoutes`,
+`..._MultipleSubscribersOnTheSameRoute_AllInvoked`, `..._OneSubscriberThrows_TheOthersAreStillNotified`,
+`..._PartialMatchAcrossMultipleRoutes_NamesExactlyTheUnmatchedOnes`,
+`..._SubscribersDisposedAfterNotification_AreNotInvokedOnASecondBroadcast`; `PushReactionServiceTests`:
+`..._ChangedPage_EmitsOneStructuredInformationRecordWithAllThreeQuantities`,
+`..._PartialDeliveryAcrossTwoRoutes_RendersDifferentlyFromAFullyHealthyOne`;
+`PushReactionEndpointTests`: **`RealPush_NotifiesExactlyTheChangedRoute_AndNeverAViewerOnAnUntouchedRoute`**,
+`ReplayingACapturedPushASecondTime_ForcesAServerSideRejection_AndReactsToNothing`.
+
+**The bolded one is the entire point.** That is the test whose ability to fail decided *reading 2* over
+*reading 1* — the decision that moved §12's target off `HandleReceivePackAsync`→`PageChangeNotifier` and
+onto the component boundary where the bug actually was. It is now recorded as a name that dies, not as a
+number. The count moved 6 → 7 → 11 across the three runs because blocks 1 and 2 added tests between
+them; that also retires the 6-vs-7 variance as *unexplained but no longer load-bearing* — the verdict
+never depended on the count.
+
+Run against the committed tree with the doc edits stashed, since a mutation must not run over an
+uncommitted working tree.
+
+### Carried to `## NEXT`, per `@supervisor`
+
+1. `ArgumentException.ThrowIfNullOrEmpty(Route)` **has no falsifier** — a production guard added in a
+   remediation round, the hardest door to watch. Unreachable today, but it runs during SSR prerender, so
+   a future producer turns a degraded render into a 500 on a read path. Right trade; recorded as a trade.
+2. `PushReactionService.ReactAsync`'s own `before == after` early return still logs nothing — closed at
+   the only production caller, not at the type that owns the reaction.
+3. `SubscribedRoutesAtZeroMatch` remains global-only: the partial branch names missed routes but not the
+   table.
+4. The unborn-`HEAD` `LogDebug` case — the "fourth, smaller" collapse, deliberately out of scope.
+
+**What `@supervisor` said it could not see, recorded because a review that only says `Approve` is worth
+less than one that states its limits:** it ran nothing — `GATES_EXIT:0`/895 and `516053a4e870` it read
+rather than reproduced; its agreement with `@reviewer` on `12.3`'s security is **one argument made twice,
+not two independent checks**; and "nothing broke" is scoped to `223d930..HEAD` plus the sites it traced.
+
 ## NEXT
 
 **Resume at `12.1`.** §12 is the only open section and **is not open yet** — it has no `Base:` post.
