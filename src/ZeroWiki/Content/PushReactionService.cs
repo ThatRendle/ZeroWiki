@@ -191,6 +191,15 @@ public sealed class PushReactionService
     /// healthy delivery never carries this; <see cref="PageChangeNotifier"/> never computes it for one.
     /// </remarks>
     /// <remarks>
+    /// <b>§12 remediation (supervisor finding).</b> A multi-route push that reaches viewers on some of
+    /// its routes but not all of them used to render identically to a fully healthy delivery, because
+    /// the only zero-match diagnostic fired on the *global* matched count, not per route. Whenever
+    /// <see cref="PageChangeNotificationResult.UnmatchedRoutes"/> is non-empty -- whether that is every
+    /// diffed route (the pre-existing all-zero case) or only some of them (the gap this closes) -- the
+    /// record now names exactly which ones had no subscriber, in addition to the two spec-required
+    /// counts.
+    /// </remarks>
+    /// <remarks>
     /// <b>§12 correction.</b> Both route lists are rendered through <see cref="FormatRoutes"/> rather
     /// than interpolated directly: <c>Microsoft.Extensions.Logging</c>'s default placeholder formatter
     /// enumerates an <see cref="IEnumerable{T}"/> argument and joins the items with no wrapping
@@ -207,12 +216,28 @@ public sealed class PushReactionService
         IReadOnlyList<EncodedRoute> changedRoutes,
         PageChangeNotificationResult result)
     {
+        if (result.UnmatchedRoutes.Count == 0)
+        {
+            _logger.LogInformation(
+                "Push reaction for HEAD {BeforeSha} -> {AfterSha} diffed {DiffedRouteCount} route(s) " +
+                "{DiffedRoutes}, matched {SubscribersMatched} subscriber(s), and invoked " +
+                "{CallbacksInvoked} callback(s).",
+                beforeSha,
+                afterSha,
+                changedRoutes.Count,
+                FormatRoutes(changedRoutes),
+                result.SubscribersMatched,
+                result.CallbacksInvoked);
+            return;
+        }
+
         if (result.SubscribedRoutesAtZeroMatch is { } subscribedRoutes)
         {
             _logger.LogInformation(
                 "Push reaction for HEAD {BeforeSha} -> {AfterSha} diffed {DiffedRouteCount} route(s) " +
                 "{DiffedRoutes}, matched {SubscribersMatched} subscriber(s), and invoked " +
-                "{CallbacksInvoked} callback(s); the subscription table held {SubscribedRouteCount} " +
+                "{CallbacksInvoked} callback(s); {UnmatchedRouteCount} of the diffed route(s) matched no " +
+                "subscriber: {UnmatchedRoutes}; the subscription table held {SubscribedRouteCount} " +
                 "route(s) {SubscribedRoutes} at that moment.",
                 beforeSha,
                 afterSha,
@@ -220,21 +245,28 @@ public sealed class PushReactionService
                 FormatRoutes(changedRoutes),
                 result.SubscribersMatched,
                 result.CallbacksInvoked,
+                result.UnmatchedRoutes.Count,
+                FormatRoutes(result.UnmatchedRoutes),
                 subscribedRoutes.Count,
                 FormatRoutes(subscribedRoutes));
             return;
         }
 
+        // §12 remediation: some, but not all, of the diffed routes matched a subscriber -- the
+        // partial-delivery case the global-zero check above could never see.
         _logger.LogInformation(
             "Push reaction for HEAD {BeforeSha} -> {AfterSha} diffed {DiffedRouteCount} route(s) " +
             "{DiffedRoutes}, matched {SubscribersMatched} subscriber(s), and invoked " +
-            "{CallbacksInvoked} callback(s).",
+            "{CallbacksInvoked} callback(s); {UnmatchedRouteCount} of the diffed route(s) matched no " +
+            "subscriber: {UnmatchedRoutes}.",
             beforeSha,
             afterSha,
             changedRoutes.Count,
             FormatRoutes(changedRoutes),
             result.SubscribersMatched,
-            result.CallbacksInvoked);
+            result.CallbacksInvoked,
+            result.UnmatchedRoutes.Count,
+            FormatRoutes(result.UnmatchedRoutes));
     }
 
     /// <summary>

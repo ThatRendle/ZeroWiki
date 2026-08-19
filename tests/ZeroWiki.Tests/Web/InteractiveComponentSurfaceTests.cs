@@ -196,7 +196,7 @@ public sealed class InteractiveComponentSurfaceTests : IDisposable
 
         public Task<PageChangeNotificationResult> NotifyChangedAsync(
             IReadOnlyCollection<EncodedRoute> routes, CancellationToken cancellationToken) =>
-            Task.FromResult(new PageChangeNotificationResult(0, 0, null));
+            Task.FromResult(new PageChangeNotificationResult(0, 0, [], null));
 
         private sealed class NoopSubscription : IDisposable
         {

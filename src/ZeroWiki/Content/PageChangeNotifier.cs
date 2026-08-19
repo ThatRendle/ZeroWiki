@@ -40,7 +40,7 @@ public sealed class PageChangeNotifier : IPageChangeNotifier
 
         if (routes.Count == 0)
         {
-            return new PageChangeNotificationResult(0, 0, null);
+            return new PageChangeNotificationResult(0, 0, [], null);
         }
 
         var routeSet = routes as HashSet<EncodedRoute> ?? new HashSet<EncodedRoute>(routes);
@@ -55,6 +55,11 @@ public sealed class PageChangeNotifier : IPageChangeNotifier
         var subscribersMatched = 0;
         var callbacksInvoked = 0;
 
+        // §12 remediation (supervisor finding): tracked per route, not merely as a global zero/nonzero
+        // count -- what turns "diffed 3, matched 1" into a record that names which two routes had no
+        // viewer, rather than one indistinguishable from a fully healthy 3-for-3 delivery.
+        var matchedRoutes = new HashSet<EncodedRoute>();
+
         foreach (var (route, onChanged) in snapshot)
         {
             cancellationToken.ThrowIfCancellationRequested();
@@ -67,6 +72,7 @@ public sealed class PageChangeNotifier : IPageChangeNotifier
             }
 
             subscribersMatched++;
+            matchedRoutes.Add(route);
 
             try
             {
@@ -98,7 +104,11 @@ public sealed class PageChangeNotifier : IPageChangeNotifier
             ? (IReadOnlyList<EncodedRoute>)snapshot.Select(subscription => subscription.Route).Distinct().ToList()
             : null;
 
-        return new PageChangeNotificationResult(subscribersMatched, callbacksInvoked, subscribedRoutesAtZeroMatch);
+        // Order-independent by design (routeSet is a HashSet): a reader consumes this as a set of
+        // names, not a sequence, so nothing here promises to preserve the diff's own ordering.
+        var unmatchedRoutes = routeSet.Where(route => !matchedRoutes.Contains(route)).ToList();
+
+        return new PageChangeNotificationResult(subscribersMatched, callbacksInvoked, unmatchedRoutes, subscribedRoutesAtZeroMatch);
     }
 
     private void Unsubscribe(Guid id) => _subscriptions.TryRemove(id, out _);

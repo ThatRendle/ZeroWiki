@@ -74,8 +74,14 @@ public static class GitSmartHttpEndpoints
         ContentPaths paths,
         IPageIndexBuilder pageIndexBuilder,
         PushReactionService pushReaction,
-        IHostApplicationLifetime lifetime)
+        IHostApplicationLifetime lifetime,
+        ILoggerFactory loggerFactory)
     {
+        // GitSmartHttpEndpoints is static, so it cannot be used as ILogger<T>'s type argument (CS0718)
+        // -- the category is named after it explicitly instead, the same string ILogger<T> would have
+        // produced.
+        var logger = loggerFactory.CreateLogger(typeof(GitSmartHttpEndpoints).FullName!);
+
         RepositoryWriteLock writeLock;
         try
         {
@@ -104,6 +110,15 @@ public static class GitSmartHttpEndpoints
 
         if (string.Equals(beforeSha, afterSha, StringComparison.Ordinal))
         {
+            // §12 remediation (supervisor finding, "the section's own founding inference error"): a
+            // request that reached this handler and left HEAD unmoved used to log nothing at all,
+            // making it byte-identical in the app's output to the reaction never having fired. One
+            // record here is what lets a reader tell "the server received this push and correctly had
+            // nothing to react to" apart from "this request never reached the server".
+            logger.LogInformation(
+                "Push to '/git/git-receive-pack' completed with HEAD unchanged at {Sha}; no reaction " +
+                "was triggered.",
+                beforeSha ?? "(none)");
             return;
         }
 

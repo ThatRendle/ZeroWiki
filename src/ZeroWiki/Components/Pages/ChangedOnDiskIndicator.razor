@@ -27,6 +27,14 @@
     /// <see langword="string"/> crosses the Static SSR-&gt;circuit boundary natively, and
     /// <see cref="OnInitialized"/> rebuilds the <see cref="EncodedRoute"/> from it, in-assembly, where
     /// the internal constructor has always been reachable.</summary>
+    /// <remarks>
+    /// <b>§12 remediation (supervisor finding).</b> The default of <see cref="string.Empty"/> exists only
+    /// so this type compiles under nullable reference types -- <see cref="EditorRequired"/> is an
+    /// analyzer diagnostic, not a runtime guarantee, so a future call site that omits this parameter
+    /// would otherwise subscribe under <c>new EncodedRoute("")</c> in silence: a route no diff can ever
+    /// name, the exact silent-no-broadcast class this section exists to close, wearing a different
+    /// value. <see cref="OnInitialized"/> now refuses that call shape loudly instead.
+    /// </remarks>
     [Parameter, EditorRequired]
     public string Route { get; set; } = string.Empty;
 
@@ -37,6 +45,11 @@
 
     protected override void OnInitialized()
     {
+        // §12 remediation: EditorRequired never runs at runtime, so this is the actual guard against a
+        // call site that omits Route -- fail loudly here rather than silently subscribing under
+        // EncodedRoute("").
+        ArgumentException.ThrowIfNullOrEmpty(Route);
+
         // Re-materialises the value WikiPage.razor's call site already produced via
         // PageRouteCodec.Encode on the SSR side -- this does not mint a new encoded route, it
         // reconstructs the one that crossed the boundary as a string.

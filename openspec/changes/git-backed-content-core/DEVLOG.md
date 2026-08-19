@@ -27386,6 +27386,517 @@ satisfied by observation, not by a passing test.
 **§12's tasks are complete: 45/45.** The section is not closed until `@supervisor` approves it over
 `git diff 454b64b..HEAD`.
 
+**[supervisor]** §12 section review over `git diff 454b64b..HEAD` (`223d930`, 8 commits) —
+**Request changes.** Three blockers, all in the *record* rather than the running code; the shipped
+behaviour is sound and `12.4`'s live confirmation is the strongest single artefact in the section.
+
+### Verdict: Request changes
+
+The code §12 ships works and I could not fault it. What I am blocking on is that three documents now
+state things §12 disproved, and all three sit **outside this section's diff** — which is why no block
+review could have caught them.
+
+### Blocker 1 — `design.md`'s D17 is now materially false, and it is the binding document
+
+`12.3`'s second pass added a second in-assembly construction site for `EncodedRoute`:
+
+- `src/ZeroWiki/Components/Pages/ChangedOnDiskIndicator.razor:41` — `_route = new EncodedRoute(Route);`
+  where `Route` is a `[Parameter] string` fed from `WikiPage.razor:36` across the Static SSR→circuit
+  boundary.
+
+D17's third pass (`design.md:1058–1090`) rests on exactly the premise this falsifies, and says so at
+length and in bold:
+
+- *"Nothing reads a route back from anywhere … the only other route-shaped input is an HTTP request
+  value"* — the component-marker payload **is** a route read back from a serialized form. D17 quotes the
+  earlier argument's *"a route read back from any stored or enumerated form still has to be asserted into
+  the type somewhere"*, labels it **"That premise is false"**, and disproves it by tracing. §12 has made
+  it true again.
+- *"threading the type through `Encode` removes **every** manual assertion, not merely most of them"* —
+  there is now one manual assertion, and it does not revalidate.
+- *"The type is therefore constructed in exactly one place, and the compiler, rather than a reviewer's
+  enumeration, is what guarantees it."* — the guarantee has reverted to a reviewer's enumeration. The
+  block reviewer said so plainly ("still reviewer-enumerable at two sites") and I agree with that
+  judgement **on the merits**: the marker descriptor is DataProtection-protected, so the string is
+  server-produced and not client-forgeable, and the trust model really is the same as every other
+  component parameter. My objection is not to the decision; it is that D17 still asserts the strong form.
+
+D17's own closing paragraph is the reason this is a blocker rather than a nit: *"Worth stating plainly,
+because 'constructible only inside the assembly' is the kind of sentence a later reader trusts to be
+total."* That sentence is currently in the file, unqualified, and this change is about to be archived as
+the account of how it was built. `EncodedRoute.cs`'s XML remarks and this thread both record the new
+reality; `design.md` — the binding document — does not.
+
+**Fix:** a fourth pass on D17 recording the second construction site, why it exists (no JSON surface, by
+deliberate choice), what the guarantee now is precisely, and a cross-reference from D19, which is where a
+reader looking at the broadcast will land first.
+
+### Blocker 2 — the superseded premise survives, in the one document a cold session reads for the diagnosis
+
+`openspec/changes/fix-changed-on-disk-broadcast/proposal.md` is an **active** change (it is on disk, it is
+not archived, and `make validate` covers it). Its `## Why` and `## What Changes` still state as first-hand
+findings the three claims §12 spent two live runs and a mutation disproving:
+
+- `:31–32` — *"the client half is proven healthy … so the break is server-side, between
+  `HandleReceivePackAsync` and `PageChangeNotifier`"*. Both halves inverted: that span was
+  mutation-confirmed working (block 1), and the break was on the client side of the boundary.
+- `:17–19` — *"`GitSmartHttpEndpoints.HandleReceivePackAsync` … has no covering tests, and neither does
+  its call to `PushReactionService.ReactAsync`"*. Your own ⚠️ post above names
+  `PushReactionEndpointTests.RealPush_NotifiesExactlyTheChangedRoute_AndNeverAViewerOnAnUntouchedRoute`,
+  green since the §10 close.
+
+Its STATUS banner is also stale in a way that matters: it makes supersession **conditional** on an escape
+hatch whose trigger the Product Owner has since ruled did not fire (this thread, *"1. The escape hatch is
+NOT triggered — §12 continues"*). A session picking this up cold reads a live proposal that teaches the
+wrong root cause and presents itself as a standing fallback.
+
+This is my answer to the architect's question 4: **the re-aiming reached `tasks.md` and stopped there.** It
+did not reach the document that states the superseded premise most forcefully.
+
+**Fix:** rewrite the banner to unconditional supersession naming §12 and the ruling, and either strike the
+disproved claims or mark them inline as disproved with a pointer to this thread. Deleting the change
+outright is a Product Owner call, not the fix block's.
+
+### Blocker 3 — `12.2`'s amended text still claims an artefact that does not exist
+
+`tasks.md:83` now reads: *"Test at the level `12.1`'s record locates the break — **driving a real push and
+asserting an open viewer of the pushed page is notified** — watched failing …"*.
+
+The artefact `12.2` shipped is
+`tests/ZeroWiki.Tests/Web/ChangedOnDiskIndicatorRouteRoundTripTests.cs`. It drives **no push** and asserts
+**no notification**: it issues a `GET /wiki/page` and replays the component marker through the framework's
+own deserializer. That is the right test — I say so below — but it is not what the box now claims.
+
+The amendment fixed the *level* clause and left the *instrument* clause standing, so the same class of
+defect the amendment existed to correct survives inside the amendment itself. `tasks.md` is what an
+archive reader sees when the DEVLOG is 27k lines.
+
+**Fix:** re-amend `12.2`'s appositive to describe the round-trip falsifier that actually shipped, and name
+where the push half and the join are actually evidenced (§8/§10's endpoint test; `12.4`).
+
+### Suggested remediation shape — one doc-only fix block
+
+Everything above is documentation. No source change is required, no gate should move, and no box is
+ticked or unticked:
+
+1. `design.md` D17 — fourth pass; D19 — cross-reference.
+2. `openspec/changes/fix-changed-on-disk-broadcast/proposal.md` — unconditional STATUS, disproved claims
+   struck or marked.
+3. `tasks.md` `12.2` — re-amend the instrument clause (Architect's file, Architect's edit).
+4. *Optional, and I would take it:* the observability gap in note 2 below. It is the section's own
+   founding inference error and it is cheaper to close now than to re-open §12 later.
+
+Then re-run me over the same `454b64b..HEAD` range.
+
+### Answering what the architect asked, in order
+
+#### 1. Is `12.1`'s instrument now adequate, or patched to survive the two cases we found?
+
+**The rendering is genuinely total; the record above it is not.** Two different answers, and the section
+only ever asked the first.
+
+I re-derived the rendering rather than taking it: `EscapeForRendering` doubles `\` then escapes `"`
+(`PushReactionService.cs:280`), `FormatRoute` always quotes a non-null value and renders `default` as a
+**bare** `<null>` (`:277`), and `FormatRoutes` brackets and joins with `", "` (`:274`). Scanning left to
+right, the first `"` preceded by an even number of `\` is the closing delimiter; a real route whose text
+is literally `<null>` renders `"<null>"`, quoted, never bare; `[]` and `[""]` differ because the quotes
+are unconditional. That mapping is injective over **every** `string`, not merely the ones `Encode`
+produces — so no, it was not patched to survive two found cases. It is closed as a class.
+
+**The third collapse is one level up, where neither fix looked.**
+`PageChangeNotifier.cs:96–99` computes the zero-match diagnostic only when the **global** match count is
+zero, and `LogReactionOutcome` reports aggregate counts with no per-route attribution. So for a push
+touching three pages:
+
+- viewers on all three, all notified → `diffed 3 route(s) [...], matched 3, invoked 3`
+- viewers on all three, **two silently missed** → `diffed 3 route(s) [...], matched 1, invoked 1`, **and
+  no diagnostic**, because the global count was not zero
+
+A reader cannot tell which route reached whom, and the one diagnostic that would say so is suppressed
+precisely when the failure is partial. An Obsidian sync pushes several files at once, so partial is the
+*likely* shape of the next occurrence, not the exotic one. This is not a spec violation — the scenario's
+words are "a broadcast reaching **no** viewer" — but it is the honest answer to the question, and it is
+the collapse a renderer-level review structurally could not find.
+
+**A fourth, smaller one, since it is adjacent and cheap to close.** No record is emitted at all when the
+push did not move `HEAD` (`GitSmartHttpEndpoints.cs:105` returns silently; `PushReactionService.cs:81`
+re-asserts the same check), and only a `LogDebug` — invisible at production level — for an unborn-`HEAD`
+transition (`:101`). So "the reaction ran and correctly had nothing to do" and "the reaction never fired"
+are still the same bytes: **the exact inference this section was created to eliminate**, per the scope
+decision's own *"the absence of warnings was read as evidence the reaction ran; it was not."* `12.1` was
+briefed and reviewed on the broadcast path and nobody asked which outcomes produce no record. Not a spec
+violation (the spec's `WHEN` is "reacts to a received push"), but it is three lines and it is the one I
+would most want the Product Owner to see.
+
+#### 2. `12.3` and D17 — my own weighing
+
+I agree with the reviewer on the **security** question and disagree on the **recording** question; see
+Blocker 1. Two things I would add that the block review did not reach:
+
+- **The revalidation gap has a concrete failure mode, and it is §12's own.** `Route` is
+  `[Parameter, EditorRequired] public string Route { get; set; } = string.Empty;`
+  (`ChangedOnDiskIndicator.razor:29`). `EditorRequired` is an analyzer diagnostic, not a runtime
+  guarantee. A future call site that omits the parameter yields `new EncodedRoute("")` and a subscription
+  under a route no diff can ever name — a silent no-broadcast, the exact class `12.3` just fixed, wearing
+  a different value. Under the old `EncodedRoute` parameter the same omission gave `default` and a null
+  `Value`; the fix changed *how* the value crosses without making the bad case loud.
+- **The escaping work does make it visible**, which is a genuine cross-block win worth recording:
+  `subscribed [""]` is distinguishable from `subscribed []`, so `12.1`'s hardened record would name this
+  if it happened. Visible is not loud, though. `ArgumentException.ThrowIfNullOrEmpty(Route)` — or a
+  `PageRouteCodec` revalidation — in `OnInitialized` closes it and simultaneously answers the reviewer's
+  "without revalidating it". Architect's call whether that belongs in the fix block or `## NEXT`.
+
+#### 3. Cross-block coherence — clean, with one judgement on the reflection helper
+
+- **No dead scaffolding.** The reverted JSON-converter approach left nothing in `src`;
+  `EncodedRouteTests.JsonDeserialization_CannotProduceAPopulatedInstance` is a live guard against its
+  reintroduction, not residue, and it is a genuinely *external* view (the test project holds no
+  `InternalsVisibleTo` grant).
+- **No duplicated abstraction.** `PageChangeNotificationResult`'s three members are each read exactly
+  once, in `LogReactionOutcome`. No orphaned assertion: I checked every test touching the reshaped
+  surface, and the two `IPageChangeNotifier` stubs (`PushReactionServiceTests.cs:436`,
+  `InteractiveComponentSurfaceTests.cs:197`) both moved with the interface.
+- **No mutation residue.** `git status --short -- src` and `git diff -- src` are both empty at `223d930`.
+- **One doc-vs-code drift, nit-level but introduced in `12.1` and untouched by both remediations.**
+  `PageChangeNotificationResult`'s XML says `SubscribedRoutesAtZeroMatch` is null *"whenever at least one
+  subscriber matched"*, but `PageChangeNotifier.cs:43` returns `(0, 0, null)` on the empty-route early
+  return. Null does not imply a match. `PageChangeNotifierTests.cs:109` pins the behaviour, so the code is
+  fine and only the stated invariant is wrong.
+- **`InteractiveComponentMarkerParameters.cs` — the test belongs; the extraction does not.** The test is
+  the only artefact in the repo that fails if `12.3` is reverted (revert the parameter to `EncodedRoute`
+  and the `GetParameterValue<string>` cast throws), and bUnit genuinely cannot express the crossing it
+  pins, so I would not remove it. But it has **one** caller, and its stated rationale is a future block
+  that does not exist — speculative generality carrying a permanent dependency on four framework
+  internals named by string. Its mitigation is right (each lookup throws "the framework's internal shape
+  moved"), so it will fail loudly on a .NET upgrade rather than silently. **Recommendation, for `## NEXT`
+  rather than the fix block:** inline it into its single test file, drop the future-block rationale, and
+  carry it as a known .NET-upgrade tripwire.
+
+#### 4. Did the re-aiming go far enough? No — see Blockers 2 and 3
+
+I checked the other direction too, and it is clean: `specs/git-sync/spec.md`'s requirement and both
+scenarios are location-neutral, and D19 (`design.md:1586ff`) describes the *design* of the trigger point,
+never a claim about where the defect was. The surviving superseded premise is confined to the two
+documents named above.
+
+#### 5. The evidence standard — better than I expected, with one named weak point
+
+The load-bearing conclusions do survive in the repo, and mostly not as prose:
+
+- **The fix's falsifier** survives as `ChangedOnDiskIndicatorRouteRoundTripTests` — it fails if `12.3` is
+  reverted. What it does *not* cover is the defect **class**: nothing fails if a future call site passes a
+  well-formed but wrong string, or if `OnInitialized`'s `Subscribe` call or its `RendererInfo.IsInteractive`
+  guard is changed. That is the residual, and note 2 above is the cheap way to narrow it.
+- **The external console-app probe** survives as `EncodedRouteTests.JsonDeserialization_...`, which is a
+  fair in-repo proxy because the test project genuinely has the external view.
+- **`12.4`** is the section's strongest artefact and it is not merely DEVLOG prose: commit `223d930`'s
+  message carries the observed healthy record — `diffed 1 route(s) ["scratch"], matched 1 subscriber(s),
+  invoked 1 callback(s)` — on the Product Owner's own machine. That is simultaneously the end-to-end
+  confirmation of *Viewers notified after a push* **and** the known-positive for `12.1`'s instrument that
+  the first diagnostic run explicitly recorded as its weakest link. Correctly classified as
+  human-in-the-loop, correctly confirmed, correctly ticked on the Product Owner's word.
+- **The weak point: the mutation run survives as counts, not names.** The record has
+  `Failed 7, Passed 874, Total 881` and the earlier run's 6 — but not *which* tests died. A mutation's
+  confirmation strength is which tests died, not how many; a count alone cannot distinguish "the mutant
+  killed the right test" from "the mutant killed a different test and the right one was already red".
+  Block 1's KILLED verdict is almost certainly correct — nothing else in the section contradicts it — but
+  the artefact recorded is one degree weaker than the claim it supports. Worth a `## NEXT` line for the
+  next mutation run rather than a re-run now.
+
+### Does §12 satisfy `specs/git-sync/spec.md`'s *Re-index and broadcast on received push*?
+
+- ***Viewers notified after a push*** — **yes**, and the evidence is `12.4`, not a test. The chain is
+  covered in three pieces (§8/§10's endpoint test for push→`ReactAsync`→notifier; §12's
+  `PushReactionServiceTests` for diff→subscriber; §12's round-trip test for the SSR→circuit crossing) and
+  joined by one live observation. That is the right shape for a scenario no gate in this repo can reach.
+- ***The reaction to a push is observable*** — **yes on the words**, with the two blind spots named in
+  answer 1 above: partial delivery within one multi-route push, and a reaction that correctly did nothing.
+
+### Process record — checked, clean
+
+Every block in §12 carries gate exit lines (`GATES_EXIT:0`, 891 tests at block 2) and every reviewer
+`Approve` carries a `Reviewed-state:` fingerprint — `5c69930c2bdc`, `c30d51096900`, `a48b7428f63e`. The one
+block-1 red gate is recorded rather than glossed, with its second-run reconciliation and an unchanged
+fingerprint (`37fbff2fd78e`). `12.4` is ticked on a recorded Product Owner confirmation. No dangling
+`→ @reviewer`. Nothing here is uncertified.
+
+### On the two things the architect asked me to look at without treating as §12's
+
+- **`WikiPageEditorTests.The_successful_save_redirect_carries_no_draft_token`** — not connected. §12's
+  entire `src` diff is the notifier's return shape, the reaction's log record, and one component
+  parameter's type. The draft-token redirect path touches none of them, and the flake predates `454b64b`.
+- **The 6-vs-7 variance** — most likely the same flake joining and leaving the failure set (same total,
+  ±1), and **not** connected to §12's changes. But I want to be precise about what I actually know: I
+  cannot confirm it, because the failing test *names* were not recorded for either run. That is the same
+  finding as the last bullet above, not a second one.
+
+### What this review could not see
+
+Stating my own limits, per the standard this section has been held to:
+
+- **I did not run anything.** No gates, no tests, no mutants, no browser. Every `LABEL_EXIT:0` in this
+  thread I read rather than reproduced, and the block-2 gate line (`GATES_EXIT:0`, 891 tests) I took on
+  the record.
+- **I cannot see a live circuit.** Nothing in this repo can. That the interactive instance *subscribes*
+  under the reconstructed route — as opposed to *receiving* it, which the round-trip test does pin — rests
+  entirely on `12.4`. If the Product Owner's confirmation were withdrawn, the section would have no
+  evidence for its primary scenario, and I would have no way to supply it.
+- **My check on `12.3`'s security judgement shares an instrument with the reviewer's.** We both reasoned
+  from the type system and from what the marker payload is; neither of us tampered with a marker and
+  observed the result. If the DataProtection protection of component parameters is weaker than we both
+  believe, our agreement is not independent evidence — it is one argument, made twice.
+- **My "no dead scaffolding" claim is grep- and diff-scoped to `454b64b..HEAD`.** A type built in §11 whose
+  last caller §12 removed would be outside my range, and I did not run a whole-solution unused-symbol pass.
+- **Blocker 2 is outside every instrument this workflow points at a section.** I found it by following the
+  scope-decision post's reference, not by any check that would fire on its own. There may be other
+  documents under `openspec/changes/` that §1–§11 falsified the same way, and nothing looks for them.
+
+**[worker]** §12 remediation block — supervisor's five findings (four mine, `tasks.md`'s instrument
+clause is the architect's own). Classification before implementing:
+
+- **Finding 1 (D17 fourth pass)** — build. Nothing records the second construction site; the third
+  pass's claims are simply false now and need a fourth pass, not a patch.
+- **Finding 2 (`fix-changed-on-disk-broadcast/proposal.md`)** — finish. The document exists and is
+  mostly right in structure; only the STATUS banner and three quoted claims (plus one more in `## Impact`
+  that contradicted them once those were fixed) needed correcting.
+- **Finding 3 (observability gap)** — split: the "push moves nothing logs nothing" half is **build**
+  (no log call existed at all at `GitSmartHttpEndpoints.cs:105`); the "partial broadcast invisible" half
+  is **finish** (`PageChangeNotificationResult`/`LogReactionOutcome` already carry a zero-match
+  diagnostic — it needed generalising from "global zero" to "per-route unmatched", not inventing).
+- **Finding 4 (inline the marker helper)** — finish/refactor. Confirmed via `grep -rln
+  "InteractiveComponentMarkerParameters" tests/` that `ChangedOnDiskIndicatorRouteRoundTripTests.cs` is
+  the only caller, matching the supervisor's own claim.
+- **Finding 5 (`Route`'s silent default)** — finish. One line (`ArgumentException.ThrowIfNullOrEmpty`)
+  at the point `OnInitialized` already reconstructs the route.
+
+No disagreement with the brief; nothing to raise to `@architect`.
+
+### What changed
+
+- **`design.md` D17** — fourth pass added, recording the second `EncodedRoute` construction site
+  (`ChangedOnDiskIndicator.OnInitialized`), why it's accepted (DataProtection-protected marker payload,
+  no wider than any other component parameter), and the corrected guarantee ("two named sites", not
+  "exactly one"). Earlier passes left untouched, per the file's own stated method. **D19 §3** gets a new
+  paragraph cross-referencing D17's fourth pass at the point the subscribing callback's route crosses the
+  same boundary.
+- **`fix-changed-on-disk-broadcast/proposal.md`** — STATUS made unconditional (escape hatch did not
+  fire, per the Product Owner's own ruling in this thread). Three disproved first-hand claims struck
+  inline with what replaced them and a pointer to `## 12.`/D19/the tests, not deleted. A fourth,
+  consequentially-stale line under `## Impact` ("currently exonerated") struck too, since leaving it
+  would have had the document contradict itself after the other three fixes.
+- **`PageChangeNotificationResult`** — new `UnmatchedRoutes` field: the subset of a call's routes that
+  matched zero subscribers, populated whenever non-empty (not only at global zero). `PageChangeNotifier`
+  computes it via a `matchedRoutes` set built alongside the existing loop — no second pass over the
+  subscription table.
+- **`PushReactionService.LogReactionOutcome`** — three-way branch now: fully matched (unchanged
+  message), fully unmatched (unchanged message, now sourced from `UnmatchedRoutes` instead of a
+  recomputed check), and **new**: partially matched, which names exactly which diffed routes had no
+  subscriber. Doc comments on both types record why (§12 supervisor finding).
+- **`GitSmartHttpEndpoints.HandleReceivePackAsync`** — the `beforeSha == afterSha` branch now logs one
+  `Information` record before returning, via `ILoggerFactory.CreateLogger(typeof(GitSmartHttpEndpoints).FullName!)`
+  (the class is `static`, so `ILogger<GitSmartHttpEndpoints>` doesn't compile — CS0718).
+- **`ChangedOnDiskIndicator.razor`** — `OnInitialized` now calls `ArgumentException.ThrowIfNullOrEmpty(Route)`
+  before reconstructing `_route`; XML remarks on the `Route` property explain why the analyzer-only
+  `EditorRequired` isn't enough.
+- **`InteractiveComponentMarkerParameters.cs`** deleted; its two methods (`GetParameterValue`,
+  `ExtractSingleMarkerJson`) moved private-static into `ChangedOnDiskIndicatorRouteRoundTripTests.cs`,
+  its only caller. Diagnostics ("the framework's internal shape moved") unchanged verbatim.
+- Test-double `PageChangeNotificationResult` constructions (`PushReactionServiceTests.cs`,
+  `InteractiveComponentSurfaceTests.cs`) updated for the new field.
+
+### Falsifier for finding 3 — both halves, run against the actual committed pre-fix code
+
+**Partial broadcast:** `PageChangeNotifierTests.NotifyChangedAsync_PartialMatchAcrossMultipleRoutes_NamesExactlyTheUnmatchedOnes`
+pins the notifier's own return value; `PushReactionServiceTests.ReactAsync_PartialDeliveryAcrossTwoRoutes_RendersDifferentlyFromAFullyHealthyOne`
+is the actual falsifier — it drives two routes through the real `PushReactionService` → real
+`PageChangeNotifier`, one delivered and one silently missed, and asserts the rendered log message names
+the missed route. Verified by temporarily reverting `LogReactionOutcome` in the tree to its pre-fix
+two-branch shape (git-diff-free verification isn't possible here — the property under test *is* the log
+text — so I hand-reverted, confirmed red, then restored): `Assert.Contains("[\"second\"]", ...)` failed
+with `Sub-string not found`, confirming the pre-fix code renders the partial case with no route names at
+all.
+
+**No-move push:** the real `git push` that has nothing to send **short-circuits client-side** (confirmed
+empirically — `NoOpPush_ReactsToNothing`'s own client never reaches `HandleReceivePackAsync` in this
+shape, so it can't exercise the no-move branch at all). `PushReactionEndpointTests.PushWithZeroRefUpdates_ReachesTheServer_AndStillEmitsAnObservableRecord`
+instead POSTs a hand-built, protocol-valid empty command list (`0000`, a bare flush-pkt — the wire
+encoding of "zero ref updates") directly to `/git/git-receive-pack` with Basic auth, so it reaches the
+server-side branch a real no-op push cannot from this git client. Reverted the endpoint's log call to a
+silent `return`, confirmed red (`Assert.Contains() Failure: Filter not matched in collection`), restored,
+confirmed green.
+
+Both reverts were hand-edits to already-committed logic, not `git` operations, and both are restored —
+`git diff -- src` at the end of this block matches the summary above with nothing extra.
+
+### Claims
+
+- **Claim:** the two observability gaps named in the brief (partial broadcast suppressed, no-move push
+  silent) are closed, and each is pinned by a test that fails on the exact pre-fix committed code and
+  passes on the fix.
+- **Instrument:** hand-reverting `PushReactionService.LogReactionOutcome` and
+  `GitSmartHttpEndpoints.HandleReceivePackAsync`'s log call to their pre-block shape, `dotnet build`,
+  `dotnet test --filter` on the two new tests (red), restoring, rebuilding, re-running (green) — plus
+  `dotnet build` clean (0 warnings) confirming no dead code was left from the reverts.
+- **Blind spot:** this closes the *two* collapses the brief named. It does not close the unborn-`HEAD`
+  transition, which the supervisor flagged as "a fourth, smaller one" but the brief's item 3 did not ask
+  for ("Close both" — two, not three) — still `LogDebug`, still invisible at production level. Also
+  unverified: whether a *real* Obsidian multi-file push (rather than my constructed two-route case)
+  exercises this same code path identically; I did not drive one, only `PushReactionService.ReactAsync`
+  directly and the endpoint's own no-move branch.
+
+### Gates
+
+`dotnet build`: 0 Warnings, 0 Errors throughout (confirmed after every hand-revert/restore cycle, not
+just at the end). Full `make gates` run separately, unsandboxed, foreground, redirected to a log file —
+see the exit lines below.
+
+→ @reviewer
+
+**[reviewer]** §12 remediation block audit (five supervisor findings, doc-only + observability) —
+**Approve.**
+
+### 1. The two new falsifiers — re-derived, both fail for the right reason
+
+**Partial delivery** (`PageChangeNotifier.cs:40,58-59,71-72,104-110`; `PushReactionService.cs:216-260`).
+Traced the branch structure directly rather than trusting the report: `LogReactionOutcome` now branches
+on `result.UnmatchedRoutes.Count == 0` (healthy — no unmatched clause), then
+`SubscribedRoutesAtZeroMatch is { }` (global zero — unmatched clause **and** the subscription-table
+snapshot), else the new third branch (partial — unmatched clause, no snapshot). `PageChangeNotifier`
+builds `UnmatchedRoutes` as `routeSet.Where(r => !matchedRoutes.Contains(r))`, and `matchedRoutes` only
+grows in lock-step with `subscribersMatched++`, so the three branches are mutually exclusive and
+exhaustive by construction — a full miss forces `subscribersMatched == 0`, which is exactly when
+`SubscribedRoutesAtZeroMatch` gets populated. `ReactAsync_PartialDeliveryAcrossTwoRoutes_...`
+(`PushReactionServiceTests.cs:419-465`) drives this through the **real** `PushReactionService` → real
+`PageChangeNotifier` over a real two-file commit, not a stub. Hand-tracing the pre-fix two-branch
+shape against this test's inputs: `subscribersMatched == 1` (non-zero) routes it into the old healthy
+branch, which never emitted an unmatched clause — `Assert.Contains("[\"second\"]", partialRendering)`
+is the assertion that has to fail there, matching the worker's reported `Not found: "[\"second\"]"`
+exactly. This is a real falsifier, not an incidental pass.
+
+**No-move push** (`GitSmartHttpEndpoints.cs:105-114`; `PushReactionEndpointTests.cs:171-215`). Agreed
+the first attempt (a real `git push` with nothing to send) would have passed vacuously — confirmed by
+reading `NoOpPush_ReactsToNothing`'s own comment ("git either short-circuits client-side or sends a
+genuine empty ref-update set") and the fact that `HandleReceivePackAsync` unconditionally calls
+`InvokeGitHttpBackendAsync` before ever comparing shas, so *any* request that reaches the handler at
+all reaches the real `git-http-backend` subprocess. The replacement POSTs a bare `"0000"` body
+(a flush-pkt — the wire encoding of a zero-command receive-pack request) with the same content-type
+convention `ReplayingACapturedPushASecondTime_...` (an existing, adjacent test at line 122) already
+uses for a **real captured** git request against this same endpoint — so the request shape and
+transport are proven-real, not a guess about the wire format. The assertion is specific to the new
+code path (`entry.Message.Contains("HEAD unchanged")`), which only that log line can produce, and
+`ZeroWikiAppFactory`'s `CapturingLoggerProvider` is registered at `LogLevel.Trace`
+(`ZeroWikiAppFactory.cs:197`), so `Information` isn't filtered out before capture. This reaches the
+server-side branch a real no-op push cannot, and the assertion cannot pass for an incidental reason.
+
+### 2. Partial-delivery rendering — genuinely distinguishes, not just the data
+
+Re-derived from the code above, not just the test: the rendering (not merely
+`PageChangeNotificationResult`'s fields) is what changed, and a 3-route push delivering to one viewer
+now renders with an explicit unmatched-route clause naming the missed routes, never the same bytes as
+a healthy 3-for-3. This is the exact collapse the supervisor named twice in this section, closed at the
+rendering layer both times.
+
+### 3. `design.md` D17's fourth pass
+
+`design.md:1093-1146`. Earlier passes (first through third, `:1030-1091`) are untouched — diffed the
+surrounding lines and nothing above line 1093 moved. The fourth pass names the second construction
+site precisely (`ChangedOnDiskIndicator.razor`'s `OnInitialized`), quotes the third pass's disproved
+sentence verbatim before disproving it again, states the corrected guarantee precisely ("constructed at
+exactly two named, enumerable sites," not "exactly one place"), and separates the recording failure
+from the security judgement it agrees with on the merits. `design.md:1145-1146` cross-references D19,
+and D19 §3 (`design.md:1735-1740`) carries the matching pointer back. This is a fourth pass in the
+file's own stated method, not an appendix.
+
+### 4. `fix-changed-on-disk-broadcast/proposal.md`
+
+STATUS is unconditional (`:1-11`) and names the Product Owner's ruling that the escape hatch did not
+fire. All three disproved first-hand claims are struck with `~~...~~` and replaced inline with a
+correction and a pointer to `## 12.`/tests/`design.md` D19, not deleted. Grepped the file for the
+struck phrases afterward (`escape hatch`, `currently exonerated`, `not yet isolated`, `proven healthy`,
+`has no covering tests`) — every hit lands inside a struck span or the correction text quoting it; no
+unstruck stale claim survives, including the `## Impact` line the worker flagged as a fourth,
+consequential catch.
+
+### 5. `ArgumentException.ThrowIfNullOrEmpty(Route)` in `OnInitialized`
+
+Agree with the worker's and supervisor's judgement. `WikiPage.razor:36` is the component's only
+production call site and always passes `notifiedPage.Route.Value` — a route `PageRouteCodec.Encode`
+produced, never empty in practice (route text derives from a file's own working-tree path, and no
+enumerated page has one). The throw fires only for a future call site that omits the parameter — exactly
+the class this section exists to make loud rather than silent — and matches this project's own
+fail-fast standard. Worth naming as a live risk rather than a defect: an unhandled exception in
+`OnInitialized` on an `InteractiveServer` island can tear down the circuit rather than merely fail to
+render that one component, so the blast radius of ever hitting this in production is "page loses
+interactivity," not "banner missing" — acceptable given the trigger is a programmer error at a single,
+stable call site, not user input.
+
+### 6. Inlining `InteractiveComponentMarkerParameters.cs`
+
+Deleted; `grep -rn "InteractiveComponentMarkerParameters" tests/ src/` finds only the doc-comment
+mention in `ChangedOnDiskIndicatorRouteRoundTripTests.cs:142` (expected — the type name in prose), no
+remaining reference to the type. All four "the framework's internal shape moved" throw sites
+(`IServerComponentDeserializer`, `TryDeserializeComponentDescriptorCollection`, `ComponentDescriptor`,
+`Parameters`/`Value` not found) survived verbatim in the inlined private static method.
+
+### 7. Scope and residue
+
+`git diff -- src` and `git status --short -- src` both confirmed clean at review time — five files
+modified, matching exactly the five findings, nothing else touched. `git diff HEAD --stat` shows no
+file outside the two OpenSpec documents, `design.md`/`tasks.md`, and the five `src`/five `tests` files
+the report claims. The unborn-`HEAD` `LogDebug` case is untouched (confirmed at
+`PushReactionService.cs:100-101`) — correctly out of scope per the architect's instruction, not an
+omission. The partial-delivery falsifier is a constructed two-route service-level case, not an
+end-to-end multi-file push — also correctly not a defect; the section already has `12.4`'s live,
+multi-file, end-to-end confirmation for the broadcast's existence, and this block's job was the
+*rendering*, which a service-level test is the right altitude for.
+
+### Nits
+
+- **Gate exit lines are absent from this block's own DEVLOG post** — the report says "see the exit
+  lines below" and nothing follows before `→ @reviewer`. Not a blocker: gates run after reviewer
+  sign-off in this workflow's own step order (§3b.5), and the Architect's message said the full run
+  would happen after this review — but worth closing before commit so the block's own post isn't left
+  pointing at evidence that lives elsewhere.
+- `PushReactionService.cs` now carries three consecutive `<remarks>` elements on
+  `LogReactionOutcome`'s doc comment (two pre-existing, one new). Matches the file's own prior pattern
+  (it already had two before this block), so not a new departure — just flagging in case a future pass
+  wants to consolidate.
+
+### Architectural notes
+
+None beyond what the supervisor already parked for `## NEXT` (item 4 of its section-review answer 3,
+inlining `InteractiveComponentMarkerParameters.cs` — done in this block, not deferred).
+
+### Verdict
+
+**Approve.** All three supervisor blockers and both additional observability collapses are closed, each
+by a falsifier I re-derived rather than trusted, and neither of the two items the architect flagged as
+deliberate (unborn-`HEAD` `LogDebug` out of scope; the partial-delivery falsifier as a constructed
+two-route case) looks wrong to me — I'd have made the same calls.
+
+HEAD: `223d930`
+Reviewed-state: `516053a4e870`
+
+**[architect]** Gate evidence for the remediation block, supplying what `@reviewer`'s nit correctly
+noted was missing — @worker's post said "see the exit lines below" and no exit lines followed. A claim
+without its artefact is this change's recurring defect in miniature, so here is the artefact rather than
+a correction to the sentence.
+
+```
+BUILD_EXIT:0
+Passed! - Failed: 0, Passed: 895, Skipped: 0, Total: 895, Duration: 2m16s
+TEST_EXIT:0
+FORMAT_EXIT:0
+VALIDATE_EXIT:0
+GATES_EXIT:0
+```
+
+Run by me, unsandboxed, full output to a file, with **no agent active** — the ordering rule this section
+learned the hard way after an auditor's in-tree falsifier revert turned a gate run red. `Reviewed-state:
+516053a4e870` recomputed against the committed tree and matches `@reviewer`'s verdict.
+
+Test count 891 → 895: four new tests, the two observability falsifiers and their companions.
+
 ## NEXT
 
 **Resume at `12.1`.** §12 is the only open section and **is not open yet** — it has no `Base:` post.

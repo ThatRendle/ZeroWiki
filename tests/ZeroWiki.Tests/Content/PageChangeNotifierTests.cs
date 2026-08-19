@@ -106,7 +106,52 @@ public sealed class PageChangeNotifierTests
 
         Assert.Equal(0, result.SubscribersMatched);
         Assert.Equal(0, result.CallbacksInvoked);
+        Assert.Empty(result.UnmatchedRoutes);
         Assert.Null(result.SubscribedRoutesAtZeroMatch);
+    }
+
+    /// <summary>
+    /// §12 remediation (supervisor finding): a push that touches several routes and reaches viewers on
+    /// only some of them must be distinguishable from a fully healthy delivery, not merely from a
+    /// fully-missed one. Before this fix, <see cref="PageChangeNotificationResult.SubscribedRoutesAtZeroMatch"/>
+    /// stayed <see langword="null"/> whenever the *global* matched count was non-zero, so this exact
+    /// scenario -- one route delivered, one silently missed -- rendered no differently from two-for-two.
+    /// </summary>
+    [Fact]
+    public async Task NotifyChangedAsync_PartialMatchAcrossMultipleRoutes_NamesExactlyTheUnmatchedOnes()
+    {
+        var deliveredRoute = PageRouteCodec.Encode("delivered.md");
+        var missedRoute = PageRouteCodec.Encode("missed.md");
+        using var subscription = _notifier.Subscribe(deliveredRoute, () => Task.CompletedTask);
+
+        var result = await _notifier.NotifyChangedAsync([deliveredRoute, missedRoute], CancellationToken.None);
+
+        Assert.Equal(1, result.SubscribersMatched);
+        Assert.Equal(1, result.CallbacksInvoked);
+        var unmatched = Assert.Single(result.UnmatchedRoutes);
+        Assert.Equal(missedRoute, unmatched);
+
+        // The pre-existing all-zero diagnostic is a different field and must stay unset here -- this
+        // delivery was not a global zero-match, only a partial one.
+        Assert.Null(result.SubscribedRoutesAtZeroMatch);
+    }
+
+    /// <summary>
+    /// The full-match end of the same property: every diffed route reaching at least one subscriber
+    /// must render as genuinely empty, so a reader (or <see cref="PushReactionService.LogReactionOutcome"/>)
+    /// can tell "nothing missed" apart from "something missed" on this field alone.
+    /// </summary>
+    [Fact]
+    public async Task NotifyChangedAsync_EveryRouteMatched_UnmatchedRoutesIsEmpty()
+    {
+        var routeA = PageRouteCodec.Encode("a.md");
+        var routeB = PageRouteCodec.Encode("b.md");
+        using var subscriptionA = _notifier.Subscribe(routeA, () => Task.CompletedTask);
+        using var subscriptionB = _notifier.Subscribe(routeB, () => Task.CompletedTask);
+
+        var result = await _notifier.NotifyChangedAsync([routeA, routeB], CancellationToken.None);
+
+        Assert.Empty(result.UnmatchedRoutes);
     }
 
     [Fact]

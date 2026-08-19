@@ -170,6 +170,49 @@ public sealed class PushReactionEndpointTests
         Assert.Equal(0, notificationCount);
     }
 
+    /// <summary>
+    /// §12 remediation (supervisor finding): before this fix, a push that reached
+    /// <c>HandleReceivePackAsync</c> and left <c>HEAD</c> unmoved logged nothing at all -- the same
+    /// silence as a request that never reached the server, "the exact inference this section was
+    /// created to eliminate." Falsified against <see cref="ZeroWikiAppFactory.Logs"/>, the app's own
+    /// output, rather than against <see cref="PushReactionService"/> or <see cref="PageChangeNotifier"/>
+    /// directly, because those two are never even invoked on a no-op push -- the missing record lived a
+    /// layer above both, in the endpoint itself.
+    /// </summary>
+    /// <remarks>
+    /// Not a real <c>git push</c> with nothing to send: <see cref="NoOpPush_ReactsToNothing"/> already
+    /// establishes (and this was confirmed empirically while writing this test) that the client
+    /// short-circuits before ever sending the request when there is truly nothing new to push, so that
+    /// shape never reaches <c>HandleReceivePackAsync</c> at all and cannot exercise its no-move branch.
+    /// A hand-built request with a valid, empty <c>git-receive-pack</c> command list -- a bare
+    /// <c>0000</c> flush-pkt, the wire encoding of zero ref updates -- reaches the endpoint exactly the
+    /// way a genuinely empty real push would, without depending on a git client's own optimisation
+    /// choosing not to try.
+    /// </remarks>
+    [Fact]
+    public async Task PushWithZeroRefUpdates_ReachesTheServer_AndStillEmitsAnObservableRecord()
+    {
+        using var factory = ZeroWikiAppFactory.WithRealServer();
+        var (_, token) = await SeedAccountWithTokenAsync(factory);
+        var paths = factory.Services.GetRequiredService<ContentPaths>();
+
+        var headBefore = await RunOrThrowAsync(paths.RepositoryRoot, ["rev-parse", "HEAD"]);
+
+        using var client = AuthenticatedClient(factory, token);
+        using var content = new ByteArrayContent("0000"u8.ToArray());
+        content.Headers.ContentType = MediaTypeHeaderValue.Parse("application/x-git-receive-pack-request");
+
+        using var response = await client.PostAsync("/git/git-receive-pack", content);
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+        var headAfter = await RunOrThrowAsync(paths.RepositoryRoot, ["rev-parse", "HEAD"]);
+        Assert.Equal(headBefore.StandardOutput, headAfter.StandardOutput);
+
+        Assert.Contains(
+            factory.Logs.Entries,
+            entry => entry.Message.Contains("HEAD unchanged", StringComparison.Ordinal));
+    }
+
     private static async Task WaitUntilAsync(Func<bool> condition, TimeSpan timeout)
     {
         using var cancellation = new CancellationTokenSource(timeout);

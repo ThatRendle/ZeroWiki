@@ -1090,6 +1090,61 @@ most dangerous, because it *sounded* like the kind of reasoning this change asks
 argument is not self-certifying — its premises are claims about the code and have to be traced like any
 other.**
 
+**Fourth pass (§12 supervisor review, "the section's most important finding" — the third pass above is now
+materially false, and this records why and what the guarantee actually is.** `12.3`'s second pass
+(DEVLOG, `## 12.`) added a second in-assembly construction site for `EncodedRoute`:
+
+- `ChangedOnDiskIndicator.razor`'s `OnInitialized`: `_route = new EncodedRoute(Route);`, where `Route` is
+  a `[Parameter] string` fed across the Static SSR→circuit boundary from `WikiPage.razor`'s
+  `<ChangedOnDiskIndicator Route="@notifiedPage.Route.Value" />`.
+
+The third pass above rests on exactly the premise this reopens, and states it at length and in bold:
+*"Nothing reads a route back from anywhere … the only other route-shaped input is an HTTP request
+value."* The component-marker payload **is** a route read back from a serialized form — the DataProtection-
+protected `descriptor` JSON a real Blazor circuit start deserializes, dumped and replayed by
+`ChangedOnDiskIndicatorRouteRoundTripTests` and its own reflective instrument. The third pass quoted
+the second pass's *"a route read back from any stored or enumerated form still has to be asserted into
+the type somewhere,"* labelled it **"That premise is false,"** and disproved it by tracing every
+construction site in the assembly. §12 made the disproved premise true again, at a site tracing could not
+have found because it did not exist yet.
+
+**What is still true, restated precisely rather than left to the third pass's stronger words.** External
+callers still cannot construct a populated `EncodedRoute` — verified from *outside* the assembly by
+`EncodedRouteTests.JsonDeserialization_CannotProduceAPopulatedInstance`, which the reverted
+`System.Text.Json` converter approach left behind as a live guard against reintroducing exactly that
+surface (the test project holds no `InternalsVisibleTo` grant, so this is a genuine external view, not an
+in-assembly proxy for one). What is no longer true is the *count*: in-assembly construction sites are now
+**two** — `PageRouteCodec.Encode` and `ChangedOnDiskIndicator.OnInitialized` — not one, and they are
+asymmetric. `Encode` mints a route from a filesystem-derived path; `OnInitialized` **re-materialises** a
+value `Encode` already produced elsewhere, across a boundary, without revalidating it beyond
+`ArgumentException.ThrowIfNullOrEmpty` (added in the same §12 remediation this pass records, closing a
+separate silent-empty-route gap the supervisor found adjacent to this one). *"The type is therefore
+constructed in exactly one place, and the compiler, rather than a reviewer's enumeration, is what
+guarantees it"* — the third pass's own words — no longer holds arithmetically: the guarantee has reverted
+to a reviewer's enumeration of two named sites, not the compiler's enforcement of one.
+
+**Why this is accepted rather than fixed, on the merits — a security judgement, separable from the
+recording failure above.** The marker descriptor is DataProtection-protected: the string
+`ChangedOnDiskIndicator.Route` receives has already been produced server-side and protected before it
+ever reaches the client, so it is not client-forgeable, and an external caller has exactly the same trust
+relationship with it as with any other component parameter crossing that boundary — no weaker. Threading
+`EncodedRoute` itself across the boundary was tried first and reverted precisely because it required a
+`System.Text.Json` converter, which *would* have widened who can construct the type (any external caller
+with the JSON shape, not merely the DataProtection-protected marker payload) — the second construction
+site is the narrower exposure of the two shapes considered, not an oversight. Both the block reviewer and
+the §12 supervisor reached this same conclusion independently by reasoning from the type system and the
+marker's provenance; neither tampered with a live marker to observe the result, so this remains one
+argument made twice, not two independent checks.
+
+**The corrected sentence.** Not *"constructed in exactly one place"* — constructed at exactly two named,
+enumerable sites, one of which is a mint and one of which is a re-materialisation of a DataProtection-
+protected value across a process boundary, neither reachable by an external, unprotected caller. Worth
+restating what the third pass itself warned about its own sentence: *"'constructible only inside the
+assembly' is the kind of sentence a later reader trusts to be total."* It was, once; §12 is the record of
+it stopping being true, at a site the assembly did not yet have when the third pass was written — which is
+also why no amount of re-tracing the third pass's own evidence would have caught it. See D19 §3's own
+cross-reference to this pass for where a reader arriving at the broadcast design will land first.
+
 ### D18 — The Smart HTTP surface: routes, the CGI contract, the streaming host, and lock policy per verb
 
 D3 named `git http-backend` as the mechanism; D16 built the lock it runs under; D17 built the browser
@@ -1676,6 +1731,13 @@ reaction looks up only the routes named by its diff and invokes exactly those ca
 route the push never touched has no callback registered under any of the changed routes, so it is **never
 invoked at all** — not told and then filtering client-side, simply never addressed — which is what answers
 "must not receive": nothing crosses that viewer's circuit, because the reaction never reaches for it.
+
+**The route this callback registers under crosses the same Static SSR→circuit boundary D7 named — see
+D17's fourth pass for what that crossing costs.** `ChangedOnDiskIndicator` is the component D7 named as
+the first `InteractiveServer` island; the route it subscribes under is not assigned inside the circuit,
+it is re-materialised from a plain `string` parameter the SSR-rendered call site passed across exactly
+this boundary. D17's fourth pass records why that is a second `EncodedRoute` construction site, what
+guarantee is and is not lost by it, and why it is accepted rather than fixed.
 
 **4 — Composition with §4/D15: 8.1 is a freshness win, not a correctness one, stated plainly rather than
 assumed in its favour.** D15 already stamps the in-memory index with the `HEAD` it was built from and

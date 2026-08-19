@@ -416,6 +416,52 @@ public sealed class PushReactionServiceTests : IDisposable
         Assert.Contains("held 1 route(s) [<null>]", defaultSentinelRendering);
     }
 
+    /// <summary>
+    /// §12 remediation (supervisor finding): a push touching two routes that reaches a viewer on one
+    /// and misses the other must not render byte-identically to a fully healthy two-for-two delivery.
+    /// Before the fix, <see cref="PushReactionService.LogReactionOutcome"/> only ever consulted the
+    /// *global* matched count, so this exact partial-delivery record was indistinguishable from a
+    /// healthy one on the wire -- the collapse this section exists to close, one level up from where
+    /// the earlier §12.1 rendering fixes looked.
+    /// </summary>
+    [Fact]
+    public async Task ReactAsync_PartialDeliveryAcrossTwoRoutes_RendersDifferentlyFromAFullyHealthyOne()
+    {
+        await InitializeRepositoryAsync();
+        var before = await CommitAsync("unrelated.md", "unrelated content");
+
+        var repositoryRoot = Paths.RepositoryRoot;
+        await File.WriteAllTextAsync(Path.Combine(repositoryRoot, "docs", "first.md"), "one");
+        await File.WriteAllTextAsync(Path.Combine(repositoryRoot, "docs", "second.md"), "two");
+        await _git.RunOrThrowAsync(repositoryRoot, ["add", "-A"]);
+        await _git.RunOrThrowAsync(
+            repositoryRoot, ["commit", "-m", "two pages"], new GitAuthor("Alice", "alice@zerowiki.example").ToEnvironmentVariables());
+        var after = await CurrentHeadAsync();
+
+        async Task<string> RenderedMessageAsync(PageChangeNotifier notifier)
+        {
+            var loggerProvider = new CapturingLoggerProvider();
+            await CreateService(notifier, loggerProvider.CreateLogger<PushReactionService>())
+                .ReactAsync(before, after, CancellationToken.None);
+            return Assert.Single(loggerProvider.Entries, e => e.Level == LogLevel.Information).Message;
+        }
+
+        var fullyHealthyNotifier = new PageChangeNotifier(NullLogger<PageChangeNotifier>.Instance);
+        using var firstSubscriptionHealthy = fullyHealthyNotifier.Subscribe(PageRouteCodec.Encode("first.md"), () => Task.CompletedTask);
+        using var secondSubscriptionHealthy = fullyHealthyNotifier.Subscribe(PageRouteCodec.Encode("second.md"), () => Task.CompletedTask);
+        var healthyRendering = await RenderedMessageAsync(fullyHealthyNotifier);
+
+        var partialNotifier = new PageChangeNotifier(NullLogger<PageChangeNotifier>.Instance);
+        using var firstSubscriptionPartial = partialNotifier.Subscribe(PageRouteCodec.Encode("first.md"), () => Task.CompletedTask);
+        // Deliberately no subscriber for "second.md" -- the silently-missed route.
+        var partialRendering = await RenderedMessageAsync(partialNotifier);
+
+        Assert.NotEqual(healthyRendering, partialRendering);
+        Assert.Contains("matched 2 subscriber(s)", healthyRendering);
+        Assert.Contains("matched 1 subscriber(s)", partialRendering);
+        Assert.Contains("[\"second\"]", partialRendering);
+    }
+
     private sealed class ThrowingPageIndexBuilder : IPageIndexBuilder
     {
         public Task<string?> ProbeCurrentHeadShaAsync(CancellationToken cancellationToken) =>
@@ -437,7 +483,7 @@ public sealed class PushReactionServiceTests : IDisposable
             IReadOnlyCollection<EncodedRoute> routes, CancellationToken cancellationToken)
         {
             Calls.Add(routes);
-            return Task.FromResult(new PageChangeNotificationResult(0, 0, null));
+            return Task.FromResult(new PageChangeNotificationResult(0, 0, [], null));
         }
     }
 }

@@ -78,7 +78,7 @@ public sealed class ChangedOnDiskIndicatorRouteRoundTripTests : IDisposable
 
         var body = await (await client.GetAsync("/wiki/page")).Content.ReadAsStringAsync();
 
-        var route = InteractiveComponentMarkerParameters.GetParameterValue<string>(
+        var route = GetInteractiveComponentMarkerParameterValue<string>(
             _app, body, typeof(ChangedOnDiskIndicator), "Route");
 
         // The SSR side passed the page's own canonical route's raw value,
@@ -136,5 +136,93 @@ public sealed class ChangedOnDiskIndicatorRouteRoundTripTests : IDisposable
         ])));
 
         return client;
+    }
+
+    /// <summary>
+    /// §12 remediation (supervisor finding): inlined from a standalone <c>InteractiveComponentMarkerParameters</c>
+    /// helper -- this test is its only caller, and the helper's original rationale (a future block that
+    /// would need the same reflection) never materialised, leaving speculative generality carrying a
+    /// permanent dependency on four framework internals named by string for no second consumer. The
+    /// diagnostics stay exactly as they were: each lookup throws "the framework's internal shape moved"
+    /// rather than a bare <see cref="NullReferenceException"/>, so a future .NET upgrade that relocates
+    /// any of these fails loudly here rather than silently.
+    /// </summary>
+    /// <remarks>
+    /// Locates the single <c>&lt;!--Blazor:{...}--&gt;</c> open marker for <paramref name="componentType"/>
+    /// in <paramref name="html"/>, replays it through the host's own component deserializer exactly as a
+    /// real circuit start would, and returns the reconstructed value of the named parameter. See this
+    /// type's own remarks above for the call shape this was reached by (dumping a real marker against
+    /// this app's own DI container), not by reading the framework's source.
+    /// </remarks>
+    private static T GetInteractiveComponentMarkerParameterValue<T>(
+        WebApplicationFactory<Program> app, string html, Type componentType, string parameterName)
+    {
+        var markerJson = ExtractSingleMarkerJson(html);
+
+        var deserializerAssembly = AppDomain.CurrentDomain.GetAssemblies()
+            .Single(a => a.GetName().Name == "Microsoft.AspNetCore.Components.Server");
+        var deserializerInterface = deserializerAssembly.GetType(
+            "Microsoft.AspNetCore.Components.Server.IServerComponentDeserializer")
+            ?? throw new InvalidOperationException(
+                "IServerComponentDeserializer not found -- the framework's internal shape moved.");
+        var method = deserializerInterface.GetMethod("TryDeserializeComponentDescriptorCollection")
+            ?? throw new InvalidOperationException(
+                "TryDeserializeComponentDescriptorCollection not found -- the framework's internal shape moved.");
+
+        using var scope = app.Services.CreateScope();
+        var deserializer = scope.ServiceProvider.GetService(deserializerInterface)
+            ?? throw new InvalidOperationException("IServerComponentDeserializer is not registered in this host.");
+
+        var args = new object?[] { "[" + markerJson + "]", null };
+        var ok = (bool)method.Invoke(deserializer, args)!;
+        Assert.True(ok, "the framework's own deserializer rejected the marker it just emitted");
+
+        var descriptors = (System.Collections.IEnumerable)args[1]!;
+        var descriptorType = deserializerAssembly.GetType("Microsoft.AspNetCore.Components.Server.ComponentDescriptor")
+            ?? throw new InvalidOperationException("ComponentDescriptor not found -- the framework's internal shape moved.");
+        var componentTypeProperty = descriptorType.GetProperty("ComponentType")
+            ?? throw new InvalidOperationException("ComponentType not found -- the framework's internal shape moved.");
+        var parametersProperty = descriptorType.GetProperty("Parameters")
+            ?? throw new InvalidOperationException("Parameters not found -- the framework's internal shape moved.");
+
+        var matches = descriptors.Cast<object>()
+            .Where(d => (Type)componentTypeProperty.GetValue(d)! == componentType)
+            .ToList();
+        Assert.Single(matches);
+
+        var parameters = parametersProperty.GetValue(matches[0])!;
+        var parameterViewType = parameters.GetType();
+        var enumerator = parameterViewType.GetMethod("GetEnumerator")!.Invoke(parameters, null)!;
+        var enumeratorType = enumerator.GetType();
+        var moveNext = enumeratorType.GetMethod("MoveNext")!;
+        var current = enumeratorType.GetProperty("Current")!;
+
+        while ((bool)moveNext.Invoke(enumerator, null)!)
+        {
+            var entry = current.GetValue(enumerator)!;
+            var entryType = entry.GetType();
+            var name = (string)entryType.GetProperty("Name")!.GetValue(entry)!;
+            if (name == parameterName)
+            {
+                var valueProperty = entryType.GetProperty("Value")
+                    ?? throw new InvalidOperationException("Value not found -- the framework's internal shape moved.");
+                return (T)valueProperty.GetValue(entry)!;
+            }
+        }
+
+        throw new InvalidOperationException($"No parameter named '{parameterName}' on {componentType}.");
+    }
+
+    private static string ExtractSingleMarkerJson(string html)
+    {
+        const string openPrefix = "<!--Blazor:";
+        var start = html.IndexOf(openPrefix, StringComparison.Ordinal);
+        Assert.True(start >= 0, "no InteractiveServer component marker found in the response");
+
+        var jsonStart = start + openPrefix.Length;
+        var jsonEnd = html.IndexOf("-->", jsonStart, StringComparison.Ordinal);
+        Assert.True(jsonEnd >= 0, "unterminated InteractiveServer component marker");
+
+        return html[jsonStart..jsonEnd];
     }
 }
