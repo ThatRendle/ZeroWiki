@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Linq;
 using Microsoft.Extensions.Logging;
 
 namespace ZeroWiki.Content;
@@ -32,21 +33,29 @@ public sealed class PageChangeNotifier : IPageChangeNotifier
         return new Subscription(this, id);
     }
 
-    public async Task NotifyChangedAsync(IReadOnlyCollection<EncodedRoute> routes, CancellationToken cancellationToken)
+    public async Task<PageChangeNotificationResult> NotifyChangedAsync(
+        IReadOnlyCollection<EncodedRoute> routes, CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(routes);
 
         if (routes.Count == 0)
         {
-            return;
+            return new PageChangeNotificationResult(0, 0, null);
         }
 
         var routeSet = routes as HashSet<EncodedRoute> ?? new HashSet<EncodedRoute>(routes);
 
         // A snapshot of the current subscriptions, not a live enumeration -- ConcurrentDictionary's own
         // enumerator tolerates concurrent mutation, but a snapshot means a subscriber that registers or
-        // disposes mid-broadcast is simply not part of *this* broadcast, never a torn read of one.
-        foreach (var (route, onChanged) in _subscriptions.Values.ToArray())
+        // disposes mid-broadcast is simply not part of *this* broadcast, never a torn read of one. Also
+        // reused below (§12.1) for the zero-match diagnostic, so a non-empty diff that matches nobody
+        // never costs a second pass over the table.
+        var snapshot = _subscriptions.Values.ToArray();
+
+        var subscribersMatched = 0;
+        var callbacksInvoked = 0;
+
+        foreach (var (route, onChanged) in snapshot)
         {
             cancellationToken.ThrowIfCancellationRequested();
 
@@ -57,16 +66,20 @@ public sealed class PageChangeNotifier : IPageChangeNotifier
                 continue;
             }
 
+            subscribersMatched++;
+
             try
             {
                 await onChanged().ConfigureAwait(false);
+                callbacksInvoked++;
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
                 // D19's "cannot throw its way out of the whole reaction": one subscriber's callback
                 // failing (a disposed component racing its own circuit teardown, a JS interop fault)
                 // must not stop the remaining subscribers -- for this route or any other in this
-                // broadcast -- from being notified.
+                // broadcast -- from being notified. Counted as matched, not as invoked (§12.1) -- the
+                // two are genuinely different quantities once a callback can fail.
                 _logger.LogWarning(
                     ex,
                     "A subscriber for page route '{Route}' threw while being notified that the page " +
@@ -74,6 +87,18 @@ public sealed class PageChangeNotifier : IPageChangeNotifier
                     route);
             }
         }
+
+        // §12.1: a non-empty diff that matched nobody is exactly the case that needs diagnosing, not
+        // just recording -- "diffed [foo], subscribed []" (no circuit ever subscribed) and "diffed
+        // [foo], subscribed [bar]" (something is subscribed, just not under this route) are different
+        // defects, and a bare zero cannot tell them apart. A healthy delivery (subscribersMatched > 0)
+        // never enumerates this -- it is a projection of the snapshot already taken above, not a second
+        // scan of the table.
+        var subscribedRoutesAtZeroMatch = subscribersMatched == 0
+            ? (IReadOnlyList<EncodedRoute>)snapshot.Select(subscription => subscription.Route).Distinct().ToList()
+            : null;
+
+        return new PageChangeNotificationResult(subscribersMatched, callbacksInvoked, subscribedRoutesAtZeroMatch);
     }
 
     private void Unsubscribe(Guid id) => _subscriptions.TryRemove(id, out _);

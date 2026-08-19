@@ -1,5 +1,7 @@
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using ZeroWiki.Content;
+using ZeroWiki.Tests.Identity;
 
 namespace ZeroWiki.Tests.Content;
 
@@ -26,7 +28,14 @@ public sealed class PushReactionServiceTests : IDisposable
         }
     }
 
-    private PushReactionService CreateService()
+    /// <summary>
+    /// <paramref name="notifier"/>/<paramref name="logger"/> default to the recording fake and a
+    /// null logger -- overridden by §12.1's log-record tests, which need the real
+    /// <see cref="PageChangeNotifier"/> (so a genuine <see cref="PageChangeNotificationResult"/> is
+    /// what reaches the log call) and a capturing logger (so the record can be asserted structurally).
+    /// </summary>
+    private PushReactionService CreateService(
+        IPageChangeNotifier? notifier = null, ILogger<PushReactionService>? logger = null)
     {
         var paths = Paths;
         var historyService = new PageHistoryService(paths, _git, NullLogger<PageHistoryService>.Instance);
@@ -41,7 +50,12 @@ public sealed class PushReactionServiceTests : IDisposable
         var pageIndex = new PageIndex(builder, NullLogger<PageIndex>.Instance);
 
         return new PushReactionService(
-            paths, _git, historyService, pageIndex, _notifier, NullLogger<PushReactionService>.Instance);
+            paths,
+            _git,
+            historyService,
+            pageIndex,
+            notifier ?? _notifier,
+            logger ?? NullLogger<PushReactionService>.Instance);
     }
 
     /// <summary>Builds a service whose <see cref="PageIndex"/> is backed by <paramref name="builder"/>
@@ -219,6 +233,68 @@ public sealed class PushReactionServiceTests : IDisposable
         Assert.Equal("page", route.Value);
     }
 
+    /// <summary>
+    /// §12.1's own falsifier, at this layer: the structured record for a delivered reaction and for a
+    /// zero-match one must differ, and the assertions below are on the returned key/value state
+    /// (<see cref="CapturingLoggerProvider.LogEntry.Values"/>), never on the rendered message text.
+    /// </summary>
+    [Fact]
+    public async Task ReactAsync_ChangedPage_EmitsOneStructuredInformationRecordWithAllThreeQuantities()
+    {
+        await InitializeRepositoryAsync();
+        var before = await CommitAsync("unrelated.md", "unrelated content");
+        var after = await CommitAsync("page.md", "new content");
+
+        var realNotifier = new PageChangeNotifier(NullLogger<PageChangeNotifier>.Instance);
+        using var subscription = realNotifier.Subscribe(PageRouteCodec.Encode("page.md"), () => Task.CompletedTask);
+
+        var loggerProvider = new CapturingLoggerProvider();
+        await CreateService(realNotifier, loggerProvider.CreateLogger<PushReactionService>())
+            .ReactAsync(before, after, CancellationToken.None);
+
+        var entry = Assert.Single(loggerProvider.Entries, e => e.Level == LogLevel.Information);
+        var values = entry.Values.ToDictionary(kv => kv.Key, kv => kv.Value);
+
+        Assert.Equal(1, values["DiffedRouteCount"]);
+        Assert.Equal(1, values["SubscribersMatched"]);
+        Assert.Equal(1, values["CallbacksInvoked"]);
+        // A healthy delivery never carries the zero-match diagnostic (PageChangeNotifier never
+        // computes it for one) -- there is nothing to assert its absence against other than the key
+        // itself never having been logged.
+        Assert.DoesNotContain("SubscribedRoutes", values.Keys);
+    }
+
+    /// <summary>
+    /// The architect's addition to §12.1: a non-empty diff that matches nobody must carry the routes
+    /// the subscription table actually held, distinguishing "nothing is subscribed at all" from
+    /// "something is subscribed, just not to this route" -- two different defects a bare zero cannot
+    /// tell apart.
+    /// </summary>
+    [Fact]
+    public async Task ReactAsync_ChangedPageNobodySubscribesTo_RecordCarriesTheSubscribedRoutesInstead()
+    {
+        await InitializeRepositoryAsync();
+        var before = await CommitAsync("unrelated.md", "unrelated content");
+        var after = await CommitAsync("page.md", "new content");
+
+        var realNotifier = new PageChangeNotifier(NullLogger<PageChangeNotifier>.Instance);
+        var elsewhereRoute = PageRouteCodec.Encode("elsewhere.md");
+        using var subscription = realNotifier.Subscribe(elsewhereRoute, () => Task.CompletedTask);
+
+        var loggerProvider = new CapturingLoggerProvider();
+        await CreateService(realNotifier, loggerProvider.CreateLogger<PushReactionService>())
+            .ReactAsync(before, after, CancellationToken.None);
+
+        var entry = Assert.Single(loggerProvider.Entries, e => e.Level == LogLevel.Information);
+        var values = entry.Values.ToDictionary(kv => kv.Key, kv => kv.Value);
+
+        Assert.Equal(0, values["SubscribersMatched"]);
+        Assert.Equal(0, values["CallbacksInvoked"]);
+        var subscribedRoutes = Assert.IsAssignableFrom<IReadOnlyList<EncodedRoute>>(values["SubscribedRoutes"]);
+        var namedRoute = Assert.Single(subscribedRoutes);
+        Assert.Equal(elsewhereRoute, namedRoute);
+    }
+
     private sealed class ThrowingPageIndexBuilder : IPageIndexBuilder
     {
         public Task<string?> ProbeCurrentHeadShaAsync(CancellationToken cancellationToken) =>
@@ -236,10 +312,11 @@ public sealed class PushReactionServiceTests : IDisposable
         public IDisposable Subscribe(EncodedRoute route, Func<Task> onChanged) =>
             throw new NotSupportedException("PushReactionService never subscribes; only viewers do.");
 
-        public Task NotifyChangedAsync(IReadOnlyCollection<EncodedRoute> routes, CancellationToken cancellationToken)
+        public Task<PageChangeNotificationResult> NotifyChangedAsync(
+            IReadOnlyCollection<EncodedRoute> routes, CancellationToken cancellationToken)
         {
             Calls.Add(routes);
-            return Task.CompletedTask;
+            return Task.FromResult(new PageChangeNotificationResult(0, 0, null));
         }
     }
 }

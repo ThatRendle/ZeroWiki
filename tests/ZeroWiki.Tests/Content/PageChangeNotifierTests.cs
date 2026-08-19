@@ -29,19 +29,84 @@ public sealed class PageChangeNotifierTests
         Assert.False(bInvoked, "a viewer on a route the push never touched must never be invoked at all.");
     }
 
+    /// <summary>
+    /// §12.1's falsifier: a run that delivers and a run that matches nobody must not produce the same
+    /// observable outcome. This is the structured assertion the spec asks for -- on the returned counts
+    /// themselves, not on whether a log line happens to exist.
+    /// </summary>
+    [Fact]
+    public async Task NotifyChangedAsync_DeliveredRun_AndZeroMatchRun_AreDistinguishableByTheReturnedCounts()
+    {
+        var subscribedRoute = PageRouteCodec.Encode("subscribed.md");
+        var unsubscribedRoute = PageRouteCodec.Encode("nobody-subscribes-to-this.md");
+        using var subscription = _notifier.Subscribe(subscribedRoute, () => Task.CompletedTask);
+
+        var delivered = await _notifier.NotifyChangedAsync([subscribedRoute], CancellationToken.None);
+        var zeroMatch = await _notifier.NotifyChangedAsync([unsubscribedRoute], CancellationToken.None);
+
+        Assert.Equal(1, delivered.SubscribersMatched);
+        Assert.Equal(1, delivered.CallbacksInvoked);
+        Assert.Null(delivered.SubscribedRoutesAtZeroMatch);
+
+        Assert.Equal(0, zeroMatch.SubscribersMatched);
+        Assert.Equal(0, zeroMatch.CallbacksInvoked);
+        Assert.NotEqual(delivered, zeroMatch);
+    }
+
     [Fact]
     public async Task NotifyChangedAsync_RouteWithNoSubscribers_IsANoOp()
     {
         var route = PageRouteCodec.Encode("nobody-home.md");
 
         // No Subscribe call at all -- must not throw and must not need a subscriber to exist.
-        await _notifier.NotifyChangedAsync([route], CancellationToken.None);
+        var result = await _notifier.NotifyChangedAsync([route], CancellationToken.None);
+
+        Assert.Equal(0, result.SubscribersMatched);
+        Assert.Equal(0, result.CallbacksInvoked);
+    }
+
+    /// <summary>
+    /// The diagnostic (§12.1's architect addition): "diffed X, subscribed []" -- no circuit ever
+    /// subscribed to anything -- is a different defect from "diffed X, subscribed [Y]" below, and a
+    /// bare zero cannot tell them apart.
+    /// </summary>
+    [Fact]
+    public async Task NotifyChangedAsync_RouteWithNoSubscribers_SubscribedRoutesAtZeroMatchIsEmpty()
+    {
+        var route = PageRouteCodec.Encode("nobody-home.md");
+
+        var result = await _notifier.NotifyChangedAsync([route], CancellationToken.None);
+
+        Assert.NotNull(result.SubscribedRoutesAtZeroMatch);
+        Assert.Empty(result.SubscribedRoutesAtZeroMatch);
+    }
+
+    /// <summary>
+    /// The other half of the diagnostic: something is subscribed, just not under the route the diff
+    /// named -- the subscription table is not empty, so the record must say what it actually held.
+    /// </summary>
+    [Fact]
+    public async Task NotifyChangedAsync_SubscriberOnADifferentRoute_SubscribedRoutesAtZeroMatchNamesIt()
+    {
+        var subscribedRoute = PageRouteCodec.Encode("subscribed.md");
+        var diffedRoute = PageRouteCodec.Encode("diffed-but-nobody-subscribes-to-this.md");
+        using var subscription = _notifier.Subscribe(subscribedRoute, () => Task.CompletedTask);
+
+        var result = await _notifier.NotifyChangedAsync([diffedRoute], CancellationToken.None);
+
+        Assert.Equal(0, result.SubscribersMatched);
+        var namedRoute = Assert.Single(result.SubscribedRoutesAtZeroMatch!);
+        Assert.Equal(subscribedRoute, namedRoute);
     }
 
     [Fact]
     public async Task NotifyChangedAsync_EmptyRouteSet_IsANoOp()
     {
-        await _notifier.NotifyChangedAsync([], CancellationToken.None);
+        var result = await _notifier.NotifyChangedAsync([], CancellationToken.None);
+
+        Assert.Equal(0, result.SubscribersMatched);
+        Assert.Equal(0, result.CallbacksInvoked);
+        Assert.Null(result.SubscribedRoutesAtZeroMatch);
     }
 
     [Fact]
@@ -86,9 +151,15 @@ public sealed class PageChangeNotifierTests
         using var throwing = _notifier.Subscribe(throwingRoute, () => throw new InvalidOperationException("boom"));
         using var ok = _notifier.Subscribe(okRoute, () => { okInvoked = true; return Task.CompletedTask; });
 
-        await _notifier.NotifyChangedAsync([throwingRoute, okRoute], CancellationToken.None);
+        var result = await _notifier.NotifyChangedAsync([throwingRoute, okRoute], CancellationToken.None);
 
         Assert.True(okInvoked, "a throwing subscriber must not prevent another route's subscriber from being notified.");
+
+        // §12.1: matched and invoked are genuinely two numbers once a callback can fail -- the throwing
+        // subscriber is counted as matched (it was under a notified route) but not as invoked (its
+        // callback never completed).
+        Assert.Equal(2, result.SubscribersMatched);
+        Assert.Equal(1, result.CallbacksInvoked);
     }
 
     [Fact]

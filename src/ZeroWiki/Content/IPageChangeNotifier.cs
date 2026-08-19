@@ -24,5 +24,11 @@ public interface IPageChangeNotifier
     /// preventing the remaining subscribers — for this route or any other in <paramref name="routes"/> —
     /// from being notified.
     /// </summary>
-    Task NotifyChangedAsync(IReadOnlyCollection<EncodedRoute> routes, CancellationToken cancellationToken);
+    /// <returns>
+    /// The outcome actually observed (§12.1) — see <see cref="PageChangeNotificationResult"/>. This is
+    /// what makes a broadcast reaching no viewer distinguishable from a delivered one, rather than both
+    /// producing identical (i.e. absent) output.
+    /// </returns>
+    Task<PageChangeNotificationResult> NotifyChangedAsync(
+        IReadOnlyCollection<EncodedRoute> routes, CancellationToken cancellationToken);
 }

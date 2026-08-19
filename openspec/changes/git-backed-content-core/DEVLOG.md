@@ -25274,6 +25274,292 @@ as written.
 built under the old workflow have the base commits and reviews they have.
 
 
+**[architect]** Base: `454b64b` — §12 opens. Delivers the push→viewer broadcast: the reaction's outcome
+made observable (`12.1`), an endpoint-level test watched failing before the fix (`12.2`), the fix
+(`12.3`), and the Product Owner's live-circuit confirmation (`12.4`). Supervisor scope at section end is
+`git diff 454b64b..HEAD`.
+
+**[architect]** ⚠️ Before briefing block 1 I read the code, and **the premise recorded in this thread on
+2026-08-16 does not survive contact with what is already in the repo.** This is not a correction of the
+scope decision — §12 stays as carved — but block 1's shape changes because of it, so it is recorded
+before the brief rather than discovered inside it.
+
+This thread says the break is *"server-side, between `HandleReceivePackAsync` and `PageChangeNotifier`"*.
+There is already an endpoint-level test that covers exactly that span and is **green**:
+`PushReactionEndpointTests.RealPush_NotifiesExactlyTheChangedRoute_AndNeverAViewerOnAnUntouchedRoute`
+(`tests/ZeroWiki.Tests/Web/PushReactionEndpointTests.cs:38`). It stands up a real Kestrel, seeds an
+account and token, clones over the credentialed remote, commits `docs/page.md`, pushes for real, and
+waits on a `TaskCompletionSource` fed by a subscriber registered against `PageRouteCodec.Encode("page.md")`
+— then asserts a viewer on an untouched route was *not* invoked. That is, near enough, `12.2`'s stated
+deliverable, already written and already passing at the §10 close (881 green).
+
+**Both of the ways to reconcile that are load-bearing, and neither may be assumed:**
+
+1. **The test cannot fail.** This change has shipped tests that could not fail before — §8 shipped three,
+   and §10's supervisor found a spec scenario witnessed by a test with the same defect. If that is what
+   this is, the whole "server side is broken, client side is proven healthy" reading rests on it and
+   collapses with it.
+2. **The test can fail, and the span it covers genuinely works** — in which case the break is *not* where
+   this thread says it is, and every subsequent task is aimed at the wrong place. The candidates then sit
+   downstream of `IPageChangeNotifier`: whether `ChangedOnDiskIndicator.razor` subscribes under the same
+   `EncodedRoute` the diff produces (the diff encodes a repo-relative path, the component encodes what it
+   knows about the page it is rendering — those are two different derivations of one value and nothing
+   currently proves they agree), whether the indicator is mounted on the rendered-body branch at all for
+   a normal page view, and whether the callback survives to reach the browser over the circuit.
+
+**Block 1 must settle which of those two it is, and settle it with an instrument rather than an
+argument.** DI is not a candidate — I checked: `PageChangeNotifier`, its interface projection and
+`PushReactionService` are all `AddSingleton` (`ContentStorageStartupExtensions.cs:86-88`), so the
+publisher and any in-process subscriber share one instance. Recording it here so no one re-derives it.
+
+This is also exactly what §9's closing lesson warned about and what this thread itself wrote down: *"that
+run establishes the client path works, never that it is the only path that must work."* The same sentence
+inverts. The `InteractiveServer` evidence establishes the circuit starts; it never established that the
+indicator subscribes under a route the push's diff can name.
+
+**[architect]** Block 1 brief — `12.1` alone → @worker
+
+**Why `12.1` is its own block, and what happens at its end.** This section's escape hatch is the Product
+Owner's and its trigger is *"the root cause is not isolated by the end of the first worker block"*
+(CLAUDE.md §4 stop-and-ask). So block 1 ends at the moment that question can be answered, and it carries
+no fix. **Do not start `12.2` or `12.3`, and do not carve yourself more work to keep digging** — if the
+cause is not isolated when you have finished the tasks below, that is a legitimate outcome to report, not
+a failure to hide by continuing.
+
+**Task classification comes first.** Post your build/audit/finish call for `12.1` before writing code,
+and stop with `❓ @architect` if you disagree with how I have framed it. My call: `12.1` is **build**
+(new observability surface) with an **audit** obligation attached (the reconciliation above), and the
+audit half must complete first — what you learn from it may change what is worth recording.
+
+---
+
+### `12.1` — make the reaction's outcome observable
+
+**Spec (this is the binding text, `specs/git-sync/spec.md`, *Re-index and broadcast on received push*):**
+
+> #### Scenario: The reaction to a push is observable
+> - **WHEN** the system reacts to a received push
+> - **THEN** it records the outcome of that reaction — the routes it diffed, the subscribers it matched,
+>   and the callbacks it invoked — so that a broadcast reaching no viewer is distinguishable from a
+>   delivered one
+
+Three quantities, named explicitly, and the scenario's whole point is the **distinguishability** clause,
+not the recording. Today `ComputeChangedRoutesAsync` returning zero routes, `NotifyChangedAsync` matching
+zero subscribers, and a correct delivery to three viewers are indistinguishable in the app's output —
+which is why the absence of warnings was once read as evidence the reaction had run.
+
+**The falsifier — the observation that fails if `12.1` is undone.** Take a run that delivers to a
+subscriber and a run where the diff yields routes but *no* subscriber matches. If the app's own output
+is byte-identical between those two runs, `12.1` is not done, however much has been logged. Your test
+must be the thing that distinguishes them, and it must assert on the *three named quantities*, not on the
+presence of a log line.
+
+**Binding design constraint (mine, contest it with `❓ @architect` if you think it is wrong).** There is
+no D-number for this — the requirement was amended in on 2026-08-16 and `design.md`'s D19 predates it, so
+I am fixing the shape here and will record it as a decision when the block lands:
+
+- `IPageChangeNotifier.NotifyChangedAsync` returns the **counts it actually observed** — subscribers
+  matched and callbacks invoked — rather than `Task`. These differ: a matched subscriber whose callback
+  throws is caught and logged today, so *matched* and *invoked* are genuinely two numbers and the spec
+  names them separately. Do not collapse them.
+- `PushReactionService` emits **one** structured record per reaction carrying all three quantities
+  together — routes diffed, subscribers matched, callbacks invoked — at `Information`. One record, not
+  three scattered lines: the distinguishability the spec asks for is a property of the three read
+  together, and a reader correlating three separate lines across a concurrent push is doing the work the
+  requirement exists to remove.
+- **Structured assertion over text assertion.** Tests assert the returned counts; the log record is
+  additionally asserted to exist but never by matching its message prose. This repo's recurring defect
+  class is claims-versus-mechanism in prose, and a test pinned to log wording manufactures more of it.
+- Keep the existing `Warning`-level failure logging exactly as it is. It is a different concern and §8's
+  supervisor already made the warm and the broadcast fail independently — do not re-couple them.
+
+**Scope fence.** `12.1` adds observability and changes no behaviour. If the instrument tells you what is
+broken — and it should — **write it down and stop; do not fix it.** The fix is `12.3` and it is gated on
+`12.2` being watched failing first.
+
+---
+
+### The reconciliation — do this before the build half
+
+Establish, with an instrument, which of the two readings above is true.
+
+**Use the mutation harness, and read its rules first.** `.claude/skills/mutation-testing/mutate.sh <file>
+<search> <replace> ["label"]` — it reverts via a `trap` an interruption cannot skip, checksums the target
+before and after, refuses a no-op or a non-unique search string, and runs the **full unfiltered suite**.
+Exit `0` = killed, `1` = survived (a finding), `2` = harness fault, and **a harness fault is never a
+result**.
+
+**Caps, and they are hard:**
+
+- **One mutation site**, chosen to break the delivery the endpoint test claims to witness — the
+  route-set membership check in `PageChangeNotifier.NotifyChangedAsync`, or the broadcast call in
+  `PushReactionService.ComputeAndBroadcastChangedRoutesAsync`. Pick one; say which and why.
+- **At most 3 runs total.** A mutant that dies consistently is confirmed at 3; do not exceed it unless
+  characterising genuine flakiness *is* the finding.
+- **Do not expand to other files.** A finding is not a licence to keep digging.
+- Never post a filtered figure as the record — a filtered run measures a condition the gate never runs
+  in.
+
+**What each outcome means, decided in advance so the result cannot be rationalised afterwards:**
+
+- **Mutant survives** → the endpoint test cannot fail. That is reading 1, it is a finding in its own
+  right, and it means the "client half is proven healthy, break is server-side" premise has nothing
+  under it. Report it and stop.
+- **Mutant is killed** → the test can fail and the `HandleReceivePackAsync` → `PageChangeNotifier` span
+  genuinely works. That is reading 2: **the break is downstream of the notifier**, this thread's premise
+  is wrong, and `12.3`'s target moves. Then — and only then — spend your remaining effort naming *where*
+  downstream, by reading `ChangedOnDiskIndicator.razor` and `WikiPage.razor` for the two things I flagged:
+  does the component subscribe under the same `EncodedRoute` value the diff produces, and is it mounted
+  on the path a normal page view takes? **Read and report; do not fix.**
+
+**Then run the gates.** Before committing anything that followed a mutation run, `git diff -- src` **and**
+`git status --short -- src` — the diff is blind to untracked files, and a `??` entry means "checksum it or
+read it", not "it's fine".
+
+---
+
+### Reporting — what your post back must contain
+
+- Your build/audit/finish call for `12.1`, posted before you wrote code.
+- The mutation record: file, exact search/replace, checksum before and after, run count, exit codes,
+  killed or survived, and the **unfiltered** suite figures. Not a summary of them.
+- **Claims carry an instrument.** Any statement that something is complete, exhaustive, covered, the only
+  one, or unaffected states **claim / instrument / blind spot** as three labelled lines. "Blind spot:
+  none" is never correct.
+- Gate evidence as exit lines, not prose: `make gates` and quote `GATES_EXIT:<n>` — or the individual
+  `BUILD_EXIT:`/`TEST_EXIT:`/`FORMAT_EXIT:`/`VALIDATE_EXIT:` lines if it goes red. **Run gates
+  unsandboxed and never pipe one through `tail`** — the exit line is the last line and a truncating pipe
+  is how you lose it. A sandboxed `dotnet` dies at 5:00 still printing `0 Error(s)`.
+- **The one-sentence answer to the section's escape-hatch question: is the root cause isolated?** Say
+  yes and name it, or say no plainly. It is a Product Owner decision either way, not yours and not mine.
+
+You do not commit, you do not tick boxes in `tasks.md`, and you do not spawn agents. Post to this thread
+as you go, then `→ @reviewer` via me.
+
+
+**[worker]** `12.1` classification, before writing code — **build**, with an audit obligation attached
+(agree with the architect's framing; no disagreement to raise). Confirmed by reading
+`src/ZeroWiki/Content/PageChangeNotifier.cs` and `PushReactionService.cs` before touching either: today
+`NotifyChangedAsync` returns `Task`, callback failures are caught/logged at `Warning` only (unchanged by
+this block), and `PushReactionService.ComputeAndBroadcastChangedRoutesAsync` logs nothing on the success
+path — a zero-route diff, a zero-subscriber match, and a real delivery to three viewers are genuinely
+indistinguishable in current output. Nothing here already exists; this is new observability surface, not
+an audit of an existing one. Starting the reconciliation half first, per the brief.
+
+**[architect]** Filing correction — the `[worker]` post above was written to a **new `DEVLOG.md` at the
+repository root**, not to this file. I relocated it verbatim and deleted the stray. Recording it because
+this is the second filing fault in this change's record today and the two have the same shape: a post
+landing outside the thread it belongs to, where nothing would ever have read it.
+
+@worker — this change's DEVLOG is `openspec/changes/git-backed-content-core/DEVLOG.md`. A bare `DEVLOG.md`
+resolves against whatever the shell's working directory happens to be, and this repo has already been
+bitten by exactly that class (a sandbox-blocked `mktemp` left a path variable empty and a scratch script
+ran in the repo root). Write the full path.
+
+**[architect]** Mutation run — resolved, and the harness behaved correctly. The run was **still executing**
+when @worker stopped; the `if (true)` mutant was live in `src/ZeroWiki/Content/PageChangeNotifier.cs:53`
+for as long as the suite ran, which is by design, not a leak. I waited for the process to exit rather than
+intervening, and `mutate.sh`'s `trap` reverted it: `git diff -- src` is **empty**, and line 53 reads
+`if (!routeSet.Contains(route))` again. This is the hazard the skill documents ("an interrupted mutation
+run leaves a live mutant in `src/`") arriving and being caught by the mechanism built for it.
+
+**Two process faults to correct before continuing, both @worker's, neither affecting the code:**
+
+1. **The run was piped through `| tail -80`.** Without `pipefail` that makes `$?` `tail`'s status, not
+   `mutate.sh`'s — and `mutate.sh` encodes its entire result in its exit code (`0` killed, `1` survived,
+   `2` harness fault). The pipe destroys the one thing the run exists to produce. This is the same rule
+   the gates carry ("never pipe a gate through `tail`") and it bites harder here, because a gate at least
+   prints a `LABEL_EXIT:` line to fall back on.
+2. **Stopping to wait for a background task is not available to a worker.** If a command must run long,
+   run it in the foreground and let it finish. Nothing resumes you on a timer.
+
+**One of the three permitted runs is spent and produced no readable verdict. Two remain.**
+**[architect]** Mutation verdict — run 2/3, watched to completion by me. **KILLED.**
+
+```
+target    src/ZeroWiki/Content/PageChangeNotifier.cs
+mutant    if (!routeSet.Contains(route))  ->  if (true)
+          "always-skip: break route-set membership match, no callback ever invoked"
+checksum  e8db26eea707 (before) -> be2aa5d3c19d (live) -> e8db26eea707 (after revert, matches)
+suite     FULL, UNFILTERED, no pipe: Failed 7, Passed 874, Skipped 0, Total 881, 2m54s
+harness   KILLED — the suite failed with the mutant applied
+```
+
+`git diff -- src` empty afterwards and line 53 reads `if (!routeSet.Contains(route))` again — verified by
+me, not by the worker, and by content rather than by trusting the harness's own report.
+
+**One variance worth recording rather than smoothing over.** Run 1's harness output reported **6** failures
+and run 2 reported **7**, same mutant, same unfiltered suite. The verdict is unaffected — killed is killed,
+and both runs killed it — but a one-test swing between two identical runs means **something in this suite
+is timing-dependent**, and the endpoint tests in this very area wait on a `NotificationTimeout`. I am not
+spending run 3 characterising it; I am writing it down so that a future flake here is met with "this was
+already visible on 2026-08-19" rather than treated as new. Run 3 remains unspent.
+
+### The verdict decides between the two readings, and it picks the one that moves §12's target
+
+**Reading 2 holds.** The endpoint test *can* fail — it is one of the tests the mutant killed, alongside
+four `PageChangeNotifierTests` — so it is not a test that cannot fail, and the span from
+`HandleReceivePackAsync` through `PageChangeNotifier` to a subscriber's callback **genuinely works**.
+
+**Therefore this thread's 2026-08-16 premise is wrong.** The break is *not* "server-side, between
+`HandleReceivePackAsync` and `PageChangeNotifier`". `12.3` cannot be aimed there, and any later block that
+still assumes it is aiming at working code.
+
+**@worker's reading half then closed both of the downstream candidates I had named**, and closed them
+properly — the route the indicator subscribes under and the route the diff produces are the *same
+`PageRouteCodec.Encode` call over the same working-tree-relative path shape*, not two derivations that
+might disagree; and the indicator mounts on exactly the rendered-body branch, with `_page` and
+`_renderedBody` set together on consecutive lines so one can never be set without the other. I have
+re-read `ChangedOnDiskIndicator.razor` and `WikiPage.razor` myself and agree, and I will add what that
+leaves: the component self-declares `@rendermode InteractiveServer`, guards its subscribe on
+`RendererInfo.IsInteractive` so the prerender pass does not register a subscription it could never
+dispose, and its callback ends in `InvokeAsync(StateHasChanged)`. Read as source, every link in the chain
+is correct.
+
+**So the cause is NOT isolated by reading, and I am not going to keep reading.** Four things are now
+known to be individually correct — the push reaction, the notifier, the route derivation, the component —
+and the observed behaviour is still that no banner appears. That is precisely the situation `12.1` exists
+to resolve, and it is why the Product Owner ordered the tasks with observability *first*. An instrument
+answers this; a fifth careful read of correct-looking code does not, and this change's own record says
+what happens when three competent audits share a question.
+
+**[architect]** Block 1 continues — `12.1`'s build half → @worker
+
+Classification accepted (**build**, audit obligation attached; the audit half is now complete). The brief's
+original `12.1` section stands unchanged — spec text, the falsifier, and the binding design constraint on
+`NotifyChangedAsync`'s return shape and the single `Information` record are all still binding. **One
+addition, and it comes directly from where the audit half landed:**
+
+**Record the subscription side, not only the broadcast side.** The spec's three quantities — routes
+diffed, subscribers matched, callbacks invoked — distinguish *a broadcast that reached nobody* from *a
+delivery*. They do not distinguish **why** nobody was reached, and after today that is the live question:
+every component of this chain reads as correct, so the failure is in a value or a lifetime that reading
+cannot see. So when a **non-empty** diff matches **zero** subscribers, the record must also carry **the
+routes that are currently subscribed** — the actual keys in `PageChangeNotifier`'s subscription table at
+that moment.
+
+That single addition is what turns `12.1` from a counter into a diagnosis: a live run then says either
+*"diffed `[foo]`, subscribed `[foo]`, matched 0"* — which would mean the equality/lookup itself is the
+defect — or *"diffed `[foo]`, subscribed `[]`"* — which means no circuit ever subscribed, and the
+question moves to the component's lifetime rather than to any route value. Those are different bugs with
+different fixes and the current output cannot tell them apart.
+
+Constraints on it, so it does not become a leak or a cost:
+- Only on the **zero-matched-but-non-empty-diff** path. A healthy delivery must not enumerate the table.
+- Route values only — never subscriber identities, callbacks, or anything account-derived.
+- It is still **one record**, not a second log line to correlate.
+
+**Still no fix.** `12.1` changes no behaviour. If the instrument tells you what is broken — and it should
+— write it down and stop. `12.2` and `12.3` are later blocks and `12.2` must be watched failing first.
+
+**Gates when you are done:** `make gates` unsandboxed, quote `GATES_EXIT:<n>`; if it goes red, quote the
+individual `LABEL_EXIT:` lines. Never pipe a gate through `tail`. Then `git diff -- src` **and**
+`git status --short -- src` before you hand back — you have run mutants in this block, and the diff is
+blind to untracked files.
+
+**Housekeeping:** `mutate-run2.log` is in the repository root and the mutant it tracked is reverted, so it
+is safe to remove. I will remove it rather than leaving it for you.
+
 ## NEXT
 
 **Resume at `12.1`.** §12 is the only open section and **is not open yet** — it has no `Base:` post.
@@ -25342,3 +25628,283 @@ seven claims-about-why, §10's two). Both of §10's were found by *reading*, in 
 honesty, and no gate in this repo would catch a fourth. The recurring-class rule says that when a class
 recurs, the deliverable's rule is wrong rather than the sentences — so a fourth round of correcting
 comments is precisely what not to do. The full framing is in the `[architect]` close-out under `## 10.`
+
+**[worker]** Reading half of the reconciliation (point 4) — done while run 2/3 is in flight. Read-only,
+no code touched.
+
+**Finding 1 — the two derivations of `EncodedRoute` are not independent; they share one function.**
+
+- **Claim:** the route `ChangedOnDiskIndicator` subscribes under and the route the push diff produces
+  are the same value by construction, not by coincidence.
+- **Instrument:** read `WikiPage.razor:190-267` and `ChangedOnDiskIndicator.razor:26,42` end to end, and
+  grepped `PageRouteCodec.Encode` across `PageEnumerationService.cs` / `PageIndexBuilder.cs` /
+  `PushReactionService.cs`.
+- What I found: `ChangedOnDiskIndicator` does **not** derive its own route — it takes
+  `Route="@notifiedPage.Route"` (`WikiPage.razor:36`), i.e. `PageIndexEntry.Route`. That value is set by
+  `PageEnumerationService.Walk` (`PageEnumerationService.cs:196-197`:
+  `var relativePath = ToRoutePath(Path.GetRelativePath(workingTreeRoot, entry)); var route =
+  PageRouteCodec.Encode(relativePath);`) on full enumeration, and by `PageIndexBuilder.RefreshAsync`
+  (`PageIndexBuilder.cs:253-254`, `:296`) on incremental refresh — both call `PageRouteCodec.Encode`
+  over a working-tree-relative, forward-slash path (`ToRoutePath` at `PageEnumerationService.cs:209`
+  replaces the platform separator with `/`). `PushReactionService.ComputeChangedRoutesAsync` strips
+  `RepositoryRelativeWorkingTree + "/"` from a real `git diff --name-only -z` path (already
+  forward-slash, git's own format) and calls the same `PageRouteCodec.Encode` on what remains
+  (`PushReactionService.cs:210,223`). Same function, same input shape, both sides. There is no second
+  derivation to disagree with the first.
+- **Blind spot:** this is a static read, not an execution — it does not prove the two `relativePath`
+  strings are byte-identical for every real file (case folding on a case-insensitive host filesystem,
+  Unicode normalization in a filename, a working tree not laid out where `WorkingTree`/
+  `RepositoryRelativeWorkingTree` expect). It also does not cover the moment `PageIndex` is *stale*
+  relative to the push — `notifiedPage.Route` comes from whatever snapshot `OnInitializedAsync` read,
+  which for a page loaded *before* the push and never refreshed since is a route computed **before**
+  this push, not from this push's diff at all; on today's code that is still the identical string for an
+  unrenamed file, so it does not break the match, but I have not executed anything to rule out a subtler
+  divergence (e.g. an index built under one OS reading a repo checked out with different path
+  normalization than the git subprocess doing the diff on the same host).
+
+**Finding 2 — the indicator is mounted on every normal page view, confirmed against the razor rather
+than repeated from the comment.**
+
+- **Claim:** `PushReactionService`'s own remarks ("only the rendered-body branch mounts the subscribing
+  indicator component") hold.
+- **Instrument:** read `WikiPage.razor:22-37` and `:174-273` (the branch structure and
+  `OnInitializedAsync`).
+- What I found: `<ChangedOnDiskIndicator Route="@notifiedPage.Route" />` sits inside
+  `@if (_page is { } notifiedPage)` nested inside `else if (_renderedBody is { } body)` (`:26-37`) — the
+  `else` chain's branches are edit-mode / rendered-body / ambiguous / not-found, mutually exclusive.
+  `_page` and `_renderedBody` are set **together**, on consecutive lines, only after a successful
+  markdown read (`WikiPage.razor:266-267`: `_page = pageMatch; _renderedBody = new
+  MarkupString(...)`) — there is no code path that sets one without the other. So `_renderedBody is {}`
+  true implies `_page is {}` true, and the indicator mounts on exactly the branch the comment claims:
+  every ordinary, successfully-resolved page view, and none of edit mode, ambiguous, or not-found.
+- **Blind spot:** confirms the *branch structure* is as claimed; does not confirm the component actually
+  *renders* client-side for a live circuit (prerender vs. interactive — `ChangedOnDiskIndicator`'s own
+  `OnInitialized` guards subscription on `RendererInfo.IsInteractive`, which this read did not execute
+  against a running app). That question is §12's `12.4`, human-in-the-loop, not something this reading
+  answers.
+
+**Net:** reading finds no defect in either half the brief asked me to verify — the route derivations are
+provably the same function, not two independent guesses that happen to agree, and the mount point is
+exactly what the comment says. This narrows where a real break (if any) could be, but does not itself
+say whether one exists; that is what run 2/3's endpoint-level result settles for the span it covers.
+Waiting on @architect's run 2/3 verdict before writing `12.1`'s build half.
+
+**[worker]** `12.1` built — observability landed, no behaviour changed.
+
+**Shape:**
+
+- `IPageChangeNotifier.NotifyChangedAsync` returns `Task<PageChangeNotificationResult>`
+  (`src/ZeroWiki/Content/PageChangeNotificationResult.cs`, new file) — `SubscribersMatched` and
+  `CallbacksInvoked` kept as two numbers (a matched-but-throwing subscriber counts toward the first, not
+  the second), plus `SubscribedRoutesAtZeroMatch`: `null` on a healthy delivery, otherwise the routes the
+  subscription table actually held at the moment nothing matched — the architect's addition, turning
+  "matched 0" into "diffed X, subscribed []" (no circuit ever subscribed) vs. "diffed X, subscribed [Y]"
+  (subscribed, just not to X). Computed as a projection of the snapshot `NotifyChangedAsync` already
+  takes for its own iteration — no second table scan, so the "must not enumerate on a healthy delivery"
+  constraint holds by construction, not by a separate guard.
+- `PushReactionService.ComputeAndBroadcastChangedRoutesAsync` calls the new `LogReactionOutcome` once,
+  after `NotifyChangedAsync` returns — one `Information` record per reaction carrying
+  `BeforeSha`/`AfterSha`, `DiffedRouteCount`, `DiffedRoutes`, `SubscribersMatched`, `CallbacksInvoked`,
+  and — only on the zero-match branch — `SubscribedRoutes`. Two message templates (healthy vs.
+  zero-match), exactly one of which executes per reaction, so it stays one record, not a second line to
+  correlate. The existing `Warning`-level failure logging is untouched — different concern, per §8's
+  supervisor.
+- Updated the three test doubles (`RecordingPageChangeNotifier`, `SpyPageChangeNotifier`) and the
+  interface's XML doc for the new signature.
+
+**Tests — structured assertions, no message-text matching, per the binding constraint:**
+
+- `PageChangeNotifierTests`: the falsifier itself
+  (`NotifyChangedAsync_DeliveredRun_AndZeroMatchRun_AreDistinguishableByTheReturnedCounts` — asserts
+  `delivered != zeroMatch` on the returned records, not on any log line), the zero-match diagnostic both
+  ways (nobody subscribed at all vs. subscribed to a different route), the empty-diff no-op, and the
+  matched-vs-invoked split on `NotifyChangedAsync_OneSubscriberThrows_TheOthersAreStillNotified` (now
+  asserts `SubscribersMatched: 2, CallbacksInvoked: 1`).
+- `PushReactionServiceTests`: two new tests drive the **real** `PageChangeNotifier` (not the recording
+  fake) through a real `PushReactionService.ReactAsync`, with `CapturingLoggerProvider`
+  (`tests/ZeroWiki.Tests/Identity/CapturingLoggerProvider.cs`, reused as-is) standing in for
+  `ILogger<PushReactionService>` — assertions read `LogEntry.Values` (the structured key/value state a
+  sink would receive), never `Message`. One test is the healthy-delivery shape (asserts `SubscribedRoutes`
+  is absent as a key); the other is the zero-match shape (asserts `SubscribedRoutes` names the one route
+  actually subscribed, which is not the diffed route).
+
+**Mutation reconciliation (settled by the architect, run 2/3, recorded here for the block's own
+completeness):** `if (!routeSet.Contains(route))` → `if (true)` in `PageChangeNotifier.NotifyChangedAsync`
+— **KILLED**. checksum `e8db26eea707` → `be2aa5d3c19d` (live) → `e8db26eea707` (reverted, verified by
+content). Full unfiltered suite: `Failed 7, Passed 874, Total 881, 2m54s`. Verdict: reading 2 — the
+`HandleReceivePackAsync` → `PageChangeNotifier` → subscriber span genuinely works; §12's recorded premise
+("break is server-side, between those two") does not hold. Run 1's own transcript (unconfirmed as a
+record per the architect's ruling on the `tail` pipe) showed the same kill with 6 failures; the
+architect noted 6-vs-7 on an identical mutant+suite as a timing-dependent observation, written down but
+not to be chased in this block.
+
+**Reading half (point 4):** posted earlier in this thread — both downstream candidates
+(`ChangedOnDiskIndicator`'s route derivation, its mount point) read as correct, confirmed against the
+razor rather than the comment, each with claim/instrument/blind-spot.
+
+**Claim — root cause is not isolated.**
+- **Instrument:** the mutation-confirmed span (endpoint test genuinely covers real delivery,
+  `HandleReceivePackAsync` → `PageChangeNotifier` → subscriber) plus the static read of
+  `ChangedOnDiskIndicator.razor` / `WikiPage.razor` (route derivation shares one function with the diff's
+  own; the component mounts on exactly the rendered-body branch).
+- **Blind spot:** neither instrument executed the client-side circuit — `RendererInfo.IsInteractive`,
+  the actual `InvokeAsync(StateHasChanged)` reaching a real browser DOM update, or the index-staleness
+  edge case named in the earlier reading post (a page loaded before the push, never refreshed since).
+  §12's escape-hatch trigger is about **this** block's outcome, and on what both instruments together
+  cover: every link in the chain reads correct and nothing in this block found a defect to fix. That is
+  the "not isolated by reading" outcome the architect already named, not a new finding — I have nothing
+  to add to it.
+
+**Gates (unsandboxed, foreground, no pipe through `tail`):**
+`BUILD_EXIT:0` / `TEST_EXIT:0` (886 total: 881 + 5 net new — Passed: 886, Failed: 0, Skipped: 0,
+2m57s) / `FORMAT_EXIT:0` / `VALIDATE_EXIT:0`.
+
+**`git diff -- src` / `git status --short -- src`, verified before this post:** three modified files
+(`IPageChangeNotifier.cs`, `PageChangeNotifier.cs`, `PushReactionService.cs`) and one untracked new file
+(`PageChangeNotificationResult.cs`) — matches exactly what this block wrote, nothing else moved.
+
+**No fix landed.** `12.1` changes no behaviour — every subscriber/route/diff decision is unchanged; only
+the outcome is now returned and logged. `12.2`/`12.3` are not started.
+
+→ @reviewer
+
+**[reviewer]** Verdict: **Approve** — block 1 of §12 (`12.1` only).
+
+### What I checked and how
+
+- **Read the diff directly** (`git diff HEAD` for the three modified files; `Read` for the untracked
+  `PageChangeNotificationResult.cs`, which `git diff` cannot show).
+- **Re-ran the gates myself, unsandboxed, exit lines only:** `BUILD_EXIT:0`; `make test` foregrounded
+  under `Monitor` (no `tail`) — `Passed: 886, Failed: 0, Skipped: 0, Total: 886`, `TEST_EXIT:0`, matching
+  the worker's reported 886 exactly; `FORMAT_EXIT:0`; `VALIDATE_EXIT:0`.
+- **Mutation residue:** read `src/ZeroWiki/Content/PageChangeNotifier.cs` myself — the membership check
+  reads `if (!routeSet.Contains(route))`, not `if (true)`. `git diff -- src` / `git status --short -- src`
+  carry only the six files the worker reported; no stray mutation artefact.
+- **Reach:** `find_tests_for_symbol` (roslyn-codelens) on `PageChangeNotifier.NotifyChangedAsync`
+  (10 direct tests) and transitively on `PushReactionService.LogReactionOutcome` (10 tests reach it
+  through `ReactAsync → ComputeAndBroadcastChangedRoutesAsync`, including the two new §12.1 tests). Also
+  confirmed all three `IPageChangeNotifier` implementations (production, and the two test doubles in
+  `PushReactionServiceTests.cs` / `InteractiveComponentSurfaceTests.cs`) were updated to the new return
+  type — nothing left on the old `Task`-returning signature. No scaffolding: everything new is reached by
+  a production caller or a test that exercises it.
+
+### 1. Spec scenario
+
+Satisfied. The three named quantities are present: routes diffed (already known to
+`PushReactionService` from `ComputeChangedRoutesAsync`, carried into `LogReactionOutcome` as
+`changedRoutes`/`DiffedRouteCount`/`DiffedRoutes`), subscribers matched and callbacks invoked (the new
+`PageChangeNotificationResult.SubscribersMatched` / `CallbacksInvoked`, returned from
+`NotifyChangedAsync`). The distinguishability clause is the point, and it is actually exercised — see §3.
+
+### 2. Build/audit classification
+
+The worker's call (`12.1` = build, with an audit obligation attached) is correct and was honoured in the
+right order: the reconciliation (mutation run + the two razor reads) ran and settled before any
+production code changed, and its result — "root cause not isolated by reading; four links in the chain
+each read correct" — is exactly the outcome CLAUDE.md's escape hatch anticipates, reported plainly rather
+than chased with a fifth read. This is not a duplicate of earlier work: nothing in §1–§11 made the
+notifier's outcome observable, so the build half is genuinely new surface, not a third test of an
+already-covered property.
+
+### 3. The falsifier — does it actually distinguish, or just return a value?
+
+Re-derived rather than trusted. `NotifyChangedAsync_DeliveredRun_AndZeroMatchRun_AreDistinguishableByTheReturnedCounts`
+(`PageChangeNotifierTests.cs:38`) drives exactly the two runs the brief named — one to a subscribed
+route, one to an unsubscribed route — off the *same* notifier instance, and asserts
+`delivered.SubscribersMatched`/`CallbacksInvoked` against `zeroMatch`'s. If `12.1` were undone (revert to
+`Task`, no counts), this test does not compile, let alone pass — that is as strong a falsifier as a
+signature change can produce. The two zero-match diagnostic tests
+(`..._SubscribedRoutesAtZeroMatchIsEmpty` / `..._NamesIt`) distinguish the two sub-cases the architect's
+addition exists for by asserting on the list contents, not its presence.
+
+At the `PushReactionService` layer, the two new tests
+(`ReactAsync_ChangedPage_EmitsOneStructuredInformationRecordWithAllThreeQuantities` and
+`..._NobodySubscribesTo_RecordCarriesTheSubscribedRoutesInstead`) drive the **real** `PageChangeNotifier`
+(not the recording fake) through a real `ReactAsync`, and assert on `CapturingLoggerProvider.LogEntry.Values`
+— I read `CapturingLoggerProvider.cs` myself: `Values` is `state as IReadOnlyList<KeyValuePair<string,
+object?>>`, the structured argument list a real sink receives, captured independently of the rendered
+`Message`. The healthy-path test asserts `Assert.DoesNotContain("SubscribedRoutes", values.Keys)` — a
+genuine negative assertion on the key's absence, not merely unasserted. None of the eight new/changed
+tests assert on message prose. This is the opposite of the tests-that-cannot-fail defect class this
+change has shipped before (§8, §10) — I checked for it specifically and did not find it here.
+
+### 4. Binding design constraints
+
+All four honoured:
+- `NotifyChangedAsync` returns `Task<PageChangeNotificationResult>` with `SubscribersMatched` and
+  `CallbacksInvoked` as two separate `int`s, incremented at different points
+  (`PageChangeNotifier.cs`: `subscribersMatched++` before the `try`, `callbacksInvoked++` only after
+  `onChanged()` completes without throwing) — a throwing subscriber genuinely produces
+  `SubscribersMatched: 2, CallbacksInvoked: 1` in
+  `NotifyChangedAsync_OneSubscriberThrows_TheOthersAreStillNotified`, which is the exact case the
+  constraint exists for.
+- One `Information` record per reaction: `LogReactionOutcome` has exactly one call site (from
+  `ComputeAndBroadcastChangedRoutesAsync`, once, after `NotifyChangedAsync` returns) and the method body
+  is two mutually-exclusive branches (`if (... is { } ...) { ...; return; } ...`) each ending in exactly
+  one `_logger.LogInformation` call — never both.
+- Structured-over-text assertion: confirmed above.
+- Existing `Warning`-level failure logging is untouched — the diff only adds a comment near it
+  (`PageChangeNotifier.cs`), and §8's decoupling of the index warm from the broadcast is not touched by
+  this diff at all (`ComputeAndBroadcastChangedRoutesAsync`'s try/catch shape is unchanged apart from the
+  new two lines calling the notifier and the logger).
+
+### 5. The zero-match addition
+
+Correctly scoped. `SubscribedRoutesAtZeroMatch` is computed only when `subscribersMatched == 0` (the
+non-empty-diff path — the `routes.Count == 0` early return skips it entirely, which is right: an empty
+diff has nothing to diagnose), it is a `.Select(subscription => subscription.Route)` projection over the
+`snapshot` array already taken for the main loop — no second `ConcurrentDictionary` scan — and it carries
+route values only, never the `onChanged` callback or anything else from the tuple. The two-shape
+diagnostic (empty list vs. a populated one naming a different route) is exercised by both the notifier-
+level tests and the `PushReactionService`-level structured-log test.
+
+### 6. Concurrency / snapshot semantics
+
+`PageChangeNotifier` remains a singleton over a `ConcurrentDictionary` with one `_subscriptions.Values.ToArray()`
+snapshot per call, taken before iteration begins (unchanged in kind from before this block). The new
+counting variables (`subscribersMatched`, `callbacksInvoked`) are locals scoped to one `NotifyChangedAsync`
+call — no shared mutable state added, so no new race. The zero-match projection reads the same `snapshot`
+array, not the live table, so it cannot observe a subscription that registered or disposed after the
+snapshot was taken — consistent with the existing "never a torn read" comment, which the worker extended
+rather than contradicted.
+
+### 7. OpenSpec scope
+
+Clean. `git status --short` shows exactly the six files the DEVLOG reports plus one untracked file
+(`PageChangeNotificationResult.cs`) — no `Makefile`, no `tasks.md` edit (both boxes for `12.1`–`12.4`
+remain `- [ ]`, correctly left unticked by the worker), no file outside `src/ZeroWiki/Content` and its
+three corresponding test files. Nothing here fixes the break `12.3` is scoped to — confirmed by reading:
+every subscriber/route/diff decision path is byte-identical to before except for the two new counters and
+the projection, which is exactly what "no behaviour change" requires and what the worker claimed.
+
+### Nits
+
+None worth blocking on. The XML doc on `PageChangeNotificationResult` and the two log-message templates
+in `PushReactionService.LogReactionOutcome` are more verbose than the codebase's median, but they carry
+real content (the matched-vs-invoked distinction, why the diagnostic is conditional) rather than
+restating the signature, consistent with this file's existing documentation style.
+
+### Architectural note (not blocking this block)
+
+`tasks.md:84`'s `12.3` text still says "Fix the break between `HandleReceivePackAsync` and
+`PageChangeNotifier`" — a location this block's own reconciliation (mutation-confirmed) has shown is not
+where the break is, if a break exists downstream at all. Not this block's problem to fix (tasks.md is
+Architect-owned and out of a worker's reach), but worth flagging so `12.2`/`12.3`'s briefs don't inherit
+wording that points at code already shown to work.
+
+### Process note
+
+The one thing I could not independently re-verify is the mutation run itself (KILLED, 7/874/881,
+checksum `e8db26eea707` → `be2aa5d3c19d` → `e8db26eea707`) — re-running it would mean spending this
+block's own budget on a fourth confirmation run past the architect's already-completed 2/3, which the
+skill's cap disallows without a flakiness reason. I instead verified its *residue* (the code is reverted,
+content-checked) and its *conclusion* (the endpoint test and four `PageChangeNotifierTests` genuinely
+exercise the span, per the `find_tests_for_symbol` results above) independently. Recorded here as claim /
+instrument / blind spot: **claim** — the mutation run at line 53 (now ~62) was correctly executed and
+reverted; **instrument** — my own read of the live file content plus `git diff -- src`/`git status
+--short -- src`; **blind spot** — I did not re-run the mutant myself, so I have not personally watched it
+kill, only confirmed the tree carries no residue and that the tests it's claimed to have killed do exist
+and do assert on the right things.
+
+Reviewed-state: c30d51096900
+HEAD: 454b64b

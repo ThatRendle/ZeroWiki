@@ -150,7 +150,9 @@ public sealed class PushReactionService
             var changedRoutes = await ComputeChangedRoutesAsync(beforeSha, afterSha, cancellationToken)
                 .ConfigureAwait(false);
 
-            await _notifier.NotifyChangedAsync(changedRoutes, cancellationToken).ConfigureAwait(false);
+            var result = await _notifier.NotifyChangedAsync(changedRoutes, cancellationToken).ConfigureAwait(false);
+
+            LogReactionOutcome(beforeSha, afterSha, changedRoutes, result);
         }
         catch (OperationCanceledException)
         {
@@ -168,6 +170,58 @@ public sealed class PushReactionService
                 beforeSha,
                 afterSha);
         }
+    }
+
+    /// <summary>
+    /// §12.1 (<c>specs/git-sync/spec.md</c>'s <em>The reaction to a push is observable</em>): one
+    /// structured <see cref="LogLevel.Information"/> record per reaction carrying the three quantities
+    /// the spec names -- the routes diffed, the subscribers matched, and the callbacks invoked -- read
+    /// together rather than scattered across separate lines a reader would have to correlate under a
+    /// concurrent push. This is what makes a broadcast reaching no viewer distinguishable from a
+    /// delivered one; the outcome is unrecorded on <see cref="ComputeAndBroadcastChangedRoutesAsync"/>'s
+    /// own failure path above, which already logs its own <see cref="LogLevel.Warning"/> and is a
+    /// different concern (§8's supervisor already made the warm and the broadcast fail independently).
+    /// </summary>
+    /// <remarks>
+    /// When <paramref name="result"/> matched no subscriber against a non-empty diff, the record also
+    /// carries the routes the subscription table actually held at that moment (route values only, never
+    /// subscriber identities) -- the diagnostic that turns "matched 0" into "diffed X, subscribed []"
+    /// (no circuit ever subscribed) versus "diffed X, subscribed Y" (subscribed, just not under X). A
+    /// healthy delivery never carries this; <see cref="PageChangeNotifier"/> never computes it for one.
+    /// </remarks>
+    private void LogReactionOutcome(
+        string beforeSha,
+        string afterSha,
+        IReadOnlyList<EncodedRoute> changedRoutes,
+        PageChangeNotificationResult result)
+    {
+        if (result.SubscribedRoutesAtZeroMatch is { } subscribedRoutes)
+        {
+            _logger.LogInformation(
+                "Push reaction for HEAD {BeforeSha} -> {AfterSha} diffed {DiffedRouteCount} route(s) " +
+                "{DiffedRoutes}, matched {SubscribersMatched} subscriber(s), and invoked " +
+                "{CallbacksInvoked} callback(s); the subscription table held {SubscribedRoutes} at that " +
+                "moment.",
+                beforeSha,
+                afterSha,
+                changedRoutes.Count,
+                changedRoutes,
+                result.SubscribersMatched,
+                result.CallbacksInvoked,
+                subscribedRoutes);
+            return;
+        }
+
+        _logger.LogInformation(
+            "Push reaction for HEAD {BeforeSha} -> {AfterSha} diffed {DiffedRouteCount} route(s) " +
+            "{DiffedRoutes}, matched {SubscribersMatched} subscriber(s), and invoked " +
+            "{CallbacksInvoked} callback(s).",
+            beforeSha,
+            afterSha,
+            changedRoutes.Count,
+            changedRoutes,
+            result.SubscribersMatched,
+            result.CallbacksInvoked);
     }
 
     /// <summary>
