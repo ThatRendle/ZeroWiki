@@ -25787,6 +25787,72 @@ question by attaching it to a solved one.
    its failing test costs a re-run and still leaves the question open — which is exactly what happened
    here. (Filtering is still fine for reading the exit lines; the point is the file exists.)
 
+**[architect]** Live re-run against the hardened record — **§12's root cause is identified, and it is
+not what I concluded the first time.**
+
+Same method as before: scratch `DataRoot`, fresh bootstrap, token from `/account`, clone and push over
+`http://localhost:5171/git` with `-c credential.helper=` pinned off. The Product Owner's
+`src/ZeroWiki/App_Data/` untouched — `identity.db` mtime still 15 Aug 21:00. App stopped, tab closed,
+tree clean at `9e1f4cd`.
+
+| # | Browser state | Record |
+|---|---|---|
+| 1 | none open (control) | `diffed 1 route(s) ["diag"] … matched 0 … the subscription table held **0 route(s) []**` |
+| 2 | signed in, page rendered, **`WebSocket connected`** in console | `diffed 1 route(s) ["diag"] … matched 0 … the subscription table held **1 route(s) [<null>]**` |
+
+### The finding
+
+**`ChangedOnDiskIndicator` *does* subscribe. It subscribes under `default(EncodedRoute)`.**
+
+The `Route` parameter does not survive the crossing from the Static SSR render into the
+`InteractiveServer` circuit: the interactive instance receives `default(EncodedRoute)`, whose `Value` is
+`null`, and registers under that. The push's diff produces `["diag"]`, the table holds `[<null>]`, the
+route-set lookup correctly finds no match, and **the notifier is behaving exactly as designed** — it is
+being asked about a route nobody is subscribed to.
+
+`EncodedRoute` is a `readonly record struct` with an `internal` constructor, a get-only property and no
+public parameterless constructor (`src/ZeroWiki/Content/EncodedRoute.cs`). Its own remarks already
+record the relevant property — *"C# gives every struct a public `default` … `default(EncodedRoute)` is
+available to any caller and carries a `null` `Value`"* — written about a different concern, and it is
+the exact shape a component-parameter round-trip lands on when it cannot reconstruct the value.
+
+**The framework says nothing.** No exception, no warning, nothing in the server log or the browser
+console. A parameter silently arriving as `default` is why this survived a design decision (D19 §3), an
+implementation, a review, a supervisor pass, and my own first live run.
+
+- **Claim:** the break is the `Route` parameter arriving as `default(EncodedRoute)` in the interactive
+  instance; every other link in the chain works.
+- **Instrument:** the hardened `12.1` record over two live pushes differing only in whether a browser
+  was open, with the circuit independently confirmed by `WebSocket connected` in the browser console;
+  block 1's mutation result for the server span; the reviewer's re-derivation of the route derivations.
+- **Blind spots:** (1) one route (`diag`) on one host — I have not shown the value is *always* `default`
+  rather than sometimes mangled, and a route needing D12 encoding was not tried; (2) I have **not**
+  established the mechanism *inside* the framework — "the parameter does not round-trip" is what the
+  evidence shows, not *why* Blazor cannot reconstruct this type, and the fix depends on the why; (3)
+  this is a scratch store with a freshly-bootstrapped account, not the Product Owner's environment.
+
+### What this corrects, and what it vindicates
+
+My earlier post concluded *"`Subscribe` is never invoked in the running application"*. **That was wrong**,
+and it was wrong for exactly the reason the correction identified: a blank field read as an empty table.
+The hardened record shows `1 route(s) [<null>]` where the old one showed blank — the same run, the same
+code, a different instrument. **The instrument was the finding.**
+
+This is also why the escaping round mattered rather than being scope creep: a record that cannot render
+`[<null>]` unambiguously could not have produced this result.
+
+### `12.2` and `12.3` now have concrete targets
+
+- **`12.2`** — the falsifier is now nameable: *the route an interactive `ChangedOnDiskIndicator`
+  subscribes under equals the route its `Route` parameter was given*. Today that is false and the test
+  will fail. **Note the hazard**: `InteractiveComponentSurfaceTests`'s own remarks record that this suite
+  *never drives a real browser or SignalR client*, so no existing harness produces a genuinely
+  interactive instance. Whether this is provable in-process, or needs a new test dependency, is the
+  first question `12.2` must answer — and it is a Product Owner call if it means adding one.
+- **`12.3`** — fix the round-trip. Blind spot 2 above is the gate: establish *why* the value cannot be
+  reconstructed before choosing between making `EncodedRoute` round-trippable and passing the route
+  across the boundary as a plain string that the component re-encodes.
+
 ## NEXT
 
 **Resume at `12.1`.** §12 is the only open section and **is not open yet** — it has no `Base:` post.
