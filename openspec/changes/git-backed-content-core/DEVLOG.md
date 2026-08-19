@@ -25853,6 +25853,88 @@ This is also why the escaping round mattered rather than being scope creep: a re
   reconstructed before choosing between making `EncodedRoute` round-trippable and passing the route
   across the boundary as a plain string that the component re-encodes.
 
+**[architect]** Block 2 brief — `12.2` + `12.3` → @worker
+
+**Product Owner decision on bUnit, and why it is not this block's instrument.** The Product Owner is
+happy to add bUnit and expects it to be useful later. **It is still the wrong tool for `12.2`, and using
+it here would be actively harmful:** bUnit renders a component in-process and assigns parameters
+directly to the instance — it never serializes them across an SSR→circuit boundary. That crossing *is*
+the defect. A bUnit test asserting *"the indicator subscribes under the route it was given"* would
+**pass today, against broken code**, which is precisely the failure mode this change has shipped before
+and the one thing `12.2` must not do. Do not add it in this block. It will be added when a block needs
+it and it can fail.
+
+**The root cause, established by live run (see the `[architect]` post above):** the interactive instance
+of `ChangedOnDiskIndicator` subscribes under `default(EncodedRoute)` — `Value` is `null` — instead of the
+route its `Route` parameter was given. The push diffs `["diag"]`, the subscription table holds
+`[<null>]`, and the notifier correctly matches nothing. No exception or warning anywhere.
+
+---
+
+### `12.2` — the test, watched failing, before any fix
+
+**Falsifier:** *an `InteractiveServer` render of `ChangedOnDiskIndicator` receives, on the interactive
+side of the boundary, the same `EncodedRoute` its call site passed on the SSR side.* Today that is false.
+**You must watch your test fail against current code and record the failure output before touching
+`12.3`.** A test that has never been observed failing is not evidence, and this change's record is
+explicit about that.
+
+**Where to put the instrument — read this before choosing.** The existing suite cannot help you
+directly: `InteractiveComponentSurfaceTests`'s own remarks state it *never drives a real browser or
+SignalR client*, so no test today produces a genuinely interactive instance. **But the boundary is
+observable without one.** Each `InteractiveServer` component the framework prerenders emits a marker pair
+into the response, and the open marker carries the component's **serialized parameters** —
+`InteractiveComponentSurfaceTests` and `HttpAssertions.CountInteractiveComponentMarkers` already locate
+and count those markers off a real `WebApplicationFactory` response, so the plumbing to reach them
+exists. If `EncodedRoute` cannot round-trip, that payload is where it is visible.
+
+That is my recommendation, not a mandate. If first-hand inspection shows the payload does **not** expose
+this, say so with what you actually dumped and stop with `❓ @architect` rather than inventing a
+harness — the choice of instrument is the whole block.
+
+**Derive the marker's real shape by dumping one, not from documentation or from the existing test's
+assumptions.** The existing test's comment is explicit that its own two-marker claim was *"confirmed by
+execution, not assumed"* — hold yourself to that standard. Blazor's parameter payload is base64 and its
+internals are not a public contract; say what you observed.
+
+### `12.3` — the fix, gated on establishing the mechanism
+
+**Do not choose a fix until you can state why the value cannot be reconstructed.** This is a real gate,
+not ceremony: the two candidate fixes are different and the evidence picks between them.
+
+- Make `EncodedRoute` round-trippable as a component parameter, or
+- pass the route across the boundary as a plain `string` the component re-encodes on arrival.
+
+`EncodedRoute` is a `readonly record struct`, `internal` constructor, get-only property, no public
+parameterless constructor. **Its `internal` constructor is load-bearing** — D17's third and fourth passes
+made `PageRouteCodec.Encode` the single legitimate producer so the compiler enforces it rather than a
+reviewer re-enumerating call sites. **Any fix that makes the type publicly constructible destroys that
+invariant and is a design change I have not authorised — bring it back with `❓ @architect`.** That
+constraint is exactly why the second option may be the better one; I am not pre-deciding it.
+
+State what you establish about the mechanism, with what you ran.
+
+---
+
+### Standing requirements
+
+- Post your build/audit/finish classification for **each** task before writing its code; `❓ @architect`
+  if you disagree.
+- **Claims carry an instrument** — claim / instrument / blind spot as three labelled lines. "Blind spot:
+  none" is never correct.
+- Gates: `make gates` **unsandboxed**, **foreground**, quote `GATES_EXIT:<n>`. Never pipe a gate through
+  `tail`. **Write full gate output to a file** so a red gate can name its failing test — a red run today
+  cost a re-run because it could not.
+- **Do not run a gate while you have source hand-edited for a falsifier check.** An auditor's in-tree
+  revert contaminated a gate run today; the same applies to yours.
+- Do not end your turn waiting on a background task — nothing wakes you on a timer; let slow commands
+  block.
+- Then `git diff -- src` **and** `git status --short -- src`.
+- No new NuGet dependency in this block. If you conclude one is unavoidable, stop with `❓ @architect`.
+
+You do not commit, do not tick boxes, do not edit `tasks.md`/`Makefile`/`CLAUDE.md`/`.claude/`, and do
+not spawn agents. Post to `openspec/changes/git-backed-content-core/DEVLOG.md` — full path — at `###`.
+
 ## NEXT
 
 **Resume at `12.1`.** §12 is the only open section and **is not open yet** — it has no `Base:` post.
