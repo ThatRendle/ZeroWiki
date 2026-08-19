@@ -25560,6 +25560,67 @@ blind to untracked files.
 **Housekeeping:** `mutate-run2.log` is in the repository root and the mutant it tracked is reverted, so it
 is safe to remove. I will remove it rather than leaving it for you.
 
+**[architect]** Product Owner decisions, 2026-08-19 — both taken at block 1's close, on the report that
+`12.1` landed (`bf42588`) and that the root cause is **not** isolated.
+
+### 1. The escape hatch is NOT triggered — §12 continues
+
+Its stated trigger (*"the root cause is not isolated by the end of the first worker block"*) has, read
+literally, fired. The Product Owner declined to pull it, and the reasoning is worth recording because a
+future reader will otherwise see a trigger condition met and a section that carried on anyway:
+
+The hatch was written for *"§12 proves deeper than a bounded fix"*. That is not what block 1 found. It
+found a **bounded fix aimed at the wrong place**, with the right place one live observation away — which
+is a better position than the section opened in, not a worse one. Shipping 0.1 with a known-issue note
+and deferring to `fix-changed-on-disk-broadcast` would discard a mutation-confirmed narrowing and restart
+against a proposal written from the same wrong premise this block just disproved.
+
+**So the hatch stays available but unpulled.** If the live observation in the next block fails to isolate
+the cause, it comes back to the Product Owner — the trigger is not spent by having been declined once.
+
+### 2. `tasks.md` `12.2` and `12.3` amended — they named a location the evidence has ruled out
+
+`@reviewer` flagged `12.3`; the Product Owner ruled both. **I extended the amendment to `12.2` and am
+saying so explicitly, because that half was not in the reviewer's finding** — but the two are invalidated
+by one and the same result, and correcting only `12.3` would have left the section half-aimed.
+
+- **`12.3`** read *"Fix the break between `HandleReceivePackAsync` and `PageChangeNotifier`"*. That span
+  is mutation-confirmed **working** (this block's `if (true)` mutant, KILLED, full unfiltered suite). The
+  task pointed a future worker at correct code.
+- **`12.2`** read *"Endpoint-level test driving a real push through `git-receive-pack` and asserting a
+  subscriber registered under the pushed page's route is invoked; watched failing against the current
+  code before the fix"*. **That test already exists and already passes** —
+  `PushReactionEndpointTests.RealPush_NotifiesExactlyTheChangedRoute_AndNeverAViewerOnAnUntouchedRoute` —
+  so the task as written could not be discharged: nothing about it can be *watched failing against the
+  current code*, because the code it describes is not broken. Writing it a second time would have
+  produced a second passing test over a working span and called it evidence.
+
+Both now name the level `12.1`'s own record identifies rather than a location fixed in advance. **The
+watched-failing discipline is preserved verbatim in `12.2`** — that was never the wrong part; only the
+address was.
+
+**What did not change: the spec.** `specs/git-sync/spec.md`'s *Re-index and broadcast on received push*
+is unaffected — it says viewers of affected pages are notified, and says nothing about which component
+fails to do it. The wrong premise lived in `tasks.md` and in this thread's 2026-08-16 post, never in the
+requirement. No spec delta is needed and none was made.
+
+### Where §12 actually stands
+
+Known by instrument, not by reading: the push reaction fires, the notifier delivers, the route
+derivations are one function rather than two, and the indicator mounts on the right branch with the right
+render mode and the right guard. Every link is individually correct and the banner still does not appear.
+
+`12.1` is the instrument that splits the two survivors, and it needs **one live run** to speak:
+*diffed `[foo]`, subscribed `[foo]`, matched 0* means the lookup is the defect; *diffed `[foo]`,
+subscribed `[]`* means no circuit ever subscribed and the question is the component's lifetime. Nothing
+before this block could tell those apart, and no server-side test can produce the second reading — a
+suite has no browser, so it has no circuit to subscribe.
+
+**That is why the next step needs the Product Owner's browser**, and it is the one genuinely new fact
+about this section: `12.4` was carved as a *confirmation* at the end, but the observation it describes is
+now also the *diagnostic* the middle of the section depends on. That ordering was not visible when §12
+was carved.
+
 ## NEXT
 
 **Resume at `12.1`.** §12 is the only open section and **is not open yet** — it has no `Base:` post.
