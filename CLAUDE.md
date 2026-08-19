@@ -44,18 +44,45 @@ Read it to pick up in-flight context; write to it as you act. The `/devlog` skil
 When an OpenSpec change is archived, use the `mcp__meko__artifact_put` tool to upload the
 DEVLOG.md file to Meko.
 
-## Commands
+## Commands — the Makefile is the command surface
 
-- Build: `dotnet build` — must be clean.
-- Test: `dotnet test` — all green.
-- Format: `dotnet format --verify-no-changes` — clean.
-- Validate a change: `openspec validate <change-name> --strict`.
-- List changes: `openspec list` (or the directories under `openspec/changes/`, excluding `archive/`).
+Every gate runs through the root **`Makefile`**. Build, test, format, and spec validation are `make`
+targets; **do not call the underlying toolchain directly**. That keeps the command names stable as the
+toolchain moves underneath them, and — the load-bearing part — **every gate target prints its own exit
+code** as `LABEL_EXIT:<n>` on its last line.
+
+**Read the exit line, not the output.** A gate passed only if you saw `BUILD_EXIT:0`. Tools routinely
+exit non-zero while printing output that scans exactly like a clean run, and a gate has been reported
+as passing on that basis before. Quote the code; don't interpret the log. This project has two live
+examples: `dotnet format --verify-no-changes` exits 2 while printing one `warning: IDEnnnn` line, and a
+**sandboxed** `dotnet` dies at exactly five minutes still reporting `0 Error(s)`.
+
+- Build: `make build` → `BUILD_EXIT:0`.
+- Test: `make test` → `TEST_EXIT:0`, all green.
+- Format: `make format` → `FORMAT_EXIT:0`.
+- Validate the active change(s): `make validate` → `VALIDATE_EXIT:0`. It validates **every** active
+  change, not just the one being applied.
+- Whole gate set in one pass: `make gates` → `GATES_EXIT:0`. It runs the set with `-k`, so one
+  invocation reports **every** failing gate instead of hiding the rest behind the first.
+- List active changes: `make changes` (or the directories under `openspec/changes/`, excluding
+  `archive/`).
+
+**Run the gates unsandboxed.** A sandboxed `dotnet` is killed at the five-minute mark and prints
+`0 Error(s)` on its way out, so the exit line is the only thing that distinguishes it from a pass —
+and `make gates` inherits the same hazard. Never pipe a gate through `tail`: the `LABEL_EXIT:` line is
+the last line, and a truncating pipe is how you lose it.
+
+`make clean` is **not** a gate and no agent runs it — it is the Product Owner's.
+
+**The Makefile is yours (Architect), not the workers'.** When a block adds a project, a test suite, or
+a stack that the existing targets don't cover, *you* update the Makefile and say so in the DEVLOG. A
+worker that needs a target changed stops and reports it; it does not edit the Makefile, and it does not
+route around it by calling the raw toolchain.
 
 ---
 
 ## OpenSpec Workflow
-<!-- dmons-scaffold: 0.3.0 -->
+<!-- dmons-scaffold: 0.5.1 -->
 
 **This section is authoritative.** If a skill's behavior ever conflicts with what's written here,
 **follow this document.**
@@ -92,7 +119,39 @@ looks for what block reviews structurally cannot catch — cross-block drift, du
 dead scaffolding, and whether the section genuinely satisfies its spec rather than merely ticking its
 tasks. Neither ever edits code: both report, and a worker fixes.
 
+**You are the only agent that invokes agents.** The `worker`, the `reviewer`, and the `supervisor`
+never spawn each other or any other subagent — they report back to you and you route the next step.
+Every handoff in the DEVLOG (`→ @reviewer`, `❓ @architect`) is a *post*, not an invocation: the
+reviewer runs when **you** spawn it, the supervisor runs when **you** spawn it at section end. This
+keeps one thread holding the whole picture — if an agent could call the next one, the workflow's loops
+would run without you and the gates, ticks, and commits you own would be skipped. The agents have no
+Agent tool at all, so this is a fact about them rather than an instruction to them.
+
 All agents are defined for this repo. Delegate; don't shortcut by writing the implementation yourself.
+
+### Boundaries — enforced by hooks, not by trust
+
+Three things belong to you alone: **the commits, the ticked boxes, and the decision to invoke an
+agent.** Those rules are written into every agent's prompt, and they are also enforced, because a rule
+that only exists as prose is one an agent under pressure to finish a block will eventually break.
+
+- **`.claude/hooks/dmons-guard.sh`** — a `PreToolUse` hook wired into each agent's own frontmatter, so
+  it sees that agent's tool calls and never yours. It blocks git writes, edits to `tasks.md`, the
+  `Makefile`, `CLAUDE.md` and `.claude/`, and any attempt to spawn another agent — across Bash *and*
+  the `ctx_*` tools, since those run commands too. The auditors (`reviewer`, `supervisor`) are further
+  confined to writing `DEVLOG.md` and nothing else.
+- **`.claude/hooks/dmons-tripwire.sh`** — it records `HEAD` and each active change's tick count when an
+  agent spawns, re-checks both when that agent finishes, and reports any movement to you at the end of
+  your turn. Agents run in the background, so this is deliberately not tied to the moment your `Agent`
+  call returns — that moment is the launch, not the finish.
+
+**When the tripwire fires, it is telling you the block skipped a gate.** Don't accept the state and
+move on: read what landed, then `git reset --soft <the sha it names>` to put the work back in the tree
+without the agent's commit, untick anything you didn't tick, and run the block through the rest of the
+loop — reviewer, gates, your tick, your commit. Record it in the DEVLOG. The work is often fine; the
+problem is that nothing verified it, and that's exactly what the loop exists to do.
+
+Neither hook constrains you. You commit, you tick, you spawn the agents.
 
 ### 1. Select the change
 
@@ -160,17 +219,26 @@ see the section as a whole. Post it **before** any block of the section is commi
    briefed — where a brief framed something as a *property*, the evidence was excellent; where it framed
    a *deliverable*, nothing asked what would have to be false, and three tests shipped that could not
    fail. Three of that section's five findings would have been block-level catches.
-2. **Worker implements the block** and reports back, posting to the DEVLOG as it goes.
+2. **Worker implements the block** and reports back, posting to the DEVLOG as it goes. If the boundary
+   tripwire reports at the end of your turn, deal with it **before** step 3 — an unreviewed, ungated
+   commit is not a starting point for a review.
 3. **Audit.** Spawn `reviewer` on the block diff (correctness, design-decision compliance, OpenSpec
    scope, C# idiom, auth/crypto correctness and git-integrity hazards). The reviewer posts its verdict
    to the DEVLOG.
 4. **Review loop.** Worker and reviewer resolve findings **in the DEVLOG thread** — reviewer posts
    findings, worker fixes and responds, reviewer re-audits. **Repeat until the reviewer signs off.**
-5. **Gates — all must pass before ticking any box:**
-   - `dotnet build` clean (no errors)
-   - `dotnet test` green — the block's new tests **and** all existing tests
-   - `openspec validate <change-name> --strict`
-   - `dotnet format --verify-no-changes` clean
+5. **Gates — all must pass before ticking any box.** Run each and **read its exit line**; a gate
+   passed only when you saw its `LABEL_EXIT:0`:
+   - `make build` → `BUILD_EXIT:0` (no errors)
+   - `make test` → `TEST_EXIT:0` — the block's new tests **and** all existing tests
+   - `make format` → `FORMAT_EXIT:0`
+   - `make validate` → `VALIDATE_EXIT:0`
+
+   `make gates` runs the whole set in one `-k` pass and is the quickest way to get the full picture —
+   but a green `GATES_EXIT:0` is what you're after, and a red one still needs the individual exit
+   lines to say which gate failed. Never conclude a gate passed from reading its output; quote the
+   code.
+
    A block commits green. If a block must land with a failing test for a sound technical reason (e.g. a
    red test a later block in the same section turns green), that is a deliberate Architect call — state
    the reason in the DEVLOG **and** the commit body. Otherwise a failed gate sends you back to step 4,

@@ -25185,6 +25185,33 @@ run establishes the client path works, never that it is the only path that must 
 comes back clean, `ChangedOnDiskIndicator.razor` is exonerated by evidence, not by assumption, and the
 evidence gets re-examined rather than the conclusion reused.
 
+**[architect]** Workflow scaffold migrated 0.3.0 → 0.5.1, 2026-08-19 — concerns §12 and everything after
+it. Three things change for the remaining blocks:
+
+- **Gates now run through a root `Makefile`.** `make build` / `test` / `format` / `validate`, or
+  `make gates` for the set in one `-k` pass. Each target prints `LABEL_EXIT:<n>` as its last line, and
+  **that line is the evidence** — a worker reports `BUILD_EXIT:0 TEST_EXIT:0`, not "builds and tests
+  pass". This exists because a tool can exit non-zero while printing what scans as a clean run, which is
+  this repo's own sandboxed-`dotnet` hazard: killed at 5:00, still printing `0 Error(s)`. Run gates
+  unsandboxed and never pipe one through `tail` — truncating the pipe loses the exit line. Verified on
+  migration: `GATES_EXIT:0`, 881 tests.
+- **Blocks already landed have no exit codes in their DEVLOG entries.** That is a version boundary, not
+  a lapse. Do not backfill them, and the supervisor must not fire its new "no exit codes" clause
+  retroactively on §1–§11.
+- **The boundaries are now enforced, not requested.** `.claude/hooks/dmons-guard.sh` blocks agents from
+  git writes, `tasks.md`, the `Makefile`, `CLAUDE.md` and `.claude/` — the auditors can write only
+  `DEVLOG.md` — and `.claude/hooks/dmons-tripwire.sh` reports at the Architect's turn-end if `HEAD` or a
+  tick count moved while an agent ran. Agents also have no Agent tool at all now. If an agent hits a
+  block it reads `BLOCKED by the OpenSpec Apply Workflow`; that hand-back is designed behaviour.
+
+This repo never ran the 0.5.0 tripwire wiring, so there is no window here that was silently undetected —
+it went straight to the 0.5.1 `SubagentStart`/`SubagentStop`/`Stop` wiring that actually fires. Detection
+starts now and covers nothing before it; §1–§11 were built with prevention only, and their record stands
+as written.
+
+**Not retro-fitted.** Nothing above changes how §1–§11 were built or how they are recorded. Sections
+built under the old workflow have the base commits and reviews they have.
+
 ## NEXT
 
 ### ⚠️ The workflow changed on 2026-08-16 — read this before briefing anything

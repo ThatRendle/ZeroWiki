@@ -1,0 +1,173 @@
+#!/usr/bin/env bash
+# dmons-scaffold: 0.5.1
+#
+# dmons boundary tripwire — brackets every agent the Architect spawns.
+#
+#   usage: dmons-tripwire.sh start|stop|report
+#
+# Three hooks, because measuring and reporting happen in different sessions:
+#
+#   start   SubagentStart — records HEAD and each active change's tick count as an agent spawns.
+#   stop    SubagentStop  — recomputes both when that agent finishes and, if either moved, writes
+#                           a report to disk. It deliberately says nothing: a SubagentStop hook
+#                           talks to the subagent, not to you, and the subagent is not the one who
+#                           needs to hear it.
+#   report  Stop          — runs at the end of your (the Architect's) turn and hands you whatever
+#                           reports `stop` left behind.
+#
+# The pair is correlated by `agent_id`, which SubagentStart and SubagentStop both carry, so
+# concurrent agents don't collide.
+#
+# This is detection, not prevention — dmons-guard.sh does the prevention. The two are not
+# redundant: the guard can only block surfaces it knows about, and this catches the rest by
+# looking at the outcome. It is also the only check that survives a repo where frontmatter
+# hooks are skipped because the workspace was never trusted.
+#
+# Fails OPEN: a tripwire that breaks the Architect's turn would be worse than one that
+# occasionally misses. Anything it cannot compute, it stays quiet about.
+
+set -uo pipefail
+
+MODE="${1:-}"
+
+ROOT="${CLAUDE_PROJECT_DIR:-}"
+INPUT=$(cat 2>/dev/null || printf '')
+command -v jq >/dev/null 2>&1 || exit 0
+
+[ -n "$ROOT" ] || ROOT=$(printf '%s' "$INPUT" | jq -r '.cwd // empty')
+[ -n "$ROOT" ] || ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
+cd "$ROOT" 2>/dev/null || exit 0
+
+STATE_DIR=".claude/.dmons-tripwire"
+OPEN_DIR="$STATE_DIR/open"        # one snapshot per in-flight agent, keyed by agent_id
+PENDING_DIR="$STATE_DIR/pending"  # reports written but not yet handed to the Architect
+DELIVERED_DIR="$STATE_DIR/delivered"  # reports already handed over, kept as a record
+
+# Tick counts per active change, one `<count> <path>` line each. A count is more useful than a
+# checksum: when it moves, the report can name the file and the delta rather than just
+# asserting that something changed.
+tasks_state() {
+  find openspec/changes -maxdepth 2 -name tasks.md 2>/dev/null |
+    grep -v '/archive/' |
+    LC_ALL=C sort |
+    while IFS= read -r f; do
+      printf '%s %s\n' "$(grep -c '^[[:space:]]*- \[x\]' "$f" 2>/dev/null || printf '0')" "$f"
+    done
+}
+
+# Only the Apply Workflow's own agents are bracketed. An Explore or general-purpose agent the
+# Architect spawns for its own reasons is not bound by these boundaries. The settings.json
+# matcher already filters on agent type; this is the same rule restated, so the script stays
+# correct if someone merges the hook without a matcher.
+watched_agent() {
+  case "$1" in
+    worker | worker-* | reviewer | supervisor) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+case "$MODE" in
+  start)
+    AGENT=$(printf '%s' "$INPUT" | jq -r '.agent_type // empty')
+    ID=$(printf '%s' "$INPUT" | jq -r '.agent_id // empty')
+    [ -n "$AGENT" ] && [ -n "$ID" ] || exit 0
+    watched_agent "$AGENT" || exit 0
+
+    mkdir -p "$OPEN_DIR" 2>/dev/null || exit 0
+    {
+      printf 'AGENT %s\n' "$AGENT"
+      printf 'HEAD %s\n' "$(git rev-parse HEAD 2>/dev/null || printf 'none')"
+      tasks_state
+    } >"$OPEN_DIR/$ID" 2>/dev/null
+    exit 0
+    ;;
+
+  stop)
+    ID=$(printf '%s' "$INPUT" | jq -r '.agent_id // empty')
+    [ -n "$ID" ] || exit 0
+    SNAPSHOT="$OPEN_DIR/$ID"
+    [ -f "$SNAPSHOT" ] || exit 0
+
+    AGENT=$(awk '/^AGENT /{print $2; exit}' "$SNAPSHOT")
+    BEFORE_HEAD=$(awk '/^HEAD /{print $2; exit}' "$SNAPSHOT")
+    BEFORE_TASKS=$(grep -v '^AGENT \|^HEAD ' "$SNAPSHOT")
+    rm -f "$SNAPSHOT" 2>/dev/null
+
+    AFTER_HEAD=$(git rev-parse HEAD 2>/dev/null || printf 'none')
+    AFTER_TASKS=$(tasks_state)
+
+    FINDINGS=""
+
+    if [ "$BEFORE_HEAD" != "$AFTER_HEAD" ]; then
+      COMMITS=$(git log --oneline "$BEFORE_HEAD..$AFTER_HEAD" 2>/dev/null | sed 's/^/    /')
+      FINDINGS="${FINDINGS}- HEAD moved while \`${AGENT}\` was running: ${BEFORE_HEAD} -> ${AFTER_HEAD}. Commits that appeared:
+${COMMITS}
+"
+    fi
+
+    if [ "$BEFORE_TASKS" != "$AFTER_TASKS" ]; then
+      DELTA=$(printf '%s\n' "$AFTER_TASKS" | while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        path=${line#* }
+        now=${line%% *}
+        was=$(printf '%s\n' "$BEFORE_TASKS" | awk -v p="$path" '$2 == p {print $1; exit}')
+        [ -n "$was" ] || was=0
+        [ "$was" = "$now" ] || printf '    %s: %s -> %s ticked\n' "$path" "$was" "$now"
+      done)
+      FINDINGS="${FINDINGS}- Ticked boxes changed while \`${AGENT}\` was running:
+${DELTA}
+"
+    fi
+
+    [ -n "$FINDINGS" ] || exit 0
+
+    # Write it down and stop. Anything this hook prints goes to the agent that just finished,
+    # which is neither the audience nor the one who can act on it — `report` does the talking.
+    mkdir -p "$PENDING_DIR" 2>/dev/null || exit 0
+    {
+      printf 'BOUNDARY TRIPWIRE — `%s` changed state that only you (the Architect) may change.\n\n' "$AGENT"
+      printf '%s\n' "$FINDINGS"
+      printf 'Neither is the agent'"'"'s to do: you commit once per block, after the reviewer approves and every gate has printed EXIT:0, and you tick the boxes yourself once you have run them. Whatever moved here was not gated by you.\n\n'
+      printf 'Before you continue:\n'
+      printf '1. Read what actually landed (`git show`, `git diff %s..HEAD`) — the work may be fine even though the way it landed was not.\n' "$BEFORE_HEAD"
+      printf '2. Undo the agent'"'"'s bookkeeping, not its work: `git reset --soft %s` puts the changes back in the tree with the history where you left it, and untick any box you did not tick.\n' "$BEFORE_HEAD"
+      printf '3. Run the block through the rest of the loop as normal — reviewer, gates, your tick, your commit.\n'
+      printf '4. Post it to the DEVLOG. A boundary that was crossed silently is the one that gets crossed again.\n'
+    } >"$PENDING_DIR/$ID" 2>/dev/null
+    exit 0
+    ;;
+
+  report)
+    # A Stop hook in settings.json may also fire at the end of a subagent's turn. The Architect's
+    # own Stop payload carries no agent_id; a subagent's does. Only the Architect gets told.
+    [ -z "$(printf '%s' "$INPUT" | jq -r '.agent_id // empty')" ] || exit 0
+
+    # Snapshots for agents that never reported back — killed session, crashed run. Not evidence
+    # of anything, just litter; drop the ones older than a day so the directory stays bounded.
+    [ -d "$OPEN_DIR" ] && find "$OPEN_DIR" -type f -mtime +1 -delete 2>/dev/null
+
+    [ -d "$PENDING_DIR" ] || exit 0
+    REPORTS=$(find "$PENDING_DIR" -type f 2>/dev/null | LC_ALL=C sort)
+    [ -n "$REPORTS" ] || exit 0
+
+    REASON=$(printf '%s\n' "$REPORTS" | while IFS= read -r f; do
+      [ -n "$f" ] || continue
+      cat "$f"
+      printf '\n'
+    done)
+    [ -n "$REASON" ] || exit 0
+
+    # Move rather than delete: handing a report over clears it (so this can't block the same turn
+    # twice), but the text stays on disk as a record of a boundary that was crossed.
+    mkdir -p "$DELIVERED_DIR" 2>/dev/null
+    printf '%s\n' "$REPORTS" | while IFS= read -r f; do
+      [ -n "$f" ] || continue
+      mv "$f" "$DELIVERED_DIR/" 2>/dev/null || rm -f "$f" 2>/dev/null
+    done
+
+    jq -n --arg r "$REASON" '{decision: "block", reason: $r}'
+    exit 0
+    ;;
+
+  *) exit 0 ;;
+esac
