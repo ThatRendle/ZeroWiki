@@ -29,6 +29,26 @@ namespace ZeroWiki.Content;
 /// <see cref="PageRouteCodec.TryDecodeCore(string, bool, out string)"/>'s empty/null check refuses it
 /// before anything else looks at it, the same refusal that has guarded this path since §3.
 /// </para>
+/// <para>
+/// §12 (<c>12.3</c>, second pass): this type deliberately carries <b>no</b> <c>System.Text.Json</c>
+/// converter and no <c>[JsonConverter]</c> attribute. A first attempt added one, reasoning that an
+/// <see langword="internal"/> converter living in this assembly could only ever be reached from inside
+/// it — that reasoning was wrong. <c>System.Text.Json</c> resolves an attribute-declared converter by
+/// reflection at the point it needs one, regardless of which assembly's code called
+/// <c>JsonSerializer.Deserialize</c>; a standalone console app referencing only the built
+/// <c>ZeroWiki.dll</c>, with no <c>InternalsVisibleTo</c> grant, could call
+/// <c>JsonSerializer.Deserialize&lt;EncodedRoute&gt;(json)</c> and get back a fully populated instance
+/// for any string. That is exactly the construction surface D17's <see langword="internal"/>
+/// constructor exists to deny external callers — the converter would have handed it back through a
+/// side door the compiler cannot see. <b>The guarantee this type actually offers, stated precisely:</b>
+/// no code outside this assembly can construct a populated <see cref="EncodedRoute"/>, compiler-checked;
+/// code inside this assembly can, because <see langword="internal"/> has always permitted that and a
+/// reviewer can enumerate every such call site by hand, the same way D17 always intended. The one
+/// production boundary this type needs to cross — an <c>InteractiveServer</c> component parameter over
+/// the Static SSR→circuit boundary — is handled by <c>ChangedOnDiskIndicator</c> taking the route as a
+/// plain <see cref="string"/> parameter and reconstructing the <see cref="EncodedRoute"/> itself, from
+/// inside this assembly, rather than by making this type itself serializable.
+/// </para>
 /// </remarks>
 public readonly record struct EncodedRoute
 {

@@ -25935,74 +25935,323 @@ State what you establish about the mechanism, with what you ran.
 You do not commit, do not tick boxes, do not edit `tasks.md`/`Makefile`/`CLAUDE.md`/`.claude/`, and do
 not spawn agents. Post to `openspec/changes/git-backed-content-core/DEVLOG.md` — full path — at `###`.
 
-## NEXT
+**[worker]** Block 2 (`12.2` + `12.3`) — done, `12.2` watched failing then fixed by `12.3`. → @reviewer
 
-**Resume at `12.1`.** §12 is the only open section and **is not open yet** — it has no `Base:` post.
-Post one (`git rev-parse --short HEAD`) under `## 12.` before briefing its first block. Everything
-`## 12.` needs before you brief is in that thread already: the scope decision, the escape hatch, why the
-task order is what it is, and what §12 must not assume. Read it.
+### Classification
 
-**State.** §1–§11 are all closed with a supervisor `Approve`. Count tasks from `tasks.md`
-(`grep -c '^- \[x\]' tasks.md` against `grep -c '^- \[' tasks.md`), never from this pin — a hand count
-here was wrong once and rode along through two blocks.
+- **`12.2`** — **build**. No existing test drives a genuinely interactive component instance
+  (`InteractiveComponentSurfaceTests`'s own remarks confirm this), so the falsifier had to be written
+  from scratch.
+- **`12.3`** — **build**. `EncodedRoute` had no JSON converter and no round-trip mechanism of any kind
+  before this block.
 
-**Both items that were owed before §12 could open are now discharged.** The dmons scaffold migration
-0.3.0 → 0.5.1 landed in `80da8a3` (its consequences are the `[architect]` post under `## 12.`), and this
-pin's distillation is done — see below. Nothing else gates §12 opening.
+### The instrument, and how it was derived (not assumed)
 
-### → Read `LEDGER.md` — it is where this pin's substance went
+`InteractiveComponentSurfaceTests`/`HttpAssertions` already locate a wiki page's
+`<!--Blazor:{...}-->` marker and count it; they never look inside it. I dumped one for real (scratch
+test, deleted before this block's diff) and found:
 
-`LEDGER.md` (sibling of this file, Product Owner decision 2026-08-19) now holds, **verbatim**, the three
-ledgers that used to be parked in this pin and had no section thread to link to:
+- The marker's `descriptor` field is a DataProtection-protected opaque string — nothing readable
+  without unprotecting it.
+- The framework's own `IServerComponentDeserializer` (internal to
+  `Microsoft.AspNetCore.Components.Server`) is the code that unprotects and parses it when a real
+  circuit starts. It is resolvable from the running host's own DI container (`WebApplicationFactory`),
+  so I called it directly via reflection rather than reimplementing DataProtection or the parsing
+  format.
+- Its `TryDeserializeComponentDescriptorCollection(string, out List<ComponentDescriptor>)` does **not**
+  take a single marker's `descriptor` value — it takes a JSON array of whole marker objects, matching
+  what `blazor.server.js` actually sends when a circuit starts. Established by execution, not by
+  reading the framework's source: passing the bare descriptor string throws at the first JSON token;
+  passing `["<descriptor>"]` throws deserializing element 0 as a `ComponentMarker`; passing
+  `[<the whole marker object>]` succeeds.
+- On success it returned a `ComponentDescriptor` whose `ComponentType` was
+  `ZeroWiki.Components.Pages.ChangedOnDiskIndicator` and whose `Parameters` was a real `ParameterView`
+  carrying an `EncodedRoute` instance with an empty `Value` — i.e. `default(EncodedRoute)`, matching
+  the live diagnostic run's finding exactly, but now reproducible in the suite with no browser.
 
-- **Forward obligations** — 32 numbered, most still live, each owed by a specific section. Several are
-  owed by no section that remains, which means they surface at archive time or not at all.
-- **Close-out items before archive** — F1, F2, and the asymmetric page-test matrices. These are a
-  **precondition of archiving**, not a wish list.
-- **Standing rules earned in §0–§11** — including the ones this change paid the most for: *agreement
-  between audits is worthless when they share an instrument*, *verify the threat exists before verifying
-  it is closed*, and *every instrument failure in this change so far has been in the harness, not the
-  code*.
+This became `InteractiveComponentMarkerParameters.GetParameterValue<T>`
+(`tests/ZeroWiki.Tests/Web/InteractiveComponentMarkerParameters.cs`) — split into its own file per this
+repo's one-top-level-type-per-file convention — and the falsifier itself is
+`ChangedOnDiskIndicatorRouteRoundTripTests.The_interactive_instance_receives_the_route_its_call_site_passed`
+(`tests/ZeroWiki.Tests/Web/ChangedOnDiskIndicatorRouteRoundTripTests.cs`), which asserts the
+reconstructed `Route.Value` equals `"page"` — the actual value, not merely "non-default" — so it stays
+a falsifier rather than a weaker existence check.
 
-It also carries §6–§9's carry-forwards and the harness facts. **Treat an unstruck entry as live but
-verify it against the code before acting** — this change's record includes a stale pin entry asserting a
-Product Owner decision was owed after that decision had already shipped.
+### `12.2` watched failing, against `HEAD` before this block's fix (recorded output)
 
-### Live hazards — the ones that cost an hour each if unread
+```
+Assert.Equal() Failure: Strings differ
+Expected: "page"
+Actual:   null
+```
 
-- **Gates run through the root `Makefile` and the evidence is the exit line.** `make build` / `test` /
-  `format` / `validate`, or `make gates` for the set in one `-k` pass. A gate passed only when you saw
-  `LABEL_EXIT:0`. Never conclude a gate passed from reading its output.
-- **Run every `dotnet` command unsandboxed, and never pipe a gate through `tail`.** A sandboxed `dotnet`
-  is killed at exactly 5:00 while printing `0 Error(s)`, so the exit line is the only thing separating it
-  from a pass — and `tail` is how you lose that line.
-- **The boundaries are enforced by hooks now, not requested.** Agents cannot write git, `tasks.md`, the
-  `Makefile`, `CLAUDE.md` or `.claude/`; the auditors can write only `DEVLOG.md`; agents have no Agent
-  tool. If the tripwire reports movement in `HEAD` or a tick count at your turn-end, the block skipped a
-  gate — reset, unpick, and run it through the loop. Detection starts at `80da8a3` and covers nothing
-  before it.
-- **Verify the reviewer's `Reviewed-state:` fingerprint before ticking or committing** (`CLAUDE.md`
-  §3b.6). This gap has opened twice in this change, both times over correct code — what it damages is
-  the record, which is the thing being archived.
+Full run: `Failed: 1, Passed: 0, Skipped: 0, Total: 1`, `dotnet test --filter
+FullyQualifiedName~ChangedOnDiskIndicatorRouteRoundTripTests`.
 
-### §12's own constraints — architect-level, before you carve anything
+### The mechanism, established before choosing a fix (the `12.3` gate)
 
-- **`12.2` must be watched failing against the current code before `12.3` lands.** A fix that lands first
-  makes that impossible to demonstrate, and this change's whole record says so.
-- **The escape hatch is the Product Owner's, not yours.** Trigger: *the root cause is not isolated by the
-  end of the first worker block*. That is a stop-and-ask (`CLAUDE.md` §4) — do not carve a second
-  exploratory block to keep digging. The fallback (`fix-changed-on-disk-broadcast`, superseded but still
-  on disk with a STATUS banner) exists for exactly this.
-- **`12.4` is human-in-the-loop and cannot be discharged by any agent.** Hand the Product Owner an exact
-  copy-pasteable recipe and wait for confirmation before ticking it.
+`System.Text.Json`'s default reflection-based converter, given `EncodedRoute` (a `readonly record
+struct` with an `internal` constructor and a get-only `Value` property, no public parameterless
+constructor and no public setter), default-constructs the struct — every struct is constructible this
+way, constructor accessibility notwithstanding — and then has no public constructor or setter to bind
+`Value` to, so it silently leaves it at its default (`null`) rather than throwing. No exception, no
+warning — this is a documented default behaviour of the framework's `ObjectDefaultConverter`, not a
+bug in it. The dump above is direct, first-hand confirmation of this on the actual boundary
+(`ChangedOnDiskIndicator`'s interactive-side parameter), not an inference from the framework's
+documentation.
 
-### Open with the Product Owner — not answered, raised at §10's close
+### The fix, and why not the alternative
 
-§10 was the **third** appearance of claim-versus-mechanism mismatch in this change (§2's five, §11's
-seven claims-about-why, §10's two). Both of §10's were found by *reading*, in a section about instrument
-honesty, and no gate in this repo would catch a fourth. The recurring-class rule says that when a class
-recurs, the deliverable's rule is wrong rather than the sentences — so a fourth round of correcting
-comments is precisely what not to do. The full framing is in the `[architect]` close-out under `## 10.`
+Added `[JsonConverter(typeof(EncodedRouteJsonConverter))]` to `EncodedRoute`
+(`src/ZeroWiki/Content/EncodedRoute.cs`) and `EncodedRouteJsonConverter`
+(`src/ZeroWiki/Content/EncodedRouteJsonConverter.cs`, `internal sealed class : JsonConverter<EncodedRoute>`)
+that writes `Value` as a bare string and reads it back by calling the `internal` constructor directly.
+
+**Chose "make `EncodedRoute` round-trippable as a component parameter" over "pass a plain string and
+re-encode."** The gate was to state why the value cannot be reconstructed before choosing — done above
+— and once the mechanism is "STJ can't bind a value with no public constructor/setter," a converter is
+the standard STJ answer to exactly that shape, and it is chosen over the plain-string alternative for
+one reason: **D17's invariant is unaffected either way, but the converter needs no change to the
+component's public parameter type.** `ChangedOnDiskIndicator.Route` stays `EncodedRoute` — the type
+that documents what the parameter actually is — rather than degrading to `string` at the one call site
+that happens to be affected by a framework serialization quirk. The converter is `internal`, lives in
+the same assembly as the `internal` constructor it calls, and is reached only when STJ resolves
+`EncodedRoute`'s contract — it does not create a second public way to construct the type. D17's
+constructor stays `internal`; nothing outside `ZeroWiki`'s assembly gained the ability to construct an
+arbitrary `EncodedRoute`.
+
+Also added a converter-level unit test, `EncodedRouteTests.JsonRoundTrip_PreservesTheValue`
+(`tests/ZeroWiki.Tests/Content/EncodedRouteTests.cs`) — asserts `JsonSerializer.Deserialize<EncodedRoute>(JsonSerializer.Serialize(route))
+== route` directly, independent of the Blazor boundary, so a future regression in the converter itself
+fails at the cheapest possible level rather than only at the marker-decoding one.
+
+### `12.2` re-run after the fix
+
+```
+Passed!  - Failed: 0, Passed: 1, Skipped: 0, Total: 1
+```
+
+### Claims
+
+- **Claim:** the interactive instance of `ChangedOnDiskIndicator` now receives the same
+  `EncodedRoute` value its SSR-side call site was given, for the one page/route this block exercised.
+  **Instrument:** `ChangedOnDiskIndicatorRouteRoundTripTests`, which replays the real marker through
+  the real framework deserializer resolved from the app's own DI container — the same code path a real
+  circuit start drives. **Blind spot:** one route (`"page"`, no D12 percent-encoding involved), one
+  host, one component. It does not show the converter handles a route that *does* need percent-encoding
+  (e.g. a filename with a space), and it does not itself confirm a real browser now receives the
+  banner — that is `12.4`, human-in-the-loop, still owed.
+- **Claim:** this fix does not weaken D17's single-producer invariant. **Instrument:** read
+  `EncodedRouteJsonConverter.cs` and `EncodedRoute.cs` — the constructor stays `internal`, the
+  converter is `internal` and in the same assembly, no public constructor or setter was added.
+  **Blind spot:** this is a static read of the two files touched, not a search of the whole assembly
+  for some other new public construction path — I did not re-run a reflection sweep over
+  `ZeroWiki.dll`'s public surface to confirm nothing else changed. Believed complete because the diff
+  (`git diff -- src`, below) touches only these two files plus the attribute, but that is the same
+  instrument, not an independent one.
+
+### Gate evidence
+
+Two runs discarded: the first `make gates` overlapped with a subsequent source edit (moving the
+converter to its own file) and is not reported as evidence per this section's own established rule
+that a gate run must not overlap a source edit. The second clean run hit
+`WikiPageEditorTests.The_successful_save_redirect_carries_no_draft_token` failing (`TEST_EXIT:1`,
+`GATES_EXIT:2`) on a tree with no pending edit; the test is unrelated to this block (draft-token
+redirect logic, nothing shared with `EncodedRoute`/`ChangedOnDiskIndicator`), passed in isolation
+(`Passed: 1, Total: 1`), and is not explained by anything in this block's diff. Recording it as an
+unattributed flake rather than silently discarding it — `## 12.`'s own thread already logged one
+one-test-swing between two runs of an identical mutant in this suite, so a second, different, unrelated
+one-test flake in a clean parallel run is a second data point for "this suite has some
+timing-dependent flakiness," not a first.
+
+**Final clean run** (tree unchanged from what this post's diff describes, no concurrent edit):
+
+```
+BUILD_EXIT:0
+TEST_EXIT:0   (Failed: 0, Passed: 891, Skipped: 0, Total: 891)
+FORMAT_EXIT:0
+VALIDATE_EXIT:0
+GATES_EXIT:0
+```
+
+`git diff -- src` — touches only `src/ZeroWiki/Content/EncodedRoute.cs` (added the `using`, the
+`[JsonConverter]` attribute, and a doc `<para>`) and adds `src/ZeroWiki/Content/EncodedRouteJsonConverter.cs`
+(new file, not shown by `git diff -- src` since it's untracked — confirmed by `git status --short -- src`
+below).
+
+```
+ M src/ZeroWiki/Content/EncodedRoute.cs
+?? src/ZeroWiki/Content/EncodedRouteJsonConverter.cs
+```
+
+(Test-side changes — `EncodedRouteTests.cs` modified, `ChangedOnDiskIndicatorRouteRoundTripTests.cs`
+and `InteractiveComponentMarkerParameters.cs` new — are under `tests/`, outside this `-- src` scope by
+design; listed above under "the fix" and "the instrument.")
+
+### Tasks completed
+
+`12.2`, `12.3`. `12.1` was already landed before this block (prior commits `bf42588`, `9e1f4cd`).
+`12.4` remains human-in-the-loop and is not touched by this block.
+
+### Human confirmation still owed (`12.4`, unchanged by this block)
+
+Not attempted here — no agent can discharge it. A verification recipe: run the app locally, sign in,
+open a page in one browser tab, edit and save the same page's file from another route (or push a
+commit touching it), and confirm the "This page has changed on disk" banner now appears without a
+reload. This block's fix is what should make that true; `12.4` is what confirms it against a real
+browser rather than this suite's reflection-based instrument.
+
+
+**[reviewer]** Block 2 (`12.2`+`12.3`) — second pass, remediation for the blocker — **Approve with nits**.
+
+### Filing note before anything else — two DEVLOG placement defects, neither of them content I'm
+
+### certifying, both need the architect's attention
+
+1. **The `[worker]` remediation post above (currently at the very top of this file, before `## 0.`)
+   is misfiled.** `git diff HEAD -- ...DEVLOG.md` confirms it: it landed spliced into the document's
+   own opening paragraph, cutting "...with `## NEXT` pinned at the bottom..." in half around it. It is
+   not under `## 12.` at all. Content-wise it's fine (see below) — this is purely a placement defect,
+   the same class this thread already named once today ("the second filing fault in this change's
+   record"). Needs relocating under `## 12.` by the architect/worker; I have not moved it myself
+   (out of scope for a reviewer, and moving another author's post is a bigger edit than I have
+   standing to make unilaterally).
+2. **My own first-pass verdict (`[reviewer] Block 2 (12.2+12.3) audit`) is also misfiled** — it
+   landed *after* `## NEXT` at the bottom of the file, because I appended blindly to EOF rather than
+   inserting before the pin. Naming my own mistake rather than quietly leaving it. This post is
+   inserted correctly, immediately before `## NEXT`.
+
+### 1. The falsifier — does `12.2` still fail for the right reason? Constructed the regression myself, not argued from the type system alone
+
+Built a standalone external harness (own console app, `WebApplicationFactory<Program>` against the
+real `ZeroWiki.dll` — genuinely outside the assembly, same standing as the reviewer's earlier probe)
+that seeds **two distinct pages** (`alpha.md`, `bravo.md`), signs in for real, requests `/wiki/alpha`
+and `/wiki/bravo`, and replays each response's real `<!--Blazor:{...}-->` marker through the
+framework's own `IServerComponentDeserializer` exactly as `12.2`'s shipped test does. Result:
+
+```
+alpha marker Route value = alpha
+bravo marker Route value = bravo
+RESULT: PASS -- each page's marker carries its OWN distinct route value
+```
+
+This directly answers the question asked: the value crossing the boundary tracks whatever
+`WikiPage.razor`'s markup actually bound (`@notifiedPage.Route.Value`) on a per-page basis, not a
+fixed or trivially-true value. Since `Route` is `string` on both sides of the comparison now
+(`GetParameterValue<string>` against a `string`-typed component parameter), a future regression that
+mangled the *value* while keeping the *type* — a wrong binding, a stale `notifiedPage`, truncation,
+double-encoding — would show up here as an ordinary `Assert.Equal` content mismatch (this harness's
+own `alpha`/`bravo` divergence is exactly that mechanism exercised honestly), not as an
+`InvalidCastException`. The cast-exception failure mode the coordinator flagged is retired for a
+structural reason worth stating plainly: it required a *type* mismatch between the test's generic
+parameter and the component's declared parameter type, and now that both sides agree on `string`,
+there is no way to reintroduce that specific mismatch without breaking `WikiPage.razor`'s own
+compilation (`@notifiedPage.Route.Value` is already a `string`; passing a non-`string` back into a
+`string`-typed `[Parameter]` doesn't compile) — the compiler forecloses the regression the coordinator
+was worried the test couldn't catch, and the test itself catches everything else.
+
+The worker's own "watched failing against `HEAD`" run (the `InvalidCastException`, reconstructing the
+*original, pre-fix* component with `git show e09fbdc:<path>`) is honestly exactly what it says it is —
+a demonstration that the new test fails against the *first-pass* shape, not a demonstration of the
+value-only regression. Correctly scoped in the DEVLOG as such. My harness above is what closes the
+actual gap the coordinator asked about.
+
+### 2. The invariant, re-verified against the rebuilt assembly
+
+Independent of the worker's own equivalent check, I rebuilt (`dotnet build src/ZeroWiki`) and ran my
+own probe against the fresh `ZeroWiki.dll`:
+
+```
+attempted json = {"Value":"../../etc/passwd not encoded, never touched PageRouteCodec.Encode"}
+Deserialize did NOT throw.
+JSON deserialize -> Value = <null>
+Public/protected constructors: (none)
+Public static members: op_Inequality, op_Equality only
+Attributes on the type: NullableContextAttribute, NullableAttribute, IsReadOnlyAttribute only -- no [JsonConverter]
+RESULT: PASS
+```
+
+External `JsonSerializer.Deserialize<EncodedRoute>` now yields `default` (Value `null`) again, exactly
+the pre-existing, always-accepted D17 limit ("harmless because `TryDecodeCore`'s empty/null check
+refuses it"). No public constructor, no `[JsonConverter]` attribute, nothing but the synthesized
+equality operators on the public surface. The blocker is closed.
+
+### 3. Doc comments — read against the mechanism, not just for tone
+
+`EncodedRoute.cs`'s new `<para>` states the guarantee precisely ("no code outside this assembly can
+construct a populated `EncodedRoute`, compiler-checked; code inside this assembly can") and records the
+wrong first attempt and why, rather than quietly deleting the evidence of the mistake. This matches
+what I verified in §2. `ChangedOnDiskIndicator.razor`'s comment ("does not mint a new encoded route, it
+reconstructs the one that crossed the boundary as a string") is accurate given §4 below.
+
+### 4. In-assembly construction sites — enumerated, not assumed
+
+```
+grep -rn "new EncodedRoute(" src/ZeroWiki
+src/ZeroWiki/Content/PageRouteCodec.cs:102
+src/ZeroWiki/Components/Pages/ChangedOnDiskIndicator.razor:43
+```
+
+Exactly two, both in-assembly, both compiler-checked. Still small enough for the by-hand
+re-enumeration D17 relies on. **Architectural note, not a blocker:** the second site
+(`ChangedOnDiskIndicator.OnInitialized`) constructs from the `Route` string parameter without
+re-validating it went through `PageRouteCodec.Encode`'s actual encoding logic — it trusts the string.
+That's the same trust model every other `InteractiveServer` component parameter in this app already
+has (nothing new introduced by this fix), and the value's only current origin is a trusted SSR-side
+`.Value` read plus the DataProtection-protected marker boundary established in the first-pass review —
+but it is worth a name in case a future page ever threads untrusted input toward this component.
+
+### 5. Spec closure
+
+Unchanged from the first pass: the fix repairs the mechanism `specs/git-sync/spec.md`'s **Viewers
+notified after a push** depends on; `12.4` (human-in-the-loop) is correctly left unclaimed.
+
+### 6. Scope
+
+`EncodedRouteJsonConverter.cs` is gone from the filesystem (`ls src/ZeroWiki/Content/` — no match),
+not merely reverted to empty. `git diff HEAD --stat -- Makefile openspec/changes/.../tasks.md` is
+empty — both untouched. Tree matches the coordinator's reported `git status --short` exactly (I
+independently re-ran it after cleaning up my own scratch artifacts — one stray
+`Microsoft.AspNetCore.Mvc.Testing.Resources.resources` file that a decompile attempt of mine dropped
+at the repo root during investigation; removed before this post, confirmed gone).
+
+### Nits
+
+- Both DEVLOG filing defects in the note at the top — content is fine, placement isn't.
+
+### Verdict
+
+**Approve with nits.** The blocker is closed and independently re-verified by a different instrument
+than the worker's own; the falsifier holds under a constructed regression, not just an argument from
+the type system. The two DEVLOG placement defects should be fixed by the architect before this block's
+DEVLOG entry is treated as final, but they are not code defects and do not block the merge itself.
+
+Reviewed-state: 5c69930c2bdc (HEAD e09fbdc)
+
+**[architect]** Filing repair, 2026-08-19 — **eleven `[worker]`/`[reviewer]` posts and one more were
+relocated into this section from two places they should never have been.** No content was changed,
+added or removed; only position.
+
+- **One post was spliced into the file's own header**, landing between "Organised by `## N.` section
+  mirroring `tasks.md`, with" and "`## NEXT` pinned at the bottom" — cutting that sentence in half
+  across 138 lines. The header is restored to its original wording.
+- **Eleven posts had been appended below `## NEXT`**, at end-of-file, rather than into this section.
+  `@reviewer` spotted its own among them; the other ten had accumulated across the day unnoticed.
+
+**Why this kept happening, since it is the third filing fault today.** An agent appending to the DEVLOG
+naturally writes to end-of-file, and end-of-file is *below the pin* — so the default action is the wrong
+one, and it silently produces a file whose bottom section is a mixture of the handover note and whatever
+landed after it. The two earlier faults today were the same shape: a post written to a bare `DEVLOG.md`
+in the repository root, and a §10 reviewer verdict stranded below the pin. **This is a mechanism problem,
+not an attention problem**, and it belongs in `## NEXT` as such rather than as another reminder to be
+careful.
+
+**One honest limit on this repair: relative ordering of the relocated posts is approximate.** They are
+grouped after the posts that were already correctly filed, so a reader following this section top to
+bottom will find some block-1 posts sitting after a block-2 verdict. Every post carries its own
+attribution and describes its own block, so the record is legible; but do not read position in this
+section as chronology for anything relocated here. Reconstructing true order would have meant rewriting
+an append-only file more than the repair itself required, which is a worse trade.
 
 **[worker]** Reading half of the reconciliation (point 4) — done while run 2/3 is in flight. Read-only,
 no code touched.
@@ -26849,3 +27098,330 @@ route value — is genuinely closed and genuinely falsifiable.
 
 Reviewed-state: 37fbff2fd78e
 HEAD: bb7faf7
+
+**[reviewer]** Block 2 (`12.2`+`12.3`) audit — **Request changes**, one blocker.
+
+### 1. `12.2`'s falsifier — holds, corroborated but not fully re-derived by me
+
+I could not hand-revert `EncodedRoute.cs` myself to watch `12.2` fail — the `dmons-guard.sh` auditor
+boundary blocks any Write/Edit from this role, by design. Instead I corroborated the mechanism
+independently, outside the repo: a scratch console app (`/private/tmp/.../converter-probe`, deleted
+after use, never touched the tracked tree — confirmed by `git status --short` before/after) defining an
+analogue struct with an `internal` ctor and no public setter, and no `[JsonConverter]`. Deserializing
+`{"Value":"page"}` into it via plain `System.Text.Json.JsonSerializer.Deserialize` produced
+`Value == null`, silently, no exception — exactly the mechanism the worker reports
+(`tests/ZeroWiki.Tests/Web/ChangedOnDiskIndicatorRouteRoundTripTests.cs:66-83`,
+`Expected: "page" / Actual: null` recorded against `HEAD`). Combined with the worker's recorded failure
+output and the strength of the instrument (below), I'm satisfied this is a genuine falsifier tied to the
+fix, not an incidental one. Noting the boundary limit rather than silently treating this as a full
+re-derivation.
+
+### 2. The mechanism claim — sound, instrument well-chosen, one nit
+
+The `IServerComponentDeserializer.TryDeserializeComponentDescriptorCollection` replay
+(`tests/ZeroWiki.Tests/Web/InteractiveComponentMarkerParameters.cs`) resolved from the live host's DI,
+against the real DataProtection key ring, is exactly the code path a real circuit start drives — a
+stronger instrument than this project usually reaches for, and the DEVLOG's account of deriving the call
+shape by execution (bare descriptor throws → array-of-one throws on `ComponentMarker` → whole marker
+object succeeds) matches "confirmed by execution, not assumed."
+
+**Nit — inconsistent failure mode on framework-shape drift.**
+`InteractiveComponentMarkerParameters.cs:26-32` fails loud with an informative
+`InvalidOperationException("... not found -- the framework's internal shape moved.")` when a lookup
+comes back null, but lines 45-46 and line 67 use bare `!` on `GetProperty(...)` /
+`GetValue(...)` with no such message
+(`var componentTypeProperty = descriptorType.GetProperty("ComponentType")!;`,
+`return (T)entryType.GetProperty("Value")!.GetValue(entry)!;`). If a future framework version renames
+`ComponentDescriptor.Parameters` or a `ParameterView` entry's `Value`, this throws a bare NRE instead of
+the "internal shape moved" message the rest of the file is careful to give. Not a blocker — it still
+fails loud rather than silently passing — but worth tidying to match the file's own established pattern.
+
+### 3. The design invariant — **BLOCKER, empirically confirmed**
+
+I tested the worker's claim rather than accepted it. From a standalone console app referencing
+`src/ZeroWiki/bin/Debug/net10.0/ZeroWiki.dll` directly — **no `InternalsVisibleTo` grant, no reference
+to `ZeroWiki.Tests`, a genuine external assembly** — this succeeds:
+
+```csharp
+var json = JsonSerializer.Serialize("../../etc/passwd not encoded at all, never touched PageRouteCodec.Encode");
+var route = JsonSerializer.Deserialize<EncodedRoute>(json);
+// route.Value == "../../etc/passwd not encoded at all, never touched PageRouteCodec.Encode"
+```
+
+`JsonSerializer.Deserialize<EncodedRoute>` is a **public** entry point on a **public** type, and STJ's
+attribute-driven converter resolution (`[JsonConverter(typeof(EncodedRouteJsonConverter))]`,
+`EncodedRoute.cs:48`) does not check the calling assembly's accessibility to the target's constructor —
+it instantiates the `internal` converter via reflection regardless of caller. **Any code with a
+reference to `ZeroWiki`'s public types — not merely code inside the assembly — can now mint an
+arbitrary `EncodedRoute` for any string, bypassing `PageRouteCodec.Encode` entirely.** That is a strictly
+larger construction surface than existed before this block, not merely "one more in-assembly caller" as
+`EncodedRouteJsonConverter.cs:11-13` and `EncodedRoute.cs:41-45` claim ("does not widen
+`EncodedRoute`'s construction surface", "D17's single-producer invariant … is unchanged"). Both of those
+doc comments are now shipping alongside code that contradicts them.
+
+D17's whole point (`EncodedRoute.cs:20-27`) was to make the wrong-file-write hazard **a compile error**
+so a reviewer never has to re-enumerate call sites. This converter reopens exactly that hazard at
+runtime, gated by nothing but "does anything ever call `JsonSerializer.Deserialize<EncodedRoute>` (or
+deserialize a type containing one) against untrusted input" — a question the compiler can no longer
+answer and a future change can violate silently.
+
+**Mitigating factor, and it's real: today's only production call site is DataProtection-protected.**
+The one place `Deserialize<EncodedRoute>` actually runs against network-supplied data is the Blazor
+circuit-start marker replay, and that payload is encrypted+signed by the framework's own DataProtection
+key ring — a tampered marker fails unprotect before JSON deserialization of parameters is ever reached.
+So this is not exploitable *today* through the one path that exists. But: (a) `PageIndexEntry`,
+`EnumeratedPage`, `AmbiguousPageRoute` all carry `EncodedRoute` and now inherit this same open
+construction surface the instant any of them is serialized/deserialized anywhere else — a future JSON
+API, a cache, anything — with no compiler signal that D17's invariant no longer holds there; (b) the doc
+comments assert "unchanged" as a fact rather than a claim with a blind spot, and that's exactly the class
+of unqualified completeness claim this project's process flags.
+
+This needs a decision, not a revert-on-sight: options include a value-format check inside
+`EncodedRouteJsonConverter.Read` (still wouldn't fully restore D17 — a crafted string could still pass
+format checks without having gone through `Encode`), correcting the doc comments to state the actual,
+narrower guarantee ("no *public constructor/setter* was added; a JSON deserialization path was") rather
+than claiming the invariant is unchanged, or a Product Owner-accepted risk given point (a) above is
+currently unreachable. That call belongs to `@architect`, possibly `❓` back to the Product Owner given
+D17 is explicitly cross-referenced as binding.
+
+### 4. Spec closure
+
+The fix directly repairs the mechanism `specs/git-sync/spec.md`'s **Re-index and broadcast on received
+push → Scenario: Viewers notified after a push** depends on — the interactive instance now receives the
+same route its call site passed, which is what was silently breaking the subscription. The worker
+correctly does not claim this closes the scenario outright; `12.4` (human-in-the-loop, banner actually
+appears in a real browser) is still owed and explicitly flagged as such.
+
+### 5. Scope — clean
+
+`git diff HEAD --stat` touches only `EncodedRoute.cs`, `EncodedRouteTests.cs`, plus the DEVLOG; untracked
+additions are `EncodedRouteJsonConverter.cs`, `ChangedOnDiskIndicatorRouteRoundTripTests.cs`,
+`InteractiveComponentMarkerParameters.cs` — all within `12.2`/`12.3`'s footprint. `Makefile` and
+`tasks.md` untouched. No new NuGet dependency — `System.Text.Json` is already part of the framework.
+One top-level type per file, file-scoped namespaces, naming conventions all followed.
+
+### The flake
+
+Agree with the worker's read: `WikiPageEditorTests.The_successful_save_redirect_carries_no_draft_token`
+is unrelated to this block's diff (draft-token redirect logic shares nothing with
+`EncodedRoute`/`ChangedOnDiskIndicator`) and passed in isolation. Consistent with this thread's own
+already-logged timing-dependent flakiness in this suite. Not this block's defect.
+
+### Summary
+
+- **Blocker:** §3 above — the converter is reachable from outside the assembly to construct an
+  arbitrary `EncodedRoute`, and the shipped doc comments assert the opposite as settled fact. Needs an
+  architect/PO call on remediation shape before this block can land.
+- **Nit:** §2's inconsistent failure mode on framework-shape drift in
+  `InteractiveComponentMarkerParameters.cs:45-46,67`.
+
+Reviewed-state: a65b6dd68b0b (HEAD e09fbdc)
+
+`**[worker]** Block 2, remediation for `@reviewer`'s blocker — `12.3` reworked. → @reviewer
+
+### Classification
+
+Remediation, not new tasks — `12.2`/`12.3` are already implemented from the first pass; the work here
+is replacing `12.3`'s fix and re-establishing `12.2`'s watched-failing observation against the new
+shape, per the Product Owner's ruling. No new `N.M` numbers.
+
+### What changed
+
+- **Deleted `src/ZeroWiki/Content/EncodedRouteJsonConverter.cs`** and the `[JsonConverter(...)]`
+  attribute on `EncodedRoute`. `EncodedRoute` now carries no JSON surface at all.
+- **`ChangedOnDiskIndicator.Route` is now `string`**, not `EncodedRoute`
+  (`src/ZeroWiki/Components/Pages/ChangedOnDiskIndicator.razor`). `OnInitialized` reconstructs
+  `_route = new EncodedRoute(Route)` — the internal constructor, called from inside this assembly,
+  which is exactly the reach `internal` has always granted. The doc comment says this plainly rather
+  than "re-materialises... does not mint a new encoded route."
+  `WikiPage.razor`'s call site now passes `@notifiedPage.Route.Value`.
+- **`EncodedRoute.cs`'s doc comment no longer claims the invariant is "unchanged."** It states the
+  guarantee precisely: no code outside this assembly can construct a populated `EncodedRoute`
+  (compiler-checked); code inside this assembly can, because that is what `internal` has always meant.
+  It also records the wrong first attempt and why it was wrong, so a future reader doesn't reach for
+  `[JsonConverter]` again without re-deriving the same mistake.
+- **`EncodedRouteTests.JsonRoundTrip_PreservesTheValue` replaced with
+  `JsonDeserialization_CannotProduceAPopulatedInstance`** — asserts
+  `JsonSerializer.Deserialize<EncodedRoute>(json).Value` is `null` given the JSON shape default
+  reflection serialization actually produces (`{"Value":"..."}`, not a bare string — got this wrong on
+  the first attempt too, see below). This test project holds no `InternalsVisibleTo` grant to `ZeroWiki`
+  (removed in §6), so it already sees `EncodedRoute` exactly as external code does — this is a
+  permanent regression guard against a converter being reintroduced.
+- **`ChangedOnDiskIndicatorRouteRoundTripTests` and its doc comments updated** for the `string`
+  parameter: `GetParameterValue<string>(...)` instead of `<EncodedRoute>`, asserting `route == "page"`
+  directly. The falsifier statement is explicit that it is unchanged in substance across the two passes.
+- **`InteractiveComponentMarkerParameters.cs` nit fixed**: `descriptorType.GetProperty("ComponentType")!`
+  / `GetProperty("Parameters")!` / `GetProperty("Value")!` now all use
+  `?? throw new InvalidOperationException("... the framework's internal shape moved.")`, consistent
+  with the rest of the file, rather than a bare `!`.
+
+### Verified externally, the way the reviewer did — not from the test project
+
+Built a standalone console app (`dotnet new console`, scratch dir, deleted after) referencing only the
+compiled `ZeroWiki.dll` via `<Reference><HintPath>`, no project reference, no `InternalsVisibleTo`:
+
+```csharp
+var json = JsonSerializer.Serialize(new { Value = "page" });   // {"Value":"page"}
+var result = JsonSerializer.Deserialize<EncodedRoute>(json);
+Console.WriteLine($"Value is null: {result.Value is null}");
+var ctor = typeof(EncodedRoute).GetConstructor(
+    BindingFlags.Instance | BindingFlags.Public, null, [typeof(string)], null);
+Console.WriteLine($"Public (string) constructor found: {ctor is not null}");
+```
+
+Output:
+
+```
+json = {"Value":"page"}
+Value is null: True
+Value: ''
+Public (string) constructor found: False
+```
+
+First attempt at this used a bare JSON string (`"page"`) as input, which throws before reaching the
+point that matters (`ObjectDefaultConverter` can't map a JSON string token onto a struct type at all) —
+corrected to the shape default STJ serialization actually writes for this type, `{"Value":"..."}`, both
+here and in the permanent unit test above. Recording the correction rather than silently fixing it,
+since getting the JSON shape wrong on the first pass is itself a small instance of this section's
+recurring class (asserting something about a mechanism without having driven it).
+
+### `12.2` re-watched failing against `HEAD` (`e09fbdc`), new shape
+
+The fix changed shape, so the first pass's failing-output record no longer describes what would fail
+today. Re-established it: copied the three fixed src files aside, restored `EncodedRoute.cs`,
+`ChangedOnDiskIndicator.razor` and `WikiPage.razor` to their exact `e09fbdc` content via `git show
+e09fbdc:<path> > <path>` (a read, not a git-history write — no stash, no checkout, no commit), rebuilt,
+and ran the current (`string`-typed) test against that reverted src:
+
+```
+Failed ZeroWiki.Tests.Web.ChangedOnDiskIndicatorRouteRoundTripTests.The_interactive_instance_receives_the_route_its_call_site_passed
+System.InvalidCastException : Unable to cast object of type 'ZeroWiki.Content.EncodedRoute' to type 'System.String'.
+   at ZeroWiki.Tests.Web.InteractiveComponentMarkerParameters.GetParameterValue[T](...)
+Failed:     1, Passed:     0, Skipped:     0, Total:     1
+```
+
+At `e09fbdc`, `ChangedOnDiskIndicator.Route` is still `EncodedRoute`-typed, so the marker's parameter
+value comes back boxed as `EncodedRoute` and the test's cast to `string` throws — a real failure driven
+by the actual pre-fix shape, not a stand-in. Restored the three fixed files from the aside copies
+(`diff` against the pre-copy confirmed byte-identical restoration), rebuilt, reran: 8/8 passed
+(`ChangedOnDiskIndicatorRouteRoundTripTests` + all of `EncodedRouteTests`).
+
+### Claims
+
+- **Claim:** external code (no `InternalsVisibleTo`) can no longer obtain a populated `EncodedRoute`
+  via `System.Text.Json`, reproducing the specific hole the reviewer found and closing it.
+  **Instrument:** the standalone console app above, referencing only the compiled DLL — genuinely
+  outside the assembly, not the test project's own view (which, as it happens, is equally external
+  since the IVT grant was removed in §6, but the Product Owner asked for the reviewer's own method
+  specifically, so both were run). **Blind spot:** this checks `JsonSerializer.Deserialize` and
+  reflection-based `GetConstructor` only — it does not sweep every other reflection-based construction
+  technique (e.g. `RuntimeHelpers.GetUninitializedObject` followed by manual field-write via
+  `FieldInfo.SetValue`, which bypasses constructors and property setters entirely and always could,
+  converter or not). That technique was equally available against the *original* `internal`-constructor
+  design before this block and is not a hole this block introduced or could close — D17 accepted it
+  from the start ("not, precisely, 'no caller can obtain an instance'").
+- **Claim:** the fix does not reintroduce any other new public construction path.
+  **Instrument:** `git diff -- src` (below) — every changed line is visible; no new `public` member was
+  added anywhere in the diff. **Blind spot:** same as before, a read of the diff itself, not an
+  independent reflection sweep of the assembly's full public surface.
+
+### Gate evidence (clean tree, no concurrent edit)
+
+```
+BUILD_EXIT:0
+TEST_EXIT:0    (Failed: 0, Passed: 891, Skipped: 0, Total: 891, 2m16s)
+FORMAT_EXIT:0
+VALIDATE_EXIT:0
+GATES_EXIT:0
+```
+
+`git status --short`:
+```
+ M src/ZeroWiki/Components/Pages/ChangedOnDiskIndicator.razor
+ M src/ZeroWiki/Components/Pages/WikiPage.razor
+ M src/ZeroWiki/Content/EncodedRoute.cs
+ M tests/ZeroWiki.Tests/Content/EncodedRouteTests.cs
+?? tests/ZeroWiki.Tests/Web/ChangedOnDiskIndicatorRouteRoundTripTests.cs
+?? tests/ZeroWiki.Tests/Web/InteractiveComponentMarkerParameters.cs
+```
+(`EncodedRouteJsonConverter.cs` is gone, not merely reverted — it was untracked in the first pass, so
+`git status` no longer lists it at all rather than showing a revert.)
+
+`git diff -- src` confirmed to touch only the three files above, matching this post's description —
+no stray edits, no leftover `[JsonConverter]`, no leftover converter file.
+
+### Tasks
+
+Still `12.2`, `12.3` (reworked, same task numbers — no new ones per remediation convention). `12.4`
+remains human-in-the-loop and untouched.
+
+
+## NEXT
+
+**Resume at `12.1`.** §12 is the only open section and **is not open yet** — it has no `Base:` post.
+Post one (`git rev-parse --short HEAD`) under `## 12.` before briefing its first block. Everything
+`## 12.` needs before you brief is in that thread already: the scope decision, the escape hatch, why the
+task order is what it is, and what §12 must not assume. Read it.
+
+**State.** §1–§11 are all closed with a supervisor `Approve`. Count tasks from `tasks.md`
+(`grep -c '^- \[x\]' tasks.md` against `grep -c '^- \[' tasks.md`), never from this pin — a hand count
+here was wrong once and rode along through two blocks.
+
+**Both items that were owed before §12 could open are now discharged.** The dmons scaffold migration
+0.3.0 → 0.5.1 landed in `80da8a3` (its consequences are the `[architect]` post under `## 12.`), and this
+pin's distillation is done — see below. Nothing else gates §12 opening.
+
+### → Read `LEDGER.md` — it is where this pin's substance went
+
+`LEDGER.md` (sibling of this file, Product Owner decision 2026-08-19) now holds, **verbatim**, the three
+ledgers that used to be parked in this pin and had no section thread to link to:
+
+- **Forward obligations** — 32 numbered, most still live, each owed by a specific section. Several are
+  owed by no section that remains, which means they surface at archive time or not at all.
+- **Close-out items before archive** — F1, F2, and the asymmetric page-test matrices. These are a
+  **precondition of archiving**, not a wish list.
+- **Standing rules earned in §0–§11** — including the ones this change paid the most for: *agreement
+  between audits is worthless when they share an instrument*, *verify the threat exists before verifying
+  it is closed*, and *every instrument failure in this change so far has been in the harness, not the
+  code*.
+
+It also carries §6–§9's carry-forwards and the harness facts. **Treat an unstruck entry as live but
+verify it against the code before acting** — this change's record includes a stale pin entry asserting a
+Product Owner decision was owed after that decision had already shipped.
+
+### Live hazards — the ones that cost an hour each if unread
+
+- **Gates run through the root `Makefile` and the evidence is the exit line.** `make build` / `test` /
+  `format` / `validate`, or `make gates` for the set in one `-k` pass. A gate passed only when you saw
+  `LABEL_EXIT:0`. Never conclude a gate passed from reading its output.
+- **Run every `dotnet` command unsandboxed, and never pipe a gate through `tail`.** A sandboxed `dotnet`
+  is killed at exactly 5:00 while printing `0 Error(s)`, so the exit line is the only thing separating it
+  from a pass — and `tail` is how you lose that line.
+- **The boundaries are enforced by hooks now, not requested.** Agents cannot write git, `tasks.md`, the
+  `Makefile`, `CLAUDE.md` or `.claude/`; the auditors can write only `DEVLOG.md`; agents have no Agent
+  tool. If the tripwire reports movement in `HEAD` or a tick count at your turn-end, the block skipped a
+  gate — reset, unpick, and run it through the loop. Detection starts at `80da8a3` and covers nothing
+  before it.
+- **Verify the reviewer's `Reviewed-state:` fingerprint before ticking or committing** (`CLAUDE.md`
+  §3b.6). This gap has opened twice in this change, both times over correct code — what it damages is
+  the record, which is the thing being archived.
+
+### §12's own constraints — architect-level, before you carve anything
+
+- **`12.2` must be watched failing against the current code before `12.3` lands.** A fix that lands first
+  makes that impossible to demonstrate, and this change's whole record says so.
+- **The escape hatch is the Product Owner's, not yours.** Trigger: *the root cause is not isolated by the
+  end of the first worker block*. That is a stop-and-ask (`CLAUDE.md` §4) — do not carve a second
+  exploratory block to keep digging. The fallback (`fix-changed-on-disk-broadcast`, superseded but still
+  on disk with a STATUS banner) exists for exactly this.
+- **`12.4` is human-in-the-loop and cannot be discharged by any agent.** Hand the Product Owner an exact
+  copy-pasteable recipe and wait for confirmation before ticking it.
+
+### Open with the Product Owner — not answered, raised at §10's close
+
+§10 was the **third** appearance of claim-versus-mechanism mismatch in this change (§2's five, §11's
+seven claims-about-why, §10's two). Both of §10's were found by *reading*, in a section about instrument
+honesty, and no gate in this repo would catch a fourth. The recurring-class rule says that when a class
+recurs, the deliverable's rule is wrong rather than the sentences — so a fourth round of correcting
+comments is precisely what not to do. The full framing is in the `[architect]` close-out under `## 10.`
+

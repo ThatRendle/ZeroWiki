@@ -33,7 +33,7 @@ else if (_renderedBody is { } body)
            above and below renders Static SSR. Keyed by this page's own canonical route, so it only
            ever hears about a push that touched this exact page. Render mode is declared inside the
            component itself, not here (see its own remarks). *@
-        <ChangedOnDiskIndicator Route="@notifiedPage.Route" />
+        <ChangedOnDiskIndicator Route="@notifiedPage.Route.Value" />
     }
 
     @if (_page?.LastEdit is { } lastEdit)

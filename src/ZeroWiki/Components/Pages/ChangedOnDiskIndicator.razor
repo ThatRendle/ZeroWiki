@@ -20,18 +20,28 @@
 }
 
 @code {
-    /// <summary>The page's own canonical route (D12) -- the exact key <see cref="PushReactionService"/>
-    /// notifies under, so this component only ever hears about the page it is mounted on.</summary>
+    /// <summary>The page's own canonical route (D12), in its raw <see cref="EncodedRoute.Value"/>
+    /// form rather than as <see cref="EncodedRoute"/> itself (§12, <c>12.3</c> second pass) --
+    /// <see cref="EncodedRoute"/> deliberately has no JSON surface, since a JSON converter for it
+    /// would let external code construct one, defeating D17's internal-constructor invariant. A plain
+    /// <see langword="string"/> crosses the Static SSR-&gt;circuit boundary natively, and
+    /// <see cref="OnInitialized"/> rebuilds the <see cref="EncodedRoute"/> from it, in-assembly, where
+    /// the internal constructor has always been reachable.</summary>
     [Parameter, EditorRequired]
-    public EncodedRoute Route { get; set; }
+    public string Route { get; set; } = string.Empty;
 
     private IDisposable? _subscription;
     private bool _changedOnDisk;
     private string _pageHref = string.Empty;
+    private EncodedRoute _route;
 
     protected override void OnInitialized()
     {
-        _pageHref = $"/wiki/{Route.Value}";
+        // Re-materialises the value WikiPage.razor's call site already produced via
+        // PageRouteCodec.Encode on the SSR side -- this does not mint a new encoded route, it
+        // reconstructs the one that crossed the boundary as a string.
+        _route = new EncodedRoute(Route);
+        _pageHref = $"/wiki/{_route.Value}";
 
         // Guards against subscribing during the static-SSR prerender pass, which this component also
         // runs through once before its real InteractiveServer circuit starts (D7's render-mode split):
@@ -39,7 +49,7 @@
         // never be disposed (its circuit never ends -- it never had one).
         if (RendererInfo.IsInteractive)
         {
-            _subscription = Notifier.Subscribe(Route, OnPageChangedAsync);
+            _subscription = Notifier.Subscribe(_route, OnPageChangedAsync);
         }
     }
 

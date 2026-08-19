@@ -1,3 +1,4 @@
+using System.Text.Json;
 using ZeroWiki.Content;
 
 namespace ZeroWiki.Tests.Content;
@@ -64,6 +65,25 @@ public sealed class EncodedRouteTests
 
         Assert.Equal("Project_Notes", route.ToString());
         Assert.Equal(route.Value, route.ToString());
+    }
+
+    [Fact]
+    public void JsonDeserialization_CannotProduceAPopulatedInstance()
+    {
+        // §12 (12.3, second pass): a JSON converter was tried and reverted -- System.Text.Json
+        // resolves an attribute-declared converter by reflection regardless of the calling assembly, so
+        // an `internal` converter would have let any external caller construct a populated
+        // EncodedRoute, defeating D17's compile-time single-producer invariant. This test project holds
+        // no InternalsVisibleTo grant to ZeroWiki (see the note below), so this exercises exactly the
+        // same view of the type an external caller has: default reflection-based deserialization
+        // default-constructs the struct (always possible) and has no public constructor or setter to
+        // bind Value to, so it silently stays null rather than throwing. A regression that reintroduces
+        // a JSON converter would make this assertion fail.
+        var json = JsonSerializer.Serialize(new { Value = "page" });
+
+        var result = JsonSerializer.Deserialize<EncodedRoute>(json);
+
+        Assert.Null(result.Value);
     }
 
     // ConstructibleWithinThisAssembly_ForFixturesEncodeCanNeverProduce was deleted here (reviewer
