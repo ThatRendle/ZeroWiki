@@ -28160,6 +28160,94 @@ less than one that states its limits:** it ran nothing — `GATES_EXIT:0`/895 an
 rather than reproduced; its agreement with `@reviewer` on `12.3`'s security is **one argument made twice,
 not two independent checks**; and "nothing broke" is scoped to `223d930..HEAD` plus the sites it traced.
 
+## Close-out — pre-archive
+
+**[architect]** Base: `03d2761` — the pre-archive close-out block, Product Owner authorised 2026-08-20.
+Not a task section: §1–§12 are all closed and all 45 tasks ticked. This clears `LEDGER.md`'s
+*Close-out items before archive*, which is a **precondition of archiving**, not a wish list. No task
+numbers, no ticks.
+
+**Why now and not later.** Archiving **promotes the spec deltas** — `specs/user-accounts/spec.md` stops
+being a change delta and becomes ZeroWiki's durable description of its own username rule. F2 is a
+scenario that describes a rule the code does not implement; archiving is the step that makes that
+permanent and authoritative. That is the whole argument for doing this before `/opsx:archive` rather
+than after.
+
+I verified all three items against the current code before briefing rather than trusting the ledger —
+the ledger's own rule. All three are live.
+
+**[architect]** Close-out block brief → @worker
+
+### F1 first, because a reproduction is explicitly owed
+
+`LEDGER.md` records F1 as **"Unverified by the Architect — reproduce before fixing."** That instruction
+is older than today and it still binds. I have confirmed the constants and the unqualified sentence;
+**I have not reproduced the behaviour**, and you must, before you change a character of it.
+
+`src/ZeroWiki/Identity/CredentialPolicy.cs:85-91` states, without qualification:
+
+> an over-long username fails the length check and is reported as a length problem rather than also
+> being told its charset is wrong
+
+`MaximumUsernameLength` is `64`; the pattern's `125` bound admits **127** unbroken alphanumerics. So the
+claim should hold for 65–127 and **break at 128+**, where both the length rule and the shape rule fire
+and one fault yields two messages.
+
+**Reproduce it at both surfaces before deciding anything** — the ledger says the claim holds at the
+**service** at every length but at the **form** only to 127, and those are different code paths.
+Report what you actually observed at, say, 64, 65, 127 and 128 characters, at each surface. **If the
+reproduction contradicts the ledger, say so and stop with `❓ @architect`** — a stale ledger entry is a
+finding, and this change's record already contains one entry that was wrong and rode along unchallenged.
+
+Then fix the *claim*, not the mechanism: the pattern's bound is deliberately not derived from the length
+cap and **must not be made to track it** — the comment says so and it is right. Name the surface the
+claim holds on, or its bound.
+
+### F2 — the one that actually matters, because archiving promotes it
+
+`openspec/changes/git-backed-content-core/specs/user-accounts/spec.md`, scenario *"Well-formed username
+is accepted"*:
+
+> **WHEN** a user chooses a username of at least 3 characters that begins and ends with a letter or
+> digit and otherwise uses only letters, digits, dots, hyphens and underscores
+
+`a..b` satisfies **every clause** of that WHEN and the system **refuses it** (§11 tightened the pattern
+to reject consecutive dots). The WHEN also omits the 64-character cap, so a 200-character name reads as
+accepted. Pre-existing from `bd2eeea` — not caused by this change, but promoted by archiving it.
+
+**Falsifier, and it is a real one you can execute:** derive the accepted set from
+`CredentialPolicy.UsernamePattern` plus `MinimumUsernameLength`/`MaximumUsernameLength`, then try to
+construct a string that **satisfies your rewritten WHEN and is refused**, and one that **violates it and
+is accepted**. If you can build either, F2 is undone. Do that against the code, not against the prose.
+
+Check the sibling scenarios in the same delta stay consistent — this scenario has always been
+illustrative, and the fix is to make it describe the accepted set or to say plainly that it illustrates
+rather than defines. Either is acceptable; a WHEN that admits refused inputs is not.
+
+`make validate` must stay green — `openspec validate --strict` covers this file.
+
+### The asymmetric matrices
+
+`BootstrapPageTests.cs:83-94` covers `"café"` and `"admin\tx"`; `RedeemInvitationPageTests.cs:268-273`
+omits both. Two entry points to the same username rule, one tested against non-ASCII and a control
+character and one not. Close the gap.
+
+**Falsifier:** the added cases must **fail** if the redeem path stopped refusing those inputs. Verify
+that by breaking the refusal and watching them die — not by observing them pass. Three tests in §8
+shipped that could not fail, and this repo's rule is that a passing new test is not evidence it
+discriminates.
+
+### Standing requirements
+
+- Classification per item before its code; `❓ @architect` if you disagree.
+- Claim / instrument / blind spot on any completeness claim; "blind spot: none" is never correct.
+- `make gates` **unsandboxed**, **foreground**, full output to a file; quote `GATES_EXIT:<n>`. Never pipe
+  a gate through `tail`. Never run a gate while source is hand-edited for a falsifier check.
+- `git diff -- src` **and** `git status --short -- src` at the end.
+- Post to `openspec/changes/git-backed-content-core/DEVLOG.md` — full path — at `###`, **immediately
+  before `## NEXT`, never at end-of-file**.
+- Do not end your turn waiting on a background task; let slow commands block.
+
 ## NEXT
 
 **Resume at `12.1`.** §12 is the only open section and **is not open yet** — it has no `Base:` post.
