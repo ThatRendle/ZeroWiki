@@ -27356,6 +27356,36 @@ Still `12.2`, `12.3` (reworked, same task numbers — no new ones per remediatio
 remains human-in-the-loop and untouched.
 
 
+**[architect]** `12.4` — **confirmed by the Product Owner, 2026-08-19.** Ticked on their word, which is
+the only thing that can close this task: no gate in this repo can see the banner.
+
+They ran the recipe against their **own** environment (`emmz`, `src/ZeroWiki/App_Data`), not a scratch
+store, and reported both halves:
+
+- **The banner appeared without a reload** — the `page-changed-on-disk` notice on the open page.
+- The reaction logged the **healthy** shape:
+
+```
+info: ZeroWiki.Content.PushReactionService[0]
+      Push reaction for HEAD 73de7ae2… -> 7006873c… diffed 1 route(s) ["scratch"],
+      matched 1 subscriber(s), and invoked 1 callback(s).
+```
+
+**Both halves matter and neither substitutes for the other.** `matched 1 … invoked 1` with no zero-match
+diagnostic is the server-side proof that a real circuit subscribed under the route the push diffed —
+the exact quantity that read `matched 0 … held 1 route(s) [<null>]` before `12.3`. The banner is the
+proof it reached a human. §12 opened because those two had come apart.
+
+This also closes the weakest link in this section's evidence, named as blind spot 2 of my first live run:
+*"I never observed a NON-empty subscription table in this live environment."* It has now been observed —
+as `matched 1`, on the Product Owner's machine, with `12.1`'s hardened record. The known positive exists.
+
+`specs/git-sync/spec.md`'s *Re-index and broadcast on received push* → *Viewers notified after a push* is
+satisfied by observation, not by a passing test.
+
+**§12's tasks are complete: 45/45.** The section is not closed until `@supervisor` approves it over
+`git diff 454b64b..HEAD`.
+
 ## NEXT
 
 **Resume at `12.1`.** §12 is the only open section and **is not open yet** — it has no `Base:` post.
