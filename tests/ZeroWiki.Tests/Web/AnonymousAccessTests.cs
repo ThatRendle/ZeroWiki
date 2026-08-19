@@ -153,12 +153,14 @@ public sealed partial class AnonymousAccessTests : IDisposable
         // left both sides equally unframed and survived the whole suite.
         //
         // AD21's "the app emits no cache directives" is asserted the same way: by the header set
-        // being exactly these two, so a Cache-Control added later fails here rather than needing
-        // someone to have predicted its name.
+        // being exactly these three, so a Cache-Control added later fails here rather than needing
+        // someone to have predicted its name. Content-Security-Policy joined the set in block 3's S1
+        // remediation — it applies to every response, including this one, per spec ("WHEN any page is
+        // served THEN the response carries a Content-Security-Policy header").
         var response = await _app.CreateHttpClient().GetAsync(ProtectedUrl);
 
         Assert.Equal(
-            ["Content-Length", "Content-Type"],
+            ["Content-Length", "Content-Security-Policy", "Content-Type"],
             ComparableHeaders(response).Select(header => header.Key));
 
         Assert.Equal("text/html; charset=utf-8", response.Content.Headers.ContentType?.ToString());

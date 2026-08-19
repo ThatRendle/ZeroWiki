@@ -1,0 +1,236 @@
+@* The browser editing surface (D17, §6 block D4) — not a page in its own right. WikiPage.razor
+   renders this in place of its own view markup when the `edit` query flag is present on
+   `/wiki/{*Route}`; there is no separate `@page` route for it (a catch-all may only occupy the last
+   route segment, and a sibling `/edit` route would collide with content — see D17). *@
+@using ZeroWiki.Content
+@using ZeroWiki.Identity
+@inject PageSaveService PageSaveService
+@inject EditDraftStore DraftStore
+@inject CurrentUserAccessor CurrentUserAccessor
+@inject NavigationManager Navigation
+
+@if (_refused)
+{
+    <h1>This address cannot be edited</h1>
+    <p>
+        It does not identify exactly one file in the wiki's content — a different condition from a
+        page that simply does not exist here yet — so there is nothing to open an editor for.
+    </p>
+}
+else
+{
+    <h1>@(IsNewPage ? "Create page" : "Edit page")</h1>
+
+    @if (_saveMessage is { } message)
+    {
+        <p class="editor-save-outcome" role="alert">@message</p>
+    }
+
+    <EditForm Model="Input" FormName="pageEditor" OnValidSubmit="SubmitAsync">
+        @* Not an InputText/InputHidden: Blazor has no built-in hidden-field input component, and the
+           name below must match exactly what the [SupplyParameterFromForm] complex-type binder expects
+           for a nested property under "Input" — the same "Input.<Property>" shape Login.razor's own
+           InputText-rendered fields use, verified against the rendered form by this block's tests
+           rather than assumed. *@
+        <input type="hidden" name="Input.BaseRevisionToken" value="@Input.BaseRevisionToken" />
+
+        <p>
+            <InputTextArea @bind-Value="Input.Content" rows="24" cols="100" />
+        </p>
+
+        <button type="submit">Save</button>
+    </EditForm>
+}
+
+@code {
+    private const string ConflictMessage =
+        "This page changed underneath your save, so nothing was written. Copy your text out, reload the page, and try again.";
+
+    private const string RepositoryBusyMessage =
+        "The repository is busy right now. Nothing was written — try saving again in a moment.";
+
+    private const string RefusedMessage =
+        "This address no longer identifies a single file, so nothing was written.";
+
+    private const string FailedMessage =
+        "The save failed and the working tree was restored. Nothing was written — try again.";
+
+    private const string RollbackFailedMessage =
+        "The save failed and the automatic recovery also failed. An administrator needs to check the repository.";
+
+    private const string DraftExpiredMessage =
+        "Your draft expired, so this is a fresh copy of the page rather than what you were working on.";
+
+    private const string DraftUnavailableMessage =
+        "Your save failed, and there was too much other activity right now to hold onto a copy of what " +
+        "you typed. Nothing was written, but your text is still shown below exactly as you typed it — " +
+        "copy it out before reloading or navigating away.";
+
+    /// <summary>The same route value <c>WikiPage.razor</c>'s own <c>Route</c> parameter carries.</summary>
+    [Parameter, EditorRequired]
+    public string? Route { get; set; }
+
+    /// <summary>
+    /// A <see cref="EditDraftStore"/> token carried by a Post/Redirect/Get redirect after a failed save
+    /// (D17, §6 block D4 continuation) — absent on an ordinary first visit to this address.
+    /// </summary>
+    [SupplyParameterFromQuery(Name = "draft")]
+    private string? DraftToken { get; set; }
+
+    [CascadingParameter]
+    private HttpContext? HttpContext { get; set; }
+
+    [SupplyParameterFromForm(Name = nameof(Input))]
+    private PageEditorInput? PostedInput { get; set; }
+
+    /// <summary>Non-null view of the form state — populated by <see cref="OnInitializedAsync"/> on a
+    /// fresh load or a recovered draft, or by form binding on the save's own post.</summary>
+    private PageEditorInput Input => PostedInput ??= new();
+
+    private bool IsNewPage => Input.BaseRevisionToken.Length == 0;
+
+    private bool _refused;
+    private string? _saveMessage;
+
+    private HttpContext RequireContext() => HttpContext
+        ?? throw new InvalidOperationException("Editing a page requires the static server-rendered HttpContext.");
+
+    private AuthenticatedAccount RequireAccount() => CurrentUserAccessor.GetCurrent()
+        ?? throw new InvalidOperationException("Editing a page requires a signed-in account.");
+
+    /// <summary>
+    /// Loads the address for editing (D17) — but only on the initial GET. When
+    /// <see cref="PostedInput"/> is already populated by form binding, this render is the save's own
+    /// post, and <see cref="Input"/> already carries exactly what the member submitted; reloading here
+    /// would read the working tree a second, unnecessary time and cannot make the save any safer —
+    /// <see cref="SubmitAsync"/>'s call into <see cref="PageSaveService.SaveAsync"/> re-checks the
+    /// route and the base revision under the write lock, which is what actually protects a lost update
+    /// or a since-become-ambiguous route.
+    /// </summary>
+    /// <remarks>
+    /// A GET carrying a <see cref="DraftToken"/> (D17, §6 block D4 continuation) is the follow-up half
+    /// of a failed save's Post/Redirect/Get: it takes priority over an ordinary fresh load, because the
+    /// whole point is to show the member's own rejected text and the reason, not a clean copy of
+    /// whatever is currently at <c>HEAD</c>. A missing, expired, or foreign-account token degrades to an
+    /// ordinary fresh load with <see cref="DraftExpiredMessage"/> — never to silently rendering the
+    /// committed content as though nothing were lost, which would be worse than the bug this exists to
+    /// fix.
+    /// </remarks>
+    protected override async Task OnInitializedAsync()
+    {
+        if (PostedInput is not null)
+        {
+            return;
+        }
+
+        var context = RequireContext();
+        var routeValue = new RouteValue(Route ?? string.Empty);
+        string? fallbackMessage = null;
+
+        if (DraftToken is { Length: > 0 } token)
+        {
+            var draft = DraftStore.TryGet(RequireAccount().Id, token);
+
+            if (draft is not null && draft.Route == routeValue)
+            {
+                PostedInput = new PageEditorInput
+                {
+                    Content = draft.Content,
+                    BaseRevisionToken = draft.BaseRevisionToken,
+                };
+                _saveMessage = draft.Message;
+                return;
+            }
+
+            fallbackMessage = DraftExpiredMessage;
+        }
+
+        var loaded = await PageSaveService.LoadForEditAsync(routeValue, context.RequestAborted);
+
+        if (loaded.Outcome == PageLoadForEditOutcome.Refused)
+        {
+            _refused = true;
+            return;
+        }
+
+        // PageLoadForEditOutcome.New: Content is string.Empty and BaseRevision is AbsentAtHead, which
+        // BaseRevisionToken represents as the same empty-string sentinel — an empty editor that saves
+        // as a create (D17).
+        PostedInput = new PageEditorInput
+        {
+            Content = loaded.Content ?? string.Empty,
+            BaseRevisionToken = loaded.BaseRevision.BlobSha ?? string.Empty,
+        };
+
+        if (fallbackMessage is not null)
+        {
+            _saveMessage = fallbackMessage;
+        }
+    }
+
+    private async Task SubmitAsync()
+    {
+        var context = RequireContext();
+        var account = RequireAccount();
+
+        var baseRevision = Input.BaseRevisionToken.Length == 0
+            ? PageBaseRevision.AbsentAtHead
+            : PageBaseRevision.ForBlob(Input.BaseRevisionToken);
+
+        var routeValue = new RouteValue(Route ?? string.Empty);
+        var result = await PageSaveService.SaveAsync(routeValue, Input.Content, baseRevision, account, context.RequestAborted);
+
+        // PageRouteCodec.ResolveUrlForms is the one implementation this class and WikiPage.razor's edit
+        // link both share (§6 remediation, Blocker 2) — computing both forms from one call is what
+        // guarantees a redirect this method builds and the draft entry it stores always agree on the
+        // same route string, rather than risking two independent re-derivations drifting apart.
+        var (urlRoute, comparableRoute) = PageRouteCodec.ResolveUrlForms(routeValue);
+
+        if (result.Outcome == SaveOutcome.Saved)
+        {
+            // Back to the view — through the route's own canonical, already-escaped form rather than
+            // re-interpolating the raw request value, which may contain characters (a space, '#') that
+            // are not safe to place directly into a URL.
+            Navigation.NavigateTo($"/wiki/{urlRoute}", replace: true);
+            return;
+        }
+
+        // Post/Redirect/Get on every failure outcome (D17, §6 block D4 continuation — the Product Owner
+        // found, in a browser, that a re-rendered POST response makes a reload raise "resubmit this
+        // form?"). Nothing typed is discarded on any of the five outcomes: the submitted content, the
+        // declared base revision, and the message to show for it are stashed in EditDraftStore, keyed by
+        // an unguessable token this redirect carries, and recovered by the follow-up GET above.
+        var message = result.Outcome switch
+        {
+            SaveOutcome.Conflict => ConflictMessage,
+            SaveOutcome.RepositoryBusy => RepositoryBusyMessage,
+            SaveOutcome.Refused => RefusedMessage,
+            SaveOutcome.Failed => FailedMessage,
+            SaveOutcome.RollbackFailed => RollbackFailedMessage,
+
+            // Unreachable in practice (SaveOutcome.Saved always takes the branch above); kept as an
+            // honest fallback rather than an unchecked cast if a future SaveOutcome member is added.
+            _ => FailedMessage,
+        };
+
+        var draftToken = DraftStore.Save(
+            account.Id, new RouteValue(comparableRoute), Input.Content, Input.BaseRevisionToken, message);
+
+        if (draftToken is null)
+        {
+            // EditDraftStore.Save returns null when its global backstop is reached with nothing expired
+            // to reclaim (D17, §6 block D4 continuation round two) — refusing rather than evicting a
+            // live entry belonging to an account other than this one. There is nowhere left to stash
+            // this save's text for a follow-up GET to recover it from, and "never discard what the
+            // member typed" stays absolute with no carve-out (§6 remediation, Product Owner decision):
+            // Post/Redirect/Get yields here rather than the other way round. Re-rendering this same POST
+            // response in place, with Input untouched, keeps every character the member typed at the
+            // cost of the browser's resubmit-on-reload prompt — accepted deliberately, and only in this
+            // one, hardest-to-reach case.
+            _saveMessage = DraftUnavailableMessage;
+            return;
+        }
+
+        Navigation.NavigateTo($"/wiki/{urlRoute}?edit&draft={Uri.EscapeDataString(draftToken)}", replace: true);
+    }
+}

@@ -20,7 +20,7 @@ namespace ZeroWiki.Web;
 /// set of anonymously reachable surfaces is stated once — as <c>[AllowAnonymous]</c> on the pages
 /// that need it and <c>AllowAnonymous()</c> on the static assets — and the fallback policy behind
 /// this middleware enforces the same list. Two lists would drift, and the drift would be silent in
-/// the unsafe direction. It also gives §8 its seam: the git Smart HTTP routes opt out here and
+/// the unsafe direction. It also gives §7 its seam: the git Smart HTTP routes opt out here and
 /// answer with a real <c>401</c> plus <c>WWW-Authenticate</c>, without this mechanism changing.
 /// </para>
 /// <para>

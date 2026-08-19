@@ -32,31 +32,104 @@ public static partial class CredentialPolicy
 
     public const string MaximumPasswordLengthRuleDescription = "A password can be at most 256 characters.";
 
+    /// <summary>
+    /// Minimum username length (D11). A length rule rather than part of the pattern, for the same
+    /// reason <see cref="MinimumPasswordLength"/> is: a username that is merely too short should
+    /// be told so, not told its character set is wrong.
+    /// </summary>
+    public const int MinimumUsernameLength = 3;
+
+    /// <summary>
+    /// Kept beside the number it quotes, because an interpolated <c>const</c> cannot embed an
+    /// <c>int</c>. A test asserts the two still agree.
+    /// </summary>
+    public const string MinimumUsernameLengthRuleDescription = "A username must be at least 3 characters.";
+
     /// <summary>Matches the <c>Accounts.Username</c> column width.</summary>
     public const int MaximumUsernameLength = 64;
 
     public const string MaximumUsernameLengthRuleDescription = "A username can be at most 64 characters.";
 
     /// <summary>
-    /// ASCII letters, digits, <c>.</c>, <c>-</c> and <c>_</c>, with at least one alphanumeric
-    /// (AD11).
+    /// ASCII letters, digits, <c>.</c>, <c>-</c> and <c>_</c>, beginning and ending with an
+    /// alphanumeric, with no two dots in a row (D11).
     /// </summary>
     /// <remarks>
     /// <para>
-    /// The constraint is technical rather than stylistic: the git remote presents the username
-    /// as the Basic-auth userid, where RFC 7617 makes a colon structurally illegal, and
+    /// The charset constraint is technical rather than stylistic: the git remote presents the
+    /// username as the Basic-auth userid, where RFC 7617 makes a colon structurally illegal, and
     /// whitespace or control characters in a credential are a correctness hazard. This is the
     /// minimum charset that rules those out — tightening it later stays backward-compatible in a
     /// way that loosening a username someone already holds does not.
     /// </para>
     /// <para>
-    /// Both quantifiers are bounded, and that is what keeps matching constant-time. The obvious
-    /// unbounded form (<c>[…]*[…][…]*</c>) is quadratic, because every split point either side of
-    /// the required alphanumeric has to be tried; a timeout does not fix that, it only converts
-    /// an unbounded burn into a bounded burn plus an exception. The literal <c>63</c> is
-    /// <see cref="MaximumUsernameLength"/> minus the one required character — it cannot be
-    /// composed from the constant because an attribute argument must itself be a compile-time
-    /// constant string, so a test holds the two in step.
+    /// The dot rules are what D10 needs: a browser save is authored
+    /// <c>username@&lt;host domain&gt;</c>, and RFC 5322 <c>dot-atom-text</c> is
+    /// <c>1*atext *("." 1*atext)</c> — a dot may only appear <em>between</em> runs of
+    /// <c>atext</c>, and <c>.</c> is not itself <c>atext</c>. So a leading dot, a trailing dot and
+    /// a <em>doubled</em> dot are all equally illegal: <c>a..b</c> is no more a dot-atom than
+    /// <c>.ab</c> is. Each alternation branch below that starts with a dot also consumes the
+    /// character after it, and that character is never a dot — which is how a doubled dot is
+    /// excluded without a lookahead. Fixing the shape where a username is <em>chosen</em> is what
+    /// stops it being patched at every point of use.
+    /// </para>
+    /// <para>
+    /// What this pattern accepts is a <strong>strict subset</strong> of what a dot-atom allows,
+    /// and that is deliberate. The property D10 needs is that everything accepted is legal, not
+    /// that everything legal is accepted: <c>_legacy_</c> is a perfectly good localpart and is
+    /// refused anyway, because a rule protecting a permanent artifact is allowed to be narrower
+    /// than the grammar it protects. Do not read the subset relation as an equality and "fix" the
+    /// ends rule to match.
+    /// </para>
+    /// <para>
+    /// This pattern governs <strong>shape only</strong>, and its bound is deliberately looser than
+    /// <see cref="MaximumUsernameLength"/> — <c>125</c> admits 127 characters of unbroken
+    /// alphanumerics (253 with a dot between every pair). The literal is therefore <em>not</em>
+    /// derived from the length cap and must not be made to track it; a test pins the direction of
+    /// the slack (the pattern admits at least the maximum length), which is the property that
+    /// matters.
+    /// </para>
+    /// <para>
+    /// What that slack buys an over-long username differs by surface, and the difference is
+    /// structural rather than incidental. At the service boundary (<c>InvitationService</c>,
+    /// <c>BootstrapService</c>) the length and shape checks are sequential <c>if</c>-throw
+    /// statements, so the length check always reports and returns first — an over-long username is
+    /// told only that it is too long, at <em>every</em> length past the cap, because the shape
+    /// check never runs. At the form boundary, <c>[StringLength]</c> and <c>[RegularExpression]</c>
+    /// are independent <see cref="System.ComponentModel.DataAnnotations.ValidationAttribute"/>s
+    /// that <see cref="System.ComponentModel.DataAnnotations.Validator.TryValidateObject(object,
+    /// System.ComponentModel.DataAnnotations.ValidationContext,
+    /// System.Collections.Generic.ICollection{System.ComponentModel.DataAnnotations.ValidationResult}?,
+    /// bool)"/> evaluates independently and both report into the same result set — so the
+    /// single-fault guarantee holds only while the 125-bounded pattern can still fail to match on
+    /// shape grounds alone, i.e. through 127 characters. At 128 characters and beyond the pattern
+    /// can no longer match regardless of content (its own quantifier is exhausted), so
+    /// <c>[RegularExpression]</c> fails alongside <c>[StringLength]</c> and the form reports both
+    /// messages for one fault.
+    /// </para>
+    /// <para>
+    /// Every quantifier is bounded, and the two branches inside the bounded run are disjoint on
+    /// their first character (dot versus not), so the run never branches. Measured on the
+    /// <c>[GeneratedRegex]</c> engine this type actually uses: a one-million-character hostile
+    /// input costs no more than a one-thousand-character one — the measured ratio sits at the
+    /// stopwatch's noise floor rather than above it — so the work really is independent of the
+    /// input's length. The obvious unbounded form (<c>[…]*[…][…]*</c>) is
+    /// quadratic instead, because every split point either side of the required alphanumeric has
+    /// to be tried; a timeout does not fix that, it only converts an unbounded burn into a bounded
+    /// burn plus an exception.
+    /// </para>
+    /// <para>
+    /// What the test suite pins is the weaker property that no input makes matching
+    /// <em>catastrophic</em> — not the stronger one that its cost is constant. At least two
+    /// rewrites are correct, slower, and refused by nothing: expressing the consecutive-dot rule
+    /// as a <c>(?!.*\.\.)</c> lookahead over the older pattern, and leaving this pattern's bounded
+    /// run unbounded. Measured on the <c>[GeneratedRegex]</c> engine that ships (not the
+    /// interpreted one — the two disagree by orders of magnitude here), against a
+    /// million-character input: the lookahead stays well under a hundredth of the limit the timing
+    /// test asserts, and the unbounded form under a fifth of it. Both are stated against that
+    /// limit rather than against this pattern's own cost, which is too small to divide by. So
+    /// neither is a denial-of-service risk and neither fails a test. Prefer the bounded form; do
+    /// not assume a test will stop you replacing it.
     /// </para>
     /// <para>
     /// <c>\z</c>, never <c>$</c>: <c>$</c> also matches immediately before a trailing newline, so
@@ -65,13 +138,20 @@ public static partial class CredentialPolicy
     /// particular caller adding a length check of its own.
     /// </para>
     /// </remarks>
-    public const string UsernamePattern = @"^[A-Za-z0-9._-]{0,63}[A-Za-z0-9][A-Za-z0-9._-]{0,63}\z";
+    public const string UsernamePattern =
+        @"^[A-Za-z0-9](([A-Za-z0-9_-]|\.[A-Za-z0-9_-]){0,125}([A-Za-z0-9]|\.[A-Za-z0-9]))?\z";
 
-    /// <summary>A belt only — the bounded quantifiers above are what keep the work constant.</summary>
+    /// <summary>A belt only — the bounded quantifier above is what keeps the work constant.</summary>
     public const int UsernamePatternTimeoutMilliseconds = 250;
 
+    /// <summary>
+    /// The single message every shape fault reports. It has to name each rule the pattern
+    /// enforces, or a name refused for one of them is told about a rule it did not break.
+    /// Deliberately free of characters HTML-encoding would alter, because the form surfaces it
+    /// verbatim and tests assert it against the rendered body.
+    /// </summary>
     public const string UsernameRuleDescription =
-        "A username can use letters, digits, dots, hyphens and underscores, and must contain at least one letter or digit.";
+        "A username can use letters, digits, dots, hyphens and underscores, must begin and end with a letter or digit, and cannot contain two dots in a row.";
 
     /// <summary>
     /// <see cref="UsernamePattern"/> for callers outside DataAnnotations, so nobody has to

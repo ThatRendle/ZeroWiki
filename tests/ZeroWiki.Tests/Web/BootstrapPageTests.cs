@@ -85,7 +85,19 @@ public sealed class BootstrapPageTests : IDisposable
     [InlineData("___")]
     [InlineData("café")]
     [InlineData("admin\tx")]
-    public async Task A_username_outside_the_permitted_charset_is_rejected(string username)
+    [InlineData(".abc")]
+    [InlineData("abc.")]
+    [InlineData("-abc")]
+    [InlineData("abc-")]
+    [InlineData("_abc")]
+    [InlineData("abc_")]
+    [InlineData("_x_")]
+    // The consecutive-dot rule (D11). It lives in the pattern rather than in a service-only check
+    // precisely so the form refuses these too, with the same message from the same constant.
+    [InlineData("a..b")]
+    [InlineData("a...b")]
+    [InlineData("ab..cd")]
+    public async Task A_username_of_the_wrong_shape_is_rejected(string username)
     {
         var client = _app.CreateHttpClient();
 
@@ -99,6 +111,40 @@ public sealed class BootstrapPageTests : IDisposable
             CredentialPolicy.UsernameRuleDescription,
             await response.Content.ReadAsStringAsync(),
             StringComparison.Ordinal);
+        Assert.Empty(await _app.GetAccountsAsync());
+    }
+
+    [Theory]
+    [InlineData("a")]
+    [InlineData("ab")]
+    public async Task A_username_below_the_minimum_length_is_rejected_as_a_length_fault(string username)
+    {
+        var client = _app.CreateHttpClient();
+
+        var response = await SubmitAsync(client, username, Password, Password);
+        var body = await response.Content.ReadAsStringAsync();
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+        // One fault, one message: a name that is only too short must not also be told its
+        // character set is wrong.
+        Assert.Contains(CredentialPolicy.MinimumUsernameLengthRuleDescription, body, StringComparison.Ordinal);
+        Assert.DoesNotContain(CredentialPolicy.UsernameRuleDescription, body, StringComparison.Ordinal);
+        Assert.Empty(await _app.GetAccountsAsync());
+    }
+
+    [Fact]
+    public async Task An_overlong_username_is_rejected_as_a_length_fault_not_a_shape_one()
+    {
+        var client = _app.CreateHttpClient();
+        var username = new string('a', CredentialPolicy.MaximumUsernameLength + 1);
+
+        var response = await SubmitAsync(client, username, Password, Password);
+        var body = await response.Content.ReadAsStringAsync();
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        Assert.Contains(CredentialPolicy.MaximumUsernameLengthRuleDescription, body, StringComparison.Ordinal);
+        Assert.DoesNotContain(CredentialPolicy.UsernameRuleDescription, body, StringComparison.Ordinal);
         Assert.Empty(await _app.GetAccountsAsync());
     }
 
@@ -120,7 +166,10 @@ public sealed class BootstrapPageTests : IDisposable
     [Theory]
     [InlineData("admin")]
     [InlineData("a.b-c_1")]
-    [InlineData("_x_")]
+    [InlineData("abc")]
+    // Single dots stay accepted on the form as well as at the service — the rule forbids two in a
+    // row, not dots.
+    [InlineData("a.b.c")]
     public async Task A_username_within_the_permitted_charset_is_accepted(string username)
     {
         var client = _app.CreateHttpClient();

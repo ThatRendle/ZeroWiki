@@ -131,7 +131,13 @@ public sealed partial class RedeemInvitationPageTests : IDisposable
         var unknown = await client.GetStringAsync($"{InvitationPolicy.RedemptionPath}/{NewToken()}");
         var malformed = await client.GetStringAsync($"{InvitationPolicy.RedemptionPath}/not-a-token");
 
-        Assert.Equal(unknown, malformed);
+        // §8 block B: the persisted-component-state marker every Razor Components response now
+        // carries is DataProtection-encrypted and differs per response even when the visible page is
+        // identical -- normalised away first, the same way an antiforgery token already needs to be
+        // (see HttpAssertions.StripPersistedComponentState's own remarks).
+        Assert.Equal(
+            HttpAssertions.StripPersistedComponentState(unknown),
+            HttpAssertions.StripPersistedComponentState(malformed));
     }
 
     [Fact]
@@ -154,8 +160,8 @@ public sealed partial class RedeemInvitationPageTests : IDisposable
 
         Assert.Equal(HttpStatusCode.OK, existing.StatusCode);
         Assert.Equal(
-            await unknown.Content.ReadAsStringAsync(),
-            await existing.Content.ReadAsStringAsync());
+            HttpAssertions.StripPersistedComponentState(await unknown.Content.ReadAsStringAsync()),
+            HttpAssertions.StripPersistedComponentState(await existing.Content.ReadAsStringAsync()));
 
         await AssertOnlyTheIssuerExistsAsync();
     }
@@ -262,7 +268,21 @@ public sealed partial class RedeemInvitationPageTests : IDisposable
     [InlineData("has space")]
     [InlineData("colon:name")]
     [InlineData("___")]
-    public async Task A_username_outside_the_permitted_charset_is_rejected_and_creates_nothing(string username)
+    [InlineData("café")]
+    [InlineData("admin\tx")]
+    [InlineData(".abc")]
+    [InlineData("abc.")]
+    [InlineData("-abc")]
+    [InlineData("abc-")]
+    [InlineData("_abc")]
+    [InlineData("abc_")]
+    [InlineData("_x_")]
+    // The consecutive-dot rule (D11), refused on this form as on the bootstrap one — the two
+    // surfaces share the pattern, and the matrices have to stay in step for that to mean anything.
+    [InlineData("a..b")]
+    [InlineData("a...b")]
+    [InlineData("ab..cd")]
+    public async Task A_username_of_the_wrong_shape_is_rejected_and_creates_nothing(string username)
     {
         var link = await IssueInvitationAsync();
 
@@ -273,6 +293,40 @@ public sealed partial class RedeemInvitationPageTests : IDisposable
             CredentialPolicy.UsernameRuleDescription,
             await response.Content.ReadAsStringAsync(),
             StringComparison.Ordinal);
+        await AssertOnlyTheIssuerExistsAsync();
+    }
+
+    [Theory]
+    [InlineData("a")]
+    [InlineData("ab")]
+    public async Task A_username_below_the_minimum_length_is_rejected_as_a_length_fault(string username)
+    {
+        var link = await IssueInvitationAsync();
+
+        var response = await SubmitAsync(_app.CreateHttpClient(), link, username, InviteePassword);
+        var body = await response.Content.ReadAsStringAsync();
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+        // One fault, one message: a name that is only too short must not also be told its
+        // character set is wrong.
+        Assert.Contains(CredentialPolicy.MinimumUsernameLengthRuleDescription, body, StringComparison.Ordinal);
+        Assert.DoesNotContain(CredentialPolicy.UsernameRuleDescription, body, StringComparison.Ordinal);
+        await AssertOnlyTheIssuerExistsAsync();
+    }
+
+    [Fact]
+    public async Task An_overlong_username_is_rejected_as_a_length_fault_not_a_shape_one()
+    {
+        var link = await IssueInvitationAsync();
+        var username = new string('a', CredentialPolicy.MaximumUsernameLength + 1);
+
+        var response = await SubmitAsync(_app.CreateHttpClient(), link, username, InviteePassword);
+        var body = await response.Content.ReadAsStringAsync();
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        Assert.Contains(CredentialPolicy.MaximumUsernameLengthRuleDescription, body, StringComparison.Ordinal);
+        Assert.DoesNotContain(CredentialPolicy.UsernameRuleDescription, body, StringComparison.Ordinal);
         await AssertOnlyTheIssuerExistsAsync();
     }
 

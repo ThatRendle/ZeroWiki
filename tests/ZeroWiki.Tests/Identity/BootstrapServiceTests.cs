@@ -217,32 +217,128 @@ public sealed class BootstrapServiceTests : IDisposable
     [InlineData("café")]
     [InlineData("___")]
     [InlineData("admin\tx")]
-    public async Task Username_outside_the_permitted_charset_is_rejected_by_the_service_itself(string username)
+    // D11: the username is D10's commit-author localpart, and a dot-atom admits a dot only
+    // between runs of other characters — so an alphanumeric is required at each end...
+    [InlineData(".abc")]
+    [InlineData("abc.")]
+    [InlineData("-abc")]
+    [InlineData("abc-")]
+    [InlineData("_abc")]
+    [InlineData("abc_")]
+    [InlineData("_x_")]
+    // ...and two dots may not be adjacent. Same grammar rule, applied to the middle rather than
+    // the ends, and a shape fault for the same reason.
+    [InlineData("a..b")]
+    [InlineData("a...b")]
+    [InlineData("ab..cd")]
+    public async Task Username_of_the_wrong_shape_is_rejected_by_the_service_itself(string username)
     {
         // The web form validates too, but the invariant belongs to the store: §8 presents the
         // username as a Basic-auth userid, where a colon is structurally illegal. A caller that
         // is not the form must not be able to persist one.
-        await Assert.ThrowsAsync<ArgumentException>(
+        var error = await Assert.ThrowsAsync<ArgumentException>(
             () => _service.CreateFirstAdministratorAsync(username, "a good long passphrase"));
 
+        // Which rule was reported, not merely that one was: D11 requires one fault to produce one
+        // message, so a shape fault must never come back as a length complaint.
+        Assert.Contains(CredentialPolicy.UsernameRuleDescription, error.Message, StringComparison.Ordinal);
+        Assert.Empty(await _db.Accounts.AsNoTracking().ToListAsync());
+    }
+
+    [Theory]
+    [InlineData("a")]
+    [InlineData("ab")]
+    public async Task Username_below_the_minimum_length_is_rejected_as_a_length_fault(string username)
+    {
+        var error = await Assert.ThrowsAsync<ArgumentException>(
+            () => _service.CreateFirstAdministratorAsync(username, "a good long passphrase"));
+
+        Assert.Contains(
+            CredentialPolicy.MinimumUsernameLengthRuleDescription,
+            error.Message,
+            StringComparison.Ordinal);
+        Assert.DoesNotContain(CredentialPolicy.UsernameRuleDescription, error.Message, StringComparison.Ordinal);
+        Assert.Empty(await _db.Accounts.AsNoTracking().ToListAsync());
+    }
+
+    [Theory]
+    [InlineData(".")]
+    [InlineData(".a")]
+    public async Task Username_breaking_both_length_and_shape_is_rejected_on_length(string username)
+    {
+        // The overlap the requirement now settles: these are under the minimum *and* have no
+        // alphanumeric at each end, so both rules match and only one message may come back. The
+        // requirement fixes length first, which pins the guard order — swapping the length and
+        // shape checks would report the shape rule and fail the DoesNotContain below.
+        var error = await Assert.ThrowsAsync<ArgumentException>(
+            () => _service.CreateFirstAdministratorAsync(username, "a good long passphrase"));
+
+        Assert.Contains(
+            CredentialPolicy.MinimumUsernameLengthRuleDescription,
+            error.Message,
+            StringComparison.Ordinal);
+        Assert.DoesNotContain(CredentialPolicy.UsernameRuleDescription, error.Message, StringComparison.Ordinal);
         Assert.Empty(await _db.Accounts.AsNoTracking().ToListAsync());
     }
 
     [Fact]
-    public async Task Overlong_username_is_rejected_by_the_service_itself()
+    public async Task Overlong_username_is_rejected_as_a_length_fault_not_a_shape_one()
     {
-        var username = new string('a', 65);
+        // Alphanumeric throughout, so the only thing wrong with it is its length. The pattern's
+        // bound is looser than the cap precisely so this reports the length rule.
+        var username = new string('a', CredentialPolicy.MaximumUsernameLength + 1);
 
-        await Assert.ThrowsAsync<ArgumentException>(
+        var error = await Assert.ThrowsAsync<ArgumentException>(
             () => _service.CreateFirstAdministratorAsync(username, "a good long passphrase"));
 
+        Assert.Contains(
+            CredentialPolicy.MaximumUsernameLengthRuleDescription,
+            error.Message,
+            StringComparison.Ordinal);
+        Assert.DoesNotContain(CredentialPolicy.UsernameRuleDescription, error.Message, StringComparison.Ordinal);
+        Assert.Empty(await _db.Accounts.AsNoTracking().ToListAsync());
+    }
+
+    /// <summary>
+    /// One username per username refusal kind: shape at the ends, shape in the middle (the
+    /// consecutive-dot rule), below the minimum, above the maximum.
+    /// </summary>
+    public static IEnumerable<object[]> RefusedUsernames() =>
+    [
+        [".abc"],
+        ["a..b"],
+        ["ab"],
+        [new string('a', CredentialPolicy.MaximumUsernameLength + 1)],
+    ];
+
+    [Theory]
+    [MemberData(nameof(RefusedUsernames))]
+    public async Task A_refused_username_costs_no_password_derivation(string username)
+    {
+        // All three username checks have to sit in front of the hash, and /bootstrap stays
+        // anonymously reachable for the life of a deployment: any one of them moving below
+        // `passwordHasher.Hash` would let every POST of a bad username spend a 64 MiB Argon2id
+        // derivation on a request that was always going to be rejected. The fixture's real hasher
+        // cannot see that — it is silent about whether it ran — so this one boundary case runs
+        // over a recording hasher instead, as invitation redemption already does.
+        var recordingHasher = new CountingPasswordHasher();
+        var service = new BootstrapService(_db, recordingHasher, _time);
+
+        await Assert.ThrowsAsync<ArgumentException>(
+            () => service.CreateFirstAdministratorAsync(username, "a good long passphrase"));
+
+        Assert.Empty(recordingHasher.Derivations);
         Assert.Empty(await _db.Accounts.AsNoTracking().ToListAsync());
     }
 
     [Theory]
     [InlineData("admin")]
     [InlineData("a.b-c_1")]
-    [InlineData("_x_")]
+    [InlineData("abc")]
+    // Single dots between runs of other characters are legal in a dot-atom and stay accepted; the
+    // consecutive-dot rule must cost nothing here.
+    [InlineData("a.b.c")]
+    [InlineData("a-_-b")]
     [InlineData("  admin  ")]
     // Trimmed first, so a pasted trailing newline is accepted as "admin" rather than refused.
     [InlineData("admin\n")]
@@ -255,6 +351,18 @@ public sealed class BootstrapServiceTests : IDisposable
         Assert.Equal(
             username.Trim(),
             Assert.Single(await _db.Accounts.AsNoTracking().ToListAsync()).Username);
+    }
+
+    [Fact]
+    public async Task A_username_at_exactly_the_maximum_length_is_accepted()
+    {
+        var username = new string('a', CredentialPolicy.MaximumUsernameLength);
+
+        Assert.Equal(
+            BootstrapOutcome.Created,
+            await _service.CreateFirstAdministratorAsync(username, "a good long passphrase"));
+
+        Assert.Equal(username, Assert.Single(await _db.Accounts.AsNoTracking().ToListAsync()).Username);
     }
 
     [Theory]

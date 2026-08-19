@@ -1,12 +1,9 @@
 {
   "mcpServers": {
-    "codegraph": {
-      "type": "stdio",
-      "command": "codegraph",
-      "args": [
-        "serve",
-        "--mcp"
-      ]
+    "roslyn-codelens": {
+      "command": "roslyn-codelens-mcp",
+      "args": [],
+      "env": {}
     }
   }
 }

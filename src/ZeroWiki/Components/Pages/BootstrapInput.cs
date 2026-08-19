@@ -23,6 +23,9 @@ public sealed class BootstrapInput
     /// fails either way.
     /// </remarks>
     [Required(ErrorMessage = "Enter a username.")]
+    [MinLength(
+        CredentialPolicy.MinimumUsernameLength,
+        ErrorMessage = CredentialPolicy.MinimumUsernameLengthRuleDescription)]
     [StringLength(
         CredentialPolicy.MaximumUsernameLength,
         ErrorMessage = CredentialPolicy.MaximumUsernameLengthRuleDescription)]

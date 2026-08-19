@@ -1,10 +1,59 @@
 using System.Net;
+using System.Text.RegularExpressions;
 using ZeroWiki.Web;
 
 namespace ZeroWiki.Tests.Web;
 
-public static class HttpAssertions
+public static partial class HttpAssertions
 {
+    /// <summary>
+    /// Strips the Blazor Server persisted-component-state marker
+    /// (<c>&lt;!--Blazor-Server-Component-State:...--&gt;</c>) that every Razor Components response now
+    /// carries once §8 block B wires <c>InteractiveServer</c> into the app (D7, D19 §3) — appended after
+    /// <c>&lt;/html&gt;</c> regardless of whether the specific page renders any interactive component,
+    /// since the render mode is an app-wide capability rather than a per-page one. It is DataProtection-
+    /// encrypted, so it differs between any two responses even when their visible content is otherwise
+    /// identical. A test comparing two responses for a uniform-response property (AD17, AD21) must
+    /// normalise this away first, exactly as an antiforgery token already needs normalising.
+    /// </summary>
+    public static string StripPersistedComponentState(string html) =>
+        PersistedComponentStateMarker().Replace(html, string.Empty);
+
+    [GeneratedRegex("<!--Blazor-Server-Component-State:[^>]*-->")]
+    private static partial Regex PersistedComponentStateMarker();
+
+    /// <summary>
+    /// Strips the <c>&lt;!--Blazor:{...}--&gt;</c> start/end marker comments the framework wraps every
+    /// <c>InteractiveServer</c> component instance in — a second, independent source of
+    /// DataProtection-protected (hence effectively random) bytes, distinct from
+    /// <see cref="StripPersistedComponentState"/>'s end-of-document marker. §8 block C's first
+    /// case-insensitive/short-substring assertion against a real page's body (one that renders
+    /// <c>ChangedOnDiskIndicator</c>, D19 §3's first <c>InteractiveServer</c> island) hit a
+    /// reproducible ~1-in-several flake from this marker's <c>"descriptor"</c> field coincidentally
+    /// containing the needle; <see cref="StripPersistedComponentState"/> alone does not cover it,
+    /// because until that assertion no test's body check was both case-insensitive/short <em>and</em>
+    /// against a response carrying an interactive component's own marker. Non-greedy — the marker's
+    /// base64-encoded fields never contain <c>-</c> (standard alphabet: <c>A-Za-z0-9+/=</c>), so
+    /// <c>"}-->"</c> cannot appear inside one and prematurely close the match early.
+    /// </summary>
+    public static string StripInteractiveComponentMarkers(string html) =>
+        InteractiveComponentMarker().Replace(html, string.Empty);
+
+    /// <summary>
+    /// How many <c>InteractiveServer</c> component instances a response's HTML carries — the outcome
+    /// <see cref="StripInteractiveComponentMarkers"/> strips away, counted instead of discarded. §8
+    /// remediation (supervisor findings 1 and 3): mechanism-independent, unlike a reflection check
+    /// against a component's own class — it is sensitive to a component actually being <em>mounted</em>
+    /// on a given response (delete its usage and the count drops to zero) and to <em>either</em> form of
+    /// <c>@rendermode</c> (self-declared on the component or assigned at a caller's usage site), since
+    /// both produce this same marker at render time regardless of which C# attribute or Razor directive
+    /// produced them.
+    /// </summary>
+    public static int CountInteractiveComponentMarkers(string html) => InteractiveComponentMarker().Count(html);
+
+    [GeneratedRegex(@"<!--Blazor:\{[\s\S]*?\}-->")]
+    private static partial Regex InteractiveComponentMarker();
+
     /// <summary>
     /// Asserts the response is the one page every unauthenticated request gets (AD21) — which is
     /// also the only shape an anonymous denial takes, since nothing redirects a stranger to login.

@@ -204,6 +204,58 @@ public sealed partial class LoginPageTests : IDisposable
     }
 
     [Fact]
+    public async Task A_session_survives_a_restart_because_the_key_ring_is_persisted()
+    {
+        // Regression test for the DataProtection key ring (git-backed-content-core, 1.4): before
+        // it was persisted to <DataRoot>/keys, every restart regenerated it, and a cookie issued
+        // before the restart could never be unprotected after. ZeroWikiAppFactory.RestartedFrom
+        // gives the second host a fresh DI container and a freshly loaded key ring from disk —
+        // everything a real restart changes — while keeping the same database and key directory.
+        await SeedAccountAsync(_app, Username, new Argon2idPasswordHasher().Hash(Password));
+        var loginResponse = await SubmitAsync(_app.CreateHttpClient(), "/login", Username, Password);
+        AssertRedirectedTo("/", loginResponse);
+        var cookie = AuthenticationCookiePair(loginResponse);
+
+        // Proves the ring landed at ContentPaths.KeysDirectory specifically, not some other
+        // location a default DataProtection repository discovery might otherwise have picked
+        // (e.g. a writable $HOME on a dev machine) — the assertion below would pass for the wrong
+        // reason if this weren't true.
+        Assert.True(
+            Directory.Exists(_app.DataRoot) && Directory.GetFiles(_app.DataRoot, "*.xml", SearchOption.AllDirectories).Length > 0,
+            $"Expected at least one persisted key under '{_app.DataRoot}'.");
+
+        using var restarted = ZeroWikiAppFactory.RestartedFrom(_app);
+        var restartedClient = restarted.CreateHttpClient();
+        restartedClient.DefaultRequestHeaders.Add("Cookie", cookie);
+
+        Assert.Contains(
+            $"You are signed in as <strong>{Username}</strong>",
+            await restartedClient.GetStringAsync("/logout"),
+            StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task A_session_does_not_survive_an_unshared_key_ring()
+    {
+        // The control for the test above: without RestartedFrom's shared key-ring directory, an
+        // independent instance generates its own ring and cannot unprotect the first instance's
+        // cookie. This is what the pre-fix behaviour looked like, and it proves the positive test
+        // is actually exercising key-ring persistence rather than, say, a hard-coded ticket or a
+        // cookie check that never runs.
+        await SeedAccountAsync(_app, Username, new Argon2idPasswordHasher().Hash(Password));
+        var loginResponse = await SubmitAsync(_app.CreateHttpClient(), "/login", Username, Password);
+        AssertRedirectedTo("/", loginResponse);
+        var cookie = AuthenticationCookiePair(loginResponse);
+
+        using var independent = new ZeroWikiAppFactory();
+        await SeedAccountAsync(independent, Username, new Argon2idPasswordHasher().Hash(Password));
+        var independentClient = independent.CreateHttpClient();
+        independentClient.DefaultRequestHeaders.Add("Cookie", cookie);
+
+        await HttpAssertions.AssertIsAnonymousLandingPageAsync(await independentClient.GetAsync("/logout"));
+    }
+
+    [Fact]
     public async Task A_corrupt_timestamp_row_still_gets_the_uniform_rejection_rather_than_an_error()
     {
         await SeedAccountAsync(_app, Username, new Argon2idPasswordHasher().Hash(Password));
@@ -257,7 +309,15 @@ public sealed partial class LoginPageTests : IDisposable
     /// Blanks the antiforgery token, which is regenerated per response and would otherwise make
     /// two identical pages compare unequal.
     /// </summary>
-    private static string Normalise(string html) => AntiforgeryToken().Replace(html, "TOKEN");
+    private static string Normalise(string html) =>
+        HttpAssertions.StripPersistedComponentState(AntiforgeryToken().Replace(html, "TOKEN"));
+
+    /// <summary>Extracts just the <c>name=value</c> pair, stripping attributes like <c>Secure</c>.</summary>
+    private static string AuthenticationCookiePair(HttpResponseMessage response) =>
+        response.Headers
+            .GetValues("Set-Cookie")
+            .Single(cookie => cookie.StartsWith("ZeroWiki.Authentication=", StringComparison.Ordinal))
+            .Split(';')[0];
 
     private static void AssertRedirectedTo(string expectedPath, HttpResponseMessage response) =>
         HttpAssertions.AssertRedirectedTo(expectedPath, response);

@@ -54,10 +54,26 @@ public sealed class BootstrapService(
         // Completing the guard above rather than adding ceremony: it would be incoherent for a
         // blank username to be a caller error while "a:b" — the value with a real consequence,
         // since §8 presents the username as the Basic-auth userid — is persisted silently. The
-        // check is on the trimmed value and sits before the hash, so it cannot become another
+        // checks are on the trimmed value and sit before the hash, so they cannot become another
         // way to spend 64 MiB on a request that is going to be rejected.
-        if (trimmedUsername.Length > CredentialPolicy.MaximumUsernameLength
-            || !CredentialPolicy.UsernameMatcher().IsMatch(trimmedUsername))
+        //
+        // Length and shape are separate faults reporting separate messages (D11): one fault
+        // produces one message, so a name that is merely too long is never also told its
+        // character set is wrong. Where a name breaks both — "." is under the minimum and has no
+        // alphanumeric end — the requirement fixes the precedence rather than leaving it to
+        // ordering: length is evaluated first so a single-fault surface reports the length rule.
+        // Do not reorder these into "shape first" as a tidy-up; the order is the obligation.
+        if (trimmedUsername.Length < CredentialPolicy.MinimumUsernameLength)
+        {
+            throw new ArgumentException(CredentialPolicy.MinimumUsernameLengthRuleDescription, nameof(username));
+        }
+
+        if (trimmedUsername.Length > CredentialPolicy.MaximumUsernameLength)
+        {
+            throw new ArgumentException(CredentialPolicy.MaximumUsernameLengthRuleDescription, nameof(username));
+        }
+
+        if (!CredentialPolicy.UsernameMatcher().IsMatch(trimmedUsername))
         {
             throw new ArgumentException(CredentialPolicy.UsernameRuleDescription, nameof(username));
         }

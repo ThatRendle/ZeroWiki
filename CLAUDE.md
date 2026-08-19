@@ -13,6 +13,20 @@ Analyst/Architect, the worker(s), and the reviewer all write to as they work, li
 room. Conventions:
 
 - Organised by `## N.` **section** (mirroring `tasks.md`), with a pinned `## NEXT` at the bottom.
+- **`##` is reserved for section headings. Inside a post, start at `###`.** A post that opens
+  `## Verdict: Approve` or `## Checked clean` is structurally a *section*, indistinguishable from
+  `## 6. Commit-on-save`, and this has already happened around forty times in
+  `git-backed-content-core` — which is why that file has to be grepped rather than read by its own
+  structure.
+- **`## NEXT` is a handover note, not an archive.** It holds only what the next session must know
+  *before it reads anything else*: the resume point, what is owed and to whom, live hazards, open
+  decisions. Everything else already lives permanently in the section threads — link to them rather
+  than restating them. Target **under ~80 lines**; `git-backed-content-core`'s reached **1,084**,
+  longer than five of its twelve sections, which defeats the one job a pin has.
+- **Never write a fact you could compute.** Task counts, `HEAD`, gate results and section status are
+  derivable — state the command, or recompute at write time. A hand-arithmetic task count in a pin was
+  wrong once and rode along through two blocks. This is the project's own rule about claims and
+  artefacts, pointed at its own record.
 - Each post is **attributed** — prefixed with the author's role: `[architect]`, `[worker]`,
   `[reviewer]`, `[supervisor]` — and references the **block** (`N.1–N.3`) it concerns.
 - **The first post under each `## N.` heading is the section's base commit** —
@@ -30,18 +44,45 @@ Read it to pick up in-flight context; write to it as you act. The `/devlog` skil
 When an OpenSpec change is archived, use the `mcp__meko__artifact_put` tool to upload the
 DEVLOG.md file to Meko.
 
-## Commands
+## Commands — the Makefile is the command surface
 
-- Build: `dotnet build` — must be clean.
-- Test: `dotnet test` — all green.
-- Format: `dotnet format --verify-no-changes` — clean.
-- Validate a change: `openspec validate <change-name> --strict`.
-- List changes: `openspec list` (or the directories under `openspec/changes/`, excluding `archive/`).
+Every gate runs through the root **`Makefile`**. Build, test, format, and spec validation are `make`
+targets; **do not call the underlying toolchain directly**. That keeps the command names stable as the
+toolchain moves underneath them, and — the load-bearing part — **every gate target prints its own exit
+code** as `LABEL_EXIT:<n>` on its last line.
+
+**Read the exit line, not the output.** A gate passed only if you saw `BUILD_EXIT:0`. Tools routinely
+exit non-zero while printing output that scans exactly like a clean run, and a gate has been reported
+as passing on that basis before. Quote the code; don't interpret the log. This project has two live
+examples: `dotnet format --verify-no-changes` exits 2 while printing one `warning: IDEnnnn` line, and a
+**sandboxed** `dotnet` dies at exactly five minutes still reporting `0 Error(s)`.
+
+- Build: `make build` → `BUILD_EXIT:0`.
+- Test: `make test` → `TEST_EXIT:0`, all green.
+- Format: `make format` → `FORMAT_EXIT:0`.
+- Validate the active change(s): `make validate` → `VALIDATE_EXIT:0`. It validates **every** active
+  change, not just the one being applied.
+- Whole gate set in one pass: `make gates` → `GATES_EXIT:0`. It runs the set with `-k`, so one
+  invocation reports **every** failing gate instead of hiding the rest behind the first.
+- List active changes: `make changes` (or the directories under `openspec/changes/`, excluding
+  `archive/`).
+
+**Run the gates unsandboxed.** A sandboxed `dotnet` is killed at the five-minute mark and prints
+`0 Error(s)` on its way out, so the exit line is the only thing that distinguishes it from a pass —
+and `make gates` inherits the same hazard. Never pipe a gate through `tail`: the `LABEL_EXIT:` line is
+the last line, and a truncating pipe is how you lose it.
+
+`make clean` is **not** a gate and no agent runs it — it is the Product Owner's.
+
+**The Makefile is yours (Architect), not the workers'.** When a block adds a project, a test suite, or
+a stack that the existing targets don't cover, *you* update the Makefile and say so in the DEVLOG. A
+worker that needs a target changed stops and reports it; it does not edit the Makefile, and it does not
+route around it by calling the raw toolchain.
 
 ---
 
 ## OpenSpec Workflow
-<!-- dmons-scaffold: 0.3.0 -->
+<!-- dmons-scaffold: 0.5.1 -->
 
 **This section is authoritative.** If a skill's behavior ever conflicts with what's written here,
 **follow this document.**
@@ -78,7 +119,39 @@ looks for what block reviews structurally cannot catch — cross-block drift, du
 dead scaffolding, and whether the section genuinely satisfies its spec rather than merely ticking its
 tasks. Neither ever edits code: both report, and a worker fixes.
 
+**You are the only agent that invokes agents.** The `worker`, the `reviewer`, and the `supervisor`
+never spawn each other or any other subagent — they report back to you and you route the next step.
+Every handoff in the DEVLOG (`→ @reviewer`, `❓ @architect`) is a *post*, not an invocation: the
+reviewer runs when **you** spawn it, the supervisor runs when **you** spawn it at section end. This
+keeps one thread holding the whole picture — if an agent could call the next one, the workflow's loops
+would run without you and the gates, ticks, and commits you own would be skipped. The agents have no
+Agent tool at all, so this is a fact about them rather than an instruction to them.
+
 All agents are defined for this repo. Delegate; don't shortcut by writing the implementation yourself.
+
+### Boundaries — enforced by hooks, not by trust
+
+Three things belong to you alone: **the commits, the ticked boxes, and the decision to invoke an
+agent.** Those rules are written into every agent's prompt, and they are also enforced, because a rule
+that only exists as prose is one an agent under pressure to finish a block will eventually break.
+
+- **`.claude/hooks/dmons-guard.sh`** — a `PreToolUse` hook wired into each agent's own frontmatter, so
+  it sees that agent's tool calls and never yours. It blocks git writes, edits to `tasks.md`, the
+  `Makefile`, `CLAUDE.md` and `.claude/`, and any attempt to spawn another agent — across Bash *and*
+  the `ctx_*` tools, since those run commands too. The auditors (`reviewer`, `supervisor`) are further
+  confined to writing `DEVLOG.md` and nothing else.
+- **`.claude/hooks/dmons-tripwire.sh`** — it records `HEAD` and each active change's tick count when an
+  agent spawns, re-checks both when that agent finishes, and reports any movement to you at the end of
+  your turn. Agents run in the background, so this is deliberately not tied to the moment your `Agent`
+  call returns — that moment is the launch, not the finish.
+
+**When the tripwire fires, it is telling you the block skipped a gate.** Don't accept the state and
+move on: read what landed, then `git reset --soft <the sha it names>` to put the work back in the tree
+without the agent's commit, untick anything you didn't tick, and run the block through the rest of the
+loop — reviewer, gates, your tick, your commit. Record it in the DEVLOG. The work is often fine; the
+problem is that nothing verified it, and that's exactly what the loop exists to do.
+
+Neither hook constrains you. You commit, you tick, you spawn the agents.
 
 ### 1. Select the change
 
@@ -110,7 +183,7 @@ OUTER — for each ## N. section, in order
   ├─ post the section's base commit to the DEVLOG
   ├─ INNER — for each block in the section
   │    brief worker → worker implements → reviewer audits → loop until Approve
-  │    → gates pass → tick boxes → commit
+  │    → gates pass → verify the reviewed state → tick boxes → commit
   └─ SECTION REVIEW — supervisor audits the whole section
        Approve → next section
        Request changes → carve a remediation block, re-enter INNER
@@ -139,23 +212,69 @@ see the section as a whole. Post it **before** any block of the section is commi
 1. **Brief the worker.** Post the brief to the DEVLOG (`[architect]`, under the block's `## N.`
    section): the block's tasks (`N.1`…`N.k`), the relevant spec excerpts, the binding design decisions
    that bind them, and the done-gates below. The worker shouldn't need to go hunting.
-2. **Worker implements the block** and reports back, posting to the DEVLOG as it goes.
+
+   **Brief the falsifier, not the deliverable.** For each task, alongside "build X", name **the
+   observation that fails if X is undone**. This is one sentence per task and it is the single highest-
+   yield thing in this document: §8's post-mortem found the failures tracked exactly how each task was
+   briefed — where a brief framed something as a *property*, the evidence was excellent; where it framed
+   a *deliverable*, nothing asked what would have to be false, and three tests shipped that could not
+   fail. Three of that section's five findings would have been block-level catches.
+2. **Worker implements the block** and reports back, posting to the DEVLOG as it goes. If the boundary
+   tripwire reports at the end of your turn, deal with it **before** step 3 — an unreviewed, ungated
+   commit is not a starting point for a review.
 3. **Audit.** Spawn `reviewer` on the block diff (correctness, design-decision compliance, OpenSpec
    scope, C# idiom, auth/crypto correctness and git-integrity hazards). The reviewer posts its verdict
    to the DEVLOG.
 4. **Review loop.** Worker and reviewer resolve findings **in the DEVLOG thread** — reviewer posts
    findings, worker fixes and responds, reviewer re-audits. **Repeat until the reviewer signs off.**
-5. **Gates — all must pass before ticking any box:**
-   - `dotnet build` clean (no errors)
-   - `dotnet test` green — the block's new tests **and** all existing tests
-   - `openspec validate <change-name> --strict`
-   - `dotnet format --verify-no-changes` clean
+5. **Gates — all must pass before ticking any box.** Run each and **read its exit line**; a gate
+   passed only when you saw its `LABEL_EXIT:0`:
+   - `make build` → `BUILD_EXIT:0` (no errors)
+   - `make test` → `TEST_EXIT:0` — the block's new tests **and** all existing tests
+   - `make format` → `FORMAT_EXIT:0`
+   - `make validate` → `VALIDATE_EXIT:0`
+
+   `make gates` runs the whole set in one `-k` pass and is the quickest way to get the full picture —
+   but a green `GATES_EXIT:0` is what you're after, and a red one still needs the individual exit
+   lines to say which gate failed. Never conclude a gate passed from reading its output; quote the
+   code.
+
    A block commits green. If a block must land with a failing test for a sound technical reason (e.g. a
    red test a later block in the same section turns green), that is a deliberate Architect call — state
    the reason in the DEVLOG **and** the commit body. Otherwise a failed gate sends you back to step 4,
    not to a commit.
-6. **Tick the boxes.** Mark every `- [x] N.M` in the block in `tasks.md`.
-7. **Commit — one conventional commit per block:**
+6. **Verify the reviewer certified what you are about to commit.** An `Approve` certifies the exact
+   state the reviewer was shown; anything added after it is uncertified. Every verdict ends with a
+   `Reviewed-state:` fingerprint — recompute it and compare:
+   ```sh
+   { git diff HEAD -- ':/' ':(top,exclude,glob)**/DEVLOG.md'
+     git ls-files --others --exclude-standard -- ':/' ':(top,exclude,glob)**/DEVLOG.md' \
+       | while read -r f; do printf '%s\n' "$f"; cat "$f"; done
+   } | shasum | cut -c1-12
+   ```
+   (`git diff HEAD` alone is blind to untracked files, so a brand-new source or test file would not
+   change a naive hash — the `ls-files --others` half is what closes that.) **A mismatch sends the block
+   back to step 3, not on to a commit** — unless you post an `[architect]` note saying exactly what
+   changed after the verdict and how you verified it. Either is fine; silently committing is not. This
+   gap has opened twice in one change, both times with correct code — what it damages is the DEVLOG,
+   which is archived as the account of how the change was built.
+
+   **Why the DEVLOG is excluded, and why at the pathspec level (Product Owner decision, 2026-08-18).**
+   The reviewer writes its verdict *into* the DEVLOG, so an unexcluded fingerprint covers the very file
+   the value is written in: writing `V` changes what the hash is taken over, and no value reproduces
+   itself. The first verdict to carry a fingerprint hit this immediately and had to improvise a
+   round-trip to post one at all. **Excluding it in the pipe does not work** — `git diff HEAD` emits an
+   `index <blob>..<blob>` header per modified file, which moves when the DEVLOG moves, so stripping the
+   `Reviewed-state:` line from the stream leaves the DEVLOG's fingerprint in the diff anyway. The
+   exclusion has to happen before the diff is generated, which is what the pathspec does; `:/` anchors
+   both halves to the repository root so the value does not depend on the working directory, and
+   `**/DEVLOG.md` covers archived changes as well as active ones. `tasks.md`, `src/` and `tests/` all
+   stay covered, so a box ticked or a line added after the verdict is still caught — **what this check
+   certifies is the code the reviewer read, not the record.** The record's integrity rests on the
+   DEVLOG being append-only and committed with its block, which is a different mechanism; do not read
+   this fingerprint as evidence for it.
+7. **Tick the boxes.** Mark every `- [x] N.M` in the block in `tasks.md`.
+8. **Commit — one conventional commit per block:**
    ```
    feat(<change-name>): <block summary> (N.1–N.3)
 
@@ -235,75 +354,17 @@ When every task in the change is ticked and the **final section has a supervisor
 
 ## Mutation testing — capped and scoped
 
-Mutation testing is this project's evidence standard: a green suite is not proof a security property
-holds, so break the property and check a test dies. It has earned its place — it has caught a live
-concurrency defect, a `BootstrapConcurrencyTests` that only half-worked, an assertion that compared
-only a URL's path, and a hasher recorder blind to the password. **It is also easy to run far past
-the point of usefulness**, so it is bounded. **ZeroWiki is a wiki for a small trusted group, not a
-system that warrants unbounded verification.**
+ZeroWiki's evidence standard for security- and correctness-critical paths: a green suite is not proof
+a security property holds, so break the property and check a test dies. **Load the `mutation-testing`
+skill before running any mutant, and before briefing an agent to run one** — it carries the caps
+(3 confirmation runs, auth/concurrency/data-integrity paths only, no unbounded digging), the rules
+that make a result mean something, and the harness hazards.
 
-1. **Cap confirmation runs at 3.** A mutant that dies 3/3 with a consistent, understood failure mode
-   is confirmed. Exceed 3 **only** when results are genuinely flaky or nondeterministic and
-   characterising that variance *is* the finding.
-2. **Mutate security- and correctness-critical paths only** — auth, concurrency, and data integrity
-   (in practice `BootstrapService`, `InvitationService`, `LoginService`, `GitTokenService`, the
-   anonymous gate). **Not** general CRUD or wiki-page logic: ordinary unit tests with normal coverage
-   are correct there.
-3. **No polling loops with sleep plus background processes.** If a run must be backgrounded, use a
-   bounded wait with a short timeout (~2 min) and report if it has not resolved.
-4. **Stop and summarise when the mutant at hand is resolved.** Do not expand to other files without
-   an explicit go-ahead. A genuine finding is **not** licence to keep digging in the same area — fix
-   it and move on.
+Two rules apply even when that skill is not loaded:
 
-**Brief agents with these limits in the block brief itself.** Reining an agent in afterwards is what
-made the rule necessary.
-
-### Rules that make a mutation result mean something
-
-- **Verify under the full `dotnet test`, never a filter.** A filtered run measures a condition the
-  gate never runs in: `BootstrapConcurrencyTests` reported 3/3 filtered and 7/13 under the real
-  parallel suite. A filtered figure is not wrong, it is *irrelevant* — never post one as the record.
-- **Checksum the target before *and* after.** A no-op mutation is indistinguishable from a surviving
-  mutant. A `\n`-vs-CRLF mismatch once silently modified nothing across three mutations.
-- **Check your instrument before believing it.** Test any pattern you measure with against
-  known-present markup first. Two agents once shared a blind spot — both anchor regexes required
-  `href="…"` while Blazor renders `href=""` bare — so they corroborated each other while both were
-  wrong. Two measurements agreeing is not corroboration when they share an instrument.
-- **A surviving mutant may be correct.** Record it deliberately with the reason (an explicit
-  `app.UseRouting()` whose removal changes nothing is kept because the ordering dependency is a
-  security property). Never silently drop the result or edit the code to make it die.
-
-### Hazard: an interrupted mutation run leaves a live mutant in `src/`
-
-`BootstrapService.cs` was once found with `deferred: false` → `true` still applied after an agent was
-stopped mid-run — the mutation that breaks "exactly one administrator", sitting in production code
-with the working tree looking entirely ordinary.
-
-- **Always `git diff -- src` before committing** anything that followed a mutation run. This is not
-  ceremony.
-- **Run `git status --short -- src` alongside it — the diff is blind to untracked files.** `git diff`
-  reports only on files git already tracks; a file that has never been `git add`ed is not shown as
-  unchanged, it is not shown *at all*. §7b mutated `GitEmailService.cs`, which was brand new and
-  untracked for the whole block, so the mandated diff came back clean over a file it had never looked
-  at. A new file is the *normal* case for a block that adds a service, which is exactly when mutation
-  testing is most likely to run.
-- **A `??` entry means "read it or checksum it", not "it's fine".** `git status` surfaces that an
-  untracked file exists; it cannot show content, and for a new file git has no baseline to diff
-  against, so **no git command can verify a mutant inside it**. Git gives you visibility here, not
-  verification.
-- **The content check is what actually protects you** — checksum the target before *and* after each
-  mutation (already required above), revert via the harness, and have a second pair of eyes re-read or
-  re-run the mutants. In §7b that discipline, not git, is what confirmed the file was clean.
+- **Always run `git diff -- src` *and* `git status --short -- src` before committing** anything that
+  followed a mutation run. `git diff` is blind to untracked files — a brand-new service file is the
+  *normal* case for a block that runs mutants, and no git command can verify a mutant inside one.
+  Checksumming the target is what actually protects you.
 - **Mutation harnesses must revert via `trap`/`finally`**, never a final step that an interruption
-  can skip.
-
-<!-- CODEGRAPH_START -->
-## CodeGraph
-
-In repositories indexed by CodeGraph (a `.codegraph/` directory exists at the repo root), reach for it BEFORE grep/find or reading files when you need to understand or locate code:
-
-- **MCP tool** (when available): `codegraph_explore` answers most code questions in one call — the relevant symbols' verbatim source plus the call paths between them, including dynamic-dispatch hops grep can't follow. Name a file or symbol in the query to read its current line-numbered source. If it's listed but deferred, load it by name via tool search.
-- **Shell** (always works): `codegraph explore "<symbol names or question>"` prints the same output.
-
-If there is no `.codegraph/` directory, skip CodeGraph entirely — indexing is the user's decision.
-<!-- CODEGRAPH_END -->
+  can skip. An interrupted run has already left a live mutant in `src/` once.

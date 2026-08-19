@@ -1,0 +1,327 @@
+@page "/wiki/{*Route}"
+@* Anonymous requests never reach here — AnonymousGate answers them and the fallback policy would
+   refuse them anyway (AD21). The attribute is kept for the same reason every other protected page
+   keeps it: the page states its own requirement rather than inheriting it from a pipeline it cannot
+   see. *@
+@attribute [Authorize]
+@using ZeroWiki.Content
+@using Markdig
+@using Microsoft.AspNetCore.Diagnostics
+
+@inject PageIndex PageIndex
+@inject MarkdownPipeline MarkdownPipeline
+@inject GitIdentityResolver GitIdentityResolver
+@inject ILogger<WikiPage> Logger
+
+<PageTitle>@PageDisplayTitle</PageTitle>
+
+@* Editing is a mode of this page, not a second address for it (D17, §6 block D4): the `edit` query
+   flag selects PageEditor in place of everything below, rather than a sibling `@page` route (a
+   catch-all may only occupy the last route segment, and a sibling `/edit` route would collide with
+   content whose own path happens to start with "edit/" — see D17). *@
+@if (Edit is not null)
+{
+    <PageEditor Route="@Route" />
+}
+else if (_renderedBody is { } body)
+{
+    <h1>@PageDisplayTitle</h1>
+
+    @if (_page is { } notifiedPage)
+    {
+        @* D19 §3, §8 block B: the one InteractiveServer island on this page (D7) -- everything else
+           above and below renders Static SSR. Keyed by this page's own canonical route, so it only
+           ever hears about a push that touched this exact page. Render mode is declared inside the
+           component itself, not here (see its own remarks). *@
+        <ChangedOnDiskIndicator Route="@notifiedPage.Route.Value" />
+    }
+
+    @if (_page?.LastEdit is { } lastEdit)
+    {
+        <p class="page-last-edit">
+            Last edited by <strong>@(_lastEditAttributedName ?? lastEdit.AuthorName)</strong> on
+            <time datetime="@lastEdit.EditedAt.ToString("O")">@lastEdit.EditedAt.ToString("f", System.Globalization.CultureInfo.InvariantCulture)</time>
+        </p>
+    }
+
+    @if (_page is { Tags.Count: > 0 } page)
+    {
+        <ul class="page-tags">
+            @foreach (var tag in page.Tags)
+            {
+                <li>@tag</li>
+            }
+        </ul>
+    }
+
+    @if (_editHref is { } editHref)
+    {
+        <p><a href="@editHref">Edit this page</a></p>
+    }
+
+    <div class="page-body">
+        @body
+    </div>
+}
+else if (_ambiguousRoute is { } ambiguous)
+{
+    <h1>This page name is ambiguous</h1>
+    <p>
+        More than one file in the wiki's content resolves to this address, so ZeroWiki cannot tell
+        which one you mean. Rename one of the following so each has its own address, then reload this
+        page:
+    </p>
+    <ul class="ambiguous-route-claimants">
+        @foreach (var path in ambiguous.RelativePaths)
+        {
+            <li><code>@path</code></li>
+        }
+    </ul>
+}
+else
+{
+    <h1>Page not found</h1>
+    <p>There is no page at this address.</p>
+
+    @if (_editHref is { } editHref)
+    {
+        <p><a href="@editHref">Create this page</a></p>
+    }
+}
+
+@code {
+    [Parameter]
+    public string? Route { get; set; }
+
+    /// <summary>
+    /// The `edit` mode flag (D17, §6 block D4) — presence, not value, selects edit mode. A valueless
+    /// `?edit` binds this <see cref="string"/> parameter to the empty string, not <see langword="null"/>
+    /// — verified by execution, not assumed. A nullable <see cref="bool"/> parameter was tried too and
+    /// is <b>not</b> the 400 an earlier draft of this block's brief claimed: it silently binds to
+    /// <see langword="null"/> for both a valueless flag and an explicit empty value, indistinguishable
+    /// from the flag being entirely absent, and only faults (500, not 400) on a non-empty value it
+    /// cannot parse. See the DEVLOG post for this block for the exact responses observed.
+    /// </summary>
+    [SupplyParameterFromQuery(Name = "edit")]
+    private string? Edit { get; set; }
+
+    [CascadingParameter]
+    private HttpContext? HttpContext { get; set; }
+
+    private PageIndexEntry? _page;
+    private AmbiguousPageRoute? _ambiguousRoute;
+    private MarkupString? _renderedBody;
+    private string? _editHref;
+
+    /// <summary>
+    /// §8.3 (D19 §5): the account <see cref="GitIdentityResolver"/> attributes <c>_page.LastEdit</c>'s
+    /// raw git identity to, or <see langword="null"/> to fall back to
+    /// <see cref="PageLastEdit.AuthorName"/> as-is — set once in <see cref="OnInitializedAsync"/>, never
+    /// baked into the index itself (see <see cref="GitIdentityResolver"/>'s own remarks for why
+    /// resolution happens here, at display time, rather than when the index is built).
+    /// </summary>
+    private string? _lastEditAttributedName;
+
+    private string PageDisplayTitle =>
+        _page?.Title is { Length: > 0 } title ? title : _page?.RelativePath ?? "ZeroWiki";
+
+    /// <summary>
+    /// Resolves <see cref="Route"/> against <see cref="PageIndex"/>'s current snapshot — refreshed first
+    /// if it is stale (D15, 4.3) — and either renders the page, surfaces D12's refusal for it, or reports
+    /// it as not found. None of these three outcomes collapse into another: an ambiguous or
+    /// sole-claimant-refused route names every file implicated (D12) rather than reading as an ordinary
+    /// 404. Title, tags, and last-edit all come from the resolved <see cref="PageIndexEntry"/> — only the
+    /// body is read from the working tree on this request, never from the index (D15: "index holds no
+    /// content"), so metadata can be a refresh behind but the rendered body never can.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// D12's ambiguous/sole-claimant-refused routes report <see cref="StatusCodes.Status409Conflict"/> —
+    /// the address exists but resolves to more than one file, a different condition than nothing being
+    /// there at all, and one the purpose-built <see cref="IStatusCodePagesFeature"/> opt-out (see
+    /// <see cref="SetStatusCode"/>) delivers correctly end to end, verified against the real pipeline.
+    /// </para>
+    /// <para>
+    /// A genuinely unmatched, malformed, or vanished-mid-request route stays <b>200</b> — not the honest
+    /// 404 tried first (block 3b round 2, a reviewer finding). <see cref="IStatusCodePagesFeature"/> fixes
+    /// <c>UseStatusCodePagesWithReExecute</c>'s re-execution (confirmed by the 409 path above actually
+    /// working), but 404 specifically also runs into a <i>second</i>, unrelated mechanism, and it is app
+    /// <i>configuration</i>, not a property of Blazor or of HTTP: <c>Routes.razor</c> currently sets
+    /// <c>&lt;Router NotFoundPage="typeof(Pages.NotFound)"&gt;</c>, and <b>while that configuration
+    /// stands</b>, ASP.NET Core's Blazor Web App treats any Static SSR response whose status is set to 404
+    /// as eligible for its own built-in not-found handling — reproducibly, an empty body and a
+    /// <c>blazor-enhanced-nav: allow</c> response header instead of this component's own rendered markup.
+    /// Reproduced against the real app, and isolated to 404 specifically (not to non-2xx statuses
+    /// generally, nor to <see cref="IStatusCodePagesFeature"/>'s absence) by swapping the same code path to
+    /// <see cref="StatusCodes.Status410Gone"/>, which delivered this component's own body correctly. 410
+    /// isn't the honest answer either (410 means something existed and was deliberately removed, not
+    /// "never existed"), so this outcome keeps 200 with distinguishing body content instead — the same
+    /// choice this block made for every outcome before this round, now scoped to only the one case where
+    /// 404 is unusable under today's <c>NotFoundPage</c> setting, not applied everywhere by default. The
+    /// lever this block deliberately did not touch: removing or reworking <c>Routes.razor</c>'s
+    /// <c>NotFoundPage</c> (or the newer <c>NavigationManager.NotFound()</c>-based API it's built for)
+    /// would change this and could make 404 usable here — that is application configuration this block has
+    /// no reason to touch, not evidence the status code itself is unusable in ASP.NET Core or Blazor
+    /// generally. Whether §4 or a later change should make that trade is recorded in <c>## NEXT</c>, not
+    /// settled here.
+    /// </para>
+    /// <para>
+    /// Neither is an AD21 existence-oracle concern: <c>AnonymousGate</c> already makes every anonymous
+    /// response uniform regardless of status, and this page is <c>[Authorize]</c>, so a signed-in member's
+    /// status code carries no information an anonymous visitor could ever observe.
+    /// </para>
+    /// </remarks>
+    protected override async Task OnInitializedAsync()
+    {
+        if (Edit is not null)
+        {
+            // Edit mode delegates entirely to PageEditor (D17, §6 block D4) — none of the read path
+            // below (the index lookup, the rendered body) applies to this request at all.
+            return;
+        }
+
+        var context = HttpContext
+            ?? throw new InvalidOperationException("Rendering a wiki page requires the static server-rendered HttpContext.");
+
+        // Route arrives already percent-decoded once by ASP.NET Core routing — TryDecodeRouteValue is
+        // the only correct entry point here; TryDecode would decode it a second time (see its remarks).
+        // Wrapped in RouteValue rather than passed as a bare string so the compiler enforces that
+        // contract rather than a comment.
+        if (string.IsNullOrEmpty(Route) || !PageRouteCodec.TryDecodeRouteValue(new RouteValue(Route), out var relativePath))
+        {
+            return;
+        }
+
+        var routeValue = new RouteValue(Route);
+        var canonicalRoute = PageRouteCodec.Encode(relativePath); // Encode returns EncodedRoute directly (D17)
+
+        // S2 (block 3 remediation): Encode is not injective, so decode-then-re-Encode alone can land a
+        // request on a different file's canonical route than the one it actually named — e.g. a route
+        // value carrying two literal spaces re-encodes to the same route a single literal underscore
+        // does, resurrecting D12's own collision through the request rather than the filename. Refusing
+        // here, before any enumeration lookup, means a non-canonical request can never resolve to a
+        // different file than a canonical one would — the request-side twin of enumeration's own "the
+        // route identifies exactly this file" invariant.
+        if (!PageRouteCodec.IsCanonicalRouteValue(routeValue, canonicalRoute))
+        {
+            return;
+        }
+
+        // The edit affordance for this address (D17, §6 block D4) — set once the request's own route
+        // value is confirmed canonical, so a link this page renders is never built off a request form
+        // an editor load would itself go on to refuse. Built from PageRouteCodec.ResolveUrlForms, the
+        // one implementation this class and PageEditor.razor's own redirect both share (§6 remediation,
+        // Blocker 2) — never from context.Request.Path.Value, which is already percent-decoded and
+        // therefore wrong for exactly the characters Encode's second layer exists to escape (%, #, ?,
+        // control characters): a route containing one of those linked to a different page entirely.
+        var (editUrlSegment, _) = PageRouteCodec.ResolveUrlForms(routeValue);
+        _editHref = $"/wiki/{editUrlSegment}?edit";
+
+        // D15/4.3: refreshes the snapshot first when its stamp no longer matches the repository's
+        // current HEAD — the mechanism that keeps this correct for a writer that never notifies the app
+        // (an `updateInstead` push, or an operator committing on the volume), identically to a browser
+        // save. GitProcessRunner still does not kill its subprocess on cancellation (obligation 8, owed
+        // to §6): a cancelled request abandons the wait rather than the underlying `git` invocation, an
+        // existing, narrow gap this call makes reachable from the request path, not one it introduces.
+        var snapshot = await PageIndex.GetCurrentAsync(context.RequestAborted);
+
+        // EncodedRoute's synthesized equality delegates to string.Equals on Value, which is ordinal by
+        // default — the same comparison StringComparison.Ordinal made explicit before the route type
+        // existed (D17, §6 block C1 delta).
+        var ambiguousMatch = snapshot.AmbiguousRoutes
+            .FirstOrDefault(candidate => candidate.Route == canonicalRoute);
+        if (ambiguousMatch is not null)
+        {
+            _ambiguousRoute = ambiguousMatch;
+            SetStatusCode(context, StatusCodes.Status409Conflict);
+            return;
+        }
+
+        var pageMatch = snapshot.Pages
+            .FirstOrDefault(candidate => candidate.Route == canonicalRoute);
+        if (pageMatch is null)
+        {
+            return;
+        }
+
+        string markdown;
+        try
+        {
+            markdown = await File.ReadAllTextAsync(pageMatch.AbsolutePath, context.RequestAborted);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // The file existed in the index a moment ago and is gone, mid-write, or newly unreadable now
+            // — a concurrent save racing this read without D3's lock (a gap 3a's review already parked
+            // for §6). UnauthorizedAccessException does not derive from IOException (S3, block 3
+            // remediation) and was previously uncaught here, producing a 500 instead of the clean
+            // not-found this comment already promised. Report not found rather than a 500; the next
+            // request re-resolves against a fresh (or freshly refreshed) index.
+            return;
+        }
+
+        // D15: the index holds no content — the body is always read from the working tree on the
+        // request that renders it, above, never from the snapshot, so an out-of-date CommitSha can make
+        // metadata stale for the instant before a refresh, but never the rendered body.
+        _page = pageMatch;
+        _renderedBody = new MarkupString(Markdown.ToHtml(markdown, MarkdownPipeline));
+
+        if (pageMatch.LastEdit is { } lastEdit)
+        {
+            _lastEditAttributedName = await ResolveLastEditAttributedNameAsync(lastEdit, context.RequestAborted);
+        }
+    }
+
+    /// <summary>
+    /// §8.3: maps <paramref name="lastEdit"/>'s raw git author email back to the account it attributes
+    /// to (D19 §5's synthetic-first, then <c>GitEmails</c>, then raw-identity order), returning
+    /// <see langword="null"/> — never throwing — for an unresolvable, missing, or malformed address, or
+    /// a genuine resolution failure. A page must still render even when attribution cannot be computed;
+    /// the caller falls back to <see cref="PageLastEdit.AuthorName"/> exactly as git reported it (spec:
+    /// <em>Unknown git email is attributed to the raw identity</em>).
+    /// </summary>
+    private async Task<string?> ResolveLastEditAttributedNameAsync(PageLastEdit lastEdit, CancellationToken cancellationToken)
+    {
+        try
+        {
+            var resolved = await GitIdentityResolver.ResolveAsync(lastEdit.AuthorEmail, cancellationToken);
+            return resolved?.Username;
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            Logger.LogWarning(
+                ex,
+                "Resolving the git identity for '{Route}' failed; the page will render with the raw " +
+                "pushed identity instead of an attributed account.",
+                Route);
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Sets <paramref name="statusCode"/> and opts this response out of
+    /// <c>UseStatusCodePagesWithReExecute("/not-found", ...)</c> (<c>Program.cs</c>).
+    /// </summary>
+    /// <remarks>
+    /// Verified against the real application pipeline, not assumed or tried only against a simplified
+    /// probe (block 3b round 2 — a reviewer finding): setting <c>Response.StatusCode</c> alone into the
+    /// 400-599 range, with no opt-out, silently re-executes the request into <c>NotFound.razor</c> and
+    /// discards this component's own rendered body — including the ambiguous-route claimant list D12
+    /// exists to surface. <see cref="IStatusCodePagesFeature"/> exists specifically to opt a response out
+    /// of that re-execution; setting <see cref="IStatusCodePagesFeature.Enabled"/> to <see
+    /// langword="false"/> here, before assigning the status code, was tested end to end through
+    /// <c>WikiPageTests</c> against the real Blazor Static SSR render (not a minimal-API stand-in, whose
+    /// simpler response-writing path does not reproduce the discard at all) and does deliver this
+    /// component's own body at the requested status code.
+    /// </remarks>
+    private static void SetStatusCode(HttpContext context, int statusCode)
+    {
+        var statusCodePagesFeature = context.Features.Get<IStatusCodePagesFeature>();
+        if (statusCodePagesFeature is not null)
+        {
+            statusCodePagesFeature.Enabled = false;
+        }
+
+        context.Response.StatusCode = statusCode;
+    }
+}
