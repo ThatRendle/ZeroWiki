@@ -268,6 +268,8 @@ public sealed partial class RedeemInvitationPageTests : IDisposable
     [InlineData("has space")]
     [InlineData("colon:name")]
     [InlineData("___")]
+    [InlineData("café")]
+    [InlineData("admin\tx")]
     [InlineData(".abc")]
     [InlineData("abc.")]
     [InlineData("-abc")]

@@ -28248,6 +28248,223 @@ discriminates.
   before `## NEXT`, never at end-of-file**.
 - Do not end your turn waiting on a background task; let slow commands block.
 
+### Close-out block complete — all three items resolved
+
+**[worker]** Classification, all three: **finish** — each item is an existing claim/scenario/matrix
+with a specific, named gap; none is new surface.
+
+**F1 — reproduced at both surfaces before touching anything.** Wrote a throwaway xunit fixture
+(`ScratchF1ReproTests.cs`, deleted after use, never committed) that called `InvitationService
+.RedeemAsync` directly for the service surface and `Validator.TryValidateObject` against
+`RedeemInvitationInput` for the form surface, at username lengths 64/65/127/128 (all-`a`).
+Observed, verbatim:
+
+- **Service** — 64: no exception (valid). 65, 127, 128: `ArgumentException` with
+  *"A username can be at most 64 characters."* only, at every length. The two checks are
+  sequential `if`-throw statements; length throws and returns before the pattern is ever
+  evaluated, so the single-message guarantee is unconditional here, not probabilistic.
+- **Form** — 64: 0 errors. 65: 1 error (length only). 127: 1 error (length only). **128: 2
+  errors** — length *and* `UsernameRuleDescription` together. `[StringLength]` and
+  `[RegularExpression]` are independent `ValidationAttribute`s that `Validator.TryValidateObject`
+  evaluates independently (confirmed via the actual `Validator` call, not by reading its source);
+  the 125-bounded pattern can only fail to match on shape grounds through 127 characters — at 128
+  its own quantifier is exhausted regardless of content, so both attributes fail together.
+
+This matches the ledger's claim exactly (service: every length; form: holds to 127, breaks at
+128) — **not** a stale-ledger finding, so no `❓ @architect` needed. Corrected
+`CredentialPolicy.cs:85-108` to state the per-surface bound explicitly instead of the unqualified
+sentence, and left `UsernamePattern`'s literal (`125`) untouched — the bound is still deliberately
+not derived from `MaximumUsernameLength`, only the claim about its consequence changed.
+
+**F2 — derived the accepted set from `CredentialPolicy` and tried to break the rewritten WHEN in
+both directions**, via a second throwaway fixture (`ScratchF2ReproTests.cs`, also deleted, never
+committed) comparing a WHEN-predicate coded independently against `CredentialPolicy.UsernameMatcher()`
++ length bounds, over 12 cases (`abc`, `a-b`, `a.b`, `a_b`, `a__b`, `a.b.c.d.e`, 64-char alnum,
+`a..b`, `.ab`, `ab.`, `"has space"`, 65-char alnum). **Zero counterexamples in either direction** —
+every case where the predicate said "satisfies WHEN" the system accepted, and every case where it
+said "violates WHEN" the system refused. Rewrote the scenario's WHEN in
+`specs/user-accounts/spec.md` to add the 64-character cap and the no-consecutive-dots clause:
+
+> WHEN a user chooses a username of at least 3 and at most 64 characters that begins and ends with
+> a letter or digit, contains no two consecutive dots, and otherwise uses only letters, digits,
+> dots, hyphens and underscores
+
+Checked the four sibling scenarios in the same requirement block — all already state refusal
+conditions correctly and needed no change. `make validate` → `VALIDATE_EXIT:0`.
+
+**Matrices — closed the gap and verified it discriminates, not just that it passes.** Added
+`"café"` and `"admin\tx"` to `RedeemInvitationPageTests.cs`'s
+`A_username_of_the_wrong_shape_is_rejected_and_creates_nothing` theory (was missing both;
+`BootstrapPageTests.cs` already had them). Ran one mutation-testing confirmation via `mutate.sh`
+against `RedeemInvitationInput.cs`, replacing the `[RegularExpression]` attribute's pattern
+argument (`CredentialPolicy.UsernamePattern` → `".*"`) so the redeem form's shape check accepts
+everything. Full unfiltered `dotnet test`: **KILLED**, 15 failed / 882 passed / 897 total, harness
+checksum-verified the revert (`e3230d38caa2` before/after match). Read the full test log
+(`mutate-testlog.rAmU3PZvNA`, not just the script's `tail`) and confirmed by name that both new
+cases are among the 15 failures:
+`A_username_of_the_wrong_shape_is_rejected_and_creates_nothing(username: "café")` and
+`(username: "admin\tx")` both `[FAIL]`. One run — 15/15 failed with the same, understood mechanism
+(pattern bypassed → shape no longer refused), no flakiness to characterise, so the 3-run cap was
+not needed. `git diff -- src` and `git status --short -- src` after revert show only the intended
+`CredentialPolicy.cs` doc change — no stray mutant.
+
+**Claim / instrument / blind spot** (F2's "no counterexample" claim): **Claim** — the rewritten
+WHEN and `CredentialPolicy`'s actual accepted set agree on the 12 constructed cases tested.
+**Instrument** — a hand-derived predicate function checked against `CredentialPolicy
+.UsernameMatcher().IsMatch(...)` plus the length constants, run as an xunit theory
+(`ScratchF2ReproTests.cs`, deleted after the run). **Blind spot** — 12 hand-picked cases is not
+exhaustive over the input space; it cannot see a disagreement at a length or shape combination
+nobody thought to try (e.g. very long dot-heavy strings near the 125-bound edge, or Unicode
+letters that `char.IsLetterOrDigit` treats as letters but the ASCII-only pattern does not — the
+predicate deliberately restricted itself to `< 128` to mirror the pattern's ASCII charset, so it
+does not by itself prove the two never diverge on non-ASCII input; the existing `"café"` refusal
+test elsewhere covers that specific case).
+
+Gates: `BUILD_EXIT:0 TEST_EXIT:0 FORMAT_EXIT:0 VALIDATE_EXIT:0 GATES_EXIT:0` (full log
+`/tmp/gates.log`, unsandboxed, foreground, no `tail`). `git status --short -- src tests openspec`
+final: only the three intended files modified (`CredentialPolicy.cs`, `spec.md`,
+`RedeemInvitationPageTests.cs`) — no scratch files, no leftover mutant.
+
+→ @reviewer
+
+**[reviewer]** Audit of the close-out block (working tree vs `03d2761`; 3 files: `spec.md`,
+`CredentialPolicy.cs`, `RedeemInvitationPageTests.cs`). **Verdict: Approve.**
+
+### F2 — re-derived independently, no disagreement found
+
+Wrote my own predicate from scratch (not the worker's) and diffed it against the real
+`CredentialPolicy.UsernameMatcher()` regex plus the length constants — no code shared with the
+worker's `ScratchF2ReproTests.cs`, which I did not read before writing mine.
+
+- **Exhaustive** over every string of length 0–7 from `{a,b,A,B,0,9,.,-,_}` (n ≈ 380k after
+  dedup by itertools product).
+- **Targeted probes** at exactly the boundaries this brief named: min (`""`, `"a"`, `"aa"`,
+  `"aaa"`), max (64/65/66 chars), leading/trailing separators (`.ab`/`ab.`/`-ab`/`ab-`/`_ab`/
+  `abc_`), strings that are only separators (`.`, `-`, `_`, `..`, `--`, `__`, `...`, `---`,
+  `___`), consecutive dots vs. consecutive hyphens/underscores (`a..b`, `a--b`, `a__b`, mixed
+  `a-.b`/`a._b`), and non-ASCII (`café`, `naïve`, `Zürich`, `日本語abc`) plus control characters
+  the worker's own instrument excluded (`admin\tx`, `admin\nx`, `admin\rx`).
+- **200,000-case random fuzz** over an alphabet that includes the unicode and control characters
+  above (length 0–70) — deliberately probing past the worker's declared blind spot ("the
+  predicate deliberately restricted itself to `< 128` … does not by itself prove the two never
+  diverge on non-ASCII input").
+
+**Zero counterexamples in either direction**, across all of the above, including the exact cases
+the brief called out as worth probing. The rewritten WHEN — *"at least 3 and at most 64
+characters … begins and ends with a letter or digit, contains no two consecutive dots, and
+otherwise uses only letters, digits, dots, hyphens and underscores"* — correctly permits
+consecutive hyphens and consecutive underscores (`a--b`, `a__b` both accepted) while refusing
+only consecutive dots, which is easy to get wrong by generalizing "no doubled separator" instead
+of the dot-specific rule the pattern actually enforces; I checked this asymmetry specifically and
+it holds. I did not find the disagreement the brief invited me to look for.
+
+**Siblings checked**, not just re-read: the "consecutive dots" and "length-and-shape precedence"
+scenarios that sit beside the rewritten one were *added* in this same delta (not present before
+§11), and they now state, in the requirement text, the length-first tie-break the reviewer
+flagged as N2 in §11 (`"Where a username breaks both a length rule and the shape rule, the
+system SHALL evaluate length first…"`) — so N2 reads as resolved by this delta even though
+neither this brief nor the worker's report names it as such. No contradiction or duplication
+among the five sibling scenarios.
+
+### F1 — the doc-comment claim, checked against the code that actually runs it
+
+- **Service surface** (`InvitationService.cs:249-262`): three sequential `if`-throw statements,
+  min-length → max-length → shape, each returning immediately. Confirms the doc's claim that an
+  over-long username is told *only* it is too long, unconditionally, at every length past the
+  cap — there is no code path where the shape check runs after the length check has already
+  thrown.
+- **Form surface** (`RedeemInvitationInput.cs:21-31`): `[MinLength]`, `[StringLength(64)]` and
+  `[RegularExpression(UsernamePattern)]` are three independent attributes. I reproduced the
+  regex's own internal length bound directly (not by reading the doc comment's claim) against the
+  live `UsernamePattern` literal (`{0,125}` — unchanged from before this block):
+  matches at 64, 65, 127; **first fails to match at 128**, for every quantifier-length reason the
+  comment gives (the group's own multiplicity is exhausted, independent of content). That is
+  exactly the boundary the corrected `<remarks>` states, and the `125` literal is confirmed
+  byte-for-byte unchanged from before this block — it was never touched, only the prose describing
+  its consequence.
+- The corrected text drops the previous unqualified sentence and states the per-surface bound
+  explicitly; it no longer claims the single-fault guarantee holds at the form past 127. Accurate.
+
+### Test cases — corroborated without re-running the mutation
+
+I did not re-run the mutation (the finding it protects is well short of the 3-run cap territory
+and the worker's own account is internally verifiable). Instead: the theory both cases were added
+to (`A_username_of_the_wrong_shape_is_rejected_and_creates_nothing`) now carries **exactly 15**
+`[InlineData]` entries — I counted them in the current file, not from the diff. The worker's
+mutation (widening `RedeemInvitationInput`'s `[RegularExpression]` to `.*`) would make every
+one of those 15 inputs pass shape validation, and the test asserts the shape-rule message is
+present in the response body — so all 15, and only those 15 (no other theory in this suite
+exercises `RedeemInvitationInput`'s `[RegularExpression]` failure path), would fail together. That
+matches the worker's reported "15 failed / 897 total" exactly, by mechanism as well as by count,
+which is stronger corroboration than re-running the same mutation would have been on its own.
+Confirmed `"café"` and `"admin\tx"` are two of the 15 `[InlineData]` rows in that theory
+(`RedeemInvitationPageTests.cs:266-267`) and asserted against the shape-rule message like every
+sibling row in the theory — not a status-only assertion, so it cannot pass against a dead form.
+
+**Source restored, checked by content, not diff alone.**
+`RedeemInvitationInput.cs:28-31`'s `[RegularExpression]` currently reads
+`CredentialPolicy.UsernamePattern` (not a literal `.*` or any other residue) — read the live file,
+not inferred from `git diff` being clean.
+
+### Scope
+
+`git diff HEAD -- src` shows only `///` doc-comment lines added/changed in `CredentialPolicy.cs` —
+no non-comment line touched, confirmed by filtering the diff for added lines that are not `///`
+(none). `git status --short` / `git ls-files --others --exclude-standard` show only the three
+files reported, no scratch fixtures (`ScratchF1ReproTests.cs`, `ScratchF2ReproTests.cs`) and no
+`mutate-testlog*` residue anywhere in the tree. The block stays inside what §1–§12 already closed —
+no new task numbers, no drive-by change, and `make validate`'s green result is consistent with
+`spec.md`'s only change being the two clauses the brief asked for.
+
+### Nits
+
+None.
+
+### Architectural notes
+
+None beyond what the worker's own blind-spot note already flagged (non-ASCII beyond `café`/
+`naïve`/CJK was not exhaustively fuzzed by either instrument against the *service* boundary, only
+the *pattern* directly — low value to chase further here since the pattern is ASCII-anchored by
+construction and both instruments agree on it).
+
+Reviewed-state: d76cffa349bd (HEAD 18cc8e3)
+
+→ @architect
+
+**[architect]** Close-out block CLOSED — `@reviewer` `Approve`, `Reviewed-state: d76cffa349bd`,
+`GATES_EXIT:0` (897 passed). **`LEDGER.md`'s *Close-out items before archive* is now clear, which was the
+last precondition of archiving.**
+
+All three items were verified by execution, not by reading:
+
+- **F1** carried the ledger's "reproduce before fixing" instruction and the reproduction **matched the
+  ledger exactly** — service reports length-only at every length (three sequential `if`-throws, so shape
+  never runs); form reports length-only through 127 and **both** at 128, because `[StringLength]` and
+  `[RegularExpression]` are independent attributes. The comment now names the per-surface bound. The
+  `125` literal is untouched: it is deliberately not derived from `MaximumUsernameLength` and must not be
+  made to track it. **A ledger entry that had sat unverified since §11 turned out to be right** — worth
+  recording, because this change also contains one that was wrong and rode along for two blocks.
+- **F2** was the item that mattered, because archiving promotes the spec. `@reviewer` did not accept the
+  worker's 12-case differential: it wrote its own predicate and checked it against the live matcher
+  **exhaustively over lengths 0–7**, across targeted boundaries, and over **200,000 random cases
+  including unicode** — deliberately past the worker's declared ASCII-only blind spot. Zero
+  counterexamples in either direction.
+- **The matrices** were verified by widening the pattern and watching the suite go red, with both new
+  cases named among the failures — and `@reviewer` corroborated the count **by mechanism** (the theory
+  has exactly 15 `[InlineData]` rows, all shape-refusals) rather than by re-running, which is the
+  stronger check.
+
+**One side effect worth naming:** F2's added scenarios — consecutive dots, and the length-first
+tie-break — also **resolve §11's open N2 question**, spotted by `@reviewer`. A documentation fix closed a
+design question, which is the opposite of this change's usual direction and is recorded here so it is not
+re-opened later as though still open.
+
+### The change is complete
+
+45/45 tasks. §1–§12 each closed with a supervisor `Approve`. Ledger close-out items cleared. `make
+gates` green at 897 tests. **Ready to archive on the Product Owner's decision** — `## NEXT` and
+`LEDGER.md` carry what outlives this change.
+
 ## NEXT
 
 **Resume at `12.1`.** §12 is the only open section and **is not open yet** — it has no `Base:` post.

@@ -84,11 +84,28 @@ public static partial class CredentialPolicy
     /// <para>
     /// This pattern governs <strong>shape only</strong>, and its bound is deliberately looser than
     /// <see cref="MaximumUsernameLength"/> — <c>125</c> admits 127 characters of unbroken
-    /// alphanumerics (253 with a dot between every pair), so an over-long username fails the
-    /// length check and is reported as a length problem rather than also being told its charset is
-    /// wrong. The literal is therefore <em>not</em> derived from the length cap and must not be
-    /// made to track it; a test pins the direction of the slack (the pattern admits at least the
-    /// maximum length), which is the property that matters.
+    /// alphanumerics (253 with a dot between every pair). The literal is therefore <em>not</em>
+    /// derived from the length cap and must not be made to track it; a test pins the direction of
+    /// the slack (the pattern admits at least the maximum length), which is the property that
+    /// matters.
+    /// </para>
+    /// <para>
+    /// What that slack buys an over-long username differs by surface, and the difference is
+    /// structural rather than incidental. At the service boundary (<c>InvitationService</c>,
+    /// <c>BootstrapService</c>) the length and shape checks are sequential <c>if</c>-throw
+    /// statements, so the length check always reports and returns first — an over-long username is
+    /// told only that it is too long, at <em>every</em> length past the cap, because the shape
+    /// check never runs. At the form boundary, <c>[StringLength]</c> and <c>[RegularExpression]</c>
+    /// are independent <see cref="System.ComponentModel.DataAnnotations.ValidationAttribute"/>s
+    /// that <see cref="System.ComponentModel.DataAnnotations.Validator.TryValidateObject(object,
+    /// System.ComponentModel.DataAnnotations.ValidationContext,
+    /// System.Collections.Generic.ICollection{System.ComponentModel.DataAnnotations.ValidationResult}?,
+    /// bool)"/> evaluates independently and both report into the same result set — so the
+    /// single-fault guarantee holds only while the 125-bounded pattern can still fail to match on
+    /// shape grounds alone, i.e. through 127 characters. At 128 characters and beyond the pattern
+    /// can no longer match regardless of content (its own quantifier is exhausted), so
+    /// <c>[RegularExpression]</c> fails alongside <c>[StringLength]</c> and the form reports both
+    /// messages for one fault.
     /// </para>
     /// <para>
     /// Every quantifier is bounded, and the two branches inside the bounded run are disjoint on

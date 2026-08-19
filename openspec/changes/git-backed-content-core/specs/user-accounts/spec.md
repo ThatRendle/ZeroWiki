@@ -8,7 +8,7 @@ The system SHALL enforce these rules wherever a user chooses a username — the 
 
 #### Scenario: Well-formed username is accepted
 
-- **WHEN** a user chooses a username of at least 3 characters that begins and ends with a letter or digit and otherwise uses only letters, digits, dots, hyphens and underscores
+- **WHEN** a user chooses a username of at least 3 and at most 64 characters that begins and ends with a letter or digit, contains no two consecutive dots, and otherwise uses only letters, digits, dots, hyphens and underscores
 - **THEN** the system accepts it
 
 #### Scenario: Username with a leading or trailing separator is refused
