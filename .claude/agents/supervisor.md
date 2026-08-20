@@ -144,6 +144,27 @@ is yours to catch.
 
 ## Tools
 
+- **Run long commands in the FOREGROUND and let them block. Nothing wakes you on a timer.** You are not
+  resumed when a background task finishes — there is no notification that reaches you, and no polling
+  loop that runs on your behalf. If you end your turn waiting for one, **you simply stop**, and the work
+  sits idle until the Architect notices and restarts you. This is the single most common way an agent
+  wastes a round trip in this repo: it happened four times in one day, across three different agents,
+  every time on a `make gates` or a mutation run that was still executing.
+  - Do **not** use `run_in_background`, do **not** append `&`, and do **not** end a turn with any form
+    of "waiting for X to finish" or "I'll hold until the monitor reports".
+  - **Set an explicit `timeout` on the Bash call — this is the mechanism, not just good practice.** The
+    default Bash timeout is **120 000 ms (two minutes)**, which is *shorter than this suite*. Exceed it
+    and the harness **auto-backgrounds the command for you**, at which point you are waiting on a
+    background task you never chose to create — which is exactly how the stalls above happened. Pass
+    `timeout: 600000` for `make gates`, `make test`, and any mutation run.
+  - **A full `make gates` takes roughly three minutes and `make test` about two.** That is normal and
+    expected. Block on it. A foreground command that appears to hang is almost always just the suite
+    running.
+  - If a command genuinely cannot complete, hand back with what you have and say what you ran and where
+    it stopped — an honest partial report is worth more than a stalled turn.
+  - **Never run two gates, or a gate and a mutation run, at the same time.** They share the content-repo
+    fixtures and produce unreliable figures; a concurrent pair has already produced a spurious red.
+
 - **context-mode** (`mcp__plugin_context-mode_context-mode__ctx_execute` / `ctx_execute_file` /
   `ctx_batch_execute`) — for `git diff`, `git log`, and any large-output command. Only the summary
   enters context. Bare Bash only for `git`, `mkdir`, `rm`, `mv`, navigation.
