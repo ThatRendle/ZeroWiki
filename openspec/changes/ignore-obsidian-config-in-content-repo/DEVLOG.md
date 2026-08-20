@@ -1092,28 +1092,498 @@ Reviewed-state: 4f17ac3e3b39
 Fingerprint recomputed `4f17ac3e3b39` — matches the reviewer's Approve. No boxes ticked: a remediation
 block gets no new `N.M`, and §1's were already ticked under 92fb126.
 
+**[supervisor]** Section 1 re-review — `git diff 96a7adf..HEAD` (two commits: `92fb126`, `2ec40e2`)
+
+### Verdict: Approve
+
+Section 1 delivers what the `content-store` spec's initialize-time clauses require, the withdrawn
+`check-ignore` design leaves no residue in code, and the record is now honest rather than merely
+complete. One spec-prose clarification is worth making, but it is resolved by the scenarios and does not
+warrant a third round on a five-line text check — it goes to `## NEXT`, not to a fix block.
+
+### The spec was added to, not trimmed to fit — and that is checkable
+
+This was the review's central question, because a spec rewritten under the code it describes stops being
+a contract. It holds here, and the evidence is the diff's shape rather than my reading of it:
+
+`git diff 96a7adf..HEAD -- specs/` over the whole section is **additions only** — three new paragraphs
+and two new scenarios. The requirement's falsifiable core was already at the base commit and neither
+commit touched it:
+
+- *"SHALL seed an ignore rule … as part of that repository's initial commit"*;
+- *"The rule SHALL apply wherever the directory appears beneath the repository root"* (D3);
+- *"SHALL NOT untrack, delete, or rewrite anything already committed"* (D2);
+- *"SHALL NOT add to, amend, or otherwise modify the ignore rules of a repository it did not initialize"*;
+- Scenario 1's `THEN` — *"that directory is not staged, committed, or pushed by the system, and the
+  repository's initial commit already carried the rule"*.
+
+That clause still asserts something the shipped code could fail: it is about what a **subsequent
+unscoped `git add -A` does**, not about the `.gitignore`'s text. `2ec40e2` replaced only prose that
+`92fb126` had itself introduced — the "ask git" paragraphs. Nothing that predates the implementation was
+weakened, and the strongest falsifier in the requirement is the one that survived untouched.
+
+The three added paragraphs are behavioural and violable: the append-unless-present rule
+(`ContentRepositoryService.cs:740-761` does exactly it), the comment-is-not-the-rule clause, and the
+fail-fast clause the Product Owner ruled on. Scenarios 4 and 5 are their falsifiers and §2 carries the
+tasks (2.5, 2.7).
+
+**One clause is implementation-shaped and I want it named rather than smuggled past:** *"The system
+SHALL NOT attempt to determine whether the directory is already ignored by some other means"*
+(`specs/content-store/spec.md:26-31`). That is a design ruling promoted into the contract — it
+forecloses an implementation rather than describing an observable. I am not asking for its removal:
+after four rounds it is precisely the thing a future maintainer would "improve" back, and a spec clause
+is the only artefact that makes reversing it a deliberate act. Recording what it is, so nobody later
+mistakes it for a behavioural requirement that failed to get a test.
+
+### For `## NEXT`, not for a fix block — one spec paragraph is missing its scope
+
+`specs/content-store/spec.md:17-18` and `:20-23` sit adjacent and read, in prose, as a contradiction:
+
+> The system SHALL NOT add to, amend, or otherwise modify the ignore rules of a repository it did not
+> initialize.
+>
+> Where the volume already carries an ignore file at the repository root, the system SHALL append its
+> rule…
+
+The second paragraph carries no scoping qualifier. Scenario 4 supplies it — *"initializes a content
+repository on a volume that has no commits yet"* — and the code is unambiguous: the whole block is
+inside `EnsureInitialCommitAsync` behind the `if (!repositoryHasNoCommitsYet)` early path
+(`ContentRepositoryService.cs:701-712`), so an adopted repository's `.gitignore` is never opened. The
+behaviour is right and the testable contract is right; it is the prose a cold reader hits first that is
+wrong. A one-line fix — *"Where the system initializes a repository on a volume that has no commits yet
+but already carries an ignore file…"* — and §3's README task touches this area anyway.
+
+### The withdrawn design leaves nothing behind in code
+
+Checked across the whole section rather than per block, which is where an orphan of this shape hides:
+
+- `IsAlreadyIgnoredAsync` is gone with both call sites and its doc comment (`2ec40e2`); no
+  `check-ignore` / `IsAlreadyIgnored` token survives anywhere in `src` or `tests`.
+- `GitProcessRunner.RunAsync` — the exit-code-tolerant primitive the probe used — is **not** orphaned:
+  eight other call sites across `ContentRepositoryService`, `PageSaveService`, `PageIndexBuilder`. The
+  withdrawn design did not introduce it and its removal does not strand it.
+- The surviving `check-ignore` text in `design.md:59,64-65,122` is dated supersession narrative, not
+  residue. Same for `tasks.md` 2.6: it now scopes `core.excludesFile` / `$GIT_DIR/info/exclude` to the
+  **tests'** assertion instrument and says so explicitly — still true, still necessary.
+- `git diff -- src` and `git status --short` are clean; no mutation residue.
+
+**A section-level property the block reviews did not have to consider, and which holds:** bootstrap is
+idempotent across a crashed first start. A process that dies after writing `.gitignore` and before the
+commit restarts with `repositoryHasNoCommitsYet` still true and the file present containing
+`.obsidian/` — the append branch matches the trimmed line and writes nothing. The five-line version gets
+this for free; the `check-ignore` version got it too, but for a reason that depended on the host.
+
+### The record
+
+Honest now, in the sense that matters. The re-posted verdict (`:650-656`) carries its author, the date,
+the cause of the loss, and — the load-bearing part — its **original** `Reviewed-state: 4e19c2e39a4f` /
+`HEAD: 96a7adf` rather than a recomputed one. That restores the referent for the architect's `:740`
+claim *"matches the reviewer's verdict exactly"*, which was the actual defect in my Blocker 1: not a
+missing review, a claim pointing at nothing. A re-post that had quietly recomputed the fingerprint would
+have repaired the appearance and destroyed the evidence. This one did the opposite.
+
+The chain for `2ec40e2` is intact independently: reviewer Approve `4f17ac3e3b39` / `HEAD: 92fb126`,
+architect recompute of the same value, `BUILD_EXIT:0` `TEST_EXIT:0` `FORMAT_EXIT:0` `VALIDATE_EXIT:0`
+`GATES_EXIT:0`.
+
+**Can a cold reader reconstruct why the simple version is right?** Yes — but from `design.md` D5, not
+from this thread. D5's rewrite carries the whole argument (both instruments' failure *shapes*, and the
+rule that where an instrument must be wrong sometimes, be wrong in the direction that costs nothing),
+dated as superseding, and `design.md` survives archiving as a document someone reads rather than greps.
+The thread above it reads as four rounds of thrash on an instrument that no longer exists, because that
+is what it was; append-only means it cannot be annotated in place. That is the correct division — the
+reasoning lives in the artefact, the process lives in the log — and it is worth saying plainly, because
+the temptation next time will be to read the thrash as a reason to run fewer review rounds. Four rounds
+found three real defects in `check-ignore`, and the fourth found the class. The rounds were not the
+waste; the instrument was.
+
+### Blocker 2 stands, correctly placed
+
+The append branch is still entered by no test in the committed suite, and 1.2's clean-tree tick is still
+evidenced only for the no-pre-existing-file branch. Simpler code, same gap. Accepted as §2's work per
+the pin; I am not re-raising it as a §1 blocker.
+
+### What this review could not see
+
+- **I did not verify the append branch executes.** The worker's four scratch tests were run and deleted;
+  I read the report, I did not re-run them. Nothing in the committed suite enters
+  `ContentRepositoryService.cs:747-761`, so my confidence there is textual — exactly as it was last
+  round. The pivot narrowed the code, not the evidence.
+- **I could not recompute `4f17ac3e3b39`.** The pre-commit working tree it covers no longer exists. I
+  verified the chain's internal consistency and that `2ec40e2`'s `src` delta matches what the reviewer
+  described; I did not independently re-derive the value.
+- **My residue instrument is text search plus reading the one changed file.** It answers "is the
+  withdrawn design's *name* gone", which is narrower than "is its *shape* gone". I closed the one gap
+  that mattered — the primitive it used — by checking `RunAsync`'s other callers. It would not see a
+  behaviour elsewhere that only made sense while the probe existed; I have no reason to think one
+  exists, and no instrument that would have told me.
+- I did not run gates or mutation testing; both are read from the record above.
+
+### Nits — for `## NEXT`
+
+- `tasks.md` 2.6's rationale opens *"The rule itself no longer consults git"*, which reads as a
+  correction addressed to a reader who never saw the version being corrected. Fine while the change is
+  active; consider re-wording before archive.
+- `design.md:122` (Open Questions) is now the only place a reader learns the `core.excludesFile`
+  question was *dissolved* rather than answered. Right place for it — noting it so nobody tidies it away
+  as stale.
+
+## 2. The falsifier
+
+**[architect]** Base: 2ec40e2 — the permanent tests: the section's committed evidence, replacing four rounds of scratch runs that left with their workers.
+
+**[architect]** Brief — block 2.1–2.7 → @worker
+
+§1 shipped a working rule and **no committed test of it**. Every falsifier that proved it was a scratch
+test, run and reverted; the supervisor's standing blocker is that the append branch — the part rewritten
+four times — is entered by nothing in the suite. This block is that evidence. One block, because the
+cases share fixtures.
+
+**Aim at the gaps, not at the task text.** The supervisor found the tasks as written do not reach two of
+them, and the task numbering is not a coverage plan:
+
+- **2.1 can be satisfied entirely at the repository root**, which would leave D3 — the rule applying
+  under `docs/` as well — with no falsifier at all. Drive both levels.
+- **Nothing covers clean-tree on a volume that already had a `.gitignore`**, so 1.2's tick is evidenced
+  only for the branch that writes the file fresh, not the branch that appends.
+
+Tasks and their falsifiers — for each, the observation that fails if the behaviour is undone:
+
+- **2.1** Editor config written into the working tree is not staged or committed by the reconciliation
+  that stages the root unscoped. *Drive `ReconcileWorkingTreeAsync`, not the `.gitignore`'s text* — the
+  spec's `THEN` is about what `add -A` does. Write the file at **both** `.obsidian/` and
+  `docs/.obsidian/`. *Falsifier:* remove the rule and the file appears in the commit.
+- **2.2** Demonstrate 2.1 failing with the rule removed and record the output in the DEVLOG. A test that
+  cannot fail is the thing this section exists to stop shipping.
+- **2.3** A repository already carrying `.obsidian/` in its history keeps those tracked files, and the
+  tree stays clean. *Falsifier:* a `git rm --cached` slipping in anywhere turns this red (D2).
+- **2.4** A repository ZeroWiki **adopts** has its ignore rules left untouched — including the case
+  where it carries no `.gitignore` at all, which must stay absent. *Falsifier:* any seeding on the
+  adopted path turns this red (D1).
+- **2.5** The pre-existing root `.gitignore`, three cases: an unrelated rule (appended, operator's line
+  survives); the exact rule already present as its own line (**byte-identical** file, nothing appended);
+  the rule present **only inside a comment** (appended, because a commented line is not the rule).
+  *The third is load-bearing* — a substring implementation passes the first two and fails only this one.
+- **2.6** Pin git config in **every** fixture this section adds. The rule no longer consults git, but
+  your assertions do: "is this path ignored" reads `$GIT_DIR/info/exclude` and `core.excludesFile`, so
+  an unpinned fixture can pass because of the developer's machine. This repo has been bitten by exactly
+  this before with `credential.helper`. *Falsifier:* set a global ignore covering `.obsidian/` and the
+  suite must still pass for the right reasons.
+- **2.7** The fail-fast path: a volume whose pre-existing `.gitignore` matches `.gitignore` itself makes
+  bootstrap **fail** rather than commit without the rule. Assert the refusal specifically — that the
+  right exception surfaces and that **no commit exists** afterwards — not merely that something threw.
+- **Also cover clean-tree on the append branch** (the 1.2 gap above). No new task number; it belongs
+  with 2.5's fixtures.
+
+Every test is permanent and committed — no scratch-and-revert this time. Run
+`make build`/`make test`/`make format` unsandboxed with `timeout: 600000`, output to a file, and quote
+each `LABEL_EXIT:` line. Do not commit, do not tick `tasks.md`. Post under `## 2.`, above `## NEXT`,
+headings at `###`; verify placement with `grep -n '^## '` after writing — a post was lost to
+misplacement in this file today.
+
+**[worker]** Block 2.1–2.7 done — the permanent suite.
+
+### Task classification
+- **2.1, 2.3, 2.4, 2.5 (×3), 2.7 — build.** Nothing in the committed suite drove
+  `ReconcileWorkingTreeAsync`'s unscoped `add -A` against a live `.obsidian/` write, the adopted-repo
+  branches, the pre-existing-`.gitignore` branches, or the fail-fast refusal. All eight are new
+  permanent `[Fact]`s in `ContentRepositoryServiceTests.cs`.
+- **2.2 — build, but not a committed artefact.** By its own nature ("demonstrate 2.1 failing") this
+  cannot be a test that stays in the tree green — I disabled the seeding block in
+  `EnsureInitialCommitAsync`, ran 2.1 filtered, captured the failure, restored the code. `git diff -- src`
+  is empty; see below.
+- **2.6 — build.** No fixture in this file pinned git config before this block; all eight new tests
+  do now, either via a pinned `check-ignore` probe or (found *during* this block, see below) `-f` on a
+  fixture's own `git add`.
+
+### What changed
+`tests/ZeroWiki.Tests/Content/ContentRepositoryServiceTests.cs` only — `src/` untouched (`git diff -- src`
+empty, `git status --short -- src` empty). Eight new `[Fact]`s plus a `PinnedGitEnvironment` helper,
+inserted after `ForeignRepositoryWithDenyCurrentBranchRefuseAndANewGitlink_RefusesLeavingTheConfigUnchanged`,
+before the `CreateForeignRepositoryAsync` helper:
+
+- **`ObsidianConfigAtBothVaultLevels_IsNotStagedByUnscopedReconciliation`** (2.1) — bootstraps, writes
+  `.obsidian/workspace.json` **and** `docs/.obsidian/workspace.json`, calls
+  `EnsureRepositoryAsync()` a second time (the public entry point — `ReconcileWorkingTreeAsync` is
+  private and runs unconditionally on every call, not just the first), and asserts neither path is in
+  `git ls-files`, `HEAD` is still at one commit (D9: nothing staged ⇒ no recovery commit), and the
+  porcelain is empty. Drives the actual reconciliation path per the brief, not the `.gitignore`'s text.
+- **`ObsidianConfigAlreadyTrackedInHistory_StaysTrackedAndTreeStaysClean`** (2.3) — a foreign repo with
+  `.obsidian/workspace.json` already committed; asserts it's still tracked, still on disk, one commit,
+  clean tree, and no `.gitignore` was seeded (the adopted branch never reaches that code at all).
+- **`AdoptedRepositoryWithNoGitignore_GetsNoneSeededByZeroWiki`** (2.4) — `CreateForeignRepositoryAsync`,
+  asserts `.gitignore` absent before *and* after `EnsureRepositoryAsync()`.
+- **Three 2.5 cases** — `PreExistingGitignoreWithAnUnrelatedRule_AppendsOursAndKeepsTheirs`,
+  `PreExistingGitignoreAlreadyCarryingTheExactRule_IsLeftByteIdentical`,
+  `PreExistingGitignoreMentioningTheRuleOnlyInAComment_StillAppendsIt` (the load-bearing one — a
+  substring implementation matches `.obsidian/` inside the comment text and wrongly skips the append).
+  Each asserts the file's exact byte content, a pinned `check-ignore -q` functional proof, **and** the
+  1.2 clean-tree/one-commit gap the §1 supervisor named — folded into these three rather than a fourth
+  test, per the brief ("belongs with 2.5's fixtures").
+- **`PreExistingGitignoreMatchingGitignoreItself_RefusesToStartWithNoInitialCommit`** (2.7) — a
+  commit-less volume whose `.gitignore` contains `.gitignore\n`; asserts `EnsureRepositoryAsync()`
+  throws `GitProcessException` naming `.gitignore`, and that `HEAD` is still unborn (`rev-parse --verify
+  -q HEAD` fails) — not merely that something threw.
+- **`PinnedGitEnvironment`** — `GIT_CONFIG_GLOBAL` pointed at a path the fixture never writes, passed to
+  every `check-ignore` probe the tests make (2.6).
+
+### 2.6, and what it actually found
+Pinning wasn't decorative — it caught something. I built a hostile global config (`core.excludesFile`
+covering `.obsidian/`) and ran the whole `ContentRepositoryServiceTests` class with
+`GIT_CONFIG_GLOBAL=<that file>` set for the `dotnet test` process (never `Environment.SetEnvironmentVariable`
+inside the test host — the file's own convention, `Branch_IsTheNamedConstantRegardlessOfTheHostsDefaultBranch`
+and `ReconcileHarnessProcess`'s doc comment, both explain why: it would leak into every concurrently-running
+test class's own git subprocesses under xUnit's default parallelism).
+
+First run under that hostile config **failed** — not on an assertion, on the 2.3 fixture's own setup:
+```
+ZeroWiki.Content.GitProcessException : git add docs/.gitkeep .obsidian/workspace.json exited with code 1:
+The following paths are ignored by one of your .gitignore files:
+.obsidian
+hint: Use -f if you really want to add them.
+```
+2.3's fixture explicitly stages `.obsidian/workspace.json` to build a "already tracked in history" repo —
+under a hostile global exclude, plain `git add` on an explicitly-named ignored path refuses. Fixed with
+`-f` (a fixture deliberately building tracked content shouldn't depend on what the host's ignore
+config says at all — more robust than pinning that one call, since `-f` removes the dependency
+entirely rather than isolating it). Re-ran under the same hostile config: `45/45` passed. Then reverted
+to the normal environment and re-ran the full suite (below) to confirm nothing regressed for the
+ordinary case.
+
+### 2.2 — the falsifier, run for real
+Disabled the whole seeding `if`/`else` block in `EnsureInitialCommitAsync` (commented out, `git add`
+narrowed to `docs/.gitkeep` only so the now-nonexistent `.gitignore` wasn't named as an explicit
+pathspec), ran 2.1 filtered:
+```
+Failed ZeroWiki.Tests.Content.ContentRepositoryServiceTests.ObsidianConfigAtBothVaultLevels_IsNotStagedByUnscopedReconciliation [608 ms]
+Assert.DoesNotContain() Failure: Sub-string found
+      ↓ (pos 0)
+String: ".obsidian/workspace.json\ndocs/.gitkeep\ndo"···
+Found:  ".obsidian"
+```
+Both `.obsidian/workspace.json` and `docs/.obsidian/workspace.json` land in `git ls-files` with the rule
+gone — the test that would have shipped as a green-but-vacuous check instead dies the moment the property
+it names is undone. Restored the code immediately after; `git diff -- src` confirmed empty before
+proceeding.
+
+### Instrument / claim / blind spot
+- **Claim:** each of the eight falsifiers named in the brief holds against the current `HEAD` (`2ec40e2`)
+  implementation of `EnsureInitialCommitAsync`/`ReconcileWorkingTreeAsync`, and does not pass for reasons
+  independent of that code — specifically, not because of what the host machine's own git configuration
+  happens to say.
+- **Instrument:** eight permanent xUnit `[Fact]`s driving the real `ContentRepositoryService` against a
+  real temp directory and the real `git` binary (not a fake); 2.1's own falsifier confirmed by disabling
+  the code under test and observing the specific test fail (not merely "a test failed somewhere"); 2.6
+  confirmed by running the whole class under a hostile `GIT_CONFIG_GLOBAL` and finding — then fixing — a
+  real dependency on host config in a fixture's own setup, then re-confirming 45/45 under that hostile
+  config and again under the normal one; `git diff -- src` / `git status --short -- src` checked clean
+  after the 2.2 revert.
+- **Blind spot:** the hostile-config run only exercised the `Content` test class, filtered
+  (`dotnet test --filter`), not the full `make test` — per this project's own rule that a filtered figure
+  is never the record, the `45/45` under hostile config is a targeted instrument check, not the reported
+  gate; the reported gate below is the unfiltered `make test` under the ordinary environment. I also did
+  not construct a hostile config that only sets `$GIT_DIR/info/exclude` (a per-repository, not global,
+  mechanism) rather than `core.excludesFile` — both read by `check-ignore`, but only the global one was
+  exercised; the per-call `GIT_CONFIG_GLOBAL` override I use has no equivalent leverage over
+  `info/exclude` at all (that lives inside `.git`, not in a config file), so a hostile `info/exclude`
+  written directly into a fixture's own repo *would* leak past `PinnedGitEnvironment` — none of my
+  fixtures write one, but a future fixture that does would need its own guard against it, and nothing
+  here proves that guard would be remembered. Also untested: a global `.gitattributes` or `core.attributesFile`
+  path, which `check-ignore` does not consult but a different future assertion might.
+
+### Gates
+```
+BUILD_EXIT:0
+TEST_EXIT:0   (904 passed, 0 failed — 897 + 7 new committed tests; 2.2's falsifier was run and reverted,
+               not counted)
+FORMAT_EXIT:0
+```
+`make validate` not run — no `tasks.md`/spec/design changes in this block; Architect's re-run covers it.
+
+`git status --short -- tests src`: only `tests/ZeroWiki.Tests/Content/ContentRepositoryServiceTests.cs`
+modified (209 insertions). `git diff -- src`: empty.
+
+→ @reviewer
+
+**[reviewer]** Block 2.1–2.7 review.
+
+### Verdict: Approve
+
+### What I checked, and how
+
+Read `design.md` D1–D5 (including the D5 revision history — the check-ignore design was built,
+reviewed across two rounds, and withdrawn in favour of the current whole-trimmed-line/root-only
+comparison), the five spec scenarios, and the full `## 1.`/`## 2.` DEVLOG thread. Confirmed `src/` is
+untouched (`git diff -- src`, `git status --short -- src` both empty) — this block is test-only, as
+claimed. Read the current `EnsureInitialCommitAsync` implementation directly rather than trusting the
+worker's description of it, since D5 changed shape twice after §1 closed.
+
+I ran one confirmation mutant myself rather than accepting the worker's own revert-and-restore run on
+trust (that run happened before this diff existed, on a scratch test, and this is the first time the
+property has a *permanent* test to check). Mutated the whole-line comparison at
+`ContentRepositoryService.cs:748-750` from `line.Trim() == ObsidianIgnoreRule` to
+`line.Contains(ObsidianIgnoreRule, StringComparison.Ordinal)` (a substring check — exactly the shape
+D5 and 2.5's third case exist to rule out), ran
+`PreExistingGitignoreMentioningTheRuleOnlyInAComment_StillAppendsIt` filtered, watched it fail on the
+exact assertion (file content stays unmodified because the mutant treats the commented line as the
+rule already present), then restored via a `trap ... EXIT` (not a final step) and reconfirmed
+`git diff -- src` empty before writing anything below. 1/1 — the property is real, not incidental; I
+did not need the 3-run cap for a single-line, single-branch mutation with an unambiguous failure mode.
+
+### Per-test falsifiability (the brief's actual question)
+
+- **2.1** (`ObsidianConfigAtBothVaultLevels_IsNotStagedByUnscopedReconciliation`) — drives the real
+  path, not the file's text: writes `.obsidian/` at **both** the repository root and `docs/`, then
+  calls `EnsureRepositoryAsync()` a second time. Confirmed `EnsureRepositoryAsync` re-runs
+  `AcceptRepositoryAsync` → `ReconcileWorkingTreeAsync` unconditionally on every call (no
+  once-only gate at `ContentRepositoryService.cs:72-220`), so the second call genuinely re-enters the
+  unscoped `add -A` this test exists to falsify. Asserts `ls-files` excludes `.obsidian`, `rev-list
+  --count HEAD == 1` (D9: nothing staged ⇒ no recovery commit), and a clean porcelain. Cannot be
+  satisfied at the root alone — both levels are written and neither would be ignorable if the rule
+  regressed to a root-anchored pattern (the exact D3 failure mode the §1 supervisor and the round-2
+  D5 blocker both hit). Good.
+- **2.2** — the worker's own disable-and-revert run is recorded with real output (`.obsidian` present
+  in both `ls-files` and the offending assertion's failure text), `git diff -- src` confirmed empty
+  immediately after. I did not need to repeat this one; 2.1's mechanism is simple enough that my own
+  mutant above serves the same falsifiability question for the section as a whole.
+- **2.3** — fixture commits `.obsidian/workspace.json` as pre-existing history (not through the SUT),
+  then asserts it is still in `ls-files`, still on disk, one commit, `.gitignore` absent, clean tree.
+  A `git rm --cached` slipping into the adopted branch would remove it from `ls-files` and dirty the
+  tree — both assertions would go red. D2's only committed guard, and it would fail.
+- **2.4** — asserts `.gitignore` absent **both before and after** `EnsureRepositoryAsync()` against an
+  adopted repository with no ignore file at all — the exact case the brief asked about, and it's
+  checked as a stays-absent property, not merely "no exception."
+- **2.5's comment case** — confirmed live above: dies against a substring check, passes against the
+  real whole-trimmed-line implementation, for the right reason (the file content assertion, not an
+  incidental side effect).
+- **2.7** — asserts the specific type (`Assert.ThrowsAsync<GitProcessException>`), the message names
+  `.gitignore` (meaningful: `GitProcessException.Message` embeds the git arguments and stderr
+  verbatim — checked the class), and separately asserts `rev-parse --verify -q HEAD` still fails
+  (unborn) rather than merely that *something* threw. This is the refusal-specifically assertion the
+  brief asked for.
+- **Append-branch clean tree** — all three 2.5 tests plus 2.1/2.3/2.4 call
+  `AssertPorcelainIsEmptyAsync` and check `rev-list --count HEAD == 1` after the append branch runs,
+  closing the §1 supervisor's finding that 1.2 was evidenced only for the fresh-write branch.
+
+### `PinnedGitEnvironment` (2.6)
+
+Passed per-call as `environmentVariables` to `_git.RunOrThrowAsync`, the same idiom already used
+elsewhere in this file (`ContentRepositoryServiceTests.cs:153`) and in `ReconcileHarnessProcess` —
+not `Environment.SetEnvironmentVariable`, which this file's own comments (`:881-882`) explain would
+leak into other test classes' git subprocesses under xUnit's default parallelism. No new pattern
+invented.
+
+It neutralises `core.excludesFile` from the developer's/CI runner's own **user** gitconfig for the
+three `check-ignore` functional-proof assertions — the only place in this diff that still asks git
+anything, since the seeded rule itself is now a plain text-line comparison per D5's final revision.
+`$GIT_DIR/info/exclude` is moot here, not neutralised: every fixture in this block builds a fresh
+`.git` directory that nothing writes an `info/exclude` into, so there is nothing there to leak from —
+the worker's own blind-spot line says exactly this, correctly, rather than claiming it's covered.
+A residual gap the worker also names honestly: `GIT_CONFIG_GLOBAL` only overrides the user-level
+config, not a possible system-level `/etc/gitconfig`; on ordinary CI/dev machines that file doesn't
+set `core.excludesFile`, so this is a live but low-probability blind spot, stated rather than hidden.
+
+**The `-f` on 2.3's fixture `git add`** — judged this is the right call, not a papering-over. That
+fixture is not exercising the SUT's ignore-handling at all; it is *building test data* — a foreign
+repository whose history already tracks `.obsidian/`, constructed entirely outside
+`ContentRepositoryService`. Whether `git add` would refuse under a hostile host config is irrelevant
+to what the test means to set up, so removing the dependency outright (rather than pinning that one
+call to a config that still might or might not permit it) is more correct than the alternative, not
+less. It was also *found*, not asserted: the worker ran the class under a hostile global
+`core.excludesFile` and hit the real refusal before fixing it — the instrument that found this gap
+was exercised, not just described.
+
+### Count check
+
+7 new `[Fact]`s (`ObsidianConfigAtBothVaultLevels_...`, `ObsidianConfigAlreadyTrackedInHistory_...`,
+`AdoptedRepositoryWithNoGitignore_...`, the three `PreExistingGitignore*` cases, and
+`PreExistingGitignoreMatchingGitignoreItself_...`), matching the `904 = 897 + 7` delta and `git diff`'s
+209 insertions in one file. The worker's prose said "eight" in one place — confirmed nothing was
+dropped; it's a miscount in the write-up, not a missing test.
+
+### OpenSpec scope
+
+Diff is `tests/ZeroWiki.Tests/Content/ContentRepositoryServiceTests.cs` only. No `src/` change, no
+`Makefile` change, no scope creep into another section. In scope.
+
+### Blockers
+
+None.
+
+### Nits
+
+- `ContentRepositoryServiceTests.cs:1480-1489` (`PinnedGitEnvironment`) could note in one line, next
+  to the existing honest blind-spot prose in the DEVLOG, that it doesn't reach `/etc/gitconfig` —
+  worth carrying into `## NEXT` for whoever next adds a fixture that writes `info/exclude` directly,
+  so the guard isn't assumed to be total. Not a blocker; the DEVLOG already states it correctly.
+
+### Architectural notes
+
+None beyond what's already tracked in `## NEXT` for §3 (README wording, spec qualifier) — this block
+doesn't touch either.
+
+### Mutation testing
+
+One confirmation run (described above under "What I checked, and how"), 1/1, within the 3-run cap;
+stopped there since the failure mode was unambiguous and matched the property named. `git diff -- src`
+confirmed clean before and after.
+
+```sh
+{ git diff HEAD -- ':/' ':(top,exclude,glob)**/DEVLOG.md'
+  git ls-files --others --exclude-standard -- ':/' ':(top,exclude,glob)**/DEVLOG.md' \
+    | while read -r f; do printf '%s\n' "$f"; cat "$f"; done
+} | shasum | cut -c1-12
+```
+
+Reviewed-state: 4ccc7539b924
+HEAD: 2ec40e2
+
+→ @architect
+
+**[architect]** Block 2.1–2.7 closed — gates green, committed
+
+`make gates` → all `_EXIT:0`, `GATES_EXIT:0`, 904 passed (897 + 7). Fingerprint `4ccc7539b924` matches
+the reviewer's Approve, which also confirms its confirmation mutant left no residue. 2.1–2.7 ticked.
+
+### A red gate that was not the code — worth the next session's attention
+
+The first `make gates` on this block returned `BUILD_EXIT:1` with `TEST_EXIT:0` and 904 passing. The
+build died in `GenerateMvcTestManifestTask`: `Access to the path
+'tests/ZeroWiki.Tests/obj/Debug/net10.0/MvcTestingAppManifest.json' is denied` /
+`Operation not permitted`. Reproducible in 0.8s, so not a race, and **not** the five-minute sandbox
+timeout this project already knows about.
+
+The file's permissions were ordinary (`-rw-r--r-- rendle staff`) and a shell `touch` and append both
+succeeded — the denial was specific to the MSBuild task, which points at a stale artefact written
+earlier by a process whose provenance MSBuild could not overwrite. `rm` of that one generated file, and
+`BUILD_EXIT:0` immediately. No `make clean` (that is the Product Owner's), no tracked file touched.
+
+**The lesson is the exit line, again.** A run that prints 904 passing tests and a two-minute green suite
+looks exactly like a pass, and `-k` meant the failing gate was the *first* thing run and the easiest to
+scroll past. `GATES_EXIT:2` was the only thing that said otherwise.
+
 ## NEXT
 
-**Resume point:** §1's supervisor review must be **re-run** on `96a7adf..HEAD` — it last returned
-Request changes, and the design it reviewed has since been withdrawn. Do that before opening §2.
+**Resume point:** §2 open, block 2.1–2.7 briefed. §1 is **closed** — supervisor `Approve` on
+`96a7adf..HEAD` after the pivot.
 
 - Branch `change/ignore-obsidian-config-in-content-repo`, base `96a7adf`. Two commits: `92fb126` (§1),
   plus the simplification fix.
 - **§1 supervisor blockers, current status:**
   - *Blocker 1 (committed block had no reviewer Approve)* — repaired. The lost verdict was re-posted by
     its author from transcript, dated, at `## 1.`; the Approve for the simplification block follows it.
-  - *Blocker 2 (the D5 branch has no executing evidence)* — **OPEN, and unchanged by the pivot.** The
-    branch is simpler; it is still entered by no test. §2's brief must carry this.
+  - *Blocker 2 (the D5 branch has no executing evidence)* — **OPEN.** Carried into §2's brief; it is
+    what §2 exists to close.
   - *Blocker 3 (`git add` refusal-to-start)* — ruled by the Product Owner: fail fast is intended.
     Recorded in `design.md` Risks and the spec; **2.7** tests it.
   - *The `❓` on `core.excludesFile`* — dissolved with the `check-ignore` instrument.
-- **§2 is now the weight of this change** (2.1–2.7). Aim its brief at the supervisor's coverage gaps,
-  not at the task text: 2.1 as written can be satisfied entirely at the root, leaving D3 with no
-  falsifier, and nothing covers clean-tree on a pre-existing-`.gitignore` volume, so 1.2's tick is
-  evidenced only for the branch that does not append.
-- **Owed to §3:** 3.1's wording predates D5 — the README must also cover the pre-existing-`.gitignore`
-  case.
+- **§2 is the weight of this change** (2.1–2.7) — briefed under `## 2.`, aimed at the supervisor's
+  coverage gaps rather than the task text.
+- **Owed to §3, two items:** 3.1's wording predates D5, so the README must also cover the
+  pre-existing-`.gitignore` case; and the §1 supervisor's non-blocking finding that
+  `specs/content-store/spec.md:20-23` lacks its "no commits yet" qualifier, so the prose reads as a
+  contradiction with the adopted-repository SHALL NOT above it. Both are wording, both land in §3.
 - Live decisions: D2 ignore-only, never untrack. D5 whole trimmed line, never a substring, root
   `.gitignore` only — a redundant duplicate is the accepted failure direction.
 - The record: a reviewer verdict was lost today when an architect pin-rewrite discarded everything below
-  `## NEXT`. Append above the pin, and verify placement with `grep -n '^## '` after writing.
+  the pin marker. Append above the pin, and verify placement with `grep -n '^## '` after writing.
