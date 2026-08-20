@@ -55,32 +55,41 @@ Asserting only that a `.gitignore` exists with the right text would pass against
 apply — which is precisely the kind of green-but-vacuous check this project has been bitten by. *This
 test must be shown to fail with the rule removed.*
 
-**D5 — A `.gitignore` already on the volume is appended to, and the question is put to git (Product
-Owner decision).** A volume can have no commits yet and still carry a hand-written `.gitignore` —
-content copied on before the first start. That is a third case the decisions above did not name: the
-repository is one ZeroWiki *initializes*, so D1 applies and the rule must be in the initial commit, but
-the file itself is one a human wrote, which is the thing the adopt-as-it-stands posture exists to
-protect. Skipping the seed (the first implementation) satisfies neither — it stages the operator's file
-and commits without the rule, contradicting the requirement outright.
+**D5 — A `.gitignore` already on the volume is appended to unless it already carries our exact line
+(Product Owner decision, 2026-08-20 — supersedes the earlier `check-ignore` design).** A volume can have
+no commits yet and still carry a hand-written `.gitignore`. That file is adopted, not overwritten: read
+its lines, and append `.obsidian/` unless one of them already *is* `.obsidian/`.
 
-So: **ask git whether `.obsidian/` is already ignored, and append the rule only if it is not.** The test
-is `git check-ignore`, not a text search of the file. An operator's own file may already exclude the
-directory by some other pattern — a broader glob, an `.obsidian` entry without the slash, an
-`.gitignore` in `docs/` — and a text search would miss all of them and append a redundant duplicate.
-`check-ignore` answers the question that actually matters, which is whether git ignores the path, not
-whether a particular string appears in a particular file.
+**This deliberately asks a narrower question than "is the directory ignored here?"** The earlier design
+put that wider question to `git check-ignore`, and it was built, reviewed across four rounds, and
+withdrawn. What sank it was not any single defect but the class: `check-ignore` answers whether *this
+machine, right now* ignores the path, which is not the property the spec cares about — the spec cares
+whether *the repository* ignores it, since that is what travels to every clone. The two coincide on a
+clean host and diverge on a configured one, and every divergence found failed in the same direction:
 
-The probe must ask about **both** levels — `.obsidian/` and `docs/.obsidian/` — and append unless git
-reports both already ignored. An anchored rule (`/.obsidian/`, the shape git itself suggests) matches
-the root and not `docs/`, so a root-only probe answers "already ignored" while leaving the `docs/` case
-open to reconciliation's unscoped staging. Confirmed against git 2.55.0: `/.obsidian/` gives exit 0 for
-`.obsidian/` and exit 1 for `docs/.obsidian/`. Appending the unanchored rule where only one level is
-already covered is harmless, so "unless both" is the safe side of the question. *Alternative considered:* overwrite the file
-with ours. Rejected for the same reason as D2 — it destroys something the operator wrote, and this
-change does not damage user data to tidy up after an editor.
+- an anchored `/.obsidian/` covered the root and not `docs/`, so a root-only probe skipped the append;
+- appending after an operator's same-file `!docs/.obsidian/` silently killed their negation;
+- the host's `core.excludesFile` or `$GIT_DIR/info/exclude` makes the probe answer "already ignored", so
+  the repository ships with no rule and is unprotected for everyone who clones it.
 
-Appending is never a rewrite of history: at this point the file is uncommitted, so the initial commit
-carries the operator's rules **and** ours. Nothing is removed from it.
+Each was fixable; the class was not. **The decisive argument is the shape of each design's failure.**
+The precise instrument fails by shipping a repository with no rule, silently, to an operator who
+believes they are protected. The blunt one fails by writing a line that was already covered — redundant,
+harmless, visible. Where an instrument must be wrong sometimes, be wrong in the direction that costs
+nothing.
+
+Consequences accepted knowingly: a differently shaped rule (`.o?sidian/`), a rule in `docs/.gitignore`,
+or a global ignore all produce a duplicate line. None of them break anything. The operator's negation
+case now resolves *better* than under the old design — the text is present, so nothing is appended and
+their re-inclusion survives.
+
+**Match a whole trimmed line, never a substring.** A substring search matches
+`# .obsidian/ is deliberately tracked` inside a comment and skips the append — a silent failure in the
+one direction this decision exists to avoid. A commented line does not count as the rule being present.
+
+**Root `.gitignore` only** (Product Owner decision): the simplest thing that works. A rule in
+`docs/.gitignore` is not consulted, and the resulting duplicate is harmless per the above.
+
 
 ## Risks / Trade-offs
 
@@ -89,30 +98,17 @@ carries the operator's rules **and** ours. Nothing is removed from it.
   in ZeroWiki rewrites it after bootstrap (D1).
 - **Existing deployments keep the noise** → accepted, and it is the deliberate consequence of D2. The
   Product Owner's own wiki is one of them.
-- **An operator's own negation is silently overridden** (Product Owner decision, accepted 2026-08-20).
-  Where a pre-existing root `.gitignore` re-includes the directory for some path — `.obsidian/` followed
-  by `!docs/.obsidian/` — appending our unanchored rule to that same file makes the negation stop
-  taking effect. Reproduced on git 2.55.0:
+- **A pre-existing ignore rule matching `.gitignore` itself refuses the boot** (Product Owner decision,
+  accepted 2026-08-20). Bootstrap stages by explicit pathspec (`git add docs/.gitkeep .gitignore`), and
+  `git add` on an explicit pathspec that an ignore rule matches **fails** rather than skipping. So a
+  volume whose hand-written ignore file contains `.gitignore` or `*` makes bootstrap throw and the app
+  refuse to start — on precisely the volume shape D5 exists to accommodate.
 
-  ```
-  $ printf '.obsidian/\n!docs/.obsidian/\n' > .gitignore
-  $ git check-ignore -q docs/.obsidian/ ; echo $?   # 1 — the negation works
-  $ printf '.obsidian/\n' >> .gitignore            # what bootstrap does
-  $ git check-ignore -q docs/.obsidian/ ; echo $?   # 0 — the negation is dead
-  ```
-
-  Nothing is removed textually, but the operator's configuration is behaviourally reversed on first
-  boot, and reconciliation then stops staging content they had deliberately kept tracked. The exposure
-  is **same-file only**: a negation in a `docs/.gitignore` is unaffected, because git gives the closer
-  file priority regardless of what is appended at the root.
-
-  **Accepted rather than fixed.** `check-ignore` returns a binary answer and cannot distinguish "never
-  mentioned" from "explicitly re-included"; telling them apart means parsing `!` lines, which is exactly
-  the text inspection D5 exists to avoid — and a partial `!` parser would be a *worse* instrument than
-  the one it replaced, wrong in cases nobody enumerated. The operator's remedy is the ordinary one: it
-  is their own `.gitignore` in their own repository, nothing rewrites it after bootstrap (D1), and
-  re-ordering the negation below our line restores it. §2 carries a characterisation test so the
-  behaviour is visible in the suite rather than discovered in the field.
+  **Fail fast is the intended behaviour**, consistent with this project's standing posture: refuse to
+  start on a filesystem or configuration fault rather than degrade. The alternative — skipping the
+  stage and committing without the rule — is the silent failure this change exists to prevent, and it
+  would leave an operator believing they were protected. A refusal names the problem at the only moment
+  anyone is looking, and the remedy is a line in the operator's own file.
 
 - **The rule silently hides a genuine page** → it cannot: enumeration already skips every dot-prefixed
   entry (`PageEnumerationService.cs:162`), so nothing under `.obsidian/` was ever servable. The ignore
@@ -123,4 +119,5 @@ carries the operator's rules **and** ours. Nothing is removed from it.
 
 ## Open Questions
 
-None.
+None. The `check-ignore` approach and its open question about the host's global ignore configuration
+were withdrawn with D5's revision; nothing about the text-line rule depends on the answer.

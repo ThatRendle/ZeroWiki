@@ -18,16 +18,20 @@ configuration out of every vault on its next pull.
 The system SHALL NOT add to, amend, or otherwise modify the ignore rules of a repository it did not
 initialize. A volume presented with an existing repository is adopted as it stands.
 
-Where the volume already carries an ignore file of its own at initialization time, the system SHALL
-determine whether the directory is already ignored by asking git, rather than by searching that file's
-text, and SHALL append its rule only where git reports the directory is not already ignored. It SHALL
-NOT overwrite or remove any rule already present.
+Where the volume already carries an ignore file at the repository root, the system SHALL append its
+rule unless that file already carries the same rule as a line of its own, and SHALL NOT overwrite or
+remove anything already present. The comparison is against the file's lines, and a line that is
+commented out does not count as the rule being present.
 
-Because that question is asked of git, its answer cannot distinguish a directory never mentioned from
-one an operator has deliberately re-included. Where an operator's own ignore file re-includes the
-directory for a path the appended rule then covers, the appended rule prevails and the re-inclusion
-stops taking effect. This is an accepted consequence: the system SHALL NOT parse the ignore file's text
-to detect it, since doing so would reintroduce the text inspection this requirement exists to avoid.
+The system SHALL NOT attempt to determine whether the directory is already ignored by some other means
+— a differently shaped pattern, an ignore file elsewhere in the tree, or the host's global ignore
+configuration. Where one of those already covers the directory, the appended rule is redundant and
+harmless. Being wrong in that direction is deliberate: a redundant line costs an operator nothing,
+while failing to add the rule ships a repository that is not protected and whose owner believes it is.
+
+Where the volume's own ignore rules would prevent the seeded rule from being staged, the system SHALL
+fail to start rather than complete an initial commit without it. Proceeding would leave an operator
+holding a repository that looks initialized and is not protected.
 
 #### Scenario: A freshly initialized repository ignores editor configuration
 
@@ -54,5 +58,11 @@ to detect it, since doing so would reintroduce the text inspection this requirem
 - **WHEN** the system initializes a content repository on a volume that has no commits yet but already
   carries an ignore file written by an operator
 - **THEN** the operator's existing rules survive into the initial commit, and that commit also carries a
-  rule excluding the editor's configuration directory — unless git already reports that directory
-  ignored, in which case nothing is appended
+  rule excluding the editor's configuration directory — unless that file already carries the same rule
+  as a line of its own, in which case nothing is appended
+
+#### Scenario: An ignore rule that would hide the seeded rule refuses the start
+
+- **WHEN** the system initializes a content repository on a volume whose own ignore file matches the
+  ignore file itself, so that the seeded rule cannot be staged
+- **THEN** the system fails to start, and no initial commit is made that lacks the rule
