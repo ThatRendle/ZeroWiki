@@ -28467,70 +28467,39 @@ gates` green at 897 tests. **Ready to archive on the Product Owner's decision** 
 
 ## NEXT
 
-**Resume at `12.1`.** §12 is the only open section and **is not open yet** — it has no `Base:` post.
-Post one (`git rev-parse --short HEAD`) under `## 12.` before briefing its first block. Everything
-`## 12.` needs before you brief is in that thread already: the scope decision, the escape hatch, why the
-task order is what it is, and what §12 must not assume. Read it.
+**This change is COMPLETE and ARCHIVED. There is no resume point.** Shipped 2026-08-20: 45/45 tasks,
+§1–§12 each closed with a supervisor `Approve`, merged to `main` as squash commit `c7dea65` (PR #3),
+four capability specs promoted to `openspec/specs/` (`content-store`, `content-editing`, `git-sync`, and
+a `Username form` requirement on `user-accounts`).
 
-**State.** §1–§11 are all closed with a supervisor `Approve`. Count tasks from `tasks.md`
-(`grep -c '^- \[x\]' tasks.md` against `grep -c '^- \[' tasks.md`), never from this pin — a hand count
-here was wrong once and rode along through two blocks.
+This pin previously read *"Resume at `12.1`"*. It was rewritten at archive time because the pin is the
+first thing anyone opening this file reads, and a stale one would send a reader to rebuild a section that
+has shipped. Everything else in this file is append-only and untouched.
 
-**Both items that were owed before §12 could open are now discharged.** The dmons scaffold migration
-0.3.0 → 0.5.1 landed in `80da8a3` (its consequences are the `[architect]` post under `## 12.`), and this
-pin's distillation is done — see below. Nothing else gates §12 opening.
+### What outlives this change
 
-### → Read `LEDGER.md` — it is where this pin's substance went
+- **`LEDGER.md`, beside this file.** The forward obligations, close-out items and standing rules that
+  were parked in this pin during §0–§11 and relocated there verbatim on 2026-08-19 (Product Owner
+  decision) — cutting them to fit a handover note would have deleted live obligations rather than moved
+  them. **The *Close-out items before archive* section is discharged**; the forward obligations and
+  standing rules are not, and several are owed by no section that still exists.
+- **Two items with no owner**, recorded here because an archived file is easy to lose track of. If either
+  matters, it wants to be its own change rather than a note in a shipped record:
+  1. `WikiPageEditorTests.The_successful_save_redirect_carries_no_draft_token` is **flaky** — passes in
+     isolation, costs gate re-runs. First named on 2026-08-19.
+  2. `ArgumentException.ThrowIfNullOrEmpty(Route)` in `ChangedOnDiskIndicator` has **no falsifier**. A
+     production guard added during a remediation round, unreachable today — but it runs during the SSR
+     prerender pass, so if a producer ever appears it turns a degraded render into a 500 on a read path.
 
-`LEDGER.md` (sibling of this file, Product Owner decision 2026-08-19) now holds, **verbatim**, the three
-ledgers that used to be parked in this pin and had no section thread to link to:
+### The one thing worth reading this file for
 
-- **Forward obligations** — 32 numbered, most still live, each owed by a specific section. Several are
-  owed by no section that remains, which means they surface at archive time or not at all.
-- **Close-out items before archive** — F1, F2, and the asymmetric page-test matrices. These are a
-  **precondition of archiving**, not a wish list.
-- **Standing rules earned in §0–§11** — including the ones this change paid the most for: *agreement
-  between audits is worthless when they share an instrument*, *verify the threat exists before verifying
-  it is closed*, and *every instrument failure in this change so far has been in the harness, not the
-  code*.
+§12 is the section to read, and the lesson is not the fix. The section was carved to repair a break
+between `HandleReceivePackAsync` and `PageChangeNotifier`; **that code was never broken.** A mutation
+proved the span works, which moved the target. The real defect was that `System.Text.Json`
+default-constructs `EncodedRoute` and silently leaves `Value` unset, so the interactive indicator
+subscribed under a null route and no push could ever match it — with no exception or warning anywhere.
 
-It also carries §6–§9's carry-forwards and the harness facts. **Treat an unstruck entry as live but
-verify it against the code before acting** — this change's record includes a stale pin entry asserting a
-Product Owner decision was owed after that decision had already shipped.
-
-### Live hazards — the ones that cost an hour each if unread
-
-- **Gates run through the root `Makefile` and the evidence is the exit line.** `make build` / `test` /
-  `format` / `validate`, or `make gates` for the set in one `-k` pass. A gate passed only when you saw
-  `LABEL_EXIT:0`. Never conclude a gate passed from reading its output.
-- **Run every `dotnet` command unsandboxed, and never pipe a gate through `tail`.** A sandboxed `dotnet`
-  is killed at exactly 5:00 while printing `0 Error(s)`, so the exit line is the only thing separating it
-  from a pass — and `tail` is how you lose that line.
-- **The boundaries are enforced by hooks now, not requested.** Agents cannot write git, `tasks.md`, the
-  `Makefile`, `CLAUDE.md` or `.claude/`; the auditors can write only `DEVLOG.md`; agents have no Agent
-  tool. If the tripwire reports movement in `HEAD` or a tick count at your turn-end, the block skipped a
-  gate — reset, unpick, and run it through the loop. Detection starts at `80da8a3` and covers nothing
-  before it.
-- **Verify the reviewer's `Reviewed-state:` fingerprint before ticking or committing** (`CLAUDE.md`
-  §3b.6). This gap has opened twice in this change, both times over correct code — what it damages is
-  the record, which is the thing being archived.
-
-### §12's own constraints — architect-level, before you carve anything
-
-- **`12.2` must be watched failing against the current code before `12.3` lands.** A fix that lands first
-  makes that impossible to demonstrate, and this change's whole record says so.
-- **The escape hatch is the Product Owner's, not yours.** Trigger: *the root cause is not isolated by the
-  end of the first worker block*. That is a stop-and-ask (`CLAUDE.md` §4) — do not carve a second
-  exploratory block to keep digging. The fallback (`fix-changed-on-disk-broadcast`, superseded but still
-  on disk with a STATUS banner) exists for exactly this.
-- **`12.4` is human-in-the-loop and cannot be discharged by any agent.** Hand the Product Owner an exact
-  copy-pasteable recipe and wait for confirmation before ticking it.
-
-### Open with the Product Owner — not answered, raised at §10's close
-
-§10 was the **third** appearance of claim-versus-mechanism mismatch in this change (§2's five, §11's
-seven claims-about-why, §10's two). Both of §10's were found by *reading*, in a section about instrument
-honesty, and no gate in this repo would catch a fourth. The recurring-class rule says that when a class
-recurs, the deliverable's rule is wrong rather than the sentences — so a fourth round of correcting
-comments is precisely what not to do. The full framing is in the `[architect]` close-out under `## 10.`
-
+Two conclusions were withdrawn along the way, both because an instrument could not distinguish two states
+that mattered: a blank field read as "no subscribers" when it was in fact one subscriber under a null
+route. **The instrument had to be fixed twice before it could tell the truth, and fixing it was what
+found the bug.** That is the section's actual content.
