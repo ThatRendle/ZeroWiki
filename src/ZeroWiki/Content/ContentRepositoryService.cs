@@ -726,9 +726,51 @@ public sealed class ContentRepositoryService
             await File.WriteAllTextAsync(gitKeepPath, string.Empty, cancellationToken);
         }
 
+        // The obsidian-git plugin's vault config directory. The vault is opened at the repository
+        // root and at docs/ (D3), so the unanchored pattern below must match .obsidian/ at either
+        // level; this is seeded only into the initial commit (D1) and never untracks an existing
+        // repository's own history (D2).
+        //
+        // A commit-less volume can still carry a hand-written .gitignore -- content copied on before
+        // the app's first start (D5). That file is adopted, not overwritten: the question is whether
+        // git already considers .obsidian/ ignored, answered by asking git itself
+        // (`check-ignore`) rather than by searching the file's text, because the operator's own rule
+        // could exclude the directory via a broader glob, via `.obsidian` without the trailing slash,
+        // or from a .gitignore under docs/ -- none of which a text search would recognise, and all of
+        // which would make a text-search implementation append a redundant duplicate.
+        const string ObsidianIgnoreRule = ".obsidian/\n";
+        var gitIgnorePath = Path.Combine(repositoryRoot, ".gitignore");
+        if (!File.Exists(gitIgnorePath))
+        {
+            await File.WriteAllTextAsync(gitIgnorePath, ObsidianIgnoreRule, cancellationToken);
+        }
+        else
+        {
+            // The vault is opened at the repository root *and* at docs/ (D3), and an anchored rule
+            // such as `/.obsidian/` (a shape git itself suggests) matches only the root -- so asking
+            // git about the root alone is a narrower question than the requirement it implements.
+            // Both levels are probed independently, and the rule is appended unless git reports both
+            // already ignored (D5). Appending where only one level is already covered is harmless, so
+            // "unless both" is the safe side of the question.
+            var rootIgnored = await IsAlreadyIgnoredAsync(repositoryRoot, ".obsidian/", cancellationToken);
+            var docsIgnored = await IsAlreadyIgnoredAsync(repositoryRoot, "docs/.obsidian/", cancellationToken);
+
+            if (!rootIgnored || !docsIgnored)
+            {
+                var existingContent = await File.ReadAllTextAsync(gitIgnorePath, cancellationToken);
+                var needsSeparatingNewline = existingContent.Length > 0 && !existingContent.EndsWith('\n');
+                var appendix = (needsSeparatingNewline ? "\n" : string.Empty) + ObsidianIgnoreRule;
+
+                // Append, never overwrite (D2/D5): the operator's rules survive into the initial
+                // commit alongside ours. A missing trailing newline on the operator's last line is
+                // completed above so appending cannot fold our rule onto the end of theirs.
+                await File.AppendAllTextAsync(gitIgnorePath, appendix, cancellationToken);
+            }
+        }
+
         await _git.RunOrThrowAsync(
             repositoryRoot,
-            ["add", "docs/.gitkeep"],
+            ["add", "docs/.gitkeep", ".gitignore"],
             cancellationToken: cancellationToken);
 
         await _git.RunOrThrowAsync(
@@ -738,6 +780,26 @@ public sealed class ContentRepositoryService
             cancellationToken: cancellationToken);
 
         _logger.LogInformation("Initial commit created for the content repository at '{RepositoryRoot}'.", repositoryRoot);
+    }
+
+    /// <summary>
+    /// Asks git -- not a text search -- whether <paramref name="path"/> is already ignored by
+    /// whatever the operator's pre-existing <c>.gitignore</c> carries (D5). <c>check-ignore</c>'s exit
+    /// code is the answer: 0 = ignored, 1 = not ignored -- neither is a failure, so this does not go
+    /// through <see cref="GitProcessRunner.RunOrThrowAsync"/>. Anything else (git documents 128 for a
+    /// fatal error) is a real failure and must not be folded into either answer.
+    /// </summary>
+    private async Task<bool> IsAlreadyIgnoredAsync(string repositoryRoot, string path, CancellationToken cancellationToken)
+    {
+        var checkIgnoreArguments = new[] { "check-ignore", "-q", path };
+        var checkIgnoreProbe = await _git.RunAsync(repositoryRoot, checkIgnoreArguments, cancellationToken: cancellationToken);
+
+        return checkIgnoreProbe.ExitCode switch
+        {
+            0 => true,
+            1 => false,
+            _ => throw new GitProcessException(checkIgnoreArguments, checkIgnoreProbe.ExitCode, checkIgnoreProbe.StandardError),
+        };
     }
 
     /// <summary>
