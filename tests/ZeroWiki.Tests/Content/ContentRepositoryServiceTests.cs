@@ -1245,6 +1245,17 @@ public sealed class ContentRepositoryServiceTests : IDisposable
         // stage both files and this call would produce a second, recovery commit instead.
         Assert.Equal("1", (await _git.RunOrThrowAsync(repositoryRoot, ["rev-list", "--count", "HEAD"])).StandardOutput.Trim());
         await AssertPorcelainIsEmptyAsync(repositoryRoot);
+
+        // §2 remediation: the assertions above are satisfied just as well by a hostile host's own
+        // global excludesFile silently skipping the stage — ls-files/rev-list/porcelain don't consult
+        // excludes, so on such a host they hold even with the seeding removed entirely (observed and
+        // recorded in the DEVLOG). These two assertions require the code's *own* seeded rule to exist
+        // and be committed, which no host configuration can manufacture on the code's behalf.
+        Assert.Contains(".gitignore", lsFiles.StandardOutput, StringComparison.Ordinal);
+        var committedGitignore = await _git.RunOrThrowAsync(repositoryRoot, ["show", "HEAD:.gitignore"]);
+        Assert.Contains(
+            committedGitignore.StandardOutput.Split('\n'),
+            line => line.Trim() == ".obsidian/");
     }
 
     [Fact]
@@ -1484,6 +1495,8 @@ public sealed class ContentRepositoryServiceTests : IDisposable
     /// seeded rule itself no longer consults git at all (it is a plain text-line comparison), so
     /// this is only needed for the tests' own functional-proof assertions that a path really is
     /// ignored, not for the code under test.
+    /// Edge: does not neutralise <c>/etc/gitconfig</c> (system-level) or a repository's own
+    /// <c>$GIT_DIR/info/exclude</c> — only user/global config is overridden.
     /// </summary>
     private IReadOnlyDictionary<string, string> PinnedGitEnvironment =>
         new Dictionary<string, string> { ["GIT_CONFIG_GLOBAL"] = Path.Combine(_dataRoot, "unused-global-gitconfig") };

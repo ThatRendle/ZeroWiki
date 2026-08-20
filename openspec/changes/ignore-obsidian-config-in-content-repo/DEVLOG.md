@@ -1562,6 +1562,457 @@ earlier by a process whose provenance MSBuild could not overwrite. `rm` of that 
 looks exactly like a pass, and `-k` meant the failing gate was the *first* thing run and the easiest to
 scroll past. `GATES_EXIT:2` was the only thing that said otherwise.
 
+**[supervisor]** Section 2 review — `git diff 2ec40e2..HEAD` (one commit, `9ad944f`, test-only)
+
+### Verdict: Request changes
+
+One blocker, and it sits on exactly the test this section exists to produce. Everything else in the
+section holds: the spec's five scenarios are reachable from the committed suite, the withdrawn
+`check-ignore` design leaves no residue in the tests, `git diff -- src` and `git status --short -- src`
+are both empty (no mutation residue from either the worker's 2.2 run or the reviewer's confirmation
+mutant), the diff is one test file, and the reviewer's `Reviewed-state: 4ccc7539b924` covers the
+committed tree with no post-verdict additions.
+
+### Blocker — 2.1, the section's central falsifier, is the one fixture 2.6 does not reach
+
+`ContentRepositoryServiceTests.cs:1215-1249`
+(`ObsidianConfigAtBothVaultLevels_IsNotStagedByUnscopedReconciliation`), against 2.6 and its brief.
+
+2.1's whole design (D4, correctly) is that the property is enforced by the unscoped stage, not by the
+`.gitignore`'s text — so the test asserts only the *absence* of `.obsidian` from `ls-files`, one commit,
+and a clean porcelain. But that unscoped stage is run **by the service**, through the shared unpinned
+`_git` (`:1490` — `CreateService` hands it `_git`, whose subprocesses inherit the test host's
+environment). `PinnedGitEnvironment` (`:1488`) is passed only to the three `check-ignore` probes at
+`:1331`, `:1354` and `:1379`. Nothing pins the SUT's own git.
+
+The consequence is not theoretical, and the section's own record contains the demonstration. On a host
+whose global `core.excludesFile` carries `.obsidian/` — an unanchored pattern, so it matches at the
+root *and* under `docs/` — the unscoped stage skips both files regardless of what the seeded rule says.
+`ls-files` and `rev-list` do not consult excludes, so all three assertions still hold. **Delete the
+entire seeding block and 2.1 stays green on that host.** That is the precise shape of "a check that
+passes for a reason that has nothing to do with the code" which 2.6 was written to forbid, at the one
+test whose falsifiability the whole section rests on.
+
+The second-order finding is the one only this lens sees. 2.6's brief asked that under a hostile global
+ignore "the suite must still pass **for the right reasons**". The worker's instrument was: construct
+that hostile config, run the class, observe `45/45`. For 2.1 a green result under that config is
+*indistinguishable from vacuity* — it is the same observation either way, so the instrument used to
+certify the pinning is structurally blind at the only fixture where the pinning was missing, and it
+reported its own blind spot as a pass. The worker's blind-spot section is otherwise unusually good
+(`info/exclude`, `/etc/gitconfig`, the filtered-figure caveat) and the reviewer read
+`PinnedGitEnvironment` carefully — but both reasoned about *where the pin is applied*, and neither
+asked *which assertions are load-bearing under a hostile host*. Those are different questions and only
+the second finds this.
+
+Note also that 2.2's recorded failure — genuine, and I accept it (see below) — was run on the worker's
+own machine under the ordinary environment. It proves 2.1 is falsifiable *there, then*. It cannot make
+2.1 falsifiable anywhere else, and no committed artefact of a mutation run could either. The portable
+guarantee has to be in the assertion.
+
+### Suggested remediation shape (one fix block, no new task numbers)
+
+Give 2.1 an assertion no host configuration can satisfy on the code's behalf, alongside — not instead
+of — the existing functional ones:
+
+- assert `.gitignore` is present in `git ls-files` for the initial commit, and that the committed blob
+  (`git show HEAD:.gitignore`, or the file's bytes given the tree is asserted clean) carries
+  `.obsidian/` as a whole trimmed line.
+
+With the seeding removed, that assertion dies on any host, while the existing `ls-files` / `rev-list` /
+porcelain assertions keep D4's functional proof for the ordinary case. Both halves are then required
+and the test cannot go green vacuously.
+
+While the block is open, two small things belong with it rather than in a later section:
+
+- `PinnedGitEnvironment`'s doc comment (`:1481-1489`) states the pin's purpose but not its edge: it
+  overrides user-level config only, not `/etc/gitconfig`, and has no leverage over
+  `$GIT_DIR/info/exclude`. That is stated correctly in the DEVLOG and nowhere a future fixture author
+  will read it. One line in the comment.
+- Correct the worker's write-up claim that "all eight new tests" pin git config "either via a pinned
+  `check-ignore` probe or `-f`". Seven tests landed, and three of them (2.1, 2.4, 2.7) have neither.
+  For 2.4 and 2.7 that is fine and I am not asking for a change there — 2.4 asserts file *existence*
+  and 2.7 asserts a refusal that no ignore configuration can manufacture. It is 2.1 alone that needs
+  the pin's protection and does not have it.
+
+### Checked and clean
+
+**Spec clause → the test that would die.** Every clause of the requirement maps to a committed test
+except the two noted:
+
+| Clause / scenario | Test that dies |
+|---|---|
+| Seed the rule into the initial commit (S1) | 2.1 `:1215` — **conditionally**, see blocker |
+| Rule applies at both vault levels (D3) | 2.1 `:1229-1236` writes root *and* `docs/`; a root-anchored regression turns it red |
+| Never untrack/delete/rewrite committed history (S2) | 2.3 `:1251` — `ls-files` contains it, file on disk, one commit, clean tree |
+| Never modify an adopted repo's ignore rules (S3) | 2.4 `:1296` — absent before *and* after |
+| Append, never overwrite (S4) | 2.5 case 1 `:1314` |
+| Nothing appended when the exact line is present (S4) | 2.5 case 2 `:1339` — byte-identical |
+| A commented line is not the rule (D5) | 2.5 case 3 `:1362` — the one the reviewer mutated |
+| Fail-fast rather than commit without the rule (S5) | 2.7 `:1387` — typed exception *and* unborn `HEAD` |
+| 1.2 clean tree on the **append** branch (§1 blocker) | all three 2.5 cases — this closes it |
+
+Two clauses have no direct test and neither needs one:
+
+- *"not staged, committed, **or pushed**"* — no test drives a push. Untracked implies unpushed, so
+  there is nothing independently falsifiable here.
+- *"SHALL NOT attempt to determine whether the directory is already ignored by some other means"* — the
+  implementation-shaped clause I named in the §1 re-review. It is not observable and cannot have a
+  falsifier; its guard is the spec text itself, which is why it was worth promoting there.
+
+**Does §2 discharge §1's blocker 2?** For the append branch — `ContentRepositoryService.cs:747-761` —
+**yes, completely.** Three tests now enter it, each asserting the file's exact bytes, and its clean-tree
+tick is evidenced. That half of the blocker is closed and I would not re-open it. The *executing
+evidence* half is closed only conditionally, per the blocker above.
+
+**2.2 as a DEVLOG-only artefact — acceptable, not a gap.** "Demonstrate the test failing with the code
+removed" cannot be a committed artefact by construction, and this project's mutation discipline
+requires the mutant be reverted rather than kept. The record carries the specific xUnit failure text and
+the both-levels `ls-files` output, `git diff -- src` was confirmed empty immediately after, and the
+reviewer independently ran a *different* mutant (whole-line → substring) against 2.5's comment case with
+a `trap`-based revert. The DEVLOG is the archived record and this is the right place for it. My
+reservation is not about the artefact's form, it is the portability point in the blocker.
+
+**No drift onto the withdrawn design.** The three `check-ignore` calls are test *assertions* about the
+observable property, not a resurrection of the withdrawn instrument — and they are the pinned ones, so
+the host-dependence that sank the design is handled exactly where it was reintroduced. No
+`IsAlreadyIgnored`-shaped helper, no dead scaffolding, no orphaned fixture: all seven tests are
+`[Fact]`s the runner reaches and `PinnedGitEnvironment` has three live callers. The only duplication is
+2.3's hand-rolled repo setup (`:1253-1272`) alongside `CreateForeignRepositoryAsync` (`:1414`); it needs
+different content and the divergence is honest, so I am not asking for it to be folded together.
+
+**The `-f` on 2.3's fixture stage — I agree with the reviewer.** That call builds test data (a history
+that already tracks the config directory) entirely outside the service; whether a host's ignore rules
+would refuse it is irrelevant to what the fixture means to construct, so removing the dependency
+outright is more correct than isolating it. It was also *found* by running under a hostile config rather
+than asserted, which is the part that makes it evidence.
+
+**Assertions that could pass incidentally.** 2.5 case 2's `check-ignore` would pass even if the code did
+nothing — the operator's file already carries the rule. The byte-identical assertion is what carries
+that case, and it is there, so the test is sound; noting it so nobody later "strengthens" case 2 by
+leaning on the probe.
+
+**Scope.** Test-only, one file, 209 insertions; nothing in `src/`, no `Makefile` change, nothing outside
+the proposal. `tasks.md` moved 2.1–2.7 to ticked and nothing else; 3.1 correctly still open.
+
+### What this review could not see
+
+- **I ran no mutants and no gates.** 2.1's conditional-vacuity finding is derived from git's documented
+  precedence and from the worker's own recorded hostile-config run — I did not construct the hostile
+  `core.excludesFile` and watch 2.1 go green with the seeding removed. That experiment is the one that
+  would settle it, and the fix block is a cheaper route to the same place.
+- **Falsifiability of the six unmutated tests is judged structurally**, from their assertions, not
+  demonstrated. 2.3, 2.4, 2.5 cases 1 and 2, and 2.7 each assert a state that the named regression
+  visibly inverts, and 2.7 asserts an unborn `HEAD` rather than merely a throw — but "an assertion that
+  looks like it would die" is a weaker instrument than one that did, and it is the same instrument for
+  all six.
+- **`GATES_EXIT:0` / 904 passing is read from the record**, including the stale-`obj/` red and its
+  re-run, not re-derived.
+
+**[architect]** Remediation — 2.1's vacuity under a hostile host → @worker
+
+The supervisor's blocker stands and I am not asking for a second opinion on it: on a host whose global
+`core.excludesFile` carries `.obsidian/`, 2.1 passes with the entire seeding block deleted. Its three
+assertions — `.obsidian` absent from `ls-files`, `rev-list --count` 1, porcelain empty — are all
+satisfied by the files simply never being staged, and none of them consults excludes. The service's own
+`_git` inherits the host environment; `PinnedGitEnvironment` reaches only the `check-ignore` probes.
+
+**Read the shape of this before fixing it.** You built the hostile config, ran the class, and reported
+45/45 as evidence the pinning was complete. For 2.1 that observation cannot distinguish "works" from
+"does nothing" — it is green either way. The check certified the fixtures it could see and was blind at
+the one where the pin was missing. That is not a lapse in care; it is an instrument answering a
+narrower question than the one asked, which is the same failure §1 hit twice. When a check comes back
+green, the question to ask is what *else* would produce that same green.
+
+Fix block — no new `N.M`, ticks nothing (§2 is fully ticked):
+
+1. **Add to 2.1**, alongside its existing functional assertions: `.gitignore` present in `ls-files`, and
+   the committed blob carrying `.obsidian/` as a whole trimmed line. Keep D4's functional proof — it is
+   right, and it is what makes 2.1 about `add -A` rather than about file contents. The point is that the
+   test must die **on any host** when the seeding is removed, not only on a clean one.
+2. **`PinnedGitEnvironment` doc comment** — one line naming its edge: `/etc/gitconfig` and
+   `$GIT_DIR/info/exclude` are not neutralised.
+3. **Correct your DEVLOG post's "all eight tests pin" claim.** Seven landed, and 2.1/2.4/2.7 carry no
+   pin. Post the correction as a new `[worker]` entry; the DEVLOG is append-only, so do not edit the
+   original.
+
+*Falsifier, and run it in this order so the result means something:* construct the hostile global
+`core.excludesFile` covering `.obsidian/`, remove the seeding block, and confirm 2.1 passes **before**
+your fix — that is the vacuity, observed rather than argued. Then apply the fix and confirm 2.1 now
+**fails** under the same hostile config with the seeding still removed. Then restore the seeding and
+confirm green. Paste all three observations.
+
+Revert the seeding via a `trap`/`finally`, never a final step an interruption can skip, and confirm
+`git diff -- src` is empty before you finish. A live mutant has been left in `src/` in this repo before.
+
+**[worker]** Remediation done — 2.1 no longer passes vacuously under a hostile host.
+
+### Correction to my earlier "all eight tests pin" claim
+
+Seven `[Fact]`s landed in the 2.1–2.7 block, not eight, and three of them (2.1, 2.4, 2.7) carry no
+`PinnedGitEnvironment` pin. For 2.4 and 2.7 that's correct as-is — 2.4 asserts file *absence* and 2.7
+asserts a refusal, neither of which any ignore configuration can manufacture. 2.1 was the one that
+needed the pin's protection and, until this block, did not have it. (Original post not edited — DEVLOG
+is append-only.)
+
+### How the leak worked
+
+`_git` — the SUT's own `GitProcessRunner` — starts `git` via `ProcessStartInfo`, whose `Environment`
+defaults to a copy of the *current process's* environment (`GitProcessRunner.cs:62-81`, no explicit
+clear). `EnsureInitialCommitAsync`'s `add`/`commit` calls pass no `environmentVariables` override, so
+they inherit whatever `GIT_CONFIG_GLOBAL` (or an operator's real `~/.gitconfig`) the `dotnet test`
+process itself was started under. `PinnedGitEnvironment` was passed only to the three `check-ignore`
+probes, never to `_git`'s calls inside the service — so a host-level `core.excludesFile` covering
+`.obsidian/` made the unscoped `add -A`/`add` skip both files server-side, and none of 2.1's three
+assertions (`ls-files` absence, `rev-list --count` = 1, empty porcelain) can tell that apart from the
+rule actually working.
+
+### The three observations, in order
+
+Mutation: `EnsureInitialCommitAsync`'s seeding `if`/`else` wrapped in `if (false)`/`else if (false)`
+(dead but present, mirroring 2.2's technique) and the `add` narrowed to `["add", "docs/.gitkeep"]` so
+the now-never-created `.gitignore` isn't named as an explicit pathspec (which would otherwise throw
+before the test's assertions ever run). Hostile config: a temp `GIT_CONFIG_GLOBAL` pointing at
+`[core] excludesFile = <temp-file>` containing `.obsidian/` — no touch to the machine's real
+`~/.gitconfig`, and both scratch files removed after. Filtered run
+(`dotnet test --filter FullyQualifiedName~ObsidianConfigAtBothVaultLevels...`) under
+`GIT_CONFIG_GLOBAL=<hostile>`, each observation immediately preceded/followed by `git diff -- src`:
+
+1. **Passes vacuously.** Seeding removed, hostile config, *before* adding the new assertions:
+   `Passed! - Failed: 0, Passed: 1, Skipped: 0, Total: 1` — the finding, observed rather than argued.
+2. **Fails after the fix.** Same mutation, same hostile config, *after* adding the two new assertions
+   (`.gitignore` in `ls-files`; `git show HEAD:.gitignore` carries `.obsidian/` as a whole trimmed
+   line):
+   ```
+   Assert.Contains() Failure: Sub-string not found
+   String:    "docs/.gitkeep\n"
+   Not found: ".gitignore"
+   Failed!  - Failed:     1, Passed:     0, Skipped:     0, Total:     1
+   ```
+3. **Green when restored.** Seeding block reverted (`git diff -- src` empty, checksummed by reading the
+   diff, not inferred), same test rerun under the same hostile config:
+   `Passed! - Failed: 0, Passed: 1, Skipped: 0, Total: 1`.
+
+The new assertions keep D4's functional proof intact (unchanged) — they're additive, not a
+replacement, per the brief.
+
+### `PinnedGitEnvironment` doc comment
+
+Added the missing edge, one line: does not neutralise `/etc/gitconfig` (system-level) or a
+repository's own `$GIT_DIR/info/exclude` — only user/global config is overridden
+(`ContentRepositoryServiceTests.cs:1496-1497`).
+
+### Gates
+```
+BUILD_EXIT:0
+TEST_EXIT:0  (904 passed, 0 failed — same count as before; the fix only adds assertions inside an
+              existing [Fact], no new test)
+FORMAT_EXIT:0
+```
+`git diff -- src` empty, `git status --short -- src` empty — confirmed after the mutation was reverted
+and again just before this post. `git status --short -- tests` shows only
+`ContentRepositoryServiceTests.cs` modified. No scratch hostile-config files left on disk.
+
+### Instrument / claim / blind spot
+- **Claim:** `ObsidianConfigAtBothVaultLevels_IsNotStagedByUnscopedReconciliation` now dies on any host
+  when `EnsureInitialCommitAsync`'s seeding is undone, not only on a host with an ordinary global git
+  config.
+- **Instrument:** the three filtered runs above, against the real `git` binary, under a `GIT_CONFIG_GLOBAL`
+  built to reproduce exactly the failure mode the supervisor named — plus the full unfiltered
+  `make test` (904/904) as the reported gate, run under the ordinary (non-hostile) environment.
+- **Blind spot:** I exercised `core.excludesFile` only, the same single mechanism the supervisor named
+  and the one 2.6 already covers for the `check-ignore` probes. I did not additionally try
+  `$GIT_DIR/info/exclude` or a system-level `/etc/gitconfig` — both are now named as explicit,
+  unaddressed edges in the doc comment rather than silently assumed covered. I also did not re-run the
+  full suite under the hostile config (only the filtered 2.1 test) — per this project's own rule that a
+  filtered figure is never the reported gate, the `904/904` above is the unfiltered run under the
+  ordinary environment, not a claim that every other test is hostile-config-safe.
+
+→ @reviewer
+
+**[reviewer]** Remediation block review — 2.1's vacuity under a hostile host
+
+### Verdict: Approve
+
+### What I checked, and how
+
+Read the full `[supervisor]` blocker, the `[architect]` remediation brief, and both `[worker]` posts
+in this thread. Confirmed `git diff -- src` / `git status --short -- src` are both empty and only
+`tests/ZeroWiki.Tests/Content/ContentRepositoryServiceTests.cs` and the DEVLOG are modified
+(`git status --short`). Read the current `EnsureInitialCommitAsync` (`ContentRepositoryService.cs:701-776`)
+directly, not the worker's description of it.
+
+### Does the fix close the vacuity?
+
+Yes. The two new assertions at `ContentRepositoryServiceTests.cs:1254-1258` reuse the already-fetched
+`lsFiles` variable (`Assert.Contains(".gitignore", lsFiles.StandardOutput, ...)`) and read
+`git show HEAD:.gitignore` for a whole-trimmed-line match on `.obsidian/`. `RepositoryRoot` starts with
+no pre-existing `.gitignore` in this fixture, so the only way that committed blob can carry the rule is
+if `EnsureInitialCommitAsync`'s seeding branch actually wrote and committed it — no host git config can
+manufacture that content. The initial commit's `add` names `.gitignore` explicitly (not via `-A`), and
+a hostile `core.excludesFile` covering `.obsidian/` does not match `.gitignore` itself, so the commit
+still lands under a hostile host exactly as under an ordinary one; there is no path I could find where
+2.1 goes green with the seeding removed, on any host.
+
+I did not take this on trust. I ran the sequence myself, independent of the worker's own run:
+
+1. Mutated `ContentRepositoryService.cs` to disable both seeding branches (`if (false && ...)` /
+   `else if (false)`, plus narrowing the initial `add` to `["add", "docs/.gitkeep"]` so the vanished
+   `.gitignore` isn't named as an explicit pathspec) — the same shape of mutation the worker used.
+   Built a hostile `GIT_CONFIG_GLOBAL` (`core.excludesFile` covering `.obsidian/`) and ran 2.1 filtered
+   under it:
+   ```
+   Assert.Contains() Failure: Sub-string not found
+   String:    "docs/.gitkeep\n"
+   Not found: ".gitignore"
+   ...ContentRepositoryServiceTests.cs:line 1254
+   ```
+   Killed, same message, same line the worker reported.
+2. Restored the mutation via checksum-verified copy, confirmed `git diff -- src` / `git status --short
+   -- src` empty, then reran the same filtered test under the same hostile config with the real
+   (unmutated) code: `Passed! - Failed: 0, Passed: 1, ... Total: 1`.
+
+Both runs used a scratch `GIT_CONFIG_GLOBAL` pointed at a temp file/dir, nothing touched the real
+`~/.gitconfig`, and both scratch config directories were removed after.
+
+**One honest disclosure on my own harness.** My first revert attempt hit a shell bug (a `local
+status=$?` name inside my own `trap` collided with zsh's read-only `$status`), so the trap's `cp`
+never ran and the mutant was briefly live in `src/` after run 1 completed — exactly the hazard the
+`mutation-testing` skill warns about, caused by my script rather than an interruption. The
+checksum-before/checksum-after discipline is what caught it: `git status --short -- src` showed the
+file modified, I located the `mktemp` backup from the failed trap's own log line, restored it by hand,
+and reverified the checksum matched before doing anything else. `git diff -- src` and
+`git status --short -- src` are both empty in the tree you're about to look at. Saying this because the
+discipline only means something if a near-miss gets reported, not quietly cleaned up.
+
+### D4's functional half — still intact, not swallowed by the fix
+
+2.1's original three assertions (`ls-files` excludes `.obsidian`, `rev-list --count HEAD == 1`, empty
+porcelain) are unchanged — still driving `ReconcileWorkingTreeAsync`'s real unscoped `add -A` against
+files written at both vault levels, per D3/D4, and still what actually fails on an ordinary host if the
+rule regresses. The two new assertions are additive, not a replacement — the test would still die on an
+ordinary host with the seeding removed via the original three, and now also dies on a hostile host via
+the two new ones. The fix did not turn 2.1 into a contents-only test; it closed the one gap where
+content-independence let a host substitute for the code.
+
+### The worker's three observations
+
+Checked the write-up's transcript against what a whole-trimmed-line-comparison implementation should
+produce, and it's internally consistent:
+
+- **Vacuous pass** (seeding removed, hostile config, pre-fix assertions): `1/1` passed — matches, this
+  is the exact scenario the supervisor described and I reproduced independently above.
+- **Fails after the fix** (same mutation, same hostile config, with the new assertions): quoted failure
+  `Assert.Contains() Failure: Sub-string not found / String: "docs/.gitkeep\n" / Not found:
+  ".gitignore"`. Consistent with the assertion that produced it — `lsFiles.StandardOutput` at that point
+  in the mutated run contains only `docs/.gitkeep` (the narrowed `add`, `.obsidian` never staged because
+  `add -A` never runs unscoped in this fixture's flow — it's the *initial* commit's explicit add that's
+  narrowed) and `.gitignore` is genuinely absent, so `Assert.Contains(".gitignore", ...)` is the correct
+  first failure, before `git show HEAD:.gitignore` is ever reached. My own run reproduced this message
+  byte-for-byte.
+- **Green when restored**: `1/1` passed, `git diff -- src` empty — matches my own restore-and-rerun.
+
+### Does the same vacuity affect any of the other six tests?
+
+Checked independently rather than inheriting the supervisor's judgment:
+
+- **2.3** (`ObsidianConfigAlreadyTrackedInHistory_...`) — asserts a file **already tracked in history**
+  stays tracked, on disk, one commit, clean tree. `core.excludesFile`/excludes only govern *untracked*
+  paths; git does not consult ignore rules to decide whether to keep an already-tracked file staged.
+  A hostile host cannot make this pass by skipping a stage — there is no stage in this fixture's path
+  for the rule to skip. Sound unpinned.
+- **2.4** — asserts `.gitignore` absence via `File.Exists`, not via any git operation. Not
+  git-config-dependent at all. Sound unpinned.
+- **2.5, all three cases** — none of the three fixtures write an actual `.obsidian/` file into the
+  working tree at all (only `.gitignore` content varies), so there is no untracked-`.obsidian` staging
+  decision for a hostile host to spuriously get right. The byte-identical file-content assertions
+  (`File.ReadAllTextAsync` comparisons) are host-independent; the one place these tests still ask git
+  anything is the `check-ignore -q` functional probe, and that's the one explicitly pinned via
+  `PinnedGitEnvironment`. Case 2's `check-ignore` alone could pass vacuously (operator's file already
+  carries the rule) but the byte-identical assertion is what actually carries that case — already noted
+  correctly by both the reviewer and supervisor in the prior round. Sound.
+- **2.7** — asserts a typed exception naming `.gitignore` and an unborn `HEAD`. The refusal is driven by
+  the fixture's own `.gitignore` content (`.gitignore\n`) matching an explicitly-named pathspec, nothing
+  to do with global excludes. Sound unpinned.
+
+No further vacuity found. 2.1 was the one fixture whose falsifiability depended on a git decision made
+by unpinned code the test itself never drives directly.
+
+### `PinnedGitEnvironment` doc comment and the worker's correction post
+
+`ContentRepositoryServiceTests.cs:1498-1499` — the added edge line (`/etc/gitconfig`,
+`$GIT_DIR/info/exclude` not neutralised) is present exactly where asked. Confirmed against
+`git diff HEAD -- tests/...` that this is the only change to the doc comment.
+
+Confirmed the DEVLOG is append-only for this remediation: `git diff HEAD -- .../DEVLOG.md` shows only
+`+` lines from the supervisor's post onward (one `-` in the whole diff, and it's the `---` file-header
+line, not content) — the original "all eight new tests" claim in the worker's first post is untouched;
+the correction lives in a new, separate `[worker]` post as instructed.
+
+### OpenSpec scope
+
+Diff is the same one test file plus a doc-comment line, no `src/`, no `Makefile`, no `tasks.md` change
+(nothing to re-tick — §2 was already fully ticked and stays that way). In scope.
+
+### Blockers
+
+None.
+
+### Nits
+
+None.
+
+### Architectural notes
+
+None beyond what's already in `## NEXT`.
+
+### Mutation testing
+
+Two runs (kill / restore-confirm), within the 3-run cap; both against the SUT's real `git` binary and
+a real hostile `GIT_CONFIG_GLOBAL`, checksummed before and after. `git diff -- src` and
+`git status --short -- src` confirmed empty in the final state — including recovering from my own
+harness's failed trap on the first attempt, documented above rather than silently cleaned up.
+
+```sh
+{ git diff HEAD -- ':/' ':(top,exclude,glob)**/DEVLOG.md'
+  git ls-files --others --exclude-standard -- ':/' ':(top,exclude,glob)**/DEVLOG.md' \
+    | while read -r f; do printf '%s\n' "$f"; cat "$f"; done
+} | shasum | cut -c1-12
+```
+
+Reviewed-state: 78ab2dd0e5ec
+HEAD: 9ad944f
+
+→ @architect
+
+
+**[architect]** Remediation block closed — gates green, committed
+
+`GATES_EXIT:0`, all four `_EXIT:0`, 904 passed. Fingerprint `78ab2dd0e5ec` matches the reviewer's
+Approve, and `git diff -- src` is empty — checked directly, because a mutant was briefly live in `src/`
+during this block (the reviewer disclosed it; its own harness hit a `local status=$?` collision with
+zsh's read-only `$status`). Ticks nothing: §2 was already fully ticked under `9ad944f`.
+
+### The build failure is environmental and still undiagnosed — read this before trusting a red gate
+
+Twice this section, `make gates` returned `BUILD_EXIT:1` with `TEST_EXIT:0` and 904 passing:
+`GenerateMvcTestManifestTask` → `Access to the path
+'tests/ZeroWiki.Tests/obj/Debug/net10.0/MvcTestingAppManifest.json' is denied` /
+`Operation not permitted`.
+
+What is established: the target is `-rw-r--r-- rendle staff` with a `com.apple.provenance` xattr; a
+shell `touch` and append both succeed; `make gates` is sequential (`-k`, no `-j`, Makefile:53-55), so it
+is not a build/test race; and **`make build` standalone passes every time, including immediately after a
+`gates` run in which the same target failed.** Deleting the manifest fixed it once and did not the
+second time.
+
+**Working around it:** run `make build` alone first, then `make gates`. Reliable across both
+occurrences. **The mechanism is not understood** — do not record this as solved, and do not let the
+workaround stand in for a diagnosis if it recurs.
+
+**And the reason this is in the record at all:** a run printing 904 passing tests and a green
+three-minute suite reads exactly like a pass, and `-k` puts the failing gate first, where it is easiest
+to scroll past. `GATES_EXIT:2` was the only thing that said otherwise.
+
 ## NEXT
 
 **Resume point:** §2 open, block 2.1–2.7 briefed. §1 is **closed** — supervisor `Approve` on
