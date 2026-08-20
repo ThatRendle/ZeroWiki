@@ -15,13 +15,15 @@ The system SHALL NOT untrack, delete, or rewrite anything already committed. A r
 carries editor configuration in its history keeps it — removing it would delete a user's local editor
 configuration out of every vault on its next pull.
 
-The system SHALL NOT add to, amend, or otherwise modify the ignore rules of a repository it did not
-initialize. A volume presented with an existing repository is adopted as it stands.
+The system SHALL NOT add to, amend, or otherwise modify the ignore rules of a repository that already
+has commit history. Such a repository is adopted as it stands. The discriminator is history, not the
+presence of a `.git` directory: a volume carrying a repository whose `HEAD` is unborn has no history,
+and the system initializes it.
 
 Where a volume the system is initializing — one with no commits yet — already carries an ignore file at
 the repository root, the system SHALL append its rule unless that file already carries the same rule as
-a line of its own, and SHALL NOT overwrite or remove anything already present. The comparison is against the file's lines, and a line that is
-commented out does not count as the rule being present.
+a line of its own, and SHALL NOT overwrite or remove anything already present. The comparison is
+against the file's lines, and a line that is commented out does not count as the rule being present.
 
 The system SHALL NOT attempt to determine whether the directory is already ignored by some other means
 — a differently shaped pattern, an ignore file elsewhere in the tree, or the host's global ignore
@@ -49,8 +51,8 @@ holding a repository that looks initialized and is not protected.
 
 #### Scenario: An adopted repository's ignore rules are not touched
 
-- **WHEN** the system starts against a volume that already contains a git repository, whatever ignore
-  rules that repository does or does not carry
+- **WHEN** the system starts against a volume carrying a git repository that already has commit
+  history, whatever ignore rules that repository does or does not carry
 - **THEN** the system does not create, append to, or amend an ignore file in it
 
 #### Scenario: An ignore file already on the volume is added to, not replaced

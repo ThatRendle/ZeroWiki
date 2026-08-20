@@ -1395,6 +1395,37 @@ public sealed class ContentRepositoryServiceTests : IDisposable
     }
 
     [Fact]
+    public async Task PreExistingGitignoreWithNoTrailingNewline_GetsASeparatingNewlineBeforeOurRule()
+    {
+        // 2.5, case 4 — the sub-branch the §2 supervisor found unfalsified: needsSeparatingNewline
+        // (ContentRepositoryService.cs) is false in every other 2.5 fixture because they all end in
+        // "\n". Without this test a mutant hard-coding that flag to false survives the whole suite,
+        // and the real defect it guards against is silent and damaging: appending directly onto an
+        // operator's last line without a trailing newline folds our rule onto theirs, producing
+        // "*.tmp.obsidian/" — their rule broken, ours never applied, no error anywhere.
+        var repositoryRoot = RepositoryRoot;
+        Directory.CreateDirectory(repositoryRoot);
+        var gitIgnorePath = Path.Combine(repositoryRoot, ".gitignore");
+        await File.WriteAllTextAsync(gitIgnorePath, "*.tmp");
+
+        var service = CreateService();
+        await service.EnsureRepositoryAsync();
+
+        Assert.Equal("*.tmp\n.obsidian/\n", await File.ReadAllTextAsync(gitIgnorePath));
+
+        var checkIgnoreTmp = await _git.RunOrThrowAsync(
+            repositoryRoot, ["check-ignore", "-q", "foo.tmp"], PinnedGitEnvironment);
+        Assert.Equal(0, checkIgnoreTmp.ExitCode);
+
+        var checkIgnoreObsidian = await _git.RunOrThrowAsync(
+            repositoryRoot, ["check-ignore", "-q", ".obsidian/workspace.json"], PinnedGitEnvironment);
+        Assert.Equal(0, checkIgnoreObsidian.ExitCode);
+
+        Assert.Equal("1", (await _git.RunOrThrowAsync(repositoryRoot, ["rev-list", "--count", "HEAD"])).StandardOutput.Trim());
+        await AssertPorcelainIsEmptyAsync(repositoryRoot);
+    }
+
+    [Fact]
     public async Task PreExistingGitignoreMatchingGitignoreItself_RefusesToStartWithNoInitialCommit()
     {
         // 2.7 — the fail-fast Risks entry (Product Owner decision). A broad operator rule that also

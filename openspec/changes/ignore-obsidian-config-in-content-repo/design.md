@@ -79,9 +79,14 @@ harmless, visible. Where an instrument must be wrong sometimes, be wrong in the 
 nothing.
 
 Consequences accepted knowingly: a differently shaped rule (`.o?sidian/`), a rule in `docs/.gitignore`,
-or a global ignore all produce a duplicate line. None of them break anything. The operator's negation
-case now resolves *better* than under the old design — the text is present, so nothing is appended and
-their re-inclusion survives.
+or a global ignore all produce a duplicate line. None of them break anything.
+
+**What this revision does *not* change is the negation override** — see the Risks entry below. An
+operator whose file happens to carry the literal line `.obsidian/` alongside a `!` re-inclusion is now
+left alone, because the text is present and nothing is appended; but any other shape has no matching
+line, so we append and our rule wins, exactly as before. The override is a property of appending to the
+end of someone else's file, which this design does as much as the withdrawn one. An earlier draft of
+this decision claimed the revision dissolved it. It does not.
 
 **Match a whole trimmed line, never a substring.** A substring search matches
 `# .obsidian/ is deliberately tracked` inside a comment and skips the append — a silent failure in the
@@ -98,6 +103,31 @@ one direction this decision exists to avoid. A commented line does not count as 
   in ZeroWiki rewrites it after bootstrap (D1).
 - **Existing deployments keep the noise** → accepted, and it is the deliberate consequence of D2. The
   Product Owner's own wiki is one of them.
+- **An operator's own negation is silently overridden** (Product Owner decision, accepted 2026-08-20;
+  **restored 2026-08-20** after being deleted on a wrong argument — see below). Where a pre-existing
+  root `.gitignore` re-includes the directory for some path, appending our rule to the end of that file
+  makes the re-inclusion stop taking effect. Reproduced on git 2.55.0 with an anchored rule, one of the
+  three shapes D5 names:
+
+  ```
+  $ printf '/.obsidian/\n!docs/.obsidian/\n' > .gitignore
+  $ git check-ignore -q docs/.obsidian/ ; echo $?   # 1 — the negation works
+  $ printf '.obsidian/\n' >> .gitignore            # what bootstrap appends
+  $ git check-ignore -q docs/.obsidian/ ; echo $?   # 0 — the negation is dead
+  ```
+
+  **This survives D5's revision, and the reasoning that deleted it was wrong.** The deletion argued that
+  a text check finds the operator's `.obsidian/` line and appends nothing. That holds only for a file
+  whose exclusion is written as exactly `.obsidian/`. Any other shape — anchored, globbed, or without
+  the trailing slash — has no matching line, so we append, and our line being last wins. **The override
+  was never a property of `check-ignore`; it is a property of appending to the end of someone else's
+  file, which both the withdrawn design and the current one do.**
+
+  Still accepted, for the reason it was accepted originally: detecting it means parsing `!` lines, and a
+  partial `!` parser is a worse instrument than the one it would protect. The exposure is same-file
+  only — a negation in `docs/.gitignore` is unaffected, since git gives the closer file priority. The
+  operator's remedy is to move their negation below our line.
+
 - **A pre-existing ignore rule matching `.gitignore` itself refuses the boot** (Product Owner decision,
   accepted 2026-08-20). Bootstrap stages by explicit pathspec (`git add docs/.gitkeep .gitignore`), and
   `git add` on an explicit pathspec that an ignore rule matches **fails** rather than skipping. So a

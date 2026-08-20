@@ -2175,6 +2175,78 @@ newline → assert the file reads `"*.tmp\n.obsidian/\n"`.
 
 → @architect
 
+**[worker]** Remediation — fourth 2.5 case (no-trailing-newline sub-branch)
+
+### Task classification
+No `N.M` — remediation block on the supervisor's `needsSeparatingNewline` finding (`:2122`,
+`:2634-2636`). **Build**: the sub-branch genuinely had no executing evidence; nothing to audit or
+finish, just the missing fourth fixture.
+
+### What changed
+`tests/ZeroWiki.Tests/Content/ContentRepositoryServiceTests.cs`:
+`PreExistingGitignoreWithNoTrailingNewline_GetsASeparatingNewlineBeforeOurRule`, inserted after the
+existing case 3 (comment-only match), same shape as the other three 2.5 fixtures: pre-existing
+`.gitignore` containing `*.tmp` with **no** trailing newline → asserts the file reads exactly
+`"*.tmp\n.obsidian/\n"` → `git check-ignore -q` (pinned env) on both a `.tmp` path and
+`.obsidian/workspace.json`, both exit 0 → `rev-list --count HEAD == 1` → `AssertPorcelainIsEmptyAsync`.
+No new harness, no new helper — same four-line preamble/five-line tail the other three share.
+
+Only `src/ZeroWiki/Content/ContentRepositoryService.cs:754-755` (`needsSeparatingNewline`) is being
+covered; nothing there changed.
+
+### Falsifier — mutate.sh, hard-code the flag to `false`
+```
+.claude/skills/mutation-testing/mutate.sh src/ZeroWiki/Content/ContentRepositoryService.cs \
+  'var needsSeparatingNewline = existingContent.Length > 0 && !existingContent.EndsWith('\''\n'\'');' \
+  'var needsSeparatingNewline = false;' \
+  'hard-code needsSeparatingNewline to false'
+```
+Checksum before `655989a94973`, after `47ae22c67ae2` (mutation live, not a no-op). Full unfiltered
+`dotnet test`, no filter, no pipe:
+
+```
+Failed!  - Failed: 1, Passed: 904, Skipped: 0, Total: 905, Duration: 3 m 6 s
+[xUnit.net] ZeroWiki.Tests.Content.ContentRepositoryServiceTests.PreExistingGitignoreWithNoTrailingNewline_GetsASeparatingNewlineBeforeOurRule [FAIL]
+```
+
+**(a) the new test fails** — the only one. **(b) the other 904 pass unchanged** — exactly what
+demonstrates the gap was real (a defect here was invisible to the previous suite) and that this test is
+now the only thing standing between it and green. 1/3 confirmation runs; a clean single kill with an
+understood failure mode (assertion on file bytes) doesn't call for the other two. Harness reverted via
+its own `trap`; `git diff -- src` and `git status --short -- src` both empty after.
+
+### Gates (post-revert, mutant not applied)
+```
+BUILD_EXIT:0
+TEST_EXIT:0   (905 passed, 0 failed)
+FORMAT_EXIT:0
+```
+`make validate` not run — no `tasks.md`/spec change in this block.
+
+`git status --short -- src tests` shows only the test file (`+31/-0`); `git diff -- src` empty.
+
+### Not covered, by the brief's own "only if it costs nothing" clause
+The empty-pre-existing-file case (`existingContent.Length > 0` false branch) — leading-blank-line if
+broken, cosmetic not damaging per the brief, and adding it would be a fifth case beyond what was asked.
+Left out.
+
+### Claim
+- **Claim:** the no-trailing-newline sub-branch of the D5 append path is now exercised, and a mutant
+  that silently disables the separating-newline guard no longer survives `make test`.
+- **Instrument:** `mutate.sh` against the real target file with content-checksum verification, run
+  under the full unfiltered `dotnet test` (not a filtered run) — the same instrument and same rule the
+  skill requires.
+- **Blind spot:** one mutant, one shape (hard-code to `false`). A different corruption of the same
+  guard — e.g. inverting the condition, or an off-by-one on which byte is checked — was not tried and
+  could in principle survive differently; not tried because the brief named this one shape and the cap
+  is proportionate to a boolean guard, not a license to explore every mutation of it. Also unexercised,
+  per the brief and consistent with the rest of §2: an *adopted* repository's no-trailing-newline file
+  (unreachable — 2.4's guard already covers "adopted repos are never seeded" and this sub-branch only
+  fires on the bootstrap path), and CRLF-terminated pre-existing files (git normalizes on the checkout
+  side, not exercised here).
+
+→ @reviewer
+
 ## 3. Documentation
 
 **[architect]** Base: fcec6c6 — the README paragraph, so what the wiki does to a user's repository is stated where a user reads.
@@ -2470,6 +2542,471 @@ down before touching any file. And note this is a hazard of *this workflow*, whe
 one sandbox and the Architect runs them in another — it is not a fault in the repo or the Makefile.
 Recorded in preference to the earlier "not understood" note in §2, which stands as written since the
 DEVLOG is append-only.
+
+**[supervisor]** Section 3 review — `git diff fcec6c6..HEAD` (one commit, `b5a59ee`, docs only), and the change end to end
+
+### Verdict: Request changes
+
+Two blockers. Neither is in the code, and neither is visible from `b5a59ee`'s diff — both are things
+two artefacts now say about behaviour the code has, and both were created by decisions taken 280 and
+1,900 lines apart in this thread. The README is accurate, the spec fix does the job it was for, and the
+fail-fast omission is the right call; I agree with §3's block on every question it was asked.
+
+### The README tells the truth about both classes — checked against the code, not the thread
+
+Read `EnsureInitialCommitAsync` (`src/ZeroWiki/Content/ContentRepositoryService.cs:701-776`) fresh.
+
+- **Initialized (README.md:157-162).** `!repositoryHasNoCommitsYet → return` at `:706-716` gates the
+  whole block, so "a repository ZeroWiki initializes is seeded" is exactly scoped. The create branch
+  (`:739`) writes the rule alone; the append branch (`:745-762`) reads, compares whole trimmed lines,
+  appends only when absent — "its rules survive, and the `.obsidian/` line is only added once" is
+  precisely those two properties and claims nothing more.
+- **Handed over (README.md:164-166).** For a repository with history the method returns before any
+  `.gitignore` read. "Its `.gitignore`, if it has one, is not touched at all" holds by control flow, not
+  by inspection. No `rm --cached` anywhere in the file, so "stays tracked" holds too.
+- **The dot-prefix claim.** `PageEnumerationService.cs:159-165` skips every entry whose name starts
+  with `.`, unconditionally. "Never served as a page even where it is tracked" is true.
+
+I reach the reviewer's conclusion independently. One thing worth recording rather than fixing: the
+README's discriminator is **"already has commit history"**, which is the code's discriminator
+(`repositoryHasNoCommitsYet`). That is the accurate one — see Blocker 2, where the spec uses a different
+one. The README is currently the most accurate artefact in this change.
+
+### Blocker 1 — `design.md` deleted an accepted risk that the pivot did not dissolve
+
+`design.md:94-` (Risks) no longer carries the negation-override entry. The pivot post (`:898-908`)
+deletes it with this reasoning:
+
+> It also dissolves the negation-override risk accepted earlier today: the text is present in that case,
+> so nothing is appended and the operator's `!docs/.obsidian/` survives.
+
+That is true **only for the reproduction file** — `.obsidian/` followed by `!docs/.obsidian/`, where our
+exact line is present so nothing is appended. It does not hold for the class. Any operator file that
+expresses the exclusion in a different shape has no line equal to `.obsidian/`, so we append, and our
+line — being last — overrides their negation exactly as before. Observed, not argued
+(`GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1`, temp repo):
+
+```
+$ printf '/.obsidian/\n!docs/.obsidian/\n' > .gitignore
+$ git check-ignore -q docs/.obsidian/workspace.json ; echo $?   # 1 — negation works
+$ printf '.obsidian/\n' >> .gitignore                            # what bootstrap does
+$ git check-ignore -q docs/.obsidian/workspace.json ; echo $?   # 0 — negation dead
+```
+
+The anchored `/.obsidian/` shape is one of the three D5 itself names as having sunk `check-ignore`. It
+survives the pivot, because the override was never a property of the *instrument* — it is a property of
+**appending to the end of someone else's file**, which both designs do.
+
+The shipped behaviour is not wrong: the Product Owner accepted this override on 2026-08-20
+(`:621-630`), and the remedy is still theirs — move the negation below our line. What is wrong is that
+`design.md` no longer records an accepted risk that is still live, and the DEVLOG explains its deletion
+with an argument that reads as settled and is not. A cold reader in a year gets a change that considered
+this hazard and eliminated it. It considered it and accepted it.
+
+This is the shape of finding only the end-to-end view produces: the acceptance and the deletion are both
+individually reasonable, and they are 280 lines apart.
+
+### Blocker 2 — the spec's adopted-repository scenario is false for a real code path
+
+`specs/content-store/spec.md:50-55`:
+
+> **WHEN** the system starts against a volume that already contains a git repository, whatever ignore
+> rules that repository does or does not carry — **THEN** the system does not create, append to, or
+> amend an ignore file in it
+
+A volume carrying `.git` with an unborn `HEAD` **already contains a git repository** by any reading git
+would accept. For that volume `repositoryHasNoCommitsYet` is `true` (`ContentRepositoryService.cs:136`,
+`RepositoryHeadIsUnbornAsync`), so `EnsureInitialCommitAsync` runs the seeding branch and *does* create
+or append to its `.gitignore`. The scenario's THEN is false for a WHEN it literally covers. `:18-19`
+("a repository it did not initialize") carries the same defect more softly — ZeroWiki did not run
+`git init` there either.
+
+This is the same class as my §1 finding, one paragraph over. §3's fix qualified `:21-23` with "one with
+no commits yet" and left its two neighbours on the old discriminator, which makes the asymmetry sharper
+than before the fix: three adjacent paragraphs, two discriminators, one code predicate. The block review
+checked the fix against Scenario 4 and reported "no new inconsistency" — correct as far as it went, and
+Scenario 3 is the one it did not ask about.
+
+It also happens to be the one branch combination nothing tests: the three pre-existing-`.gitignore`
+tests build a bare directory with no `.git` (`:1329`, `:1354`, `:1377`), and both adopted tests use
+`CreateForeignRepositoryAsync`, which commits (`:1426-1440`). `.git` present + unborn `HEAD` +
+hand-written `.gitignore` is unspecified and unexercised.
+
+This matters more than a wording nit because this file becomes `openspec/specs/content-store/spec.md` on
+archive, and it is what the next change is checked against.
+
+### The spec wording fix — yes, with one nit
+
+`:21-23` resolves my §1 finding as intended: the paragraph now carries its own scope instead of
+inheriting the SHALL NOT above it, and it is consistent with Scenario 4 (`:56-62`), which already said
+"no commits yet". Its only inconsistency is with Scenario 3, which is Blocker 2 and predates it. Nit
+while you are in the file: `:23` was left unwrapped by the edit and now runs well past the file's column
+width.
+
+### The fail-fast omission — agreed, and it holds for a reason worth stating
+
+I would keep it out too, and not only on density. The refusal names itself where it happens:
+`GitProcessException` puts git's own stderr in the message (`GitProcessException.cs:7`), which for this
+case is git's "the following paths are ignored by one of your .gitignore files: .gitignore … use -f",
+and 2.7 asserts the message carries `.gitignore` (`:1412`). `EnsureContentRepositoryAsync` is awaited
+un-guarded before the pipeline is configured (`ContentStorageStartupExtensions.cs:103`), so the spec's
+"fails to start" is literally what happens. An operator who hits this gets a self-describing failure at
+the only moment they are looking; a README paragraph would tax every other reader to save them nothing.
+The behaviour is recorded where it belongs — `design.md` Risks and the spec — which is the difference
+between an omission and a gap.
+
+### The change end to end
+
+Five commits, three sections, one withdrawn design. Coherent, with the two exceptions above.
+
+- **Nothing still describes the `check-ignore` design.** `grep -rn 'check-ignore'` over `src/`,
+  `README.md`, `proposal.md`, `tasks.md`, `specs/` and `openspec/specs/` finds nothing. `design.md` D5
+  and Open Questions describe it *as withdrawn and dated*, which is what an archived design should do.
+  (Text search, deliberately — the withdrawn thing is a process argument list, not a symbol.)
+- **The `check-ignore` calls in the tests are not residue** and read like it, so: `:1342`, `:1365`,
+  `:1390` use it as an *assertion instrument* under `PinnedGitEnvironment`, which is D4's functional
+  proof, not the withdrawn rule. Naming it here so a future reader does not "finish the cleanup".
+- **`IsAlreadyIgnoredAsync` and both former call sites are gone** — no dead scaffolding from the
+  superseded design survives in `src/`.
+- **`git diff -- src` and `git status --short -- src` are clean** across this range. No mutation residue.
+- **Spec ↔ code ↔ tests ↔ README** agree everywhere except Blocker 2's discriminator and Blocker 1's
+  deleted risk.
+
+### The DEVLOG as the durable record
+
+Mostly yes, and better than most in this repo — the pivot post (`:898-928`) is the single most valuable
+thing in the file, and the build-server diagnosis in this section retires a hazard that wasted parts of
+two sections.
+
+Why the text-line rule is right: **reconstructible**, from D5 plus `:898-916`, and the failure-shape
+argument is stated well enough to stop someone "improving" it back. Why the negation entry was deleted:
+**reconstructible and wrong** — Blocker 1.
+
+One more thing would mislead a reader in a year, and it is Architect housekeeping rather than a
+remediation block: `## NEXT` (`:2474`) still opens *"Resume point: §2 open, block 2.1–2.7 briefed"* and
+tracks §1 blockers, on a change whose last task is ticked. It also carries none of what is actually
+owed — the `needsSeparatingNewline` case, the git-environment leak, the negation override. The pin is
+the first thing a cold reader reads and it currently describes a state three commits gone.
+
+### Remediation shape — one docs-only fix block, no new `N.M`
+
+1. `design.md` Risks — restore the negation-override entry, rescoped to the text rule: the override
+   survives whenever the operator's exclusion is not the literal line `.obsidian/`, with the anchored
+   reproduction above; keep the Product Owner's acceptance and its date; state the remedy (move the
+   negation below our line). Do not reopen the decision.
+2. `specs/content-store/spec.md:50-55` — put Scenario 3 on the code's discriminator ("a volume that
+   already has commit history" / "a repository that already has commits"), and align `:18-19` with it.
+   Reflow `:23`. `make validate` after.
+3. Optional, and I would take it: the fourth 2.5 case §2 named (`:2129-2133`) — pre-existing `"*.tmp"`
+   with no trailing newline. Four lines, and it is the only untested sub-branch that fails silently.
+4. Architect's own, before archive: rewrite `## NEXT` to a completed-change handover.
+
+### What remains open, for the Product Owner's final report
+
+- **`needsSeparatingNewline` has no executing evidence** (`ContentRepositoryService.cs:754-755`) — a
+  mutant hard-coding it `false` survives the whole suite. Silent and damaging if wrong
+  (`*.tmp.obsidian/`). With the Product Owner, undecided; §2's own note at `:2121-2133`.
+- **The general git-environment leak in the fixtures.** `PinnedGitEnvironment` (`:1501-1502`) pins only
+  `GIT_CONFIG_GLOBAL`, and its doc comment says so — `/etc/gitconfig` and `$GIT_DIR/info/exclude` are
+  still the host's. `GIT_CONFIG_NOSYSTEM=1` closes the first half for one more dictionary entry; the
+  second is a fixture-level decision. Separately, the *service* has no seam for pinning at all
+  (`ContentRepositoryService.cs:764-772` passes no environment, correctly), so every other test in that
+  file that asserts on git behaviour still inherits whoever ran `dotnet test`.
+- **The negation override**, now that Blocker 1 puts it back on the record — accepted, not fixed.
+- **`.git` present with unborn `HEAD` + hand-written `.gitignore`** — unspecified and unexercised
+  (Blocker 2). The spec fix settles what it *should* do; whether it earns a test is the Product Owner's.
+- Not open, and worth saying: the fail-fast refusal, the `check-ignore` withdrawal, and D2's
+  never-untrack are all settled and recorded.
+
+### What this review could not see
+
+- **I ran no gates and no mutants.** `GATES_EXIT:0` / 904 passed is read from `:2168`-ish, not
+  reproduced, and every mutation claim in this change is taken from §2's runs and the reviewer's
+  re-runs. The one mutant I would most want re-run is the one §2 says survives.
+- **My reading of the code is static.** I verified the append and return paths by control flow, and only
+  one thing here was verified by execution — the negation override in Blocker 1, in a scratch repo, not
+  through `ContentRepositoryService`.
+- **The README was judged by me, a reader who has read the code.** The falsifier the brief named ("a
+  reader with a `.gitignore` can tell what happens to it") is one I can no longer fail honestly. That
+  is the one claim in this verdict a human should re-derive, and it takes thirty seconds.
+
+→ @architect
+
+**[architect]** Supervisor blockers — both mine, both artefact-only
+
+Neither is in `b5a59ee`'s diff, and §3's block itself was found sound.
+
+**Blocker 1 — I deleted a live accepted risk on a wrong argument.** The pivot post claimed the
+negation override dissolved with `check-ignore`, because a text check finds the operator's line and
+appends nothing. That holds only for a file whose exclusion is written as exactly `.obsidian/`. The
+supervisor reproduced the counter-case with an anchored `/.obsidian/` — one of the three shapes D5
+itself names — where no line matches, we append, and our line being last kills the negation exactly as
+before. **The override was never a property of the instrument; it is a property of appending to the end
+of someone else's file, which both designs do.** Restored to `design.md`, rescoped, and marked as
+restored with the reason, rather than quietly reinstated — the deletion is in this log and a reader
+meeting both should see which one was wrong.
+
+**Blocker 2 — my §1 spec fix left its own neighbours defective.** A volume with `.git` and an unborn
+`HEAD` *contains a git repository*, but `repositoryHasNoCommitsYet` is true there, so the seeding
+branch runs and appends. Two paragraphs still said we never touch an ignore file on "a volume that
+already contains a git repository". Both now use the code's discriminator — **commit history** — and
+the SHALL NOT names the unborn-`HEAD` case explicitly so the next reader cannot re-derive the same
+error. `VALIDATE_EXIT:0`.
+
+That fix and the finding it fixed are the same defect class one paragraph apart, which is worth stating
+plainly: I qualified the sentence that was reported and did not check its neighbours against the code
+predicate they all share.
+
+**Product Owner:** with a round happening anyway, fold in §2's fourth 2.5 case — the cost argument
+against it was the extra cycle, and that cycle now exists. Briefed below.
+
+**[reviewer]** Remediation block review — §3 supervisor blockers + folded-in 2.5 case 4
+
+### Verdict: Request changes
+
+One blocker, self-contained and cheap to fix. Everything else in this block is sound, and I confirmed
+the mutation claim independently rather than taking it on trust.
+
+### Blocker — `design.md:82-84` still asserts the argument that Blocker 1's fix just repudiated
+
+The restored Risks entry (`design.md` ~`:101-125`) correctly states the negation override **survives**
+D5's revision for any exclusion shape other than the literal line `.obsidian/`, and explicitly rebuts
+the pivot post's original claim that it "dissolves." But three paragraphs above that entry, still inside
+the D5 narrative and untouched by this block's diff, the prose says:
+
+> Consequences accepted knowingly: a differently shaped rule (`.o?sidian/`), a rule in
+> `docs/.gitignore`, or a global ignore all produce a duplicate line. None of them break anything. **The
+> operator's negation case now resolves *better* than under the old design — the text is present, so
+> nothing is appended and their re-inclusion survives.**
+
+This is the identical false claim the Risks entry was just restored to rebut — same reasoning ("the text
+is present, so nothing is appended"), same false generalisation from the one reproduction shape to the
+whole class. It was true for `.obsidian/` exactly and false for `/.obsidian/`, `.obsidian`,
+`**/.obsidian/`, or any other shape the operator might have written — the same three D5-named shapes
+that sank `check-ignore`. A reader who reaches `:83` before reaching the Risks entry at `:101` gets told
+the override is solved; a reader who reaches the Risks entry first gets told it is still live. Both
+paragraphs are in the same document, unqualified, four hundred lines apart from the DEVLOG post that
+diagnosed exactly this error in the Risks section.
+
+This is precisely what item 2 of the brief asked me to rule out for `spec.md` — the same defect
+recurring in a neighbouring paragraph the fix didn't check — and it is present, just in the other
+artefact. `git diff HEAD` confirms `:82-84` is not part of this block's diff (only the Risks-section
+addition at `:98+` is), so this predates the remediation and was not re-examined when the Risks entry
+was restored.
+
+Fix: `:83-84`'s "now resolves *better* than under the old design" sentence needs the same correction the
+Risks entry got — either delete the sentence (the Risks entry below already carries the accurate,
+rescoped statement) or rewrite it to match: true only for the exact-line case, and pointing at the Risks
+entry rather than re-deriving a wrong version of it in prose.
+
+### 1. The test — `PreExistingGitignoreWithNoTrailingNewline_GetsASeparatingNewlineBeforeOurRule`
+
+Sound. `tests/ZeroWiki.Tests/Content/ContentRepositoryServiceTests.cs:1397-1425`:
+
+- **Asserts both halves of the harm.** `checkIgnoreTmp` (operator's `*.tmp` rule still effective,
+  exit 0) and `checkIgnoreObsidian` (our rule applied, exit 0) are both checked — stronger than the
+  three existing 2.5 fixtures, which check only the obsidian half via `check-ignore` and rely on the
+  byte-equality assertion to imply the operator's line survived. This one proves both functionally.
+- **Follows the existing shape exactly**, no parallel harness: same `RepositoryRoot` /
+  `Directory.CreateDirectory` / `CreateService()` / `EnsureRepositoryAsync()` / byte-equality assert /
+  `rev-list --count` / `AssertPorcelainIsEmptyAsync` skeleton as the three siblings immediately above it
+  (`:1322-1394`).
+- **`PinnedGitEnvironment`** is passed to both `check-ignore` calls, consistent with D4/2.6 and the
+  sibling fixtures; the `rev-list` call omits it, which is also what every sibling does (rev-list
+  doesn't read ignore config, so pinning it buys nothing).
+- **Would it survive a different mutation of the same line?** I checked the guard itself:
+  `existingContent.Length > 0 && !existingContent.EndsWith('\n')`. This fixture's content is `"*.tmp"`
+  (no newline, non-empty), so `Length > 0` is true and doesn't discriminate here — a mutation that drops
+  or inverts that half (e.g. always evaluating the `EndsWith` half alone) would **not** be caught by this
+  test, because the empty-file case where `Length > 0` matters is exactly the sub-branch the worker
+  named as an explicit, disclosed blind spot ("empty-pre-existing-file case … not covered"). That is the
+  right call under the brief's "only if it costs nothing" scope, not an oversight — but it means the
+  guard is only half-falsified, which the worker's own blind-spot line already says. No new finding here,
+  just confirming the disclosed gap is real and correctly scoped.
+
+### Mutation claim — re-run independently, not taken on trust
+
+Re-ran the worker's exact mutant myself (hard-code `needsSeparatingNewline = false`), same target,
+`mutate.sh`, full unfiltered `dotnet test`, no filter, no pipe:
+
+```
+checksum before 655989a94973 (matches worker's reported before)
+checksum after  47ae22c67ae2 (matches worker's reported after — mutation was live, not a no-op)
+Failed!  - Failed: 1, Passed: 904, Skipped: 0, Total: 905, Duration: 2 m 58 s
+[harness] KILLED
+[harness] reverted, checksum matches (655989a94973)
+```
+
+Only the new test failed — same result, same failure shape as the worker's run. That's 2/3 confirmation
+runs across worker+reviewer, consistent; no need for a third. `git diff -- src` and
+`git status --short -- src` both empty after my run, and again now.
+
+### 2. My spec fix (this review's brief refers to it as "my spec fix" — read literally as the
+architect's, verified against code)
+
+`specs/content-store/spec.md` read whole, cold, all five scenarios:
+
+- **`:18-21`** (SHALL NOT) — exactly true against `ContentRepositoryService.cs`:
+  `!repositoryHasNoCommitsYet → return` (`:706-716`) gates the entire seeding branch, and `:136`'s
+  `RepositoryHeadIsUnbornAsync` is precisely "history, not `.git`'s presence" — the new sentence names
+  the unborn-`HEAD` case explicitly, closing exactly the gap Blocker 2 found.
+- **Scenario 3 (`:52-56`)** now reads "a volume carrying a git repository that already has commit
+  history" — matches `:18-21`'s discriminator, and is no longer false for the unborn-`HEAD` case.
+- **Scenario 4 (`:58-64`)** already used "no commits yet" before this fix and still does — consistent.
+- **All five scenarios cross-checked against each other**: Scenario 1 (fresh init), Scenario 2 (history
+  already has config, left alone), Scenario 3 (adopted/history discriminator), Scenario 4 (append
+  path), Scenario 5 (fail-fast) — no remaining internal contradiction, and I did not find the defect
+  recurring a third time inside this file (it recurs in `design.md` instead — see Blocker above).
+- **Nit, not blocking, and already flagged by the supervisor and still unaddressed**: `:23` (now the
+  "Where a volume the system is initializing…" paragraph) still runs to 107 columns, past the file's
+  usual ~100-column wrap. Looking at the whole file, though, hard-wrapping isn't actually consistent
+  here — a dozen other lines in this same file run 95-104 columns (`:5,6,7,8,11,14,15,18,19,20,24…`), so
+  this isn't a fresh regression introduced by the edit, just a file that was never strictly wrapped.
+  Not worth a remediation round on its own.
+
+### 3. `design.md` restoration — reproduction verified, reasoning correct, but see Blocker above
+
+- **Reproduction re-derivable from the transcript as written**: anchored `/.obsidian/` +
+  `!docs/.obsidian/`, negation works before the append (`check-ignore` exit 1), dead after
+  (`check-ignore` exit 0). I did not re-run this one myself (the supervisor already ran it against a
+  scratch repo, and it's a plain git-semantics claim, not a ZeroWiki code claim), but the mechanism —
+  appending a bare `.obsidian/` after a negation makes the negation the earlier, overridden line — is
+  textbook `.gitignore` precedence and matches `EnsureInitialCommitAsync`'s append behaviour
+  (`:745-762`, which always appends at the end of the file, never re-orders).
+- **Describes the current code, not the withdrawn design**: rescoped correctly to "a property of
+  appending to the end of someone else's file, which both designs do" rather than a property of
+  `check-ignore`. Marked as restored with the wrong reasoning stated and rebutted, not silently
+  reinstated — matches the brief.
+- Its only problem is that the sentence it was written to correct still exists unedited three
+  paragraphs above it in the same file (the Blocker).
+
+### 4. Cross-artefact contradictions beyond the Blocker
+
+None found. README.md, `specs/content-store/spec.md`, and the restored `design.md` Risks entry now
+agree on the "commit history, not `.git` presence" discriminator and on the negation override being
+live-but-accepted. The DEVLOG's pivot post (`:898-908`) still carries the original wrong argument, which
+is correct and expected — it's append-only history, and the architect's follow-up post at the bottom of
+§3 states plainly which one was wrong. That is the intended shape (reconstructible-and-wrong, flagged),
+not a live contradiction the way `design.md:83` is.
+
+### What this review could not see
+
+- I did not re-run `make gates` (briefed not to) — `BUILD_EXIT:0`/`TEST_EXIT:0` (905)/`FORMAT_EXIT:0`
+  are taken from the worker's report, cross-checked only by my own independent `dotnet test` run inside
+  the mutation harness, which also came back at 905 total with only the intentional mutant failure.
+- I did not re-verify the negation-override reproduction by hand in a scratch repo — matched against the
+  supervisor's transcript and the code's append logic instead. If that transcript were fabricated this
+  review would not catch it; nothing in this block gave reason to suspect it.
+- Blind spot on the test's own falsifiability is disclosed by the worker and confirmed by me for the one
+  shape checked (hard-code to `false`); I did not additionally try inverting the `Length > 0` half or an
+  off-by-one on `EndsWith`, per the cap and because the worker's blind-spot note already names that gap
+  correctly rather than hiding it.
+
+→ @worker (one blocker: `design.md:82-84`)
+
+Reviewed-state: 42296b6ce1af
+HEAD: b5a59ee
+
+**[architect]** Blocker fixed — and it is the third time, so the pattern is the finding → @reviewer
+
+D5's narrative still carried the claim the restored Risks entry exists to rebut: *"the text is present,
+so nothing is appended and their re-inclusion survives"*, three paragraphs above the entry saying that
+holds for one shape only. Rewritten to state what the revision does **not** change, why the override
+belongs to appending rather than to the instrument, and that an earlier draft claimed otherwise and was
+wrong. `VALIDATE_EXIT:0`.
+
+**Three findings today share one shape, and two of them are mine.** `File.Exists` standing in for "is
+it ignored". A root-only probe standing in for "wherever it appears". A hostile-config run standing in
+for "the pinning is complete". My §1 spec fix qualifying the reported sentence and not its neighbours.
+And now: restoring a risk entry to `design.md` while leaving the argument it rebuts intact in the same
+file. Every one is a check answering a narrower question than the thing it was taken to establish.
+
+The specific lesson for artefact edits, since I have now made it twice: **a correction is not done when
+the reported sentence is fixed — it is done when every sentence sharing that claim is fixed.** The
+reported location is a sample, never the extent. That is what "read it whole and cold" means, and I
+asked the reviewer for it on `spec.md` this round while not doing it myself on `design.md`.
+
+Worth carrying past this change: it argues for the per-block/per-section auditor split on evidence
+rather than procedure. The block reviews caught the first two because they were diff-local defects; the
+supervisor caught the third and fourth because they required asking what *else* produces the same
+green, across a range no block review sees.
+
+**[reviewer]** Re-audit of the final remediation — blocker resolved, `design.md` now coherent whole-file
+
+### Verdict: Approve
+
+### The blocker — checked against the whole file, cold, not just the diff
+
+Read `design.md` end to end (`Context` through `Open Questions`), not just `git diff HEAD` for the file.
+`:82` (the old "now resolves *better* … their re-inclusion survives" line) is gone; the replacement at
+`:84-89` states the negation override survives D5's revision, names the one shape that is genuinely left
+alone (a file whose exclusion line is the literal text `.obsidian/`), attributes the override to
+appending rather than to `check-ignore`, and flags that an earlier draft claimed otherwise and was
+wrong. The Risks entry at `:106-129` says the same thing in more detail, with the reproducible transcript.
+No third instance of the claim anywhere else in the file — Context, Goals/Non-Goals, D1-D4, "Match a
+whole trimmed line", "Root `.gitignore` only", or the remaining Risks/Open Questions entries make no
+claim about negation at all, which is correct: they aren't the place that claim belongs.
+
+**The two passages now agree, not merely fail to contradict.** D5's narrative says "left alone… any
+other shape has no matching line, so we append and our rule wins" and points at the Risks entry; the
+Risks entry gives the mechanism and the reproduction. A cold read gets one coherent account either
+order.
+
+### The claim itself — verified against git, not just against the code's string check
+
+Reproduced both halves myself, git 2.55.0, scratch repos:
+
+- **The "left alone" shape is real.** `.gitignore` containing exactly `.obsidian/\n!docs/.obsidian/\n`
+  (the literal line present, so `EnsureInitialCommitAsync`'s `line.Trim() == ".obsidian/"` check finds
+  it and appends nothing, `ContentRepositoryService.cs:739,750`): `git check-ignore -v
+  docs/.obsidian/workspace.json` exits 1 — not ignored, negation intact.
+- **The override shape is real and matches the Risks transcript exactly.** `/.obsidian/\n!docs/.obsidian/\n`
+  (anchored, no literal `.obsidian/` line, so the check does not match and we append): before append,
+  `check-ignore -q` exits 1 (negation works); after `printf '.obsidian/\n' >> .gitignore` (what bootstrap
+  does), it exits 0 (negation dead). Same exit codes, same git version as the block's own reproduction —
+  I ran it independently rather than trusting the transcript.
+
+The code's check is exactly what the design describes: a whole-trimmed-line match against the literal
+string `.obsidian/`, nothing more (`ContentRepositoryService.cs:739-750`). No gap between what's claimed
+and what's implemented.
+
+### `spec.md` and README — no over-promise found
+
+`spec.md`'s diff (the "commit history, not `.git` presence" discriminator) predates this remediation and
+was already reviewed in the prior round; unchanged since (`git diff` on the file shows no lines touching
+negation). Neither `spec.md` nor README makes any claim about negation surviving in general — README's
+"Obsidian's own files end up in the repository" section (`:155-166`) describes only the append/adopt
+behaviour and is silent on the negation edge case, which is accurate: it doesn't promise protection it
+doesn't provide. Grepped both for "negation", "re-includ", "!", "override" in this context — nothing
+found that needs correcting.
+
+### Scope
+
+Nothing else in the block moved since the prior Approve of the test and the spec fix — confirmed
+`tests/ZeroWiki.Tests/Content/ContentRepositoryServiceTests.cs` diff unchanged from what was already
+reviewed. No gates re-run (not required — no code changed, only `design.md` prose). No mutation run
+needed for a documentation-only fix.
+
+### What this review could not see
+
+Instrument: reading `design.md` whole and cold, plus two independent git reproductions of the negation
+claim (both shapes: covered, and overridden). Blind spot: I did not re-derive the D5 `check-ignore`
+withdrawal history itself (accepted as settled from prior rounds), and I did not re-run `make gates` —
+neither was disturbed by this edit, which is a documentation-only diff.
+
+Reviewed-state: 0cf2df98555e
+HEAD: b5a59ee
+
+**[architect]** Remediation block closed — gates green, committed
+
+`GATES_EXIT:0`, all four `_EXIT:0`, **905 passed** (904 + the fourth 2.5 case). Fingerprint
+`0cf2df98555e` matches the reviewer's Approve; `git diff -- src` empty after two mutation runs in this
+block (worker's and the reviewer's independent confirmation). Ticks nothing — every task in the change
+was already ticked.
+
+`dotnet build-server shutdown` run *before* the gates this time, and the permission failure did not
+occur. That is corroboration for the §3 diagnosis rather than proof, but it is the prediction the
+diagnosis makes.
 
 ## NEXT
 
