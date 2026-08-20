@@ -16,4 +16,4 @@
 
 ## 3. Documentation
 
-- [ ] 3.1 Update the README's `.obsidian/` paragraph to say the rule is seeded for new repositories, and that existing ones keep what they already track — stating what happens, without explaining the plugin's or git's internals
+- [x] 3.1 Update the README's `.obsidian/` paragraph to say the rule is seeded for new repositories, and that existing ones keep what they already track — stating what happens, without explaining the plugin's or git's internals

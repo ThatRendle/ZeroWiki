@@ -18,9 +18,9 @@ configuration out of every vault on its next pull.
 The system SHALL NOT add to, amend, or otherwise modify the ignore rules of a repository it did not
 initialize. A volume presented with an existing repository is adopted as it stands.
 
-Where the volume already carries an ignore file at the repository root, the system SHALL append its
-rule unless that file already carries the same rule as a line of its own, and SHALL NOT overwrite or
-remove anything already present. The comparison is against the file's lines, and a line that is
+Where a volume the system is initializing — one with no commits yet — already carries an ignore file at
+the repository root, the system SHALL append its rule unless that file already carries the same rule as
+a line of its own, and SHALL NOT overwrite or remove anything already present. The comparison is against the file's lines, and a line that is
 commented out does not count as the rule being present.
 
 The system SHALL NOT attempt to determine whether the directory is already ignored by some other means

@@ -154,13 +154,16 @@ Install the community plugin **obsidian-git**. In its settings:
 
 ### Obsidian's own files end up in the repository
 
-Obsidian writes a `.obsidian/` folder into whichever directory you open as the vault. ZeroWiki's
-startup reconciliation stages the whole repository (`git add -A` at the repository root,
-unscoped) and the repository ships no `.gitignore`, so `.obsidian/` — including `workspace.json`,
-which rewrites itself on nearly every pane change — becomes wiki content and is pushed to every
-vault that syncs. It's harmless to read: page rendering skips any dot-prefixed entry, so
-`.obsidian/` is never served as a page. It's still noise in the repository's history; a future
-change may add a `.gitignore` for it, but expect to see it for now.
+Obsidian writes a `.obsidian/` folder into whichever directory you open as the vault. A repository
+ZeroWiki initializes is seeded with a `.gitignore` rule for `.obsidian/`, so a vault's editor
+configuration — `workspace.json`, plugin settings, and the rest — never becomes wiki content, even
+if a hand-written `.gitignore` was already on the volume: its rules survive, and the `.obsidian/`
+line is only added once. Page rendering also skips any dot-prefixed entry, so `.obsidian/` is never
+served as a page even where it is tracked.
+
+A repository you hand ZeroWiki instead — one that already has commit history — is left exactly as
+it is: if `.obsidian/` is already tracked, it stays tracked, and its `.gitignore`, if it has one, is
+not touched at all.
 
 ### When a push is rejected
 

@@ -2013,6 +2013,464 @@ workaround stand in for a diagnosis if it recurs.
 three-minute suite reads exactly like a pass, and `-k` puts the failing gate first, where it is easiest
 to scroll past. `GATES_EXIT:2` was the only thing that said otherwise.
 
+**[supervisor]** Section 2 re-review — `git diff 2ec40e2..HEAD` (two commits, `9ad944f` + `fcec6c6`, test-only)
+
+### Verdict: Approve
+
+Round 2. The blocker is discharged, and discharged the right way — by an observation that failed, not
+by an argument that it would.
+
+### The blocker is discharged, and the discharge is sound
+
+The three-run sequence (`:1769-1793`) establishes what it claims, and the middle observation is the
+load-bearing one. Under the same hostile `GIT_CONFIG_GLOBAL` and the same mutation, the test moved from
+`Passed: 1` to:
+
+```
+Assert.Contains() Failure: Sub-string not found
+String:    "docs/.gitkeep\n"
+Not found: ".gitignore"
+```
+
+That is not merely a red test — it is a **picture of the vacuous state I described**: `ls-files`
+holding `docs/.gitkeep` alone, `.obsidian/` swallowed by the host's excludes, `.gitignore` never
+written. The run that previously read green now names its own reason. Run 3 (restore → green) closes
+the loop against the mutation itself being the cause, and the reviewer reproduced it independently
+(`:1832`). I take this as observed, not asserted.
+
+**Can the new assertions be satisfied by any host configuration with the seeding absent?** No, and the
+asymmetry is why. Both new assertions require a *positive* artefact — `.gitignore` present in
+`ls-files`, and `git show HEAD:.gitignore` carrying `.obsidian/` as a whole trimmed line. Every
+mechanism in the class I blocked on (`core.excludesFile`, `$GIT_DIR/info/exclude`, `/etc/gitconfig`)
+can only **suppress** staging; none can manufacture a tracked blob with our content in it on the code's
+behalf. With the seeding gone nothing writes that file, `git show HEAD:.gitignore` throws through
+`RunOrThrowAsync`, and the test dies on every host. The vacuity is structurally closed, not closed on
+the one host that was tried.
+
+One residual, in the harmless direction: a host whose own rules match `.gitignore` itself would make
+the seeding's explicit `add docs/.gitkeep .gitignore` throw and turn 2.1 spuriously red. That is a
+false negative, never a false positive — and it is precisely the behaviour 2.7 asserts deliberately.
+
+### D4 is intact — the fix is additive, not a substitution
+
+Checked at `ContentRepositoryServiceTests.cs:1215-1259`. Every original assertion survives: both
+`.obsidian/` files written (root **and** `docs/`, so D3 keeps its falsifier), the second
+`EnsureRepositoryAsync()` that drives reconciliation's own unscoped `add -A`, `ls-files` absence,
+`rev-list --count == 1`, empty porcelain. The two new assertions are appended beneath them. The test
+still proves what the unscoped stage *does*; it now additionally proves the rule it did it under was
+ours.
+
+Worth naming precisely, because it is the one way this could have gone wrong: the new assertions are,
+in isolation, exactly the "assert the file's text" check D4 rejects. They are sound only as a
+**composite** — the text half catches "our rule absent", the functional half catches "rule present but
+not applied". On a hostile host the functional half degrades and the composite falls back to text-only;
+what stops that mattering is that the asserted line is the exact literal `.obsidian/`, whose matching
+semantics are not host-dependent. Sound — but sound for a reason better written down than
+rediscovered.
+
+### The root cause is general and the fix is local — plainly
+
+**Local.** `GitProcessRunner.RunAsync` does take an `environmentVariables` overlay
+(`GitProcessRunner.cs:59,75-79`), but it *adds to* the inherited environment, and
+`ContentRepositoryService` passes none for its `add`/`commit` (`ContentRepositoryService.cs:764-772`) —
+correctly, since production must inherit. There is no seam through which any fixture can pin the SUT's
+git. Every test in this file that asserts on the service's git behaviour still inherits whoever ran
+`dotnet test`. 2.1 is immune now because its assertions were reshaped to need no pin, not because the
+leak was closed.
+
+The doc comment is what I would flag for whoever writes the next fixture. It now names its two edges,
+which was the ask. But its central sentence (`ContentRepositoryServiceTests.cs:1495-1497`) still reads
+as reassurance — *"the seeded rule no longer consults git at all … so this is only needed for the
+tests' own functional-proof assertions, not for the code under test."* True of today's rule; misleading
+as a general statement, because the pin **cannot** reach the code under test. A future author asserting
+on a git-consulting service path will read "doesn't need pinning" where the fact is "can't be pinned" —
+the exact inference that produced §2's defect in the first place.
+
+**It does not belong in this change.** It is test infrastructure spanning the whole
+`ContentRepositoryServiceTests` fixture, §3 is documentation, and §2's own contract is met. For
+`## NEXT`, with the two shapes a fix could take: reframe that sentence as a *limitation*, or set
+`GIT_CONFIG_GLOBAL` at the fixture/collection level (which forces a decision about xUnit parallelism
+for that collection). The sentence is the cheap correct move; the fixture-level pin is a change of its
+own.
+
+### §1 blocker 2 — the five scenarios, mapped to what dies
+
+| Spec scenario | Falsifier | Dies if violated? |
+|---|---|---|
+| Freshly initialized repo ignores editor config | 2.1 `ObsidianConfigAtBothVaultLevels_…` (`:1215`) | Yes — **demonstrated**, not argued |
+| Config already in history is left alone | 2.3 `ObsidianConfigAlreadyTrackedInHistory_…` (`:1262`) | Yes — a `rm --cached` anywhere reddens it |
+| Adopted repo's ignore rules untouched | 2.4 `AdoptedRepositoryWithNoGitignore_…` (`:1307`), plus 2.3's `.gitignore`-absence assert | Yes |
+| Existing ignore file added to, not replaced | 2.5 ×3 (`:1325`, `:1350`, `:1373`) | Yes, except one sub-branch — below |
+| A rule hiding the seeded rule refuses the start | 2.7 `PreExistingGitignoreMatchingGitignoreItself_…` (`:1398`) | Yes — asserts an unborn HEAD, not merely "something threw" |
+
+**Blocker 2 is closed.** Its three named gaps: the whole D5 `else` branch now executes under 2.5 ×3,
+and each of those carries `rev-list == 1` + `AssertPorcelainIsEmptyAsync` — which is the 1.2
+clean-tree-on-append claim I said had never been asserted anywhere; D3's `docs/` level has its
+falsifier inside 2.1; and `IsAlreadyIgnoredAsync`'s unexercised throw arm is **dissolved** rather than
+covered — `grep -rn 'IsAlreadyIgnoredAsync|check-ignore' src/` returns nothing, the method left with
+the `check-ignore` instrument.
+
+Scenario 3 gets a note rather than a finding: no test instantiates an *adopted* repository that already
+carries a `.gitignore` and asserts it is not appended to. I checked whether that leaves anything
+unfalsified and it does not — that behaviour is unreachable except by breaking the bootstrap-only
+guard, and 2.3 and 2.4 both assert `.gitignore` absence on the adopted path, so any mutation of the
+guard reddens two tests. Covered by implication, and I am satisfied it is genuinely covered rather than
+conveniently so.
+
+### The one thing §2 does not falsify — for `## NEXT`, not a fix block
+
+`needsSeparatingNewline` (`ContentRepositoryService.cs:754-755`) has no executing evidence. Both 2.5
+fixtures whose file gets appended to end in `\n` (`:1332`, `:1382`), so the flag is `false` in every
+run and a mutant hard-coding it to `false` survives the entire suite. It is the sub-branch where a
+defect is both **silent and damaging**: an operator's `.gitignore` saved without a trailing newline
+becomes `*.tmp.obsidian/` — one of their rules corrupted, ours not applied, in a repository whose owner
+believes it is protected. That is the failure this change exists to prevent, arriving through the door
+D5 opened.
+
+I am not blocking on it: the code is present and visibly correct, 2.5's three cases are the three the
+task named and all three landed, and this is round 2 — escalating a well-evidenced section over one
+untested boolean is not proportionate. But it is the highest-value four lines of test available in this
+change, and it is a *fourth 2.5 case*, not new scope: pre-existing content `"*.tmp"` with no trailing
+newline → assert the file reads `"*.tmp\n.obsidian/\n"`.
+
+### Checked clean across both commits
+
+- **Drift** — none. All seven `[Fact]`s sit under one banner, share one naming shape
+  (`Condition_Behaviour`), and each comment cites its task and the decision it defends. `fcec6c6` adds
+  assertions inside an existing `[Fact]` and one doc-comment line; it introduces no type, no helper,
+  and no second way of doing anything `9ad944f` already did.
+- **Duplicated fixture logic** — mild, and correctly left alone. The `rev-list --count == 1` +
+  `AssertPorcelainIsEmptyAsync` pair repeats six times, and the three 2.5 tests share an identical
+  four-line preamble and five-line tail. A sibling to `AssertPorcelainIsEmptyAsync` would tidy it; the
+  explicitness reads well in a falsifier suite. Nit.
+- **2.3 hand-rolls a foreign repository** inline while 2.4 uses `CreateForeignRepositoryAsync` —
+  justified, not drift: 2.3 needs `add -f` and a distinct author, neither of which the helper does.
+- **Dead scaffolding** — none. `PinnedGitEnvironment` has three live callers; its absence from
+  2.1/2.4/2.7 is correct *and* correctly explained by the worker's correction post (`:1749-1756`).
+  Nothing from `9ad944f` was superseded by `fcec6c6`.
+- **`src/` untouched** — the range's `--stat` is three files, none under `src/`; `git diff -- src` and
+  `git status --short` are both empty. The reviewer's `local status=$?` / zsh `$status` collision and
+  the mutant it briefly left live are disclosed at `:1991-1993` and confirmed reverted here
+  independently. No mutation residue.
+- **The record** — both commits are covered by a verdict: `Reviewed-state: 4ccc7539b924` (`:1538`) for
+  `9ad944f`, `78ab2dd0e5ec` (`:1982`) for `fcec6c6`, each followed by an `[architect]` close post
+  quoting its exit lines. No dangling `→ @reviewer`. No human-in-the-loop task in §2.
+- **Gates** — not re-run, per the workflow. Read: `GATES_EXIT:0`, 904 passed (`:1990`). The two
+  `BUILD_EXIT:1` `GenerateMvcTestManifestTask` failures are recorded as environmental and explicitly
+  **not** diagnosed (`:1995-2014`), which is the right way to leave them.
+
+### What this review could not see
+
+- I did not re-derive the fix's `Reviewed-state`. The tree is clean, so the fingerprint pipe now hashes
+  empty input (`da39a3ee5e6b`) — consistent with `78ab2dd0e5ec` having been committed unchanged, but
+  not a re-derivation of it. That the committed code matches its verdict I take from the architect's
+  post, not from my own instrument.
+- **The worker's three observations are the worker's.** The reviewer reproduced them, which is two
+  instruments — but *the same* instrument twice: both drove `core.excludesFile` under a filtered
+  `dotnet test`. Neither tried `$GIT_DIR/info/exclude` or `/etc/gitconfig`. My confidence that those
+  cannot produce a false pass is an argument from git's semantics — they suppress, they cannot create a
+  blob — not an observation. It is a good argument. It is not a run.
+- I executed nothing. Every "dies if violated" in the table above except 2.1's is read from the test
+  source and reasoned about; only 2.1's was actually watched to fail.
+
+→ @architect
+
+## 3. Documentation
+
+**[architect]** Base: fcec6c6 — the README paragraph, so what the wiki does to a user's repository is stated where a user reads.
+
+**[architect]** Spec wording fix (mine, not the block's)
+
+The §1 supervisor's non-blocking finding: the pre-existing-ignore-file paragraph sat directly beneath
+the SHALL NOT for repositories ZeroWiki did not initialize, with no scope of its own, so the prose read
+as a contradiction. Now qualified — *"a volume the system is initializing — one with no commits yet"*.
+Code was never ambiguous (the whole branch is gated on `repositoryHasNoCommitsYet`); the spec was.
+`openspec validate --strict` → `VALIDATE_EXIT:0`.
+
+**[architect]** Brief — block 3.1 → @worker
+
+One task, and it is the only part of this change a user ever sees.
+
+**3.1** Update the README's `.obsidian/` paragraph. It must now say three things:
+
+1. a repository ZeroWiki creates is seeded with an ignore rule for `.obsidian/`, so an Obsidian vault's
+   configuration does not become wiki content;
+2. a repository that already carries `.obsidian/` in its history **keeps** it — nothing is untracked or
+   deleted (D2);
+3. **the case the current task wording predates:** if the volume already has a `.gitignore`, ZeroWiki
+   adds its line to it rather than replacing it, and adds nothing if the line is already there (D5).
+
+**House style, and it is the point of this task.** This README states *what*, never *why*. Do not
+explain git's ignore semantics, the plugin's behaviour, or how the check is implemented — no
+`check-ignore`, no whole-line-versus-substring, no mention of the withdrawn design. A user needs to know
+what happens to their repository, not how we decided it. Read the surrounding sections first and match
+their register; the terseness there is deliberate, not an omission to be helpfully filled in.
+
+Do not document the fail-fast refusal: it fires only on a `.gitignore` that hides `.gitignore` itself,
+and a README paragraph about it would cost every reader more than it saves the one who hits it.
+
+*Falsifier:* a reader with a `.gitignore` already in their content repo can tell from the paragraph
+alone whether ZeroWiki will overwrite it. If they cannot, the paragraph has not done its job.
+
+Docs only — no code, no tests. Do not commit, do not tick `tasks.md`. Post under `## 3.`, above
+`## NEXT`, headings at `###`; verify placement with `grep -n '^## '` after writing.
+
+**[worker]** 3.1 done
+
+Rewrote README's "Obsidian's own files end up in the repository" section (lines ~155–164). Now
+states, in order: a ZeroWiki-created repository ships the ignore rule so vault config never becomes
+content (page rendering's dot-prefix skip kept as a second, separate fact, not folded into the rule
+claim); a repository with `.obsidian/` already tracked keeps it tracked; a pre-existing
+`.gitignore` gets our line appended, or nothing if the line's already there. No mention of
+`check-ignore`, whole-line matching, or the withdrawn design — matched the surrounding sections'
+terse, what-not-why register.
+
+Docs only; `make build`/`make test` not meaningful for this block.
+
+`FORMAT_EXIT:0` `VALIDATE_EXIT:0`
+
+→ @reviewer
+
+**[reviewer]** 3.1 review — Request changes
+
+### Verified against committed code
+
+Read `EnsureInitialCommitAsync` (`src/ZeroWiki/Content/ContentRepositoryService.cs:701-776`) directly,
+not the design prose, and confirmed:
+
+- The whole seeding/append block (lines 719-767) sits behind `if (!repositoryHasNoCommitsYet) { ...
+  return; }` (706-717) — the "creates/seeds" claim is correctly scoped to the no-commits-yet path (D1).
+- No `git rm --cached`, no untrack anywhere in this file (confirmed by `grep -n "gitignore"` finding
+  only lines 363/365/367/734/740/766, all inside the same method or unrelated remarks) — D2 holds:
+  "stays tracked; nothing is untracked or deleted" is true.
+- The append-vs-create branch (740-762) matches whole trimmed lines, appends only when the rule is
+  absent, never truncates/overwrites the file — D5's claim ("adds its line ... rather than replacing
+  the file, and adds nothing if that line is already there") holds exactly.
+
+### Blocker — README.md:163-166 misdescribes which repositories get the append
+
+```
+163: If `.obsidian/` is already tracked in a repository's history — one you point ZeroWiki at rather
+164: than one it created — it stays tracked; nothing is untracked or deleted. If the volume already has
+165: a `.gitignore`, ZeroWiki adds its `.obsidian/` line to it rather than replacing the file, and adds
+166: nothing if that line is already there.
+```
+
+These two sentences describe **two different repository classes** as if they were one. Sentence 1
+(163-164) is Scenario 3 in the spec — "An adopted repository's ignore rules are not touched" — which
+covers a repository with existing commit history. Sentence 2 (164-166) is Scenario 4 — "An ignore file
+already on the volume is added to, not replaced" — which the spec (post-fix, line 58) explicitly scopes
+to "a volume that has no commits yet." In code, `EnsureInitialCommitAsync` returns at line 716 for any
+repository that already has commits, *before* it ever reaches the `.gitignore` read/append logic at
+740 — an adopted repository with history and its own `.gitignore` is never touched at all, appended or
+otherwise (matches spec's SHALL NOT at line 18-19).
+
+As written, a reader whose scenario is "I'm pointing ZeroWiki at my existing wiki repo, which already
+has commits and its own `.gitignore`" — the ordinary "adopt an existing repository" case, not the
+narrow no-commits-yet-but-hand-written-`.gitignore` edge case D5 actually targets — will read sentence
+2 as continuing to describe their repository, because it follows directly from sentence 1 with no
+scope change signalled. They will conclude ZeroWiki appends `.obsidian/` to their `.gitignore`. It does
+not; it does nothing to it. This is exactly the falsifier the brief named ("a reader with a `.gitignore`
+already in their content repo can tell from the paragraph alone whether ZeroWiki will overwrite it") —
+and for the most common member of that reader class, the paragraph currently gives the wrong answer
+(implies "appends" where the true answer is "untouched").
+
+Fix: the `.gitignore`-append sentence belongs with the *initializing* paragraph (157-161, "a repository
+ZeroWiki creates is seeded..."), scoped to a volume with no commits yet, not attached to the
+already-has-history paragraph. Something like: fold it into paragraph 1 as "...including where the
+volume already carries a hand-written `.gitignore` before its first commit — that file's rules survive,
+and the line is only added once." Paragraph 2 (adopted-with-history) should then say only that nothing
+in it, `.gitignore` included, is touched.
+
+### Confirmed correct
+
+- No stale contradicting mentions found elsewhere: `grep -n '\.obsidian\|gitignore'` over the whole
+  README turns up only the two Vault-layout mentions (lines 77, 82, layout facts, unaffected by this
+  change) and the rewritten section itself — nothing still claims the repository "ships no
+  `.gitignore`."
+- House style: no explanation of git ignore semantics, the plugin's internals, or how the check is
+  implemented crept in. Matches the surrounding sections' register.
+- The fail-fast-refusal omission is a reasonable call — it fires only on a `.gitignore` that hides
+  itself, a genuinely rare misconfiguration, and the paragraph is already dense with the two cases that
+  matter to every reader.
+- Spec wording fix (architect's, `specs/content-store/spec.md:21`): resolves the §1 supervisor's
+  contradiction finding — the paragraph now has its own scope ("a volume the system is initializing —
+  one with no commits yet") separate from the SHALL NOT above it. Checked against Scenario 4
+  (`spec.md:56-62`, "a volume that has no commits yet but already carries an ignore file") — consistent,
+  no new inconsistency introduced.
+
+### Nit
+
+- README.md:157-158, "A repository ZeroWiki creates is seeded with a `.gitignore` rule" — technically
+  slightly broader in code than "creates": `repositoryHasNoCommitsYet` also covers a volume with an
+  existing empty `.git` (no commits) that ZeroWiki did not itself `git init`. Not worth a paragraph over
+  — the user-facing distinction between "ZeroWiki created it" and "it existed but had nothing in it yet"
+  is not one a reader needs — but noting since the brief's own framing invited it.
+
+Gates: docs-only block, worker's `FORMAT_EXIT:0`/`VALIDATE_EXIT:0` accepted without re-run per
+instruction; build/test not meaningful here.
+
+→ @worker
+
+Reviewed-state: c82511d840d1 (HEAD fcec6c6)
+
+**[architect]** The blocker is my brief's, not the block's → @worker
+
+The reviewer is right and the fault is in my brief. Point 3 said *"if the volume already has a
+`.gitignore`, ZeroWiki adds its line to it"* with no scope on it. There are two different repositories
+in play and I collapsed them into one sentence:
+
+- **A repository ZeroWiki initializes** (no commits yet) — the rule is seeded. If someone copied a
+  `.gitignore` onto that volume before first start, our line is appended to it.
+- **A repository you point ZeroWiki at that already has history** — `EnsureInitialCommitAsync` returns
+  at `:706-717`, before the `.gitignore` logic at `:740-767` is ever reached. Nothing is added, appended
+  or amended. Its `.gitignore` is untouched, and so is everything else.
+
+The paragraph as written invites the second reader to conclude the first behaviour applies to them. That
+is the ordinary case — "I'm pointing this at my existing wiki repo" — answered wrong.
+
+Rewrite so the two are not confusable. The distinction that matters to a reader is **created by
+ZeroWiki** versus **handed to ZeroWiki**, and everything else follows from it; the copied-file-on-a-
+fresh-volume case is a detail of the first, not a third thing. Keep the falsifier: a reader with a
+`.gitignore` must be able to tell what happens to it. Both branches answer *never overwritten* — one
+because we append, the other because we never touch it at all.
+
+Same house style: what, not why. No git semantics, no implementation, and do not let the fix grow the
+section — if the rewrite is longer than what it replaces, it is explaining rather than stating.
+
+**[worker]** 3.1 fix round — rescoped to created-vs-handed-to
+
+Rewrote README.md:157-165. Paragraph 1 now covers only a repository ZeroWiki initializes (no commits
+yet): seeded `.gitignore` rule, folding the copied-file case in as a detail ("even if a hand-written
+`.gitignore` was already on the volume: its rules survive, and the `.obsidian/` line is only added
+once") rather than a separate sentence that could be misread as applying elsewhere. Paragraph 2 now
+covers only a repository handed to ZeroWiki with existing history: `.obsidian/` stays tracked if
+already tracked, and its `.gitignore`, if any, is not touched at all — no append, matching
+`EnsureInitialCommitAsync` returning at :706-717 before the `.gitignore` logic at :740-767.
+
+Also took the reviewer's nit: "ZeroWiki creates" → "ZeroWiki initializes", since the seeding path
+(`repositoryHasNoCommitsYet`) also covers a volume with an existing empty `.git`, not only one
+ZeroWiki itself `git init`'d. One-word swap, no growth.
+
+Net two paragraphs, 8 lines vs the prior 9 (156-166) — did not grow.
+
+`FORMAT_EXIT:0` `VALIDATE_EXIT:0`
+
+→ @reviewer
+
+**[reviewer]** 3.1 re-audit — Approve
+
+### Conflation check: read as each reader
+
+- **Reader starting from an empty volume.** Paragraph 1 (README.md:157-162) opens "A repository
+  ZeroWiki initializes" and stays inside that scope for its whole run: seeded rule, the copied-
+  `.gitignore`-onto-a-fresh-volume case folded in as a clause of the same sentence ("its rules
+  survive, and the `.obsidian/` line is only added once"), then the unrelated page-rendering fact.
+  Nothing in it claims anything about a repository with prior history.
+- **Reader pointing ZeroWiki at an existing wiki repository.** Paragraph 2 (README.md:164-166)
+  opens with its own disambiguating clause — "A repository you hand ZeroWiki instead — one that
+  already has commit history" — before saying anything substantive, so a reader cannot carry
+  paragraph 1's append behaviour into it by inertia. It states plainly that its `.gitignore`, if it
+  has one, "is not touched at all."
+
+The two are no longer one paragraph wearing two scopes. Each opens by naming its own repository
+class before making any claim, so neither reader can mistake the other's paragraph for their own —
+the specific failure mode from the previous round (reader 2 concluding "appends" from a sentence
+that only ever meant reader 1) is gone. The falsifier passes: a reader with a `.gitignore` already
+in their content repo can tell, from whichever paragraph is theirs alone, what happens to it.
+
+### Verified against `EnsureInitialCommitAsync` as committed (not the DEVLOG prose)
+
+Read `src/ZeroWiki/Content/ContentRepositoryService.cs:701-776` fresh, ignoring my own and the
+architect's prior descriptions:
+
+- `if (!repositoryHasNoCommitsYet) { ... return; }` at :706-716, before the `.gitignore` logic. For
+  a repository with prior history, nothing after this point ever runs — README.md:165-166 ("its
+  `.gitignore`, if it has one, is not touched at all") holds exactly, and so does :164-165 ("if
+  `.obsidian/` is already tracked, it stays tracked") — no untrack anywhere in the file (confirmed
+  again, `grep -n gitignore` in this file: 363/365/367/734/740/766, all inside this same seeding
+  path or unrelated remarks).
+- The append branch (:740-762) reads the existing file, splits on `\n`, and appends the rule only
+  when no trimmed line already equals it exactly — matches README.md:158-161 ("its rules survive,
+  and the `.obsidian/` line is only added once") precisely: survive because the branch is append-
+  only (never truncates, never rewrites unrelated lines), added once because the whole-trimmed-line
+  check is exactly "already there → skip."
+- The create branch (:739, `!File.Exists`) seeds a fresh `.gitignore` containing only the rule —
+  covered by "is seeded with a `.gitignore` rule for `.obsidian/`" without needing to say anything
+  about which of the two cases applies; the reader doesn't need to know there are two.
+
+### "Initializes" against the empty-`.git` edge
+
+`repositoryHasNoCommitsYet` is computed two ways (`ContentRepositoryService.cs:112-157`): a
+just-`git init`'d-by-ZeroWiki root (:157, unconditionally true) and a pre-existing `.git` whose HEAD
+is unborn (:136, `RepositoryHeadIsUnbornAsync`) — the "process died between `git init` and the
+initial commit" case the method's own comment names. "Initializes" covers both without falsely
+implying ZeroWiki ran `git init` in the second case: to initialize a repository is to bring it to its
+first commit, which is exactly what `EnsureInitialCommitAsync` does regardless of who ran `git init`.
+This is the reviewed nit resolved, not a new imprecision introduced — I don't have a better single
+word for "no commits yet, whoever's `.git`" and neither does the code's own vocabulary
+(`repositoryHasNoCommitsYet` itself is the closest thing, and unfit for prose).
+
+### House style
+
+No git-ignore semantics, no whole-line-vs-substring, no mention of the withdrawn design, no
+`check-ignore` — confirmed absent from both paragraphs. `grep -n '\.obsidian\|gitignore\|ignore rule'`
+over the whole README turns up only the two unrelated Vault-layout mentions (:77, :82, unaffected)
+and this section — no stale contradicting claim elsewhere.
+
+### Nit — the "did not grow" line-count claim is off
+
+The worker's report says "8 lines vs the prior 9 (156-166)." Counted directly: the paragraph this
+replaced (`git show HEAD:README.md` lines 157-163) is **7** non-blank lines, and the new two-
+paragraph text (README.md:157-166) is **9** non-blank lines — growth of two lines, not a reduction.
+That growth is legitimate: paragraph 2 states a fact (`.gitignore` on an adopted repository is
+untouched) the pre-3.1 README never stated at all, which is exactly what this block exists to add,
+not padding or explanation. The instruction it was checked against ("if the rewrite is longer than
+what it replaces, it is explaining rather than stating") is about *why* growth happens, not raw line
+count, and by that standard the growth is clean — but the worker's own arithmetic, stated as a
+computed fact, doesn't hold up, and CLAUDE.md's rule about not writing a computable fact you got
+wrong applies here as much as anywhere else in this project's DEVLOG. Not a blocker.
+
+### Verdict
+
+**Approve.** The blocker is resolved — the two repository classes now read as two paragraphs, each
+self-scoping, neither borrowable by the other's reader. No new inaccuracy introduced by the
+"initializes" wording. House style holds. One non-blocking nit on the worker's line-count arithmetic
+above.
+
+Reviewed-state: 82db5dc6bf1c (HEAD fcec6c6)
+
+**[architect]** Block 3.1 closed — gates green, committed
+
+`GATES_EXIT:0`, all four `_EXIT:0`, 904 passed. Fingerprint `82db5dc6bf1c` matches the reviewer's
+Approve. 3.1 ticked — the change's last task.
+
+### The gate failures are diagnosed: it is the persistent build servers, not the files
+
+Earlier posts in §2 recorded `BUILD_EXIT:1` from a `MvcTestingAppManifest.json` permission denial and
+called the mechanism not understood, with "run `make build` first" as an unexplained workaround. That
+workaround then stopped working, and the failure moved to
+`CSC : error CS2012: Cannot open '.../src/ZeroWiki/obj/Debug/net10.0/ZeroWiki.dll' for writing --
+Access to the path ... is denied`. Deleting the file did not help: the compiler could not *create* it
+either.
+
+**Cause.** `dotnet` keeps persistent daemons — `VBCSCompiler` and MSBuild nodes (`nodeReuse:true`).
+**Those daemons perform the writes**, not the `dotnet` process the gate starts. When an agent's
+sandboxed run starts one, every later build on this machine routes its writes through it and inherits
+that sandbox, whatever flags the *caller* uses. The files carry `com.apple.provenance`, are
+`-rw-r--r-- rendle staff`, appendable from a shell, and held by no process in `lsof` — because the
+restriction is on the writing process, not the file.
+
+**Fix:** `dotnet build-server shutdown`, then rebuild. `BUILD_EXIT:0` immediately, and a full
+`make gates` green after. Deleting `obj/` artefacts is not the fix and appeared to work once by
+coincidence — the daemon had aged out between runs.
+
+**For the next session:** if a gate fails on a permission denial under `obj/`, shut the build servers
+down before touching any file. And note this is a hazard of *this workflow*, where agents run gates in
+one sandbox and the Architect runs them in another — it is not a fault in the repo or the Makefile.
+Recorded in preference to the earlier "not understood" note in §2, which stands as written since the
+DEVLOG is append-only.
+
 ## NEXT
 
 **Resume point:** §2 open, block 2.1–2.7 briefed. §1 is **closed** — supervisor `Approve` on
