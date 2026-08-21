@@ -1209,6 +1209,245 @@ public sealed class ContentRepositoryServiceTests : IDisposable
         Assert.False(receivepackConfig.Succeeded);
     }
 
+    // ── §2 (ignore-obsidian-config-in-content-repo): the permanent falsifiers ──────────────────
+
+    [Fact]
+    public async Task ObsidianConfigAtBothVaultLevels_IsNotStagedByUnscopedReconciliation()
+    {
+        // 2.1 (D3/D4): the falsifier drives ReconcileWorkingTreeAsync's own unscoped `add -A`, not
+        // the .gitignore's text — a rule git does not actually apply would still pass a check that
+        // only reads the file. D3 requires the rule to cover the vault opened at the repository
+        // root *and* at docs/, so both are written here — a root-only fixture would leave D3 with
+        // no falsifier at all.
+        var service = CreateService();
+        await service.EnsureRepositoryAsync();
+
+        var repositoryRoot = RepositoryRoot;
+
+        var rootObsidian = Path.Combine(repositoryRoot, ".obsidian");
+        Directory.CreateDirectory(rootObsidian);
+        await File.WriteAllTextAsync(Path.Combine(rootObsidian, "workspace.json"), "{}");
+
+        var docsObsidian = Path.Combine(repositoryRoot, "docs", ".obsidian");
+        Directory.CreateDirectory(docsObsidian);
+        await File.WriteAllTextAsync(Path.Combine(docsObsidian, "workspace.json"), "{}");
+
+        // A second call re-runs ReconcileWorkingTreeAsync — it is unconditional on every start, not
+        // only on the one that creates the initial commit — mirroring a running instance's next
+        // reconciliation pass discovering what an editor just wrote into the working tree.
+        await service.EnsureRepositoryAsync();
+
+        var lsFiles = await _git.RunOrThrowAsync(repositoryRoot, ["ls-files"]);
+        Assert.DoesNotContain(".obsidian", lsFiles.StandardOutput, StringComparison.Ordinal);
+
+        // Nothing was staged, so reconciliation had nothing to commit (D9: a clean tree produces no
+        // commit) — still exactly the one initial commit. If the rule were undone, `add -A` would
+        // stage both files and this call would produce a second, recovery commit instead.
+        Assert.Equal("1", (await _git.RunOrThrowAsync(repositoryRoot, ["rev-list", "--count", "HEAD"])).StandardOutput.Trim());
+        await AssertPorcelainIsEmptyAsync(repositoryRoot);
+
+        // §2 remediation: the assertions above are satisfied just as well by a hostile host's own
+        // global excludesFile silently skipping the stage — ls-files/rev-list/porcelain don't consult
+        // excludes, so on such a host they hold even with the seeding removed entirely (observed and
+        // recorded in the DEVLOG). These two assertions require the code's *own* seeded rule to exist
+        // and be committed, which no host configuration can manufacture on the code's behalf.
+        Assert.Contains(".gitignore", lsFiles.StandardOutput, StringComparison.Ordinal);
+        var committedGitignore = await _git.RunOrThrowAsync(repositoryRoot, ["show", "HEAD:.gitignore"]);
+        Assert.Contains(
+            committedGitignore.StandardOutput.Split('\n'),
+            line => line.Trim() == ".obsidian/");
+    }
+
+    [Fact]
+    public async Task ObsidianConfigAlreadyTrackedInHistory_StaysTrackedAndTreeStaysClean()
+    {
+        // 2.3 (D2): history is adopted as it stands. A repository that already carries .obsidian/ in
+        // its committed history — e.g. one from before this feature existed — must never be
+        // untracked; a `git rm --cached` slipping in anywhere turns this red.
+        var repositoryRoot = RepositoryRoot;
+        Directory.CreateDirectory(repositoryRoot);
+        await _git.RunOrThrowAsync(repositoryRoot, ["init", "-b", "main"]);
+        Directory.CreateDirectory(Path.Combine(repositoryRoot, "docs"));
+        await File.WriteAllTextAsync(Path.Combine(repositoryRoot, "docs", ".gitkeep"), string.Empty);
+        var obsidianDir = Path.Combine(repositoryRoot, ".obsidian");
+        Directory.CreateDirectory(obsidianDir);
+        var obsidianFilePath = Path.Combine(obsidianDir, "workspace.json");
+        await File.WriteAllTextAsync(obsidianFilePath, "{}");
+        // -f (2.6): this fixture is deliberately building a repository whose history already tracks
+        // .obsidian/, regardless of what a developer's or CI runner's own global excludes happen to
+        // say about that path — plain `add` would refuse under a global excludesFile covering it.
+        await _git.RunOrThrowAsync(repositoryRoot, ["add", "-f", "docs/.gitkeep", ".obsidian/workspace.json"]);
+        await _git.RunOrThrowAsync(
+            repositoryRoot,
+            ["commit", "-m", "pre-existing commit carrying .obsidian/"],
+            new Dictionary<string, string>
+            {
+                ["GIT_AUTHOR_NAME"] = "Somebody Else",
+                ["GIT_AUTHOR_EMAIL"] = "somebody@example.com",
+                ["GIT_COMMITTER_NAME"] = "Somebody Else",
+                ["GIT_COMMITTER_EMAIL"] = "somebody@example.com",
+            });
+
+        var service = CreateService();
+        await service.EnsureRepositoryAsync();
+
+        var lsFiles = await _git.RunOrThrowAsync(repositoryRoot, ["ls-files"]);
+        Assert.Contains(".obsidian/workspace.json", lsFiles.StandardOutput, StringComparison.Ordinal);
+        Assert.True(File.Exists(obsidianFilePath));
+
+        // Same one commit as adopted — nothing was rewritten, and no gitignore was seeded either
+        // (EnsureInitialCommitAsync's write branch never runs once the repository already has
+        // history).
+        Assert.Equal("1", (await _git.RunOrThrowAsync(repositoryRoot, ["rev-list", "--count", "HEAD"])).StandardOutput.Trim());
+        Assert.False(File.Exists(Path.Combine(repositoryRoot, ".gitignore")));
+        await AssertPorcelainIsEmptyAsync(repositoryRoot);
+    }
+
+    [Fact]
+    public async Task AdoptedRepositoryWithNoGitignore_GetsNoneSeededByZeroWiki()
+    {
+        // 2.4 (D1): seeding is bootstrap-only. A repository ZeroWiki adopts — already has commits —
+        // never gets a .gitignore created for it, however long it goes without one; any seeding on
+        // this branch turns this red.
+        var repositoryRoot = RepositoryRoot;
+        await CreateForeignRepositoryAsync(repositoryRoot, withDocsDirectory: true);
+        Assert.False(File.Exists(Path.Combine(repositoryRoot, ".gitignore")));
+
+        var service = CreateService();
+        await service.EnsureRepositoryAsync();
+
+        Assert.False(File.Exists(Path.Combine(repositoryRoot, ".gitignore")));
+        Assert.Equal("1", (await _git.RunOrThrowAsync(repositoryRoot, ["rev-list", "--count", "HEAD"])).StandardOutput.Trim());
+        await AssertPorcelainIsEmptyAsync(repositoryRoot);
+    }
+
+    [Fact]
+    public async Task PreExistingGitignoreWithAnUnrelatedRule_AppendsOursAndKeepsTheirs()
+    {
+        // 2.5, case 1. Also covers the 1.2 clean-tree gap the §1 supervisor found unevidenced: this
+        // is the append branch, not the fresh-write one.
+        var repositoryRoot = RepositoryRoot;
+        Directory.CreateDirectory(repositoryRoot);
+        var gitIgnorePath = Path.Combine(repositoryRoot, ".gitignore");
+        await File.WriteAllTextAsync(gitIgnorePath, "*.tmp\n");
+
+        var service = CreateService();
+        await service.EnsureRepositoryAsync();
+
+        Assert.Equal("*.tmp\n.obsidian/\n", await File.ReadAllTextAsync(gitIgnorePath));
+
+        // Functional proof, not just text (D4) — pinned per 2.6 (see PinnedGitEnvironment) so a
+        // developer's own global excludes can't make this pass for the wrong reason.
+        var checkIgnore = await _git.RunOrThrowAsync(
+            repositoryRoot, ["check-ignore", "-q", ".obsidian/workspace.json"], PinnedGitEnvironment);
+        Assert.Equal(0, checkIgnore.ExitCode);
+
+        Assert.Equal("1", (await _git.RunOrThrowAsync(repositoryRoot, ["rev-list", "--count", "HEAD"])).StandardOutput.Trim());
+        await AssertPorcelainIsEmptyAsync(repositoryRoot);
+    }
+
+    [Fact]
+    public async Task PreExistingGitignoreAlreadyCarryingTheExactRule_IsLeftByteIdentical()
+    {
+        // 2.5, case 2. Also covers the append-branch clean-tree gap (see previous test).
+        var repositoryRoot = RepositoryRoot;
+        Directory.CreateDirectory(repositoryRoot);
+        var gitIgnorePath = Path.Combine(repositoryRoot, ".gitignore");
+        const string Seeded = "node_modules/\n.obsidian/\n*.log\n";
+        await File.WriteAllTextAsync(gitIgnorePath, Seeded);
+
+        var service = CreateService();
+        await service.EnsureRepositoryAsync();
+
+        Assert.Equal(Seeded, await File.ReadAllTextAsync(gitIgnorePath));
+
+        var checkIgnore = await _git.RunOrThrowAsync(
+            repositoryRoot, ["check-ignore", "-q", ".obsidian/workspace.json"], PinnedGitEnvironment);
+        Assert.Equal(0, checkIgnore.ExitCode);
+
+        Assert.Equal("1", (await _git.RunOrThrowAsync(repositoryRoot, ["rev-list", "--count", "HEAD"])).StandardOutput.Trim());
+        await AssertPorcelainIsEmptyAsync(repositoryRoot);
+    }
+
+    [Fact]
+    public async Task PreExistingGitignoreMentioningTheRuleOnlyInAComment_StillAppendsIt()
+    {
+        // 2.5, case 3 — the load-bearing one. A substring implementation matches ".obsidian/" inside
+        // this comment and wrongly treats the rule as already present; only a whole trimmed line
+        // counts (D5). Also covers the append-branch clean-tree gap (see the first 2.5 test).
+        var repositoryRoot = RepositoryRoot;
+        Directory.CreateDirectory(repositoryRoot);
+        var gitIgnorePath = Path.Combine(repositoryRoot, ".gitignore");
+        const string Seeded = "# .obsidian/ is deliberately tracked in this repository\n";
+        await File.WriteAllTextAsync(gitIgnorePath, Seeded);
+
+        var service = CreateService();
+        await service.EnsureRepositoryAsync();
+
+        Assert.Equal(Seeded + ".obsidian/\n", await File.ReadAllTextAsync(gitIgnorePath));
+
+        var checkIgnore = await _git.RunOrThrowAsync(
+            repositoryRoot, ["check-ignore", "-q", ".obsidian/workspace.json"], PinnedGitEnvironment);
+        Assert.Equal(0, checkIgnore.ExitCode);
+
+        Assert.Equal("1", (await _git.RunOrThrowAsync(repositoryRoot, ["rev-list", "--count", "HEAD"])).StandardOutput.Trim());
+        await AssertPorcelainIsEmptyAsync(repositoryRoot);
+    }
+
+    [Fact]
+    public async Task PreExistingGitignoreWithNoTrailingNewline_GetsASeparatingNewlineBeforeOurRule()
+    {
+        // 2.5, case 4 — the sub-branch the §2 supervisor found unfalsified: needsSeparatingNewline
+        // (ContentRepositoryService.cs) is false in every other 2.5 fixture because they all end in
+        // "\n". Without this test a mutant hard-coding that flag to false survives the whole suite,
+        // and the real defect it guards against is silent and damaging: appending directly onto an
+        // operator's last line without a trailing newline folds our rule onto theirs, producing
+        // "*.tmp.obsidian/" — their rule broken, ours never applied, no error anywhere.
+        var repositoryRoot = RepositoryRoot;
+        Directory.CreateDirectory(repositoryRoot);
+        var gitIgnorePath = Path.Combine(repositoryRoot, ".gitignore");
+        await File.WriteAllTextAsync(gitIgnorePath, "*.tmp");
+
+        var service = CreateService();
+        await service.EnsureRepositoryAsync();
+
+        Assert.Equal("*.tmp\n.obsidian/\n", await File.ReadAllTextAsync(gitIgnorePath));
+
+        var checkIgnoreTmp = await _git.RunOrThrowAsync(
+            repositoryRoot, ["check-ignore", "-q", "foo.tmp"], PinnedGitEnvironment);
+        Assert.Equal(0, checkIgnoreTmp.ExitCode);
+
+        var checkIgnoreObsidian = await _git.RunOrThrowAsync(
+            repositoryRoot, ["check-ignore", "-q", ".obsidian/workspace.json"], PinnedGitEnvironment);
+        Assert.Equal(0, checkIgnoreObsidian.ExitCode);
+
+        Assert.Equal("1", (await _git.RunOrThrowAsync(repositoryRoot, ["rev-list", "--count", "HEAD"])).StandardOutput.Trim());
+        await AssertPorcelainIsEmptyAsync(repositoryRoot);
+    }
+
+    [Fact]
+    public async Task PreExistingGitignoreMatchingGitignoreItself_RefusesToStartWithNoInitialCommit()
+    {
+        // 2.7 — the fail-fast Risks entry (Product Owner decision). A broad operator rule that also
+        // matches .gitignore itself makes the explicit `git add docs/.gitkeep .gitignore` refuse
+        // (git refuses to add an explicitly-named ignored path without -f, which this app never
+        // passes), and the system must fail to start rather than complete an initial commit that is
+        // missing the seeded rule.
+        var repositoryRoot = RepositoryRoot;
+        Directory.CreateDirectory(repositoryRoot);
+        await File.WriteAllTextAsync(Path.Combine(repositoryRoot, ".gitignore"), ".gitignore\n");
+
+        var service = CreateService();
+
+        var exception = await Assert.ThrowsAsync<GitProcessException>(() => service.EnsureRepositoryAsync());
+        Assert.Contains(".gitignore", exception.Message, StringComparison.Ordinal);
+
+        // Not merely "something threw" — no initial commit exists at all. HEAD is still unborn, not
+        // a commit that landed without the rule.
+        var headProbe = await _git.RunAsync(repositoryRoot, ["rev-parse", "--verify", "-q", "HEAD"]);
+        Assert.False(headProbe.Succeeded);
+    }
+
     /// <summary>
     /// Builds a repository entirely outside <see cref="ContentRepositoryService"/> — its own
     /// initialization, its own author, its own layout — standing in for one adopted from elsewhere
@@ -1278,6 +1517,20 @@ public sealed class ContentRepositoryServiceTests : IDisposable
     }
 
     private string RepositoryRoot => Path.Combine(_dataRoot, "wiki");
+
+    /// <summary>
+    /// <c>GIT_CONFIG_GLOBAL</c> pointed at a path this fixture never writes, isolating "is this path
+    /// ignored" probes (<c>git check-ignore</c>) from whatever the developer's or CI runner's own
+    /// global/user gitconfig happens to set (2.6) — this repo has already been bitten by exactly
+    /// this class of leak once, with a global <c>credential.helper</c> flaking a clone test. The
+    /// seeded rule itself no longer consults git at all (it is a plain text-line comparison), so
+    /// this is only needed for the tests' own functional-proof assertions that a path really is
+    /// ignored, not for the code under test.
+    /// Edge: does not neutralise <c>/etc/gitconfig</c> (system-level) or a repository's own
+    /// <c>$GIT_DIR/info/exclude</c> — only user/global config is overridden.
+    /// </summary>
+    private IReadOnlyDictionary<string, string> PinnedGitEnvironment =>
+        new Dictionary<string, string> { ["GIT_CONFIG_GLOBAL"] = Path.Combine(_dataRoot, "unused-global-gitconfig") };
 
     private ContentRepositoryService CreateService(TimeSpan? writeLockTimeout = null) =>
         new(

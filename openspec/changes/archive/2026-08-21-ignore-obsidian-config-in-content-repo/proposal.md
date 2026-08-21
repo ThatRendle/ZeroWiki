@@ -27,9 +27,11 @@ exists not to have.
   `.obsidian/` keeps it. Untracking it would delete those files out of every vault on its next pull,
   which is a destructive act taken on a user's local editor configuration without asking — a far worse
   outcome than the noise it cleans up.
-- **Adopted repositories are left alone.** A volume that already contains a git repository is not
-  modified to add or amend a `.gitignore`; only a repository ZeroWiki initializes itself is seeded. The
-  system does not edit a repository it did not create.
+- **Repositories with history are left alone.** The discriminator is commit history, not the presence
+  of a `.git` directory: a repository that already has commits is not modified to add or amend a
+  `.gitignore`, while a volume whose `HEAD` is unborn has no history and is initialized and seeded. The
+  system does not edit a repository whose history it did not start. Where such a volume already carries
+  a root `.gitignore`, our line is appended to it and nothing already there is replaced.
 
 ## Capabilities
 

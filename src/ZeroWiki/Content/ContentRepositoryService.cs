@@ -726,9 +726,44 @@ public sealed class ContentRepositoryService
             await File.WriteAllTextAsync(gitKeepPath, string.Empty, cancellationToken);
         }
 
+        // The obsidian-git plugin's vault config directory. The vault is opened at the repository
+        // root and at docs/ (D3), so the unanchored pattern below must match .obsidian/ at either
+        // level; this is seeded only into the initial commit (D1) and never untracks an existing
+        // repository's own history (D2).
+        //
+        // A commit-less volume can still carry a hand-written .gitignore -- content copied on before
+        // the app's first start (D5). That file is adopted, not overwritten: append `.obsidian/`
+        // unless one of its existing lines already *is* that line, trimmed of surrounding whitespace.
+        // Matching a whole line, never a substring, is the point -- a commented-out
+        // `# .obsidian/ is deliberately tracked` does not count as the rule being present.
+        const string ObsidianIgnoreRule = ".obsidian/";
+        var gitIgnorePath = Path.Combine(repositoryRoot, ".gitignore");
+        if (!File.Exists(gitIgnorePath))
+        {
+            await File.WriteAllTextAsync(gitIgnorePath, ObsidianIgnoreRule + "\n", cancellationToken);
+        }
+        else
+        {
+            var existingContent = await File.ReadAllTextAsync(gitIgnorePath, cancellationToken);
+            var alreadyPresent = existingContent
+                .Split('\n')
+                .Any(line => line.Trim() == ObsidianIgnoreRule);
+
+            if (!alreadyPresent)
+            {
+                var needsSeparatingNewline = existingContent.Length > 0 && !existingContent.EndsWith('\n');
+                var appendix = (needsSeparatingNewline ? "\n" : string.Empty) + ObsidianIgnoreRule + "\n";
+
+                // Append, never overwrite (D2/D5): the operator's rules survive into the initial
+                // commit alongside ours. A missing trailing newline on the operator's last line is
+                // completed above so appending cannot fold our rule onto the end of theirs.
+                await File.AppendAllTextAsync(gitIgnorePath, appendix, cancellationToken);
+            }
+        }
+
         await _git.RunOrThrowAsync(
             repositoryRoot,
-            ["add", "docs/.gitkeep"],
+            ["add", "docs/.gitkeep", ".gitignore"],
             cancellationToken: cancellationToken);
 
         await _git.RunOrThrowAsync(
