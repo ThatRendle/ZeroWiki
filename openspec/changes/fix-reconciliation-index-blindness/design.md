@@ -163,30 +163,46 @@ suppressed-entry paths (symlink, gitlink, EACCES, non-ASCII) once inside the Lin
 is verification, not new behaviour, and per the workflow's §4 it is **not ticked without the Product
 Owner's confirmation** — the Architect hands over exact commands and what to expect, and waits.
 
-### Decision 9 — The suite's own execution model is what pays, and it is what gets fixed (Product Owner decision, 2026-08-21)
+### Decision 9 — The census wiring costs ~41%, and that is not worth a task (Product Owner decision, 2026-08-21; **corrected same day**)
 
-Block 2.1–2.3 took `make test` from ~2m34s–3m10s to **18m13s** — reproduced alone, with no agents and
-no other gate running, 905 passing in every run. Diagnosed by measurement rather than inspection:
+**This decision was first taken on a measurement that did not reproduce, and the correction is the
+useful part of it.** Recorded in full rather than tidied away, because the failure was mine as
+Architect and the pattern is one this change has met repeatedly: a single sample, a plausible
+mechanism reasoned on top of it, and no one asking what *else* would produce that number.
 
-- Call frequency is **unchanged** — one production call site (real app startup), not per-request or
-  per-push. The block adds exactly **two** `git ls-files -v -s -z` spawns per repository start.
-- The census is **correctly empty**: `entries.Count == 0` in all 641 instrumented calls, exactly as
-  Decision 1 assumed.
-- Per-spawn cost is **not constant**. ~16–30ms measured serially; under the suite's ~14-way xUnit
-  parallelism, p50 **153ms**, p90 372ms, p99 739ms, max 1.7s — 52% of the instrumented subset's
-  runtime.
+**What was originally reported:** `make test` went from ~2m34s–3m10s to **18m13s** after block 2.1–2.3
+— a 7× regression — diagnosed as two extra git spawns per start being amplified non-linearly by the
+suite's ~14-way parallelism (p50 153ms per spawn against ~16–30ms in isolation, 52% of an instrumented
+subset's runtime). Task 3.8 was scoped on that basis.
 
-**Decision 1 is not falsified.** One real app start pays two extra spawns and nobody notices. What was
-not anticipated is that doubling subprocess count at a site *nearly every test boots through* is
-amplified non-linearly by the suite's own concurrency.
+**What the like-for-like measurement actually shows**, taken in an isolated worktree so the branch
+never moved, and re-measuring the *same* 905 tests either side of the wiring:
 
-**The fix goes in the suite, not the product.** The tempting patch — share one census between the two
-sites — would undo precisely what Decision 5 requires: the assertion re-deriving state independently
-rather than trusting reconciliation, which is the property that makes 2.3 able to refuse on its own.
-Buying gate speed with the change's own correctness guarantee is the wrong trade.
+| commit | tests | duration | isolates |
+|---|---|---|---|
+| `1e9ffcd` | 905 | **2m55s** | before the census is wired in |
+| `317a5c9` | 905 | **4m6s** | census wired into both sites, same tests |
+| `dde2489` | 920 | 3m43s / 3m56s / 4m9s | current, +15 new tests |
+| `317a5c9` (first attempt) | 905 | 10m, then 18m13s | **never reproduced** |
 
-This adds test-infrastructure work (task 3.8) that the original proposal did not scope. It is here
-because the Product Owner scoped it, not because the change grew on its own.
+**The real cost is +71s, about +41%** — not 7×. The 18-minute figure was a degraded machine, and two
+independent corroborations say so: `dotnet`'s `obj/` permission failures struck twice in the same
+window on different artefacts (`MvcTestingAppManifest.json`, then `ZeroWiki.dll`), and a
+timing-sensitive lock test (`RepositoryWriteLockTests.HeldByAnotherProcess_BoundedWaitGivesUp…`)
+failed once under the same conditions and passes otherwise. A filesystem fighting the build inflates
+every file operation without changing how many subprocesses the code spawns — which is exactly what
+the per-spawn figures were measuring.
+
+**What survives:** the cost is real and reproducible, Decision 1's "one subprocess per start" still
+holds for production, and the census is genuinely empty (`entries.Count == 0` in all 641 instrumented
+calls). **What does not:** the magnitude, and the concurrency-amplification mechanism.
+
+**Decision: correct the record, drop task 3.8.** A 71-second cost on a 3-minute suite does not justify
+test-infrastructure work inside a change about index blindness. Sharing one census between the two
+invariant sites would still be the wrong fix if anyone revisits this — it buys speed with Decision 5's
+independence, which is what makes task 3.4 provable at all.
+
+**Left unfixed and deliberately out of scope:** the flaky lock test above. It predates this change.
 
 ## Risks / Trade-offs
 
