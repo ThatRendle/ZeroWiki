@@ -1481,41 +1481,204 @@ both `0 Warning(s). 0 Error(s).` `git status --short` shows only the four files 
 
 → @architect
 
+### Supervisor review — section 1, round three (`c4cd7fc..1e9ffcd`)
+
+**[supervisor]** Scope: `81a660c` + `60174c6` + `1e9ffcd`; one production file, `+348` over the base.
+Gates and all reviewer verdicts read from this thread.
+
+Verdict: **Approve**.
+
+The re-cut is real, not renamed. I went looking for the verdict surviving under a new name and it is
+not there. Three notes go to `## NEXT` and one to section 2's brief; none of them blocks.
+
+---
+
+#### 1. Is the re-cut real, or renamed?
+
+I checked the four ways a verdict usually survives a rename, and all four are clean:
+
+- **Nothing is filtered.** `FindSuppressedIndexObservationsAsync:1163-1175` appends every entry
+  unconditionally. The old `if (divergence == None) continue;` is gone, not moved — `Matches` now
+  reaches the caller as a fact, which is the whole substance of the change.
+- **No outcome is one only a fault could produce.** All six cases of
+  `SuppressedEntryComparisonOutcome` are statements about what was observed, and I traced each to its
+  production site (`:1223`, `:1232`, `:1276-1277`, `:1286-1287`, `:1337-1338`, `:1342-1343`). None is
+  reachable only when something is wrong; `NotCompared` in particular now says *why* no comparison was
+  possible (no blob on either side) instead of asserting what the absence means.
+- **The mode pair is reported rather than judged.** `IndexMode` and nullable `HeadMode` are both on the
+  record, so section 2 can reconstruct `FindStagedGitlinksAsync`'s exact condition
+  (`IndexMode == "160000" && HeadMode != "160000"`, null included) itself. The policy that made blocker A
+  a defect is now *derivable by the party that owns it*, which is what I was reaching for.
+- **No `IsFault`, and the type says so out loud** (`:1063-1068`). The doc comment naming the two false
+  refusals it exists to prevent is the right kind of comment — it makes the constraint survivable by
+  someone who was not here.
+
+The `ls-tree` substitution is sound and I re-derived the two things it rests on rather than reading
+them. **Absence really is empty output with exit 0**, and — the part worth stating — **`ls-tree`'s path
+argument does not glob**, which I went in expecting to be the defect. Built a tree holding
+`docs/n[1].md` *and* a decoy `docs/n1.md`, plus `docs/s*.md` and a decoy `docs/sXY.md`:
+
+```
+$ git ls-tree <tree> -- 'docs/n[1].md'
+100644 blob 2ad2be19168f90ba43ac86e8cbe68c466e1ecbef	docs/n[1].md   # the literal, not the decoy
+$ git ls-tree <tree> -- 'docs/s*.md'
+100644 blob 2d0fe468250f9a34af0515f525bedb82c3b54d48	docs/s*.md     # ditto
+```
+
+Had that globbed, a legal filename would have resolved to a sibling's sha or to empty output —
+`PathNotInHead` for a path that is in `HEAD`, the same false-refusal class a third time, and in the
+exact area (path handling) this change has already been bitten in twice. It does not. Recording the
+negative result here so nobody re-opens it, and so section 2 does not add a `:(literal)` prefix it does
+not need.
+
+#### 2. Does section 2 have what it needs, and only what it needs?
+
+Yes, and I checked it against the requirement rather than against the tasks. Each of the four spec
+scenarios is decidable from an observation alone:
+
+| scenario | decidable from |
+|---|---|
+| suppressed divergent file cannot hide | `Differs` / `WorkingTreeMissing` + path + `IndexStateName` |
+| suppressed unchanged file is not a fault | `Matches` → 2.2 starts normally |
+| the assertion cannot be answered by the index | same record, same method, both sites |
+| untracked content still reconciled | untouched — the census reads the index only |
+
+2.1 can order this: `NotCompared` plus the mode pair routes a gitlink to the existing refusal, and
+`WorkingTreeUnreadable` is now distinguishable from `WorkingTreeMissing` so §6's stderr refusal keeps
+its own diagnosis. 2.2 can write Decision 3's message: path and `IndexStateName` are both carried, and
+the tag→prose mapping lives in one place (`DescribeIndexState`), so the two sites cannot drift into two
+wordings. 3.4's seam is unaffected.
+
+#### 3. Can the section close?
+
+**Yes.** Decision 8 is a better answer than the one I asked for, and it earns that by *checking rather
+than assuming*: my round-two note flagged that the EACCES branch might be unreachable under a root
+container, and Decision 8 went and read `Dockerfile:56` — `USER $APP_UID`, non-root, which I confirmed
+independently. That converts a suspected dead branch into a live one, which is the opposite of the
+answer that would have been convenient. Routing the observation to 3.7 as human-in-the-loop, rather
+than to section 3's macOS-hosted tests, is right for the reason Decision 8 gives: those tests would
+inherit the gap, not close it.
+
+Section 1 closes as **built and internally verified**, not as *verified on the platform it ships to* —
+and with Decision 8 and task 3.7 on the record, that distinction is now carried by the change rather
+than buried in this thread. That satisfies me.
+
+#### 4. What four rounds of churn dragged in
+
+Nothing dead: every enum case is produced, every helper is reachable, `GitlinkMode`, `SymlinkMode`,
+`InvariantLocale` and `DescribeIndexState` all still have work. `FindSuppressedIndexObservationsAsync`
+has no production caller, correctly (section 2). The two surviving mentions of the retired shapes
+(`:1158` naming the phantom "browser save path"/"git-hook path" pairing as *the thing that was wrong*,
+`:1184` explaining why `rev-parse HEAD:<path>` is no longer used) are deliberate history, not stale
+crefs — they read correctly as such.
+
+Two genuine things the re-cut narrowed, both **notes, not blockers** — I want them written down because
+they are the observer collecting *less* than before, which is the opposite of the direction Decision 7
+points:
+
+- **`PathNotInHead` now returns before looking at the working tree** (`:1218-1224`, early return). The
+  previous code checked `hash-object` first, deliberately, and said so — that paragraph
+  ("a path that is both absent from the working tree and absent from `HEAD` is reported as the
+  working-tree absence, which is the more actionable diagnosis for an operator") was deleted in this
+  diff along with the ordering it justified. Section 2 can no longer tell "in the index, not in `HEAD`,
+  present on disk" from "in the index, not in `HEAD`, not on disk either". The requirement is still met
+  — both are divergences — so this is diagnosis quality, not correctness. It is a decision worth making
+  on purpose rather than by deletion.
+- **The symlink path collapses a typechange into `Differs`** (`:1274-1277`). When the index says
+  `120000` and the disk holds a regular file, the outcome is `Differs` with both modes reading
+  `120000`, so the distinction is unrecoverable downstream. Defensible — no policy calls that
+  "not a divergence", so unlike the gitlink case it cannot produce a false refusal — but note the
+  asymmetry of principle: `NotCompared`'s own doc declines to answer the typechange question for
+  gitlinks, and eight lines away the symlink path answers it. Worth one sentence in **section 2's
+  brief**: a `Differs` on a `120000` entry may mean "link text changed" *or* "no longer a symlink", and
+  if 2.2's message wants to say which, it must ask section 1 for the fact rather than infer it.
+
+Third, for `## NEXT` and **section 4's slot, which does not currently cover it**: Decision 8 records
+that the glibc `strerror` claim was reasoned rather than observed, but `design.md` is not what a reader
+of `ContentRepositoryService.cs` sees. The `InvariantLocale` remark (`:1317`) still states the glibc
+behaviour as settled fact with no mention that no one here could reproduce it. Tasks 4.1 and 4.2 as
+written do not reach this. **Add it to section 4**: state at `InvariantLocale` that the behaviour it
+defends is glibc-only, was reasoned rather than observed on the development host, and that task 3.7 is
+the observation that discharges it. That is exactly task 4.2's intent — the next reader inherits the
+measurement, not the claim — applied to the one claim in this file that has no measurement behind it.
+
+#### 5. Record
+
+`git status --short` clean; `git diff -- src` shows no mutation residue; no dangling handoff; section 1's
+boxes were ticked before any of the three remediation rounds and none of them ticked anything, which is
+correct; 3.7 is unticked and is the Product Owner's. No new project, package or stack, so no Makefile
+gate gap. I take `4ddf0bb91b2e` on the Architect's statement that it matched the committed state — the
+tree has moved since, so it is not recomputable from here.
+
+#### What this review could not see
+
+- No gate and no mutant run by me; both read from this thread.
+- Everything I measured was on git 2.55.0 / macOS APFS. That is now the sixth party on the same host,
+  and it is precisely why Decision 8 and task 3.7 exist — I am not able to close that gap by reviewing,
+  only to confirm it has been routed somewhere that can.
+- I verified section 2 *can* be built from these observations. Whether it *is* — that 2.2 does not
+  re-derive a policy this record already carries — is section 2's own review, not something this pass
+  establishes.
+- The three notes above are judgments about information value, not about behaviour. I did not
+  demonstrate that any of them changes an outcome, and I would not have blocked on them.
+
+→ @architect
+
+## 2. Wiring it into the invariant's two sites
+
+**[architect]** Base: `1e9ffcd` — section 1's observations become decisions: reconciliation and the
+post-reconciliation assertion both refuse a divergent suppressed path, each fault keeping its own
+specific diagnosis.
+
+### Inherited from section 1's close — read before briefing 2.1
+
+**[architect]** Section 1 closed on a `[supervisor]` `Approve` at round three
+(`### Supervisor review — section 1, round three`). Three things it left for this section:
+
+1. **The symlink path answers a question the gitlink path declines.** `:1274-1277` collapses a
+   typechange (index `120000`, a regular file on disk) into `Differs`, while `NotCompared`'s own doc
+   declines the equivalent question for gitlinks eight lines away. Defensible — no policy calls a
+   typechange "not a divergence" — but 2.1/2.2 should decide that asymmetry on purpose rather than
+   inherit it.
+2. **`PathNotInHead` early-returns before looking at the working tree** (`:1218-1224`). The previous
+   code checked `hash-object` first *deliberately*, and the paragraph justifying that ordering was
+   deleted with it. Section 2 can no longer distinguish "not in `HEAD`, present on disk" from "not in
+   `HEAD`, absent from disk". Diagnosis quality, not correctness — but Decision 3 requires the refusal
+   to be worth reading, so decide it rather than inheriting it by deletion.
+3. **`git ls-tree`'s path argument does not glob** — measured, negative result, recorded so it is not
+   re-opened: `docs/n[1].md` and `docs/s*.md` each returned their literal against planted decoys. Do
+   **not** add a `:(literal)` pathspec prefix; it is not needed.
+
 ## NEXT
 
-**Resume point:** section 1 remediation block — reviewer found one blocker (locale-dependent
-EACCES/ENOENT discrimination); worker briefed to fix, then reviewer re-audits. Section 1 is **not**
-closed: it needs a second supervisor pass on `c4cd7fc..HEAD` once the remediation commits. That is
-round one of two — §3c.4 says if the supervisor still requests changes after it, stop and ask the
-Product Owner rather than carving a third.
+**Resume point:** section 2, block 2.1–2.3 — section 1 is closed (`[supervisor]` `Approve`, round
+three). Base for section 2 is `1e9ffcd`.
 
-**State:** recompute, do not trust numbers written here — `git rev-parse --short HEAD`,
-`grep -c '^- \[x\]' tasks.md`, and the gate exit lines. Block 1.1–1.4 is committed; the remediation
-is not.
+**State:** recompute, never trust a number written here — `git rev-parse --short HEAD`,
+`grep -c '^- \[x\]' tasks.md` against `grep -c '^- \[ \]'`, and the gate exit lines.
 
 **Owed:**
-- @worker — pin the subprocess locale (`LC_ALL=C`) on the `hash-object` call and re-run the EACCES
-  falsifier with the pin in place. `GitProcessRunner.RunAsync` already takes `environmentVariables`.
-- @reviewer — re-audit after that fix; its last verdict said "Approve with nits" while naming a
-  blocker, so it is **not** a sign-off and must not be read as one.
-- Section 4 owes two recorded notes: the supervisor's finding 5 (a mode-only `100644`→`100755`
-  change classifies `None` — accepted, not a defect) and task 4.1's `git diff --quiet HEAD` note.
+- Section 2's three inherited decisions are posted under `## 2.`, not here — read
+  `### Inherited from section 1's close` before briefing 2.1.
+- **Task 3.7 is human-in-the-loop and is NOT tickable by any agent** (Decision 8, workflow §4). Hand
+  the Product Owner exact commands and expected output, then **wait**. Green gates are not their
+  confirmation.
+- Task 4.3 was added at section 1's close: `InvariantLocale`'s remark still states the glibc claim as
+  settled fact where a reader of the code will see it.
 
 **Live hazards:**
-- **The `## NEXT` heading was destroyed once already** (between the remediation post and the
-  reviewer's verdict — the reviewer noticed the pin was "unheaded"). Re-check the heading set after
-  every DEVLOG write: `grep -n '^#\{1,3\} '`.
-- **Everything measured so far is git 2.55.0 / macOS APFS.** Symlink, permission-bit and mode
-  behaviour under the Docker Linux runtime on a bind mount is inferred by the worker, the reviewer
-  and the supervisor alike — three parties, one environment. Section 3's committed tests inherit
-  this gap; they do not close it.
-- **Three audits already shared one blind spot** (all measured with regular files only), which is how
-  the symlink defect reached a supervisor rather than a block review. Before trusting the next clean
-  result, name what its instrument cannot see.
-- Section 2 builds its operator-facing refusal message directly on `IndexStateName`/`Divergence`, so
-  a wrong diagnosis in the classifier becomes a wrong message there. Fix diagnoses before wiring.
+- **Six parties, one host.** Every measurement in this change — worker, reviewer, supervisor, all
+  rounds — is git 2.55.0 / macOS APFS. The symlink, permission-bit, mode and `strerror` claims are
+  glibc behaviour. Section 3's tests run on that same host and **inherit** the gap; only 3.7 closes
+  it. Do not let a green suite be read as platform verification.
+- **This section produced the same defect class three times** — a false refusal on a harmless entry
+  (symlink, then gitlink, then nearly a globbed pathspec). Decision 7 removed the structural cause by
+  moving verdicts to section 2, which means **section 2 now holds the risk that kept materialising**.
+  Every fault decision it writes needs the harmless case as its own falsifier, not just the divergent
+  one.
+- **The `## NEXT` heading was destroyed once** by an agent's insert. Re-check `grep -n '^#\{1,3\} '`
+  after every DEVLOG write.
 - 3.5 runs a mutant. Load the `mutation-testing` skill before briefing it, and brief the `cp`/`trap`
   revert explicitly.
 
-**Open decisions:** none. The artefact ambiguity (2.3's phantom health-check site) was settled by the
-Product Owner and corrected in `specs/` and `tasks.md`.
+**Open decisions:** none outstanding. Decisions 7 and 8 (Product Owner, 2026-08-21) are in `design.md`.

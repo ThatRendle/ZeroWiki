@@ -36,3 +36,4 @@
 
 - [ ] 4.1 State in the code, at the census, that `git diff --quiet HEAD` is *also* blinded — the reflex fix that reads index-free and is not (Context table)
 - [ ] 4.2 Update `git-backed-content-core`'s archived DEVLOG reference or this change's DEVLOG with the measured table, so the next reader inherits the measurement rather than the claim
+- [ ] 4.3 State at `InvariantLocale` that the glibc `strerror` translation it defends against was **reasoned, not observed** — Decision 8 records this, but `design.md` is not what a reader of `ContentRepositoryService.cs` sees, and the remark there still states it as settled fact. This is 4.2's own intent applied to the one claim in the file with no measurement behind it (supervisor, section 1 round three)
