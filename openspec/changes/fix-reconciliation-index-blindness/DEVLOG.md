@@ -1649,6 +1649,260 @@ specific diagnosis.
    re-opened: `docs/n[1].md` and `docs/s*.md` each returned their literal against planted decoys. Do
    **not** add a `:(literal)` pathspec prefix; it is not needed.
 
+### Brief — block 2.1–2.3
+
+**[architect]** → @worker. Section 1 gives you observations. This block turns them into decisions at
+both sites of the invariant, and it is where the risk of this whole change now lives.
+
+**Read the section's `### Inherited from section 1's close` post first** — three decisions it handed
+you, including one measured negative result that saves you work.
+
+**Why this block is the dangerous one.** Section 1 produced the *same defect class three times*: a
+false refusal on a harmless entry — a symlink, then a gitlink, then very nearly a globbed pathspec.
+Decision 7 removed the structural cause by moving every fault decision *here*. That did not delete the
+risk; it moved it to you. **For every fault decision you write, the falsifier is the harmless case, not
+the divergent one.** A guard that refuses on divergence is easy; a guard that refuses on the *presence
+of a bit* passes every divergent test and bricks a legitimate repository.
+
+**2.1 — run the census in `ReconcileWorkingTreeAsync`, ordered against the existing refusals.**
+The ordering is the task, not an implementation detail. Each fault must keep its own specific
+diagnosis: `FindStagedGitlinksAsync`'s nested-repository refusal, §6's stderr refusal, and this new
+one must not swallow each other. `NotCompared` + the mode pair lets you reconstruct
+`FindStagedGitlinksAsync`'s exact condition (`newMode == 160000 && oldMode != 160000`) — **reconstruct
+it, do not approximate it**, because its narrowness is deliberate: an adopted submodule advancing is
+not a fault, and treating it as one is the bricking that check exists to prevent.
+*Falsifier:* a repository with a nested git repo still produces the **gitlink** message, not the
+suppressed-entry one; a repository with an unreadable directory still produces §6's **stderr** message.
+Each fault type, constructed separately, yields its own diagnosis.
+
+**2.2 — refuse, naming the path and the index state, and never clear the bit.**
+*Falsifiers, and the first is the one that matters:*
+- **An already-adopted suppressed gitlink starts normally.** Index `160000`, `HEAD` `160000`. This is
+  the case that bricked in section 1's round two, and marking a submodule `--assume-unchanged` is one
+  of the commonest real reasons anyone sets the bit.
+- **An unmodified suppressed symlink starts normally**, and a suppressed regular file matching `HEAD`
+  starts normally. Three harmless shapes, three clean starts.
+- A divergent suppressed path refuses, and the message names **both** the path and the operator-facing
+  index state (`--assume-unchanged` / `--skip-worktree`).
+- **The bit is still set afterwards.** Verify by reading the index after the refusal, not by inspecting
+  the code path. Decision 3 turns on never silently undoing an operator's explicit instruction.
+
+**2.3 — the same check at `AssertWorkingTreeIsCleanAsync`.**
+This is the site the Product Owner's ruling clarified: it *is* this system's working-tree-clean
+self-check; there is no separate health-check surface. Decision 5 exists because §5 and §6 both
+produced findings of exactly this shape — a principle applied to the case that prompted it and not to
+its siblings.
+*Falsifier (and task 3.4 will encode it):* the assertion refuses the tree **on its own**, with
+reconciliation's census neutralised. If your implementation only works because 2.1 already refused,
+2.3 is not done.
+
+**Two asymmetries to decide on purpose, not inherit** (from section 1's close):
+- The symlink path collapses a typechange into `Differs` while `NotCompared` declines the equivalent
+  question for gitlinks. Pick a consistent answer and say why in the remarks.
+- `PathNotInHead` early-returns before looking at the working tree, so you cannot currently tell "not
+  in `HEAD`, present on disk" from "not in `HEAD`, absent". Decision 3 requires a refusal worth
+  reading — decide whether that distinction is worth recovering, and record the decision either way.
+
+**Out of scope.** Committed tests (section 3 — self-test freely, but the suite is 3.x's deliverable).
+The record notes (section 4). Do not change what reconciliation *does* once divergence is seen: D9's
+policy is untouched by this change.
+
+**Boundaries.** No commit, no ticks, no `Makefile`, no `make` gates, no spawning agents. Post under
+`## 2.` (not `## 1.` — this is a new section), headings at `###`, above `## NEXT`, which you do not
+rewrite; `grep -n '^#\{1,3\} '` after writing. Hand off with `→ @reviewer`.
+
+### Worker report — block 2.1–2.3
+
+**[worker]** Three-way call before implementing: 2.1 (wire the census into `ReconcileWorkingTreeAsync`),
+2.2 (refuse, name path+state, never clear the bit), 2.3 (the same check in
+`AssertWorkingTreeIsCleanAsync`) are all **build** — `FindSuppressedIndexObservationsAsync` exists
+(section 1) but is called from neither site yet (its own remarks say so explicitly: "Not yet called
+from either candidate site — section 2 wires this in"). Confirmed via `grep -n
+FindSuppressedIndexObservationsAsync` — the only two hits are the method's own definition and its
+internal call to `ObserveSuppressedEntryAsync`; no caller anywhere in `ContentRepositoryService.cs`.
+Matches the brief; no disagreement to raise.
+
+**What changed.**
+
+- `ReconcileWorkingTreeAsync`: the census (`FindSuppressedIndexObservationsAsync`) now runs **first**,
+  before `add -A`. It doesn't depend on what `add -A` is about to stage — a suppressed path is by
+  definition one `add -A` won't touch — so this ordering costs nothing and means a fault here refuses
+  before anything is staged (no `git reset` needed, unlike the gitlink refusal a few lines below it,
+  which only knows what to unstage *after* staging). A tree built with only a nested repo, or only an
+  unreadable directory, carries no suppressed entry at all, so the census reports nothing for those and
+  execution falls through unchanged to the existing gitlink/stderr refusals — confirmed by test (below).
+- `AssertWorkingTreeIsCleanAsync`: the same census + fault check runs after the existing
+  `status --porcelain` check, independently re-derived from the repository's current state — not
+  contingent on `ReconcileWorkingTreeAsync` having already refused (Decision 5, and the PO's ruling that
+  this method *is* the only health-check surface).
+- New shared policy `IsSuppressedEntryFault(SuppressedIndexObservation)`, used by both sites:
+  `Matches` → not fault; `Differs`/`WorkingTreeMissing`/`WorkingTreeUnreadable`/`PathNotInHead` → fault;
+  `NotCompared` → fault iff `IndexMode == 160000 && HeadMode != 160000` — `FindStagedGitlinksAsync`'s
+  exact condition, reconstructed against the mode pair section 1 already reports, not reapproximated.
+- Two new exception builders (`SuppressedEntryDivergesAtReconciliationException`/`…AfterReconciliationException`),
+  each naming the path and the operator-facing index state (`--assume-unchanged`/`--skip-worktree`) and
+  pointing at the exact `git update-index` command that would clear the bit — which this code never
+  runs itself.
+
+**The two asymmetries, decided:**
+- *Symlink typechange vs. gitlink `NotCompared`:* both now land on **fault**, just via different
+  mechanisms. A symlink typechange still has bytes to compare on at least one side, so
+  `CompareSuppressedSymlinkToHeadAsync` answers it directly as `Differs`. A gitlink typechange never has
+  a blob on at least one side, so it can only be answered by the mode-pair reconstruction — which also
+  lands on fault for the two gitlink-side typechange shapes (a tracked file replaced by a gitlink; a
+  brand-new gitlink). The one shape *not* previously discussed — real content now where `HEAD` still
+  holds a gitlink — falls out of the same reconstructed condition as *not* a fault (`IndexMode != 160000`
+  fails the test), which is symmetric with `FindStagedGitlinksAsync` itself only ever guarding against a
+  gitlink being *introduced*, never against one being replaced by real content. No second policy call
+  needed for that reverse shape; reconstructing the exact condition already resolves it.
+- *`PathNotInHead` on-disk presence:* decided **not** to recover it. Decision 4 case 3 already makes
+  "not in `HEAD`" a fault unconditionally, regardless of whether the working-tree path exists — an
+  uncommitted, suppressed index entry can never be staged either way, so the distinction has no effect
+  on the verdict, only on wording. Recovering it would need a second, mode-dependent existence probe
+  (a symlink's absence test differs from a regular file's) for message polish alone. Left unrecovered;
+  the reasoning is recorded in `IsSuppressedEntryFault`'s remarks so it isn't silently re-litigated.
+
+**Falsifiers run** (scratch xUnit tests against the real `git` binary, added temporarily, run via
+`dotnet test --filter`, then deleted before handoff — not part of the committed suite, which is
+section 3's deliverable):
+
+- **Harmless — already-adopted suppressed gitlink** (index `160000`, `HEAD` `160000`, marked
+  `--assume-unchanged`): starts normally. This is the exact case that bricked in section 1's round two.
+- **Harmless — unmodified suppressed symlink** (marked `--skip-worktree`): starts normally.
+- **Harmless — suppressed regular file matching `HEAD`** (marked `--assume-unchanged`): starts normally.
+- **Divergent suppressed regular file:** refuses; message names `docs/plain.md` and
+  `--assume-unchanged`; **the bit is still set afterwards**, verified by reading `git ls-files -v` after
+  the refusal (not by inspecting the code path).
+- **Divergent suppressed gitlink** (a previously-tracked file replaced by a gitlink, suppressed): refuses.
+- **Nested repository, constructed alone (no suppressed entry):** still produces the existing
+  "nested git repository" message — not swallowed by the new check.
+- **`AssertWorkingTreeIsCleanAsync` called directly** (via reflection, bypassing `EnsureRepositoryAsync`
+  entirely) over a repo with a divergent suppressed entry: refuses on its own, naming the path.
+
+All 7 passed. One targeted mutation to confirm the guard isn't a "presence of the bit" check in
+disguise: changed `IndexMode == GitlinkMode && HeadMode != GitlinkMode` to `IndexMode == GitlinkMode`
+(dropping the `HeadMode` half — exactly the bricking shape this decision exists to prevent) and reran
+the same 7; the adopted-gitlink harmless case failed as expected (1/1 — clean, deterministic failure,
+no further runs needed per the 3-run cap). Reverted; checksum of `ContentRepositoryService.cs` after
+revert matches the pre-mutation checksum (`sha256sum`, both `84f2fc03…`), and `git status --short --
+src` shows only the intended edit, no stray mutant.
+
+**Claim / instrument / blind spot:**
+- **Claim:** the three harmless shapes named in the brief start normally, the divergent shapes refuse
+  with the required message content and without clearing the bit, and the fault-decision function does
+  not merely key off the presence of the suppression bit.
+- **Instrument:** 7 scratch xUnit tests against a real `git` (2.55.0, macOS) binary, run via
+  `dotnet test tests/ZeroWiki.Tests/ZeroWiki.Tests.csproj --filter
+  FullyQualifiedName~ScratchSuppressedEntryFalsifierTests`, plus one confirmed mutation on the shared
+  `IsSuppressedEntryFault` condition.
+- **Blind spot:** this instrument is macOS/APFS only — Decision 8's Linux/glibc-specific claims
+  (`strerror` locale translation on the `WorkingTreeUnreadable` branch) are untouched by this block and
+  remain the human-in-the-loop container task Decision 8 already scoped; nothing here re-measures that.
+  It also doesn't exercise `WorkingTreeUnreadable` or `PathNotInHead` end-to-end (both already have
+  section 1's own execution-verified behaviour; this block only adds the fault verdict on top, covered
+  by the shared `IsSuppressedEntryFault` unit logic exercised through the `Differs`/`WorkingTreeMissing`/
+  gitlink paths above) — section 3's committed suite is where those get their own fixtures, per the
+  brief's "committed tests are 3.x's deliverable."
+
+Gates (self-test, not the Architect's authoritative run): `dotnet build src/ZeroWiki/ZeroWiki.csproj`
+→ 0 Warning(s), 0 Error(s). `dotnet test tests/ZeroWiki.Tests/ZeroWiki.Tests.csproj --filter
+FullyQualifiedName~ContentRepositoryServiceTests` → 46/46 passed (the full pre-existing file, unchanged
+behaviour on every non-suppressed-entry path). `BUILD_EXIT:0` (raw `dotnet build`, not `make build` —
+boundary forbids `make` here).
+
+Tasks completed: 2.1, 2.2, 2.3 (all three, one deliverable — see brief). No task needs human
+confirmation; this block's scope has no HTTP surface, no Obsidian/browser step.
+
+→ @reviewer
+
+
+### Reviewer report — block 2.1–2.3
+
+**[reviewer]** Verdict: **Approve.**
+
+**What I checked** — a fresh instrument, not the worker's: a throwaway `dotnet run` harness
+(`Process.Start` for git plumbing, reflection into the real private `ReconcileWorkingTreeAsync` /
+`AssertWorkingTreeIsCleanAsync` on a real `ContentRepositoryService`, no Bash-typed `git`, deleted after
+use — the auditor boundary blocks git-mutating Bash commands the same as it does for the worker). Every
+scenario below is a fresh scratch repository, not reused across checks.
+
+**1. The three harmless shapes, constructed myself:** already-adopted suppressed gitlink (index
+`160000`, `HEAD` `160000`) — the exact shape that bricked in section 1's round two — an unmodified
+suppressed symlink, and a suppressed regular file matching `HEAD`. All three ran `ReconcileWorkingTreeAsync`
+to completion with no throw.
+
+**2. The reconstructed gitlink condition, including the reverse shape.** Read against
+`FindStagedGitlinksAsync`'s real condition (`ContentRepositoryService.cs:992`,
+`newMode == "160000" && oldMode != "160000"`) and the new `IsSuppressedEntryFault`
+(`observation.IndexMode == GitlinkMode && observation.HeadMode != GitlinkMode`) — `IndexMode` is the
+current-index side (`newMode`'s role), `HeadMode` is `HEAD`'s side (`oldMode`'s role); the expressions
+are the same condition, not a lookalike. Constructed the reverse shape the brief specifically named —
+index now holds real content (a regular file) where `HEAD` still records a gitlink, suppressed — and it
+did **not** refuse, matching the worker's claim: `IndexMode != GitlinkMode` fails the test on that side
+regardless of `HeadMode`, so this shape was never in danger of the same bricking; it falls out of the
+identical reconstructed condition, no second policy call.
+
+**3. The ordering claim, tested rather than read.** Constructed a nested-git-repository tree (a real
+inner repo with its own commit, no suppressed entry anywhere) — refused with the **nested git
+repository** message, not the suppressed-entry one. Constructed an unreadable directory alone (`chmod
+000`, no suppressed entry) — refused with the **stderr** message (`warning: could not open directory
+… Permission denied`), not swallowed by the new check. Both confirm the census, run first, produces
+nothing when there is genuinely nothing suppressed, and falls through unchanged — the claim that
+"a suppressed path is by definition invisible to `add -A`, so this ordering costs nothing" is not just
+asserted, it's the reason both pre-existing refusals still fire correctly on their own fixtures.
+
+**4. 2.3 stands alone.** Called `AssertWorkingTreeIsCleanAsync` directly via reflection — never calling
+`ReconcileWorkingTreeAsync` at all, so reconciliation's own refusal cannot be what's firing — over a
+repository with a divergent suppressed entry. It refused, naming the path, with the "after
+reconciliation" message shape (not the "at reconciliation" one). Task 3.4's point is answered: this is
+not passing only because 2.1 already ran.
+
+**5. The bit survives the refusal.** After `ReconcileWorkingTreeAsync` threw on a divergent suppressed
+regular file, ran `git ls-files -v` on the real repository afterward (reading the index, not the code
+path): `h docs/plain.md` — the `--assume-unchanged` bit is still lowercase-set, confirming nothing
+silently cleared it.
+
+**6. The two asymmetry decisions — judged, and found where a reader will see them.** Both are recorded
+in `IsSuppressedEntryFault`'s `<remarks>`, not just the DEVLOG: symlink-typechange and gitlink-typechange
+both landing on fault is consistent (a symlink typechange has bytes to compare directly; a gitlink
+typechange can only be answered by the mode pair, and the reconstructed condition already answers it as
+a fault) — I constructed a divergent gitlink typechange (a previously-tracked file replaced by a
+suppressed gitlink) and it refused, confirming the "fault" side of that asymmetry as well as the
+harmless side. `PathNotInHead` not recovering on-disk presence is a real, non-cosmetic case for leaving
+alone: Decision 4 case 3 already makes it an unconditional fault regardless of on-disk state, so the
+distinction genuinely only affects wording, and recovering it costs a second, mode-dependent existence
+probe — I don't see a case where the wording gap changes anyone's action, and the reasoning is recorded
+in the same `<remarks>` block a future reader of `PathNotInHead` will already be looking at.
+
+**7. The mutation's meaning.** Agree with the framing: killing a test proves the test can fail, not that
+the condition is right. What actually establishes the condition is right is item 2 above, run against the
+*real, unmutated* predicate: the adopted-gitlink harmless case (A) and the reverse-content-where-`HEAD`-
+holds-a-gitlink case (D) both exercise the same two-sided condition from opposite directions, on the
+committed code, not a reimplementation — that's stronger evidence than re-deriving the worker's mutation,
+which only shows the harmless test is a real falsifier (which it is: dropping the `HeadMode` half is
+exactly the bug this condition exists to prevent, and the worker's 1/1 kill is the expected, deterministic
+result of that specific mutation, not evidence about correctness beyond "the test can fail").
+`git diff HEAD -- src` is additions-only with no untracked files, confirming the mutation left no residue,
+independently of the Architect's own check.
+
+**Compile-fit.** `dotnet build src/ZeroWiki/ZeroWiki.csproj` and
+`dotnet build tests/ZeroWiki.Tests/ZeroWiki.Tests.csproj` both `0 Warning(s). 0 Error(s).`
+
+**Phantom-reference check.** Every `<see cref>` added in this block's diff
+(`AssertWorkingTreeIsCleanAsync`, `CompareSuppressedSymlinkToHeadAsync`, `FindStagedGitlinksAsync`,
+`GitlinkMode`, `ReconcileWorkingTreeAsync`, the `SuppressedEntryComparisonOutcome`/`SuppressedIndexObservation`
+members) resolves to a real symbol in this file — checked by grep, not by the compiler (`ZeroWiki.csproj`
+still has no `GenerateDocumentationFile`, so a clean build doesn't validate `<see cref>` targets).
+
+**Residue.** `git status --short` shows only `ContentRepositoryService.cs` and `DEVLOG.md`; no
+`InternalsVisibleTo`; my own scratch harness and its temp repos deleted after this run.
+
+**Nothing owed.**
+
+**Reviewed-state:** `5c8920c1d894`, `HEAD` `ae6ce82`.
+
+→ @architect
+
 ## NEXT
 
 **Resume point:** section 2, block 2.1–2.3 — section 1 is closed (`[supervisor]` `Approve`, round

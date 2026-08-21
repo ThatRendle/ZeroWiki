@@ -801,6 +801,24 @@ public sealed class ContentRepositoryService
     /// </remarks>
     private async Task ReconcileWorkingTreeAsync(string repositoryRoot, CancellationToken cancellationToken)
     {
+        // Section 2 (Decision 7): a suppressed index entry (--assume-unchanged/--skip-worktree) is
+        // invisible to `add -A`, `diff --cached`, and `status --porcelain` alike — that is the whole
+        // point of the bit — so it is checked here first, against the index as it stands, before any of
+        // those instruments run. It does not depend on what `add -A` is about to stage (a suppressed
+        // path is, by definition, one `add -A` will not touch), so ordering it before that call costs
+        // nothing and means a fault here refuses before anything is staged — no `git reset` to unwind,
+        // unlike the gitlink refusal below, which only knows what it is refusing after staging.
+        // Constructed separately, a nested-repository or an unreadable-directory tree carries no
+        // suppressed entry at all, so this census reports nothing and execution falls through to those
+        // checks unchanged — this refusal cannot swallow theirs, nor can theirs swallow this one.
+        foreach (var observation in await FindSuppressedIndexObservationsAsync(repositoryRoot, cancellationToken))
+        {
+            if (IsSuppressedEntryFault(observation))
+            {
+                throw SuppressedEntryDivergesAtReconciliationException(repositoryRoot, observation);
+            }
+        }
+
         // `add -A` stages tracked modifications and deletions *and* untracked files. Untracked files
         // are the load-bearing case: copying a folder of Markdown onto the volume is the ordinary way
         // to populate a new ZeroWiki, and it arrives untracked. Staging only tracked changes (e.g.
@@ -1072,6 +1090,97 @@ public sealed class ContentRepositoryService
         string IndexMode,
         string? HeadMode,
         SuppressedEntryComparisonOutcome ComparisonOutcome);
+
+    /// <summary>
+    /// The fault decision section 1 was not allowed to make (Decision 7). Both call sites —
+    /// <see cref="ReconcileWorkingTreeAsync"/> and <see cref="AssertWorkingTreeIsCleanAsync"/> — share
+    /// this one policy so the invariant means the same thing at both of its sites (Decision 5).
+    /// </summary>
+    /// <remarks>
+    /// <see cref="SuppressedEntryComparisonOutcome.PathNotInHead"/> is a fault unconditionally (Decision
+    /// 4, case 3) — a suppressed path with no counterpart in <c>HEAD</c> can never be staged or committed
+    /// while suppressed, regardless of the index mode involved, so this already generalizes Decision 7's
+    /// "not in <c>HEAD</c> at all — a new gitlink" row without needing to test the mode.
+    /// <para>
+    /// <see cref="SuppressedEntryComparisonOutcome.NotCompared"/> is where <see
+    /// cref="FindStagedGitlinksAsync"/>'s condition (<c>newMode == 160000 &amp;&amp; oldMode != 160000</c>)
+    /// is reconstructed, not approximated, against the mode pair section 1 reported: fault iff
+    /// <see cref="SuppressedIndexObservation.IndexMode"/> is <see cref="GitlinkMode"/> and <see
+    /// cref="SuppressedIndexObservation.HeadMode"/> is not. This is symmetric with the gitlink check's own
+    /// narrowness by construction, not by a second policy call: an already-adopted gitlink whose nested
+    /// <c>HEAD</c> merely advanced (both sides <c>160000</c>) is not a fault — the commonest real reason
+    /// anyone sets these bits at all — while a tracked file replaced by a gitlink, or a gitlink newly
+    /// introduced, is. The reverse shape (the index now holds real content — a blob or a symlink — where
+    /// <c>HEAD</c> still records a gitlink) is also <c>NotCompared</c> but falls on the "not a fault" side
+    /// of the same test: <see cref="FindStagedGitlinksAsync"/> only ever guards against a gitlink being
+    /// introduced, never against one being replaced by real content, and there is no separate policy call
+    /// here either — reconstructing its exact condition already resolves this shape the same way.
+    /// </para>
+    /// <para>
+    /// <b>Decided on purpose (asymmetry 1 of section 1's close):</b> a symlink typechange (index mode
+    /// <c>120000</c>, working tree now a regular file or directory) reaches this policy as
+    /// <see cref="SuppressedEntryComparisonOutcome.Differs"/>, a direct fault — decided consistently with
+    /// the gitlink typechange above (both are treated as a fault), just reached by a different mechanism:
+    /// a symlink typechange still has bytes to compare (<see cref="CompareSuppressedSymlinkToHeadAsync"/>
+    /// answers it directly), while a gitlink typechange never has a blob on at least one side and can only
+    /// be answered by the mode pair.
+    /// </para>
+    /// <para>
+    /// <b>Decided on purpose (asymmetry 2 of section 1's close):</b> <see
+    /// cref="SuppressedEntryComparisonOutcome.PathNotInHead"/> does not recover whether the working-tree
+    /// path is present or absent on disk. It does not change here: Decision 4 case 3 makes "not in
+    /// <c>HEAD</c>" a fault regardless of on-disk state — an uncommitted, suppressed index entry can never
+    /// be staged either way — so the distinction has no effect on the verdict, only on the refusal
+    /// message's wording. Recovering it would mean a second, mode-dependent existence probe (a symlink's
+    /// absence test differs from a regular file's) purely for message polish on a diagnosis that already
+    /// names the path and the index state per Decision 3. Left unrecovered; revisit only if an operator
+    /// report says the message is not actionable as written.
+    /// </para>
+    /// </remarks>
+    private static bool IsSuppressedEntryFault(SuppressedIndexObservation observation) =>
+        observation.ComparisonOutcome switch
+        {
+            SuppressedEntryComparisonOutcome.Matches => false,
+            SuppressedEntryComparisonOutcome.Differs => true,
+            SuppressedEntryComparisonOutcome.WorkingTreeMissing => true,
+            SuppressedEntryComparisonOutcome.WorkingTreeUnreadable => true,
+            SuppressedEntryComparisonOutcome.PathNotInHead => true,
+            SuppressedEntryComparisonOutcome.NotCompared =>
+                observation.IndexMode == GitlinkMode && observation.HeadMode != GitlinkMode,
+            _ => throw new ArgumentOutOfRangeException(
+                nameof(observation), observation.ComparisonOutcome, "Unhandled comparison outcome."),
+        };
+
+    private static string DescribeSuppressedEntryFault(SuppressedIndexObservation observation) =>
+        $"'{observation.RepositoryRelativePath}' (marked {observation.IndexStateName})";
+
+    /// <summary>
+    /// Decision 3: never silently clear the operator's bit. Naming the path and the operator-facing
+    /// index state (Decision 3/2.2) so the operator who set it is the one asked what it should protect,
+    /// and pointing at the exact command that would clear it — the fix this class deliberately does not
+    /// apply on the operator's behalf.
+    /// </summary>
+    private static InvalidOperationException SuppressedEntryDivergesAtReconciliationException(
+        string repositoryRoot, SuppressedIndexObservation observation) =>
+        new InvalidOperationException(
+            $"The content repository at '{repositoryRoot}' has a tracked path that differs from HEAD " +
+            $"but is hidden from git's normal comparisons: {DescribeSuppressedEntryFault(observation)}. " +
+            "Startup reconciliation cannot safely commit past this without either discarding the " +
+            "divergence or silently clearing an index bit the operator set deliberately, so it refuses " +
+            "to start rather than report a clean tree. Clear the index bit yourself if the divergence is " +
+            $"expected (`git update-index --no-assume-unchanged -- '{observation.RepositoryRelativePath}'` " +
+            "or `--no-skip-worktree` for `--skip-worktree`), or restore the tracked content to match " +
+            "HEAD, then restart.");
+
+    /// <summary>Decision 5: the same check, the same message shape, for the post-reconciliation self-check.</summary>
+    private static InvalidOperationException SuppressedEntryDivergesAfterReconciliationException(
+        string repositoryRoot, SuppressedIndexObservation observation) =>
+        new InvalidOperationException(
+            $"The content repository at '{repositoryRoot}' is not clean after startup reconciliation: " +
+            $"{DescribeSuppressedEntryFault(observation)} differs from HEAD, but git's normal " +
+            "comparisons cannot see it because the index entry suppresses them. Reconciliation should " +
+            "have committed every change; refusing to start rather than accept pushes against a tree it " +
+            "cannot verify is clean.");
 
     /// <summary>
     /// Census of every index entry whose tag suppresses git's normal working-tree comparison for that
@@ -1365,6 +1474,22 @@ public sealed class ContentRepositoryService
                 $"reconciliation (git status --porcelain reported):\n{status.StandardOutput}" +
                 "Reconciliation should have committed every change; refusing to start rather than " +
                 "accept pushes against a dirty tree.");
+        }
+
+        // Decision 5: this is the working-tree-clean self-check, and there is no separate health-check
+        // surface — so it runs the same content-level census `ReconcileWorkingTreeAsync` runs, on its
+        // own, rather than trusting `status --porcelain` above (which cannot see a suppressed entry by
+        // construction). This does not depend on `ReconcileWorkingTreeAsync` having already refused: it
+        // re-derives the census and the fault verdict from the repository's current state every time
+        // this method runs, so calling it in isolation over a repository containing a divergent
+        // suppressed entry — reconciliation's own refusal neutralised or bypassed entirely — still
+        // refuses here.
+        foreach (var observation in await FindSuppressedIndexObservationsAsync(repositoryRoot, cancellationToken))
+        {
+            if (IsSuppressedEntryFault(observation))
+            {
+                throw SuppressedEntryDivergesAfterReconciliationException(repositoryRoot, observation);
+            }
         }
     }
 }

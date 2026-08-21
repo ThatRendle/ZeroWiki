@@ -17,9 +17,9 @@
 > around a verdict its own supervisor has ruled wrong, and repairing it afterwards, would make its
 > `Approve` mean nothing. It ticks no box: section 1's boxes are already ticked.
 
-- [ ] 2.1 Run the census in `ContentRepositoryService.ReconcileWorkingTreeAsync`, ordered against the existing gitlink and stderr refusals so each fault still produces its own specific diagnosis
-- [ ] 2.2 Refuse startup on a divergent suppressed path with a message naming the path and the index state responsible, and never clear the operator's bit (Decision 3). **A suppressed entry that is merely present is not a fault** — an already-adopted gitlink whose `HEAD` mode is also `160000`, like a symlink whose link text matches, starts normally; the two false refusals section 1 produced were both this mistake (Decision 7, spec scenario 2)
-- [ ] 2.3 Apply the same check at `AssertWorkingTreeIsCleanAsync` — which *is* this system's working-tree-clean self-check, there being no separate health-check surface — so the assertion is not left answering from the index after reconciliation has stopped doing so (Decision 5)
+- [x] 2.1 Run the census in `ContentRepositoryService.ReconcileWorkingTreeAsync`, ordered against the existing gitlink and stderr refusals so each fault still produces its own specific diagnosis
+- [x] 2.2 Refuse startup on a divergent suppressed path with a message naming the path and the index state responsible, and never clear the operator's bit (Decision 3). **A suppressed entry that is merely present is not a fault** — an already-adopted gitlink whose `HEAD` mode is also `160000`, like a symlink whose link text matches, starts normally; the two false refusals section 1 produced were both this mistake (Decision 7, spec scenario 2)
+- [x] 2.3 Apply the same check at `AssertWorkingTreeIsCleanAsync` — which *is* this system's working-tree-clean self-check, there being no separate health-check surface — so the assertion is not left answering from the index after reconciliation has stopped doing so (Decision 5)
 
 ## 3. Tests
 
