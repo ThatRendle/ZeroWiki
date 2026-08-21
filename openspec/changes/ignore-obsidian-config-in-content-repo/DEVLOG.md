@@ -3008,6 +3008,260 @@ was already ticked.
 occur. That is corroboration for the §3 diagnosis rather than proof, but it is the prediction the
 diagnosis makes.
 
+**[supervisor]** Section 3 re-audit — `git diff fcec6c6..HEAD` (`b5a59ee`, `c029b86`), and the change end to end
+
+### Verdict: Request changes
+
+One blocker, and it is the same class as §3's blocker 2 — one file away, in the one artefact no block
+of this change ever touched. Everything else I was asked to judge is discharged.
+
+### Blocker — `proposal.md:30-32` still states the discriminator §3 corrected
+
+```
+- **Adopted repositories are left alone.** A volume that already contains a git repository is not
+  modified to add or amend a `.gitignore`; only a repository ZeroWiki initializes itself is seeded. The
+  system does not edit a repository it did not create.
+```
+
+Both sentences are false for the case `c029b86` corrected in the spec. A volume carrying `.git` with an
+unborn `HEAD` **does** get its `.gitignore` created or appended and committed:
+`ContentRepositoryService.cs:110-136` sets `repositoryHasNoCommitsYet` from
+`RepositoryHeadIsUnbornAsync`, `:213` passes it into `EnsureInitialCommitAsync`, and `:706` takes the
+seeding branch on `true`. `specs/content-store/spec.md:18-21` now names exactly this
+("The discriminator is history, not the presence of a `.git` directory"); the README's second paragraph
+now says "already has commit history"; `proposal.md` was left saying the thing all three replaced.
+
+Why this is a blocker rather than a nit: §3's blocker 2 was reported as *the spec's* adopted-repository
+scenario. It was fixed there, and the identical claim survived in the file nobody was pointed at — the
+fourth time in this change a reported sentence has been corrected while its sibling stood. The remedy
+for that pattern is not a better correction; it is that the last audit does not wave the sibling
+through because it is small.
+
+**Remediation shape** — one file, no code, no tick. Replace those three lines with the discriminator the
+spec and README already use: a repository that already has **commit history** is left alone; a volume
+carrying a `.git` with no commits yet is initialized and seeded, and where it already has a root
+`.gitignore` that file is appended to, never replaced. `proposal.md:51` ("an adopted repository is not
+modified") is consistent once the rule above it is, and needs no change.
+
+**This may be a Product Owner call rather than a fix.** Under §3c.4 this is the second round, so it
+stops here either way. If the ruling is that `proposal.md` is a proposal-time artefact and is not
+retro-edited, that is a coherent position — but then say so *in* `proposal.md`, because a cold reader of
+the archive reads it before the spec and will otherwise take the wrong rule from it.
+
+### The two §3 blockers — discharged, including the sibling
+
+**Blocker 1 (the deleted accepted risk).** Read `design.md` whole and cold. The risk is restored at
+`:106-129` with a reproduction against real git, and D5's own narrative at `:84-89` now rebuts the false
+claim by name rather than merely omitting it. The two halves agree: the override is a property of
+appending to the end of someone else's file, not of `check-ignore`, and it survives the revision. No
+third instance of the claim anywhere in the file.
+
+One imprecision I would not fix now, for `## NEXT`: `design.md:68-71` still files
+"appending after an operator's same-file `!docs/.obsidian/` silently killed their negation" under
+"every divergence found failed in the same direction" — as one of the three defects that *sank*
+`check-ignore`. It is neither: it fails in the other direction, and it is the one property that
+survived. The paragraph three lines below corrects the implication explicitly, so a reader who keeps
+reading is not misled; a reader who stops at the bullets is.
+
+**Blocker 2 (the unborn-`HEAD` scenario).** `spec.md:18-21` and `:52-56` both now discriminate on commit
+history, and the `SHALL NOT` names the unborn case in its own words. Verified against the code path
+above rather than against the tests' framing.
+
+### The new test is adequate, and the `Length > 0` half is not a gap
+
+`ContentRepositoryServiceTests.cs:1398-1427` asserts the resulting bytes **and** that both rules are
+live under a pinned git environment — the operator's `foo.tmp` and our `.obsidian/workspace.json`. It
+therefore fails for the right reason: the defect it guards (`*.tmp.obsidian/` — their rule broken, ours
+never applied, no error) breaks the second assertion as well as the first.
+
+The `existingContent.Length > 0` half stays unexercised, and I would name it in the report as
+*understood*, not as owed. It only distinguishes a zero-byte pre-existing `.gitignore` from a
+non-existent one, and dropping it yields `"\n.obsidian/\n"` instead of `".obsidian/\n"` — a leading
+blank line, which git's ignore grammar discards. A mutant there survives because it is behaviourally
+equivalent, not because nothing is watching. Writing a test for it would assert a byte the product does
+not care about.
+
+### The change end to end
+
+Code, spec, design, tests and README describe one system, with the single exception above.
+Cross-checks I made that no block review's range covered:
+
+- **"Fail to start" is real, not just "something throws".** The spec's refusal requirement
+  (`spec.md:34-36`) is only satisfied if the throw reaches the host. `Program.cs:108` awaits
+  `EnsureContentRepositoryAsync` uncaught, before `app.Run()`, so a `GitProcessException` from
+  `git add docs/.gitkeep .gitignore` exits the process. §1 built it, §2 tested the throw and the unborn
+  `HEAD`, and nothing in either block established the last link.
+- **Instruments.** The section does not rest on one. 2.1 drives the real unscoped `add -A`; 2.5 asserts
+  bytes; 2.5 and 2.1 both assert ignored-ness through pinned `check-ignore`; 2.7 asserts the refusal and
+  the absent commit. Worth recording, though, that the **append** branch (D5's whole reason to exist) is
+  evidenced only by `check-ignore` and by file bytes — the real reconciliation path is driven only for
+  the fresh-write branch. Both instruments read the same ignore machinery, so I rate the residual risk
+  low; it is named because it is the shape this project has been caught by, not because I found a defect
+  behind it.
+- **No residue of the withdrawn design.** `check-ignore` survives in `tests` only, as an assertion
+  instrument, documented as such at `ContentRepositoryServiceTests.cs:1523`. Nothing in `src` consults
+  it. `git status --short` clean; no mutation residue.
+- **The record is complete.** Both commits in range are covered by a reviewer verdict, and I recomputed
+  both. `0cf2df98555e` reproduces exactly for `c029b86`. `82db5dc6bf1c` reproduces for `b5a59ee` **only
+  once `tasks.md` is also excluded** — because the workflow verifies the fingerprint at step 6 and ticks
+  at step 7, so every block whose commit carries a tick has this offset by construction. That is not a
+  defect, but a future reader trying to reproduce a fingerprint from a commit range will fail without
+  it. The command that reproduces them here:
+
+  ```sh
+  git diff <base> <commit> -- ':/' ':(top,exclude,glob)**/DEVLOG.md' ':(top,exclude,glob)**/tasks.md' \
+    | shasum | cut -c1-12
+  ```
+
+### What my review could not see
+
+- I did not run the gates or any mutant; `GATES_EXIT:0`, 905 passed and the clean `git diff -- src` are
+  taken from the architect's post, not re-derived.
+- **Nothing here has been run against a real Obsidian vault.** The premise of this change came from the
+  Product Owner's `obsidian-git` run; the fix has been verified only by tests. And by D2 the Product
+  Owner's own wiki — an existing deployment — will never receive the rule, so confirming it needs a
+  fresh volume, not their live one.
+- I judged the README against the spec and the code, not against a reader. Whether its two paragraphs
+  land for someone who has never seen this change is a Product Owner judgement.
+
+**[architect]** Product Owner ruling: amend the proposal → @reviewer
+
+Put to the Product Owner at the two-round stop, per §3c.4. **Decision: amend.** The blocker's sentence
+describes system behaviour, not proposal-time intent, so freezing it would archive a false claim as the
+first thing a cold reader meets.
+
+`proposal.md:30-32` now leads on the code's discriminator — commit history, not the presence of a
+`.git` directory — names the unborn-`HEAD` case as initialized-and-seeded, and states that a root
+`.gitignore` already on such a volume is appended to rather than replaced. `proposal.md`'s Impact
+section needed nothing once the rule above it was right.
+
+**And this time I swept instead of fixing the reported line.** Every artefact grepped for the old
+discriminator and its looser phrasings. One more instance: `design.md:34`, in D1's *rejected*
+alternative — "mutate a repository it did not create". Rationale for a road not taken rather than a
+behaviour claim, so it misleads nobody on its own, but it is the same imprecise phrase and now reads
+"whose history it did not start". `spec.md:19` and `tasks.md:12` were checked and are correct as they
+stand.
+
+That sweep is the whole content of the supervisor's finding: four times in this change a correction
+fixed the sentence that was reported while a sibling stood, and the fourth was in the one artefact no
+block ever touched. `VALIDATE_EXIT:0` after the edits.
+
+**[reviewer]** Audit of the amendment block (`proposal.md`, `design.md`) → @architect
+
+### Verdict: Approve
+
+### What I checked
+
+**`proposal.md:30-33` against the code.** Read `ContentRepositoryService.cs:99-213` and
+`:687-762` directly rather than taking the prose on trust:
+
+- *"The discriminator is commit history, not the presence of a `.git` directory."* True.
+  `repositoryHasNoCommitsYet` (`:112`) is set from `RepositoryHeadIsUnbornAsync` when
+  `hasOwnGitEntry` is true (`:136`) and unconditionally `true` when there is no `.git` at all
+  (`:157`) — one predicate, both cases, exactly as claimed.
+- *"A repository that already has commits is not modified."* True — `EnsureInitialCommitAsync`'s
+  `if (!repositoryHasNoCommitsYet)` branch (`:706-715`) returns after only a
+  `Directory.Exists` check; no file, `.gitignore` included, is touched.
+- *"A volume whose `HEAD` is unborn... is initialized and seeded."* True — same predicate drives
+  both `AssertNoNestedGitRepository`/`git init` at `:179-188` and the seeding branch at
+  `:717` on down, for the `.git`-present/unborn-`HEAD` case as much as the no-`.git` case.
+- *"A root `.gitignore` already on such a volume is appended to rather than replaced."* True —
+  `:735-758`: file absent → write; file present → read lines, compare trimmed, append with a
+  completed separating newline if the operator's rule isn't already its own line, via
+  `File.AppendAllTextAsync`. No overwrite path exists.
+
+All four claims are exactly true of the code, not merely defensible.
+
+**Cross-artefact agreement.** `spec.md:19-21` ("The discriminator is history, not the presence of
+a `.git` directory: a volume carrying a repository whose `HEAD` is unborn has no history, and the
+system initializes it") states the identical fact in the identical frame — spec and proposal now
+read as one account, not two independently-worded ones that happen not to contradict. README.md's
+§"Obsidian's own files end up in the repository" (`:155-166`, corrected in `b5a59ee`, untouched by
+this block) already used commit-history framing and needed no further change. `design.md` D1/D2/D5
+already carried the correct discriminator throughout; the only edit in this block is `:34`.
+
+**`design.md:34`.** Confirmed in context: it sits inside D1's *rejected* ensure-on-every-start
+alternative, arguing the rejection from "mutate a repository whose history it did not start" —
+the same fact (history, not `.git`) applied to the rejected alternative's own action (mutating on
+every boot), not restated as a behaviour claim about the shipped design. The surrounding
+rationale — contradicts the adopt-as-it-stands posture, produces an unwanted startup commit — is
+unchanged. Meaning preserved; only the imprecise noun phrase was swapped for the precise one.
+
+**The sweep, redone independently.** Ran my own greps across every file in the change directory
+(`find . -name '*.md'`; `grep -rniE` for ".git directory" presence-language, "repository it did
+not create/initialize", and separately for every "left alone / untouched / not modified / not
+touched" occurrence, to catch a sentence that uses the correct noun but pairs it with the wrong
+verb) plus a manual read of `proposal.md`, `design.md`, `spec.md`, and `tasks.md:1-16` in full.
+Findings:
+
+- `tasks.md:12` ("a repository ZeroWiki adopts rather than initializes has its ignore rules left
+  untouched") frames the discriminator as *adopts-vs-initializes*, never as `.git` presence — no
+  correction needed, agrees with the architect's read.
+- `spec.md:19-21`, already quoted above — the corrected phrasing, source rather than target of the
+  sweep.
+- Every other "left alone/untouched/not modified" hit (`proposal.md:30-33,53`, `design.md:86`,
+  and every DEVLOG occurrence) is either post-correction text or historical thread record — DEVLOG
+  entries are append-only and not in scope for amendment.
+- No hit anywhere for the presence-of-`.git` framing outside the one instance the architect found
+  and fixed at `design.md:34`.
+
+I found nothing beyond what the architect's post already names. The sweep held up under an
+independent, differently-shaped set of greps plus a full manual read of the four non-DEVLOG
+artefacts — that is the instrument, and its blind spot is the same one any grep-based sweep has:
+a paraphrase that uses neither "`.git`" nor any of the "left alone/untouched/not modified/not
+touched" verbs (e.g. some entirely different verb) would not surface. I judge that risk low here
+given the phrase has recurred in a narrow, identifiable vocabulary across all three prior rounds,
+but it is not zero.
+
+### Blockers
+
+None.
+
+### Nits
+
+None — this is prose, not code, and the diff is exact.
+
+### Architectural notes
+
+- `## NEXT`'s resume line (`openspec/changes/.../DEVLOG.md:3151-3152`, unedited by this block)
+  still reads "§2 open, block 2.1–2.7 briefed. §1 is closed" — stale relative to §3 now closing.
+  Not this block's doing and not blocking; flagging for whoever next rewrites the pin.
+- Scope: this block touches only `proposal.md` and `design.md`, both proposal-time artefacts, no
+  `src/`, no `tests/`, no `tasks.md`. Squarely a documentation amendment, within the section, and
+  within the Product Owner's "amend" ruling — nothing here reaches into code or another section.
+
+### Reviewed-state: 1a8744a9b72d
+HEAD: c029b86
+
+**[architect]** Amendment block closed — gates green, committed
+
+`GATES_EXIT:0`, all four `_EXIT:0`, 905 passed. Fingerprint `1a8744a9b72d` matches the reviewer's
+Approve. Ticks nothing.
+
+### Two gate observations, both recorded because a clean final run hides them
+
+**1. The build-daemon diagnosis was incomplete.** §3 recorded `dotnet build-server shutdown` as the
+fix. This run failed *despite* a preemptive shutdown — `error : Error writing to source link file
+'obj/Debug/net10.0/ZeroWiki.LockTestHarness.sourcelink.json': Access ... denied`, a different project
+and a different file, same signature (`com.apple.provenance`, `-rw-r--r-- rendle staff`, appendable
+from a shell). Shutdown **plus** removing that one stale artefact gave `BUILD_EXIT:0`.
+
+So the condition is **both**: a daemon started under one sandbox *and* files it left behind. That is
+why each single fix appeared to work once and then failed — deleting `ZeroWiki.dll` alone did not fix
+it in §2, and shutdown alone did not fix it here. Corrected in preference to §3's account, which
+stands as written.
+
+**2. A transient test failure, unrelated to this change.**
+`GitSmartHttpRealClientTests.PageSavedThroughTheApp_IsWhatARealClientClones` failed once with
+`Assert.Equal() Failure: Expected: Saved / Actual: RepositoryBusy` — write-lock contention. Re-ran
+green (905/905), and green again in the gate run above; 905 had passed in every run before it. Nothing
+in this change touches the save path or the lock — §1's edit is bootstrap seeding only.
+
+**Recorded rather than dismissed.** A once-in-N lock-contention failure in the Smart HTTP client test
+is a real signal about that test or the lock, and "it passed on re-run" is how a genuine intermittent
+defect gets discovered three months later by someone else. It belongs to no section here — carried to
+`## NEXT` for the next session.
+
 ## NEXT
 
 **Resume point:** §2 open, block 2.1–2.7 briefed. §1 is **closed** — supervisor `Approve` on

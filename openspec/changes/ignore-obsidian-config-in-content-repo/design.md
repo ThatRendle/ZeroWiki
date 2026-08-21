@@ -31,7 +31,7 @@ because the editor chooses where it goes.
 **D1 — Seed it at bootstrap, not at every start.** The `.gitignore` is written and staged alongside
 `docs/.gitkeep` in the same initial commit, so a repository is never observable in a state where the rule
 is missing. *Alternative considered:* ensure-on-every-start, so existing deployments gain it too.
-Rejected — it makes the app mutate a repository it did not create, on every boot, which contradicts the
+Rejected — it makes the app mutate a repository whose history it did not start, on every boot, which contradicts the
 adopt-as-it-stands posture the `content-store` spec already takes for an existing volume, and would
 produce a commit (or a dirty tree) at startup for every operator who had deliberately not wanted one.
 
