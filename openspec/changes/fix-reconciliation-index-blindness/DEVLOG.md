@@ -1994,36 +1994,163 @@ build` still green (`0 Warning(s)`, `0 Error(s)`) after the revert.
 
 → @architect
 
+### Supervisor review — section 2 (block 2.1–2.3, `1e9ffcd..aedfdab`)
+
+**[supervisor]** Verdict: **Approve.**
+
+Scope read: `git log --oneline 1e9ffcd..HEAD` → `317a5c9` (the block) then `aedfdab` (artefact-only:
+`design.md` Decision 9, `proposal.md`, tasks 3.8/4.3). `git diff 1e9ffcd..HEAD -- src` is one file,
++125/-0. `git diff HEAD -- src` is empty — no mutation residue.
+
+**Confirmed, section-level:**
+
+1. **The wiring honours a precondition section 1 could only assert.** Section 1's
+   `ObserveSuppressedEntryAsync` remarks make "empty output, exit 0" the absence signal *only* because
+   `HEAD` is born, and stated that against two *candidate* call sites. 2.1 then moved the census to the
+   very top of `ReconcileWorkingTreeAsync` — the earliest `ls-tree` in the startup path so far.
+   `AcceptRepositoryAsync` still runs `EnsureInitialCommitAsync` (`:213`) before reconciliation (`:217`)
+   and the assertion (`:221`), so the precondition holds. Nobody re-checked it when the call site moved;
+   it is the kind of thing that survives a block review by being true rather than by being verified.
+2. **The gitlink reconstruction is faithful, including the two edges.** `newMode`/`oldMode`
+   (`:992`) map exactly onto `IndexMode`/`HeadMode` (`:1130`). Added-path (`oldMode 000000` → fault)
+   corresponds to `HeadMode: null` → `PathNotInHead` → fault: same verdict by a different arm, as the
+   remarks claim. The reverse shape (`IndexMode != 160000`, `HeadMode == 160000`) is not a fault in
+   either expression. No approximation anywhere.
+3. **Ordering is sound and needs no reset** — the census throws before `add -A`, so nothing is staged.
+4. **Decision 5's independence is real, not incidental.** `AssertWorkingTreeIsCleanAsync` re-runs
+   `FindSuppressedIndexObservationsAsync` from scratch; no field, no memo, no shared list. The two
+   `ls-files` spawns Decision 9 measured are themselves the evidence.
+5. **No dead scaffolding.** Every symbol section 1 built now has a live caller
+   (`FindSuppressedIndexObservationsAsync` ×2, `IsSuppressedEntryFault` ×2, `SymlinkMode`,
+   `GitlinkMode`, `InvariantLocale` all reachable from both sites). Section 1's "not yet called from
+   either candidate site" remark is now stale prose but is a `<remarks>` for section 3/4 to sweep, not
+   a shipping stub.
+
+**Findings — none blocking, all for `## NEXT` / a later block:**
+
+**F1 — the ordering comment's non-overlap claim is false, and all three audits shared one instrument.**
+`ContentRepositoryService.cs:809-812` says a nested-repository or unreadable-directory tree "carries no
+suppressed entry at all … this refusal cannot swallow theirs, nor can theirs swallow this one." The
+shapes are not mutually exclusive: a tree with a divergent suppressed entry *and* a nested repository
+refuses at the census, and the gitlink diagnosis is deferred to the next restart. That behaviour is
+fine — it is exactly the precedent the comment sixty lines below already documents for gitlink-vs-stderr
+("diagnosis is serial rather than lost, but it does cost a second restart") — but the method now carries
+two contradictory accounts of what happens when two faults coexist. Worth noting *how* this got here:
+the worker constructed nested-repo-alone and unreadable-dir-alone; the reviewer independently
+constructed nested-repo-alone and unreadable-dir-alone. Two audits, one instrument, and the instrument
+is shaped like the claim. Nobody built the combined tree. Fix is one sentence of prose plus a falsifier
+in section 3.
+
+**F2 — the harmless set is complete for *content* and open for *mode*.** `IsSuppressedEntryFault`
+consults the index/`HEAD` mode pair only when one side is a gitlink; every other mode-level divergence
+is settled by a byte comparison that can return `Matches`. Two shapes nobody has enumerated:
+(a) a suppressed entry whose content matches `HEAD` but whose executable bit changed on disk — starts
+normally, working tree ≠ `HEAD`, invisibly; (b) a suppressed `100644`↔`120000` typechange — decided by
+comparing link text against a regular file's blob. These are the symlink/gitlink-class shapes you asked
+me to look for, and I found them by asking what the policy *never looks at* rather than by listing more
+cases. **I do not recommend fixing (a) in code:** the obvious patch (stat the on-disk mode) ignores
+`core.fileMode` and would refuse startup on a filesystem where that bit is untrustworthy — precisely the
+false-refusal class this section exists to end. Product impact is nil for the symptom this change
+targets: git's own `updateInstead` check is blinded by the same suppression bit, so a mode-only
+divergence never bounces a push. Record the boundary at `IsSuppressedEntryFault` ("this policy decides
+content; mode is compared only for gitlinks") — a §4 line, not a code change.
+
+**F3 — `WorkingTreeUnreadable` is the one switch arm with no recorded reasoning.** Decision 4 names
+three divergent shapes and unreadable is not among them; section 1 invented the outcome and section 2
+promoted it to a fault. The remarks reason about `PathNotInHead`, `NotCompared` and the symlink
+typechange, and say nothing about this one — yet it is the arm most likely to fire in production on a
+file that is otherwise fine (Decision 8: the container runs non-root). I think fault is right, and
+consistent with the existing stderr refusal for an unreadable *directory* — but that is my reasoning,
+not the record's, and this section's whole history is recorded reasoning being wrong.
+
+**Section 3 is well-posed. Three things that make it cheaper:**
+
+- **3.4 has a construction needing no seam and no reflection** (`GitProcessRunner` is `sealed` and
+  non-virtual, so there is nothing to stub): a suppressed entry whose *index* blob differs from `HEAD`'s
+  while the *working tree* matches `HEAD`. 2.1's census compares working tree↔`HEAD` → `Matches` → it
+  passes; `add -A` skips the path; `diff --cached` is non-empty, so the recovery commit lands and
+  `HEAD`'s blob becomes the index blob; 2.3's re-derived census now sees `Differs` and refuses **on its
+  own**, with reconciliation having decided the same tree harmless moments earlier. That is a stronger
+  demonstration of Decision 5 than neutralising 2.1, and it dies if 2.3's census is deleted.
+- **3.6's gitlink case has two traps.** Build `HEAD`'s gitlink before boot (the pre-commit
+  nested-repository scan is gated on `repositoryHasNoCommitsYet`, so a repo with commits passes it), and
+  keep the nested repo clean — otherwise `AssertWorkingTreeIsCleanAsync`'s `status --porcelain` refuses
+  on "modified content" before the harmless-shape assertion is ever reached, and the test fails for a
+  reason that has nothing to do with what it is testing.
+- **Add F1's falsifier:** a tree with a suppressed divergence *and* a nested repository. Whatever it
+  shows, the comment should say it.
+
+**Decision 9:** not reopened — the diagnosis is measured and the scoping is the Product Owner's. One
+consequence for this section: 3.8's prohibition on sharing one census is exactly right, and the 3.4
+construction above is what makes that prohibition enforceable rather than merely written down.
+
+**What this review could not see.** I ran no gates, no tests and no container. Every behavioural claim
+about the four scenarios I re-derived by reading the committed code against `FindStagedGitlinksAsync`
+and the startup ordering — not by executing it; the executed evidence is the worker's and the
+reviewer's, both macOS/APFS. My reading and both of those runs share one blind spot, which is F1: none
+of the three of us put two faults in one tree. The glibc/EACCES claims remain untested by anyone and are
+still 3.7's.
+
+→ @architect
+
+## 3. Tests
+
+**[architect]** Base: `aedfdab` — the committed regression coverage: fixtures no existing dirty-tree
+helper can construct, the harmless shapes that must start, the combined tree nobody has built, the
+mutation check, the suite's runtime, and the one verification only the Product Owner can complete.
+
+### Inherited from section 2's close — read before briefing 3.1
+
+**[architect]** Section 2 closed on a `[supervisor]` `Approve` (`### Supervisor review — section 2`).
+Four things it left this section, three of which save work:
+
+1. **3.4 needs no seam.** `GitProcessRunner` is sealed and non-virtual, so neutralising reconciliation's
+   census looked like it needed test infrastructure. It does not: a suppressed entry whose **index**
+   blob differs from `HEAD` while the **working tree** matches `HEAD` passes 2.1's census, gets
+   committed, and is then refused by 2.3's re-derived census. That is 2.3 refusing alone, on a tree
+   reconciliation has just called harmless — the falsifier 3.4 was respecified to need.
+2. **3.6's gitlink case has an ordering trap.** Build `HEAD`'s gitlink *before* boot and keep the
+   nested repository clean, or `status --porcelain` refuses first for an unrelated reason and the test
+   passes for the wrong cause.
+3. **3.9 is new** (supervisor F1): the combined tree — a suppressed divergence *and* a nested repo —
+   which every audit so far failed to construct because worker, reviewer and supervisor each built the
+   fault shapes **alone**. Pin which refusal wins and that the deferred one fires on the next start.
+4. **3.7 remains unowned by any agent.** The glibc/EACCES claims are untested by *everyone* — worker,
+   reviewer and supervisor all say so explicitly. Only the container run closes it.
+
 ## NEXT
 
-**Resume point:** section 2, block 2.1–2.3 — section 1 is closed (`[supervisor]` `Approve`, round
-three). Base for section 2 is `1e9ffcd`.
+**Resume point:** section 3, block 3.1–3.4 + 3.6 + 3.9 (the committed regression tests). Sections 1
+and 2 are closed on `[supervisor]` `Approve`. Section 3's base is `aedfdab`.
 
-**State:** recompute, never trust a number written here — `git rev-parse --short HEAD`,
-`grep -c '^- \[x\]' tasks.md` against `grep -c '^- \[ \]'`, and the gate exit lines.
+**State:** recompute, never trust a number written here — `git rev-parse --short HEAD`, and
+`grep -c '^- \[x\]'` against `grep -c '^- \[ \]'` on `tasks.md`.
 
-**Owed:**
-- Section 2's three inherited decisions are posted under `## 2.`, not here — read
-  `### Inherited from section 1's close` before briefing 2.1.
-- **Task 3.7 is human-in-the-loop and is NOT tickable by any agent** (Decision 8, workflow §4). Hand
-  the Product Owner exact commands and expected output, then **wait**. Green gates are not their
-  confirmation.
-- Task 4.3 was added at section 1's close: `InvariantLocale`'s remark still states the glibc claim as
-  settled fact where a reader of the code will see it.
+**Block carve for section 3** (a block never spans sections; these are all within 3):
+- **3.1–3.4, 3.6, 3.9** — the committed tests, including the combined tree nobody has built.
+- **3.5** — the mutation check. **Load the `mutation-testing` skill before briefing it**, and brief
+  the `cp`-baseline-restored-by-`trap` revert explicitly. Never revert a mutant with `git checkout --`.
+- **3.8** — the suite runtime (Decision 9). **Do not let it share one census between the two invariant
+  sites**: that buys speed with Decision 5's independence, which is what makes 3.4 provable at all.
+- **3.7** — Product Owner verification, last. See below.
+
+**Owed, and not by an agent:**
+- **3.7 is human-in-the-loop and no agent may tick it** (Decision 8, workflow §4). Hand the Product
+  Owner exact commands and expected output, then **wait**. Green gates are not their confirmation.
+- Section 4 now owes 4.1, 4.2, 4.3 and 4.4. 4.4 corrects a **false claim currently in the code** —
+  the ordering comment at `ContentRepositoryService.cs:809-812` says the census cannot swallow the
+  gitlink/stderr diagnosis, and it can.
 
 **Live hazards:**
-- **Six parties, one host.** Every measurement in this change — worker, reviewer, supervisor, all
-  rounds — is git 2.55.0 / macOS APFS. The symlink, permission-bit, mode and `strerror` claims are
-  glibc behaviour. Section 3's tests run on that same host and **inherit** the gap; only 3.7 closes
-  it. Do not let a green suite be read as platform verification.
-- **This section produced the same defect class three times** — a false refusal on a harmless entry
-  (symlink, then gitlink, then nearly a globbed pathspec). Decision 7 removed the structural cause by
-  moving verdicts to section 2, which means **section 2 now holds the risk that kept materialising**.
-  Every fault decision it writes needs the harmless case as its own falsifier, not just the divergent
-  one.
+- **Every audit in this change has built its fault shapes alone.** That is how the symlink defect,
+  the gitlink defect, and now F1's combined tree all reached a later reviewer than they should have.
+  When briefing a falsifier, ask what the *combination* looks like, not just the case.
+- **Seven parties, one host.** Every measurement here is git 2.55.0 / macOS APFS. The symlink,
+  permission-bit, mode and `strerror` claims are glibc behaviour; section 3's tests run on that same
+  host and **inherit** the gap. Only 3.7 closes it. A green suite is not platform verification.
+- **`make test` currently takes ~18 minutes** (measured 18m13s alone). Budget for it, and do not read
+  a slow gate as a hung one. 3.8 is the task that fixes it.
 - **The `## NEXT` heading was destroyed once** by an agent's insert. Re-check `grep -n '^#\{1,3\} '`
   after every DEVLOG write.
-- 3.5 runs a mutant. Load the `mutation-testing` skill before briefing it, and brief the `cp`/`trap`
-  revert explicitly.
 
-**Open decisions:** none outstanding. Decisions 7 and 8 (Product Owner, 2026-08-21) are in `design.md`.
+**Open decisions:** none. Decisions 7, 8 and 9 (Product Owner, 2026-08-21) are in `design.md`.
