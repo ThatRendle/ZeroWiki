@@ -270,6 +270,12 @@ public sealed class ContentRepositoryServiceTests : IDisposable
         var lsFiles = await _git.RunOrThrowAsync(repositoryRoot, ["ls-files", "docs/copied-in.md"]);
         Assert.Equal("docs/copied-in.md", lsFiles.StandardOutput.Trim());
 
+        // Task 3.3 (spec scenario "Untracked content is still reconciled, not refused"): read the
+        // recovery commit's own tree, not just the current index — the two agree only because
+        // AssertPorcelainIsEmptyAsync below happens to hold; this assertion does not depend on that.
+        var committedContent = await _git.RunOrThrowAsync(repositoryRoot, ["show", "HEAD:docs/copied-in.md"]);
+        Assert.Equal("# Copied in\n", committedContent.StandardOutput);
+
         await AssertPorcelainIsEmptyAsync(repositoryRoot);
     }
 
@@ -1446,6 +1452,285 @@ public sealed class ContentRepositoryServiceTests : IDisposable
         // a commit that landed without the rule.
         var headProbe = await _git.RunAsync(repositoryRoot, ["rev-parse", "--verify", "-q", "HEAD"]);
         Assert.False(headProbe.Succeeded);
+    }
+
+    // ── fix-reconciliation-index-blindness §3: suppressed index entry regression coverage ──────
+    //
+    // Every fixture above builds its dirtiness through git's own comparisons (add/status), so none of
+    // them can construct a path whose --assume-unchanged/--skip-worktree bit hides a divergence from
+    // those very comparisons (Decision 6). SetSuppressedBitAsync below is that fixture; task 3.1's own
+    // falsifier test verifies the fixture actually suppresses before anything downstream relies on it.
+
+    public enum SuppressionKind
+    {
+        AssumeUnchanged,
+        SkipWorktree,
+    }
+
+    /// <summary>3.1's fixture: sets the bit via a real <c>git update-index</c> call, never through code
+    /// under test.</summary>
+    private async Task SetSuppressedBitAsync(string repositoryRoot, string repositoryRelativePath, SuppressionKind kind)
+    {
+        var flag = kind == SuppressionKind.AssumeUnchanged ? "--assume-unchanged" : "--skip-worktree";
+        await _git.RunOrThrowAsync(repositoryRoot, ["update-index", flag, "--", repositoryRelativePath]);
+    }
+
+    [Theory]
+    [InlineData(SuppressionKind.AssumeUnchanged, "h")]
+    [InlineData(SuppressionKind.SkipWorktree, "S")]
+    public async Task SuppressedIndexBitFixture_HidesADivergenceFromGitsOwnInstruments(
+        SuppressionKind kind, string expectedTag)
+    {
+        // Task 3.1's own falsifier: a fixture that silently failed to set the bit would make every
+        // test below pass for the wrong reason, and nothing downstream would notice. Checked directly
+        // against git's own output, not by trusting SetSuppressedBitAsync's exit code.
+        var service = CreateService();
+        await service.EnsureRepositoryAsync();
+        var repositoryRoot = RepositoryRoot;
+
+        await SetSuppressedBitAsync(repositoryRoot, "docs/.gitkeep", kind);
+        await File.WriteAllTextAsync(Path.Combine(repositoryRoot, "docs", ".gitkeep"), "diverged after the bit was set\n");
+
+        var lsFiles = await _git.RunOrThrowAsync(repositoryRoot, ["ls-files", "-v", "docs/.gitkeep"]);
+        Assert.Equal($"{expectedTag} docs/.gitkeep", lsFiles.StandardOutput.Trim());
+
+        var status = await _git.RunOrThrowAsync(repositoryRoot, ["status", "--porcelain"]);
+        Assert.Equal(string.Empty, status.StandardOutput);
+    }
+
+    [Theory]
+    [InlineData(SuppressionKind.AssumeUnchanged, "--assume-unchanged")]
+    [InlineData(SuppressionKind.SkipWorktree, "--skip-worktree")]
+    public async Task SuppressedTrackedFileThatDiverges_RefusesNamingThePathAndTheIndexState(
+        SuppressionKind kind, string expectedIndexStateName)
+    {
+        // Task 3.2, Decision 4 shape (a): both sides resolve and differ.
+        var service = CreateService();
+        await service.EnsureRepositoryAsync();
+        var repositoryRoot = RepositoryRoot;
+        var gitKeepPath = Path.Combine(repositoryRoot, "docs", ".gitkeep");
+
+        await SetSuppressedBitAsync(repositoryRoot, "docs/.gitkeep", kind);
+        await File.WriteAllTextAsync(gitKeepPath, "diverged after the bit was set\n");
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() => service.EnsureRepositoryAsync());
+        Assert.Contains("docs/.gitkeep", exception.Message, StringComparison.Ordinal);
+        Assert.Contains(expectedIndexStateName, exception.Message, StringComparison.Ordinal);
+
+        // Nothing was committed past the divergence, and the bit is untouched (Decision 3: never
+        // silently clear an operator's explicit instruction).
+        Assert.Equal("1", (await _git.RunOrThrowAsync(repositoryRoot, ["rev-list", "--count", "HEAD"])).StandardOutput.Trim());
+        var expectedTag = kind == SuppressionKind.AssumeUnchanged ? "h" : "S";
+        var lsFiles = await _git.RunOrThrowAsync(repositoryRoot, ["ls-files", "-v", "docs/.gitkeep"]);
+        Assert.Equal($"{expectedTag} docs/.gitkeep", lsFiles.StandardOutput.Trim());
+    }
+
+    [Theory]
+    [InlineData(SuppressionKind.AssumeUnchanged)]
+    [InlineData(SuppressionKind.SkipWorktree)]
+    public async Task SuppressedTrackedFileDeletedFromWorkingTree_RefusesAsAMissingFile(SuppressionKind kind)
+    {
+        // Task 3.2, Decision 4 shape (b): the working-tree file is absent — a suppressed deletion.
+        var service = CreateService();
+        await service.EnsureRepositoryAsync();
+        var repositoryRoot = RepositoryRoot;
+        var gitKeepPath = Path.Combine(repositoryRoot, "docs", ".gitkeep");
+
+        await SetSuppressedBitAsync(repositoryRoot, "docs/.gitkeep", kind);
+        File.Delete(gitKeepPath);
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() => service.EnsureRepositoryAsync());
+        Assert.Contains("docs/.gitkeep", exception.Message, StringComparison.Ordinal);
+
+        Assert.Equal("1", (await _git.RunOrThrowAsync(repositoryRoot, ["rev-list", "--count", "HEAD"])).StandardOutput.Trim());
+    }
+
+    [Fact]
+    public async Task SuppressedEntryStagedButNeverCommitted_RefusesAsNotInHead()
+    {
+        // Task 3.2, Decision 4 shape (c): the path is in the index but never made it into a commit
+        // while suppressed, so it can never be staged or committed by reconciliation either.
+        var service = CreateService();
+        await service.EnsureRepositoryAsync();
+        var repositoryRoot = RepositoryRoot;
+
+        var newPagePath = Path.Combine(repositoryRoot, "docs", "uncommitted.md");
+        await File.WriteAllTextAsync(newPagePath, "# Uncommitted\n");
+        await _git.RunOrThrowAsync(repositoryRoot, ["add", "docs/uncommitted.md"]);
+        await SetSuppressedBitAsync(repositoryRoot, "docs/uncommitted.md", SuppressionKind.AssumeUnchanged);
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() => service.EnsureRepositoryAsync());
+        Assert.Contains("docs/uncommitted.md", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("--assume-unchanged", exception.Message, StringComparison.Ordinal);
+
+        // The census runs before `add -A`, so the refusal fired before anything was staged or
+        // committed past the one initial commit.
+        Assert.Equal("1", (await _git.RunOrThrowAsync(repositoryRoot, ["rev-list", "--count", "HEAD"])).StandardOutput.Trim());
+    }
+
+    [Theory]
+    [InlineData(SuppressionKind.AssumeUnchanged)]
+    [InlineData(SuppressionKind.SkipWorktree)]
+    public async Task SuppressedTrackedFileMatchingHead_StartsNormally(SuppressionKind kind)
+    {
+        // Task 3.2, Decision 4's harmless case: the invariant the bit protects is intact, so this must
+        // not refuse — the falsifier for a guard keyed on the bit's presence rather than on divergence.
+        var service = CreateService();
+        await service.EnsureRepositoryAsync();
+        var repositoryRoot = RepositoryRoot;
+
+        await SetSuppressedBitAsync(repositoryRoot, "docs/.gitkeep", kind);
+
+        await service.EnsureRepositoryAsync();
+
+        await AssertPorcelainIsEmptyAsync(repositoryRoot);
+        Assert.Equal("1", (await _git.RunOrThrowAsync(repositoryRoot, ["rev-list", "--count", "HEAD"])).StandardOutput.Trim());
+    }
+
+    [Fact]
+    public async Task SuppressedEntryHarmlessAtReconciliationButDivergentAfterItsOwnCommit_RefusesAtTheSelfCheckAlone()
+    {
+        // Task 3.4 (Decision 5's own falsifier, construction from the section 2 supervisor — no test
+        // seam needed, GitProcessRunner is sealed and non-virtual): stage different content into the
+        // index, suppress the path (so add -A no longer looks at the working tree for it), then restore
+        // the working tree to match what HEAD still holds. Reconciliation's census compares working
+        // tree↔HEAD → Matches → it passes; add -A leaves the suppressed path alone; the index still
+        // differs from HEAD, so the recovery commit lands, and HEAD's blob becomes the staged content.
+        // Only then does the (untouched) working tree diverge from the new HEAD — caught only by
+        // AssertWorkingTreeIsCleanAsync re-deriving its own census independently, which is exactly what
+        // this test must die if 2.3 alone is reverted (self-tested below, not asserted from the code).
+        var service = CreateService();
+        await service.EnsureRepositoryAsync();
+        var repositoryRoot = RepositoryRoot;
+        var gitKeepPath = Path.Combine(repositoryRoot, "docs", ".gitkeep");
+
+        await File.WriteAllTextAsync(gitKeepPath, "staged before suppression\n");
+        await _git.RunOrThrowAsync(repositoryRoot, ["add", "docs/.gitkeep"]);
+
+        await SetSuppressedBitAsync(repositoryRoot, "docs/.gitkeep", SuppressionKind.AssumeUnchanged);
+
+        // Restore the working tree to the original (still-HEAD) content. The index keeps the blob
+        // staged above; only the working tree is reverted.
+        await File.WriteAllTextAsync(gitKeepPath, string.Empty);
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() => service.EnsureRepositoryAsync());
+        Assert.Contains("docs/.gitkeep", exception.Message, StringComparison.Ordinal);
+
+        // Reconciliation itself did not refuse — it committed the staged content (D9's "always commit"
+        // policy, applied to what its own census had just called harmless): a second commit exists, and
+        // it is the staged content, not the original.
+        Assert.Equal("2", (await _git.RunOrThrowAsync(repositoryRoot, ["rev-list", "--count", "HEAD"])).StandardOutput.Trim());
+        var committedContent = await _git.RunOrThrowAsync(repositoryRoot, ["show", "HEAD:docs/.gitkeep"]);
+        Assert.Equal("staged before suppression\n", committedContent.StandardOutput);
+    }
+
+    [Theory]
+    [InlineData(SuppressionKind.AssumeUnchanged)]
+    [InlineData(SuppressionKind.SkipWorktree)]
+    public async Task SuppressedAlreadyAdoptedGitlink_StartsNormally(SuppressionKind kind)
+    {
+        // Task 3.6, the gitlink shape section 1 got wrong. Ordering trap (section 2 supervisor): the
+        // gitlink must already be in HEAD *before* this restart, and the nested repository must stay
+        // clean — otherwise AssertWorkingTreeIsCleanAsync's `status --porcelain` refuses first, for a
+        // reason unrelated to suppression, and this test would pass for the wrong cause.
+        var service = CreateService();
+        await service.EnsureRepositoryAsync();
+        var repositoryRoot = RepositoryRoot;
+
+        var nestedPath = Path.Combine(repositoryRoot, "docs", "adopted-vault");
+        await CreateNestedGitRepositoryDirectoryAsync(nestedPath);
+
+        // Commit the gitlink directly, bypassing ReconcileWorkingTreeAsync's own guard entirely —
+        // standing in for a gitlink already adopted into HEAD before this restart.
+        await _git.RunOrThrowAsync(repositoryRoot, ["add", "-A"]);
+        await _git.RunOrThrowAsync(
+            repositoryRoot,
+            ["commit", "-m", "gitlink already adopted before suppression"],
+            GitAuthor.System.ToEnvironmentVariables());
+
+        await SetSuppressedBitAsync(repositoryRoot, "docs/adopted-vault", kind);
+
+        // Must succeed: index mode 160000, HEAD mode also 160000 — the harmless side of the
+        // reconstructed gitlink condition (2.2), and the nested repository is untouched since the
+        // commit above, so status --porcelain has nothing else to report.
+        await service.EnsureRepositoryAsync();
+        await AssertPorcelainIsEmptyAsync(repositoryRoot);
+    }
+
+    [Theory]
+    [InlineData(SuppressionKind.AssumeUnchanged)]
+    [InlineData(SuppressionKind.SkipWorktree)]
+    public async Task SuppressedUnmodifiedSymlink_StartsNormally(SuppressionKind kind)
+    {
+        // Task 3.6, the symlink shape section 1 got wrong (Blocker 1). The container's actual deployment
+        // target is Linux; symlink creation on Windows needs elevation, matching the existing
+        // Windows-skip precedent elsewhere in this file.
+        if (OperatingSystem.IsWindows())
+        {
+            return;
+        }
+
+        var service = CreateService();
+        await service.EnsureRepositoryAsync();
+        var repositoryRoot = RepositoryRoot;
+
+        var linkPath = Path.Combine(repositoryRoot, "docs", "link.md");
+        File.CreateSymbolicLink(linkPath, "target.md");
+        await _git.RunOrThrowAsync(repositoryRoot, ["add", "docs/link.md"]);
+        await _git.RunOrThrowAsync(
+            repositoryRoot,
+            ["commit", "-m", "add a symlink before suppression"],
+            GitAuthor.System.ToEnvironmentVariables());
+
+        await SetSuppressedBitAsync(repositoryRoot, "docs/link.md", kind);
+
+        // Nothing about the symlink changed since it was committed — the harmless shape Blocker 1
+        // exists to protect.
+        await service.EnsureRepositoryAsync();
+        await AssertPorcelainIsEmptyAsync(repositoryRoot);
+    }
+
+    [Fact]
+    public async Task SuppressedDivergenceAndANestedRepository_TheSuppressedEntryRefusesFirstAndTheGitlinkFaultIsDeferred()
+    {
+        // Task 3.9. Every audit in this change (worker, reviewer, supervisor) constructed its fault
+        // shapes alone; this builds two together in one working tree — a suppressed, divergent tracked
+        // file, and an untracked nested git repository not yet a gitlink in HEAD. The doc comment at
+        // ContentRepositoryService.cs:809-812 claims neither refusal "can swallow" the other; this pins
+        // which one actually wins on a single restart, and that the deferred one still fires on the
+        // very next restart, so a reader does not mistake "wins first" for "the other is lost".
+        var service = CreateService();
+        await service.EnsureRepositoryAsync();
+        var repositoryRoot = RepositoryRoot;
+        var gitKeepPath = Path.Combine(repositoryRoot, "docs", ".gitkeep");
+
+        await SetSuppressedBitAsync(repositoryRoot, "docs/.gitkeep", SuppressionKind.AssumeUnchanged);
+        await File.WriteAllTextAsync(gitKeepPath, "diverged\n");
+
+        var nestedPath = Path.Combine(repositoryRoot, "docs", "copied-vault");
+        await CreateNestedGitRepositoryDirectoryAsync(nestedPath);
+
+        // First restart: the suppressed-entry census runs before `add -A`/the gitlink check, so its
+        // fault wins — the gitlink is not even named yet.
+        var firstException = await Assert.ThrowsAsync<InvalidOperationException>(() => service.EnsureRepositoryAsync());
+        Assert.Contains("docs/.gitkeep", firstException.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("copied-vault", firstException.Message, StringComparison.Ordinal);
+
+        Assert.Equal("1", (await _git.RunOrThrowAsync(repositoryRoot, ["rev-list", "--count", "HEAD"])).StandardOutput.Trim());
+        var lsFilesAfterFirstRefusal = await _git.RunOrThrowAsync(repositoryRoot, ["ls-files", "--stage"]);
+        Assert.DoesNotContain("160000", lsFilesAfterFirstRefusal.StandardOutput, StringComparison.Ordinal);
+
+        // Fix only the suppressed divergence — restore the working tree to match HEAD. The bit itself
+        // is never cleared (Decision 3), so the census still runs on the next restart, but now reports
+        // Matches for this path.
+        await File.WriteAllTextAsync(gitKeepPath, string.Empty);
+
+        // Second restart: the suppressed entry is harmless now, so the deferred gitlink fault fires —
+        // proving the first refusal did not silently lose it.
+        var secondException = await Assert.ThrowsAsync<InvalidOperationException>(() => service.EnsureRepositoryAsync());
+        Assert.Contains("docs/copied-vault", secondException.Message, StringComparison.Ordinal);
+
+        Assert.Equal("1", (await _git.RunOrThrowAsync(repositoryRoot, ["rev-list", "--count", "HEAD"])).StandardOutput.Trim());
     }
 
     /// <summary>

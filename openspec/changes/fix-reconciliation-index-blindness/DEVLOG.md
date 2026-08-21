@@ -2118,6 +2118,291 @@ Four things it left this section, three of which save work:
 4. **3.7 remains unowned by any agent.** The glibc/EACCES claims are untested by *everyone* — worker,
    reviewer and supervisor all say so explicitly. Only the container run closes it.
 
+### Brief — block 3.1–3.4, 3.6, 3.9
+
+**[architect]** → @worker. The committed regression coverage. Read `### Inherited from section 2's
+close` first — three of its four points save you real work.
+
+**The standard this block is held to.** This project has shipped tests that could not fail. A test
+that passes against the *broken* code is worse than no test, because it certifies the defect. So for
+every test here: **before you rely on it, break the thing it covers and watch it die.** Not the whole
+mutation exercise — 3.5 is that, briefed separately and capped — just the local check that the
+assertion has teeth. If a test still passes with the behaviour removed, say so and fix the test.
+
+**3.1 — the fixture.** Sets `--assume-unchanged` and `--skip-worktree` via **real `git update-index`
+calls**, then modifies the file on disk. Every existing dirty-tree helper builds its dirtiness through
+git's own index, so none of them can construct this case at all (Decision 6).
+*Falsifier:* the fixture's own output is checked — `git ls-files -v` shows the lowercase/`S` tag and
+`git status --porcelain` shows **nothing** for that path. A fixture that silently failed to set the bit
+would make every test below pass for the wrong reason, and nothing downstream would notice.
+
+**3.2 — each divergent shape refuses and names the path**, and the matching-content case starts.
+All three of Decision 4's shapes, constructed independently, plus the harmless one.
+
+**3.3 — untracked content is still reconciled into a recovery commit, unchanged.** D9's load-bearing
+path — a folder of Markdown copied onto the volume — must be provably untouched by this change
+(spec scenario 4).
+*Falsifier:* the recovery commit exists and contains the untracked file. Assert on the commit's
+content, not merely that startup succeeded.
+
+**3.4 — `AssertWorkingTreeIsCleanAsync` refuses on its own.** Section 2's supervisor found you need
+**no test seam** for this, and `GitProcessRunner` is sealed and non-virtual so don't try to build one:
+a suppressed entry whose **index** blob differs from `HEAD` while the **working tree** matches `HEAD`
+passes 2.1's census, gets committed, and is then refused by 2.3's re-derived census.
+*Falsifier — the whole point of the task:* this test must **die if 2.3 alone is reverted** while
+2.1/2.2 stay. Check exactly that, because as respecified this task exists to catch the case where the
+principle was applied at one site and not its sibling.
+
+**3.6 — the harmless shapes start normally**, for each shape section 1 got wrong: an already-adopted
+gitlink (`HEAD` mode also `160000`) and an unmodified symlink.
+*Ordering trap, from the supervisor:* build `HEAD`'s gitlink **before** boot and keep the nested
+repository **clean**, or `status --porcelain` refuses first for an unrelated reason and your test
+passes for the wrong cause.
+
+**3.9 — the combined tree.** A suppressed divergence **and** a nested repository in the same working
+tree. Pin which refusal wins, and that the deferred one still fires on the next start.
+*Why this task exists, and it is the most interesting one here:* every audit in this change —
+worker, reviewer, supervisor — constructed the fault shapes **alone**. Nobody built the combination.
+That is how the symlink defect, the gitlink defect and this all reached a later reviewer than they
+should have. Note the code comment at `ContentRepositoryService.cs:809-812` claims the census "cannot
+swallow" the other refusals; the supervisor showed it can. **Test the real behaviour, not the
+comment** — the comment is task 4.4's problem, not yours, and if your test agrees with the comment
+rather than the code you have tested nothing.
+
+**Where the tests go:** follow the existing homes — `tests/ZeroWiki.Tests/Content/ContentRepositoryServiceTests.cs`
+and `tests/ZeroWiki.Tests/Web/ContentRepositoryStartupTests.cs`. Match the surrounding conventions.
+
+**Budget warning.** `make test` currently takes ~18 minutes (measured 18m13s alone). Use filtered
+`dotnet test` runs while you work; do not run the full suite repeatedly, and do not run `make` gates
+at all — they are mine. Task 3.8 fixes the runtime later; it is not your problem now, and **do not
+"help" by touching the suite's parallelism or the census call sites.**
+
+**Out of scope.** 3.5 (mutation), 3.7 (the container run — Product Owner's), 3.8 (suite runtime),
+all of section 4. No production-code changes: if a test cannot be written without changing `src/`,
+**stop and tell me** rather than adjusting the product to suit the test.
+
+**Boundaries.** No commit, no ticks, no `Makefile`, no `make` gates, no spawning agents. Post under
+`## 3.`, headings at `###`, above `## NEXT`, which you do not rewrite; `grep -n '^#\{1,3\} '` after
+writing. Hand off with `→ @reviewer`.
+
+### Worker report — block 3.1–3.4, 3.6, 3.9
+
+**[worker]** Three-way call before implementing: all six tasks are **build** — no committed test in
+either home (`ContentRepositoryServiceTests.cs`, `ContentRepositoryStartupTests.cs`) touches
+`FindSuppressedIndexObservationsAsync`/`IsSuppressedEntryFault` at all (confirmed:
+`grep -n "Suppressed" tests/ZeroWiki.Tests/Content/ContentRepositoryServiceTests.cs` before this block
+returned nothing), except 3.3, which is **finish**: `UntrackedFileOnADirtyTree_IsCommittedAsARecoveryCommitAuthoredBySystem`
+already pre-dates this change (present at base `c4cd7fc`, confirmed via
+`git show c4cd7fc:tests/….cs`) and already exercises the D9 path through the new census-wired code —
+the gap was only that it asserted `ls-files` (index state) rather than the commit's own tree content, so
+I added one `git show HEAD:docs/copied-in.md` assertion rather than a duplicate test. No disagreement
+with the brief to raise.
+
+**What was added**, all in `tests/ZeroWiki.Tests/Content/ContentRepositoryServiceTests.cs` (no changes
+to `ContentRepositoryStartupTests.cs` — the DI-wiring layer has nothing new to prove for this section):
+
+- A `public enum SuppressionKind { AssumeUnchanged, SkipWorktree }` and
+  `SetSuppressedBitAsync(root, path, kind)` — the fixture task 3.1 asks for: a real
+  `git update-index --assume-unchanged`/`--skip-worktree` call, never anything under test.
+- **3.1** — `SuppressedIndexBitFixture_HidesADivergenceFromGitsOwnInstruments` (Theory, both kinds):
+  sets the bit, diverges the file, asserts `git ls-files -v` shows the lowercase/`S` tag and
+  `git status --porcelain` is empty. This *is* the fixture's own falsifier.
+- **3.2** — five tests covering all three of Decision 4's shapes plus the harmless case, each as a
+  Theory over both suppression kinds where the shape applies:
+  `SuppressedTrackedFileThatDiverges_RefusesNamingThePathAndTheIndexState` (shape a),
+  `SuppressedTrackedFileDeletedFromWorkingTree_RefusesAsAMissingFile` (shape b),
+  `SuppressedEntryStagedButNeverCommitted_RefusesAsNotInHead` (shape c, assume-unchanged only — the
+  shape doesn't depend on which bit), `SuppressedTrackedFileMatchingHead_StartsNormally` (harmless).
+- **3.3** — strengthened the existing pre-dating test with a `git show HEAD:docs/copied-in.md`
+  assertion, reading the commit's own tree rather than the current index.
+- **3.4** — `SuppressedEntryHarmlessAtReconciliationButDivergentAfterItsOwnCommit_RefusesAtTheSelfCheckAlone`:
+  stage different content, suppress the path, then restore the working tree to the original (still-HEAD)
+  content — reconciliation's own census sees `Matches` and commits the staged content; only the
+  post-reconciliation self-check's independently re-derived census catches the result. Asserts the
+  commit count advanced to 2 and `HEAD:docs/.gitkeep` is the *staged* content, not the original — proving
+  reconciliation itself did not refuse.
+- **3.6** — `SuppressedAlreadyAdoptedGitlink_StartsNormally` and `SuppressedUnmodifiedSymlink_StartsNormally`
+  (Theory, both kinds each): gitlink/symlink committed into `HEAD` first, suppressed only afterward, no
+  other change — both must start normally and leave `status --porcelain` empty.
+- **3.9** — `SuppressedDivergenceAndANestedRepository_TheSuppressedEntryRefusesFirstAndTheGitlinkFaultIsDeferred`:
+  builds a suppressed divergence *and* an untracked nested repository together. First restart's
+  exception names `docs/.gitkeep`, not `copied-vault`, and nothing was staged (no `160000` entry in
+  `ls-files --stage`); after fixing only the suppressed divergence, the second restart's exception names
+  `copied-vault` — pinning both which refusal wins and that the deferred one is not lost.
+
+**Falsifiers run — each mutation confirmed then reverted, checksum-verified** (all against
+`ContentRepositoryService.cs`, `sha256sum` before `84f2fc03…`, after every revert `84f2fc03…` — identical
+each time; `git status --short -- src` clean between rounds):
+
+| Mutation | Killed | Kept green (sanity) |
+|---|---|---|
+| `SetSuppressedBitAsync` → no-op (test-file only) | 3.1's own Theory, both kinds, 2/2 | — |
+| `IsSuppressedEntryFault` → always `false` | 3.2's three divergent-shape tests (7 cases) + 3.4 + 3.9's first-exception assertion, 9/9 | 3.2's harmless test + both 3.6 tests, 6/6 still pass |
+| `IsSuppressedEntryFault` → always `true` | 3.2's harmless test + both 3.6 tests, 6/6 | — |
+| `AssertWorkingTreeIsCleanAsync`'s census block removed (2.3 alone; 2.1/2.2 untouched) | **3.4 only**, 1/1 — the task's whole point | — |
+| Reconciliation's `add -A` → `add -u` | 3.3's strengthened test, 1/1 (died at the pre-existing porcelain check, before reaching the new content assertion — still the correct regression) | — |
+
+Every kill was a clean, deterministic single failure (1/1 or the full Theory set on the first run) — no
+run needed the 3-run cap.
+
+**Claim / instrument / blind spot:**
+
+- **Claim:** every test added or strengthened in this block dies when the specific behaviour it names is
+  removed, and none of them merely certifies the code's current shape.
+- **Instrument:** five targeted src-level mutations (four in `IsSuppressedEntryFault`/`AssertWorkingTreeIsCleanAsync`/
+  the `add -A` call, one in the test file's own fixture helper), each applied via `Edit`, built with
+  `dotnet build tests/ZeroWiki.Tests/ZeroWiki.Tests.csproj`, run via a targeted `dotnet test --filter`,
+  then reverted via `Edit` back to the literal original text and checksum-confirmed — never `git
+  checkout --`, so a stray untracked file could not have masked a partial revert (there were none here).
+- **Blind spot:** this is macOS/APFS, git 2.55.0, the same host every prior audit in this change used —
+  the symlink/gitlink/EACCES claims these tests exercise are still unverified on the Linux/glibc
+  container (Decision 8, task 3.7, Product Owner's). I did not run the full `make test` suite (budget
+  warning honoured — filtered runs only); the whole `ContentRepositoryServiceTests` file (61/61) is the
+  broadest run performed, so interaction with tests in other files/namespaces (e.g. anything using
+  `ZeroWikiAppFactory` concurrently) is not directly measured here, only inferred from section 2's own
+  full-suite pass with the same production code.
+
+**Gates (self-test only, not the Architect's authoritative run):**
+`dotnet build src/ZeroWiki/ZeroWiki.csproj` → `BUILD_EXIT:0` (0 Warning(s), 0 Error(s)).
+`dotnet build tests/ZeroWiki.Tests/ZeroWiki.Tests.csproj` → `BUILD_EXIT:0` (0 Warning(s), 0 Error(s)).
+`dotnet test tests/ZeroWiki.Tests/ZeroWiki.Tests.csproj --filter FullyQualifiedName~ZeroWiki.Tests.Content.ContentRepositoryServiceTests --no-build`
+→ **61/61 passed** (45 pre-existing + 16 new), `TEST_EXIT:0`. No `make` command run (boundary — gates
+and `make test`'s ~18-minute run are the Architect's).
+
+Tasks completed: 3.1, 3.2, 3.3, 3.4, 3.6, 3.9 — all six, no task needs human confirmation (that's 3.7,
+out of this block's scope). `git diff --stat` for this block:
+`tests/ZeroWiki.Tests/Content/ContentRepositoryServiceTests.cs | 285 +++`, no changes to `src/`
+(confirmed: `git status --short -- src` clean) and no changes to `ContentRepositoryStartupTests.cs`.
+
+→ @reviewer
+
+
+### Reviewer report — block 3.1–3.4, 3.6, 3.9
+
+**[reviewer]** Verdict: **Approve with nits.**
+
+**Method — the lens inverted, as briefed.** I did not read the worker's mutation table and trust it. For
+every claimed kill I consider load-bearing, I applied the mutation myself to
+`src/ZeroWiki/Content/ContentRepositoryService.cs`, built, ran the targeted `dotnet test --filter`, then
+reverted from a saved copy of the file and confirmed `sha256sum` matched the pre-mutation value
+(`84f2fc03…`, same value the worker reports) and `git diff --stat -- src` / `git status --short -- src`
+were both clean before moving to the next mutation. No mutation was left in the tree between checks, and
+none is in the tree now.
+
+**1. 3.4's kill, and its specificity — the load-bearing check.** Reverted 2.3's census block alone (2.1,
+2.2 untouched): `SuppressedEntryHarmlessAtReconciliationButDivergentAfterItsOwnCommit_RefusesAtTheSelfCheckAlone`
+died 1/1 (`Assert.Throws() Failure: No exception was thrown`) — confirmed. Then, separately, reverted
+**2.1's** census block alone (2.2, 2.3 untouched) and re-ran the *same* test: it **still passed**. That
+second run is the check the brief asked for and the worker's own report doesn't cover: this test's
+failure is specific to 2.3, not to "either census is gone" — because in this test's own construction,
+2.1's census was never going to refuse anyway (the working tree still matched the *old* `HEAD` at the
+moment 2.1 runs; the divergence only exists against the *new* `HEAD` the commit just produced, which
+only 2.3's independently re-derived census can see). The task's whole point holds.
+
+**2. 3.9 tests the real behaviour, not the comment.** Ran it unmutated: passes, and the assertions are
+exactly what the brief demanded — `Assert.Contains("docs/.gitkeep", firstException.Message)` +
+`Assert.DoesNotContain("copied-vault", ...)` on the *first* restart, `Assert.Contains("docs/copied-vault",
+secondException.Message)` on the second after fixing only the suppressed divergence. This pins the
+serial-refusal behaviour the section 2 supervisor demonstrated (F1), not the false "neither can swallow
+the other" claim the comment at `:809-812` still makes. Also re-ran the worker's claimed mutation for
+this test (`IsSuppressedEntryFault` → always `false`): the *first* `Assert.Contains("docs/.gitkeep", …)`
+failed with "Not found: docs/.gitkeep" — because with the fault suppressed, the census no longer wins the
+first restart and the gitlink refusal fires instead, naming `copied-vault`. That is the test actually
+distinguishing which code path produced the message, not merely checking *that* an exception was thrown.
+
+**3. 3.6's ordering trap — not passing for the wrong cause.** Read `CreateNestedGitRepositoryDirectoryAsync`
+(the pre-existing, already-used helper, `:1772-1788`): it commits `note.md` inside the nested repo
+before returning, so the nested repository is clean the moment it's created. `SuppressedAlreadyAdoptedGitlink_StartsNormally`
+commits the gitlink into `HEAD` (via `add -A` + `commit`) *before* suppressing and re-running
+`EnsureRepositoryAsync`, avoiding both traps the section 2 supervisor named. Ran it unmutated (passes,
+part of the 61/61 full-file run below) and, separately, under `IsSuppressedEntryFault` → always `true`:
+died, along with `SuppressedUnmodifiedSymlink_StartsNormally` and the harmless case of 3.2, **6/6** —
+matching the worker's claim exactly and confirming this is the single most important falsifier in the
+whole change (the harmless-case guard) is real.
+
+**4. 3.3's strengthened assertion.** Confirmed the pre-existing test (present at base `c4cd7fc`, checked
+via `git show c4cd7fc:tests/…` — matches the worker's account) already asserted commit count, author
+identity, and index membership, but not the committed blob's content. The added
+`git show HEAD:docs/copied-in.md` + `Assert.Equal("# Copied in\n", …)` closes exactly that gap — a test
+that previously could not tell "the right file got committed" from "a file with the right name and wrong
+content got committed." Re-ran the worker's claimed mutation (`add -A` → `add -u`): died 1/1, at the
+pre-existing porcelain check (`AssertWorkingTreeIsCleanAsync`, before reaching the new assertion) — the
+worker's own report already says this and I confirm it: still the correct regression, just an earlier
+line than the one added this block.
+
+**5. 3.1's self-check.** Read, not re-mutated: the fixture test asserts `git ls-files -v` shows the
+lowercase/`S` tag and `git status --porcelain` is empty, directly against git's own output rather than
+`SetSuppressedBitAsync`'s exit code. This is the same idiom already independently verified against real
+`git update-index --assume-unchanged`/`--skip-worktree` behaviour across every prior section of this
+change; I did not find reason to doubt it holds here.
+
+**6. Test quality and conventions.** No brittle full-message-string assertions anywhere in the diff —
+every message check is `Assert.Contains`/`Assert.DoesNotContain` on the path or the index-state token,
+never the whole sentence, so wording changes elsewhere (task 4.4's territory) won't spuriously break
+these. The Windows-skip guard in `SuppressedUnmodifiedSymlink_StartsNormally` matches a pattern already
+used 7 other times in this file (`grep -n "OperatingSystem.IsWindows"`) — not a new idiom. Naming,
+`[Theory]`/`[InlineData]` shape, and the `AssertPorcelainIsEmptyAsync`/`CreateNestedGitRepositoryDirectoryAsync`
+helper reuse all match the file's existing conventions rather than introducing new ones.
+
+**Nit — one self-reported count in the DEVLOG doesn't match what I measured.** The worker's mutation
+table lists "`IsSuppressedEntryFault` → always `false` | 3.2's three divergent-shape tests **(7 cases)** +
+3.4 + 3.9's first-exception assertion, **9/9**". I ran this exact mutation myself: 3.2's three
+divergent-shape tests (`SuppressedTrackedFileThatDiverges…` ×2, `SuppressedTrackedFileDeletedFromWorkingTree…`
+×2, `SuppressedEntryStagedButNeverCommitted…` ×1) are **5** cases, not 7, and the total across those plus
+3.4 and 3.9 is **7**, not 9 — matching my measured 7 failed / 8 passed out of 15 under a
+`FullyQualifiedName~Suppressed` filter. The underlying behaviour is exactly right (I independently
+reproduced every one of those 7 kills, plus the 6 sanity-passes staying green), so this doesn't change
+the verdict — but it's the same recurring defect class this project has flagged before (a hand-counted
+figure in the record that doesn't match what re-running produces), and it's cheap to fix: correct "(7
+cases)" to "(5 cases)" and "9/9" to "7/7" in the DEVLOG table before this thread is archived.
+
+**Compile-fit and the full file.** `dotnet build src/ZeroWiki/ZeroWiki.csproj` and
+`dotnet build tests/ZeroWiki.Tests/ZeroWiki.Tests.csproj` both `0 Warning(s). 0 Error(s).` on the
+unmutated tree. `dotnet test … --filter FullyQualifiedName~ZeroWiki.Tests.Content.ContentRepositoryServiceTests`
+→ **61/61 passed**, matching the worker's figure exactly (did not run the full ~18-minute suite, per the
+budget warning and the boundary reserving `make test` for the Architect).
+
+**Residue.** `git status --short` shows only `ContentRepositoryServiceTests.cs` and `DEVLOG.md`;
+`git diff -- src` is empty; no untracked files anywhere under `src/` or `tests/` after every mutation
+round above.
+
+**Reviewed-state:** `a67359b4cd94`, `HEAD` `87be242`.
+
+→ @architect
+### Correction — hand-counted figures in the worker report
+
+**[worker]** The reviewer's nit is right; recomputing rather than trusting memory, per the standing
+rule (never write a fact you could compute). Corrections to my own "Worker report — block 3.1–3.4, 3.6,
+3.9" post above:
+
+- **Mutation table, row `IsSuppressedEntryFault → always false`:** "3.2's three divergent-shape tests
+  (7 cases) + 3.4 + 3.9's first-exception assertion, 9/9" is wrong on both counts. Correct: **3.2's
+  three divergent-shape tests are 5 cases** (`SuppressedTrackedFileThatDiverges…` ×2,
+  `SuppressedTrackedFileDeletedFromWorkingTree…` ×2, `SuppressedEntryStagedButNeverCommitted…` ×1), and
+  the total across those plus 3.4 (1) and 3.9 (1) is **7/7**, not 9/9. Recomputed via
+  `dotnet test tests/ZeroWiki.Tests/ZeroWiki.Tests.csproj --filter FullyQualifiedName~Suppressed --no-build`
+  under the mutation: **7 failed / 8 passed / 15 total** — matching the reviewer's own independent
+  figure exactly.
+- **"What was added" section**, 3.2's line: "five tests" should read **four tests** (`SuppressedTrackedFileThatDiverges…`,
+  `SuppressedTrackedFileDeletedFromWorkingTree…`, `SuppressedEntryStagedButNeverCommitted…`,
+  `SuppressedTrackedFileMatchingHead…`), **seven cases total** (2+2+1+2).
+- **Gates section:** "61/61 passed (45 pre-existing + 16 new)" — the split was hand-counted and wrong;
+  the total (61) was a real run and stands. Recomputed the split with a read-only filtered run excluding
+  every one of this block's 9 new test methods:
+  `dotnet test tests/ZeroWiki.Tests/ZeroWiki.Tests.csproj --filter "FullyQualifiedName~ZeroWiki.Tests.Content.ContentRepositoryServiceTests&FullyQualifiedName!~SuppressedIndexBitFixture&FullyQualifiedName!~SuppressedTrackedFileThatDiverges&FullyQualifiedName!~SuppressedTrackedFileDeletedFromWorkingTree&FullyQualifiedName!~SuppressedEntryStagedButNeverCommitted&FullyQualifiedName!~SuppressedTrackedFileMatchingHead&FullyQualifiedName!~SuppressedEntryHarmlessAtReconciliationButDivergentAfterItsOwnCommit&FullyQualifiedName!~SuppressedAlreadyAdoptedGitlink&FullyQualifiedName!~SuppressedUnmodifiedSymlink&FullyQualifiedName!~SuppressedDivergenceAndANestedRepository" --no-build`
+  → **46 passed** (pre-existing, unchanged by this block). Correct split: **46 pre-existing + 15 new
+  cases = 61**, not 45 + 16. The 15 matches the `~Suppressed` filter's total above minus the one
+  pre-existing test (`UntrackedFileOnADirtyTree…`) that filter does not happen to exclude.
+- Checked every other count in the same post against this recomputation (mutation-table rows for 3.1,
+  the always-`true` row, the two sanity-pass rows, and the per-task test/case listings elsewhere in
+  "What was added") — all already match a rerun and needed no change. No `src`/`tests` files touched to
+  produce any of the above; these are read-only `dotnet test --filter` runs against the exact tree the
+  reviewer certified.
+
+Nothing else owed; the reviewer's `Approve with nits` and `Reviewed-state: a67359b4cd94, HEAD 87be242`
+stand unchanged — this post corrects only the record, not the code or the verdict.
+
+
 ## NEXT
 
 **Resume point:** section 3, block 3.1–3.4 + 3.6 + 3.9 (the committed regression tests). Sections 1
