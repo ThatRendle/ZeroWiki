@@ -52,6 +52,15 @@ robustness and honest diagnosis rather than a live incident.
   policy switch. This change replaces an *instrument*, not a decision.
 - Regression coverage that fails if the index-independent instrument is swapped back for an
   index-consulting one — the defect's whole character is that the ordinary tests still pass.
+- **Added mid-apply on a Product Owner decision (Decision 9, 2026-08-21):** test-suite work to bring
+  `make test` back toward its ~3-minute baseline. Wiring the census into both invariant sites took the
+  suite to **18m13s** — not through any new O(n) work (the census is empty in all 641 instrumented
+  calls, as Decision 1 assumed) but because two extra git spawns at a site nearly every test boots
+  through are amplified non-linearly by the suite's own ~14-way parallelism: ~16–30ms per spawn
+  serially, p50 153ms under load. Production is unaffected — one real app start pays two spawns. The
+  fix is therefore scoped to the **suite**, not the product: sharing one census between the two sites
+  would buy gate speed with Decision 5's independence, which is what lets the assertion refuse on its
+  own.
 
 Not in scope: the save path's own guard (already fixed), the rest of the inherited-git-config class
 (`core.safecrlf`, `core.fileMode`, `core.symlinks`, and their siblings — separately owned), and any

@@ -1903,6 +1903,97 @@ still has no `GenerateDocumentationFile`, so a clean build doesn't validate `<se
 
 → @architect
 
+### Performance regression diagnosis — block 2.1–2.3 (`317a5c9`)
+
+**[worker]** Measured, not guessed, using targeted `dotnet test --filter` runs and a self-reverting
+instrumentation pass — no full `make test`/`make gates` run.
+
+**Call frequency — unchanged, still startup-only.**
+`grep -rn "EnsureRepositoryAsync\|AcceptRepositoryAsync\|ConfigureRepositoryAsync" src` shows exactly
+one production call site (`ContentStorageStartupExtensions.EnsureContentRepositoryAsync`, real app
+startup). `FindSuppressedIndexObservationsAsync`/`ReconcileWorkingTreeAsync`/
+`AssertWorkingTreeIsCleanAsync` have no call site outside `AcceptRepositoryAsync` — not per-request, not
+per-push. The hypothesis that this runs "per request" is **dead**: `find_references`-equivalent grep
+across `src/` shows one production caller, period.
+
+**What changed:** block 2.1–2.3 wires the (already-existing, previously unwired) census into both
+invariant sites, adding exactly **2 extra `git ls-files -v -s -z` subprocess spawns per
+`EnsureRepositoryAsync` call** (one in `ReconcileWorkingTreeAsync`, one in
+`AssertWorkingTreeIsCleanAsync`) — confirmed by re-reading `git diff 1e9ffcd..317a5c9 --
+src/ZeroWiki/Content/ContentRepositoryService.cs`: no new loops, no new call sites, no locking changes.
+
+**The actual driver: per-spawn cost is not constant — it is concurrency-sensitive, and the test suite is
+the thing supplying the concurrency.** I instrumented `FindSuppressedIndexObservationsAsync` (temporary
+`Stopwatch` + append-to-file, reverted before this post — `git status --short -- src` is clean) and ran
+`dotnet test --filter "FullyQualifiedName~ZeroWiki.Tests.Web|FullyQualifiedName~ZeroWiki.Tests.Content"`
+(613 tests, the two namespaces that actually exercise `ContentRepositoryService`):
+
+| | isolated, serial (my own toy repo, one test method) | in situ, full `Content`+`Web` run (14-core box, xUnit's default parallelism) |
+|---|---|---|
+| `git ls-files -v -s -z` | ~16–30ms/call | **p50 153ms, p90 372ms, p99 739ms, max 1.7s** |
+
+641 census calls captured, **`entries.Count == 0` in all 641** — confirms this is pure subprocess-*spawn*
+latency, not the observation loop (the census is empty here exactly as Decision 1 assumed; nothing is
+iterating). Summed, those 641 calls account for **123.8s of the subset's 236s wall time — 52%**.
+
+**Diagnosis:** Decision 1's cost argument ("one subprocess per start... normally empty") is true and
+stays true for what it was argued about — **one real application start**. It implicitly assumed
+subprocess-spawn cost is roughly fixed regardless of how many are in flight at once. That assumption is
+what's false, and it's specifically false under `make test`'s own execution model: xUnit runs ~900 tests
+with up to 14-way parallelism, a large fraction of which each boot a full `ContentRepositoryService`
+(many via a complete `WebApplicationFactory<Program>` host), so doubling the git-subprocess count per
+boot lands on an already CPU-contended box and the per-spawn cost balloons non-linearly (p50 10x the
+serial figure, p99 46x, max 100x+) rather than adding a fixed few-ms tax. I did not re-run the full
+905-test suite to confirm the exact 18m13s figure — the instruction was to prefer targeted measurement,
+and the subset result (52% of a representative half of the suite is these two new spawns, at costs 10–100x
+their isolated price) is already the finding, not a guess extrapolated from nothing.
+
+**This is a design-cost finding, not a bug I can code my way out of, so I am not patching it.** Two
+things stand in the way of a worker-level fix:
+- **Decision 5 requires each site to re-derive independently** — `AssertWorkingTreeIsCleanAsync`'s own
+  remarks say it "does not depend on `ReconcileWorkingTreeAsync` having already refused... re-derives the
+  census and the fault verdict... every time this method runs." Merging the two calls into one shared
+  census would directly undo that invariant (the self-check would stop being independent of
+  reconciliation having already run/refused) — that's the falsifier this exact task (2.3) names, so I
+  won't trade it away for wall-clock time.
+- There is no cheaper git incantation for this: `ls-files -v -s -z` is already the minimal call that
+  answers "what's suppressed," and the cost lives in process-spawn, not in what the command does once
+  running (0 entries every time, confirmed above).
+- The other lever — dialing down xUnit's test parallelism — is `Makefile`/test-project-config territory
+  I don't own, and even if I did, it would only buy back gate wall-clock, not change anything about
+  production behaviour, which was never actually regressed (one real start still pays ~30–60ms extra,
+  not 150ms–1.7s).
+
+**What I want you to have, explicitly:** production's one-subprocess-per-start argument (Decision 1)
+still holds — nothing here falsifies it for an actual app instance starting once. What's newly true is
+that **this specific test suite's execution model turns "cheap per start" into "not cheap in aggregate"**
+whenever a change doubles subprocess count at a site nearly every test boots through. That's worth a
+Product Owner call on whether/how to address the suite's own runtime (parallelism knob, fewer
+full-host-boot tests, or accepting it), not a worker-level patch to production code that would cost this
+change its correctness guarantee to get there.
+
+**Claim / instrument / blind spot:**
+- **Claim:** the 2 new subprocess spawns this block added are the dominant driver of the measured
+  regression, via concurrency-amplified per-spawn cost rather than any new O(n) work or a hotter-than-
+  expected call site.
+- **Instrument:** a temporary `Stopwatch`-and-append-to-file probe inside
+  `FindSuppressedIndexObservationsAsync` (reverted; `git status --short -- src tests` clean), run under
+  `dotnet test --filter "FullyQualifiedName~ZeroWiki.Tests.Web|FullyQualifiedName~ZeroWiki.Tests.Content"`
+  (613 tests, 236s wall, 641 census calls, 123.8s summed).
+- **Blind spot:** this covers 613 of 905 tests (Content + Web, the namespaces that construct
+  `ContentRepositoryService`) and does not include a full-suite run, so I have not directly measured
+  whether the remaining ~292 tests (Identity/Data/Security/etc., which grep shows don't call
+  `EnsureRepositoryAsync`) contribute further contention, nor reproduced the exact reported 10min/18m13s
+  full-suite figures — I'm inferring the mechanism generalises to the full suite from the subset's 52%
+  figure and the fact that more concurrent load only pushes contention further into the same regime, not
+  out of it. A full `make test` run (yours to run) would close that gap directly.
+
+Build/tests: no code changed (instrumentation added and fully reverted). `git diff -- src tests` and
+`git status --short -- src tests` both empty. No gates run by me per the brief's instruction; `dotnet
+build` still green (`0 Warning(s)`, `0 Error(s)`) after the revert.
+
+→ @architect
+
 ## NEXT
 
 **Resume point:** section 2, block 2.1–2.3 — section 1 is closed (`[supervisor]` `Approve`, round

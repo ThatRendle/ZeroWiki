@@ -31,6 +31,7 @@
 
 - [ ] 3.6 Test that a suppressed entry which is merely *present* and unchanged starts normally, for **each** shape section 1 got wrong: an already-adopted gitlink (`HEAD` mode also `160000`) and an unmodified symlink. These are the two false refusals; a test that only covers regular files is what let both through (Decision 7)
 - [ ] 3.7 **Human-in-the-loop, not tickable by an agent (Decision 8, workflow §4):** build the image and exercise the suppressed-entry paths — symlink, gitlink, EACCES, non-ASCII — once inside the Linux/glibc container, because `strerror` translation is a glibc behaviour that this host can neither reproduce nor observe, and the EACCES branch is reachable in production (the container runs non-root, `Dockerfile:56`). The Architect hands the Product Owner exact commands and expected output and **waits for their confirmation**
+- [ ] 3.8 Bring `make test` back toward its ~3-minute baseline by changing the **suite**, not the product (Decision 9): fewer full-host boots, shared fixtures, or a parallelism knob — whichever the measurement supports. **Do not** share one census between the two invariant sites: that buys speed with Decision 5's independence, which is what lets 2.3 refuse on its own. Falsifier: `make test` returns toward baseline **and** every block-2 behaviour still holds (three harmless shapes start, each fault keeps its own diagnosis, 2.3 stands alone, the bit survives)
 
 ## 4. Record
 
