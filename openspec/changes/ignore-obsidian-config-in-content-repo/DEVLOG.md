@@ -3262,28 +3262,172 @@ is a real signal about that test or the lock, and "it passed on re-run" is how a
 defect gets discovered three months later by someone else. It belongs to no section here — carried to
 `## NEXT` for the next session.
 
+**[supervisor]** Section 3 final audit — `git diff fcec6c6..HEAD` (`b5a59ee`, `c029b86`, `b434b2d`)
+
+### Verdict: Approve
+
+The `proposal.md:30-32` blocker is discharged, the sweep behind it is complete as far as I can
+establish it, and nothing in the amendment disturbed the rest of the range. **§3 closes and the change
+is complete.**
+
+### The blocker is discharged
+
+`proposal.md:30-34` now leads on commit history, names the unborn-`HEAD` case as
+initialized-and-seeded, and adds the D5 append behaviour that the old text omitted entirely. Checked
+against the code rather than against the spec that motivated the finding:
+`ContentRepositoryService.cs:136` sets `repositoryHasNoCommitsYet` from `RepositoryHeadIsUnbornAsync`
+whether or not `.git` exists, `:706` takes the seeding branch on `true`, `:742-762` writes-or-appends
+the root `.gitignore`. The proposal, `spec.md:18-21`, `design.md:34` and `README.md:158-166` now assert
+the same rule in four different vocabularies, and none of them says "created".
+
+### Is the sweep complete? — claim, instrument, blind spot
+
+**Claim.** No artefact in this change states a creation-based or `.git`-presence discriminator, and no
+fifth instance exists.
+
+**Instrument.** Not the phrase this time. I enumerated *every* line in `proposal.md`, `design.md`,
+`specs/content-store/spec.md`, `tasks.md` and `README.md` matching the condition vocabulary
+(`initiali|bootstrap|seed|adopt|history|no commits|unborn|existing`) and read each one — a superset of
+the offending wording rather than a search for it, which is the instrument change the fourth instance
+argued for. Then a repo-wide grep for `.obsidian`/`gitignore` across `*.md`, `*.cs`, `*.yml`,
+`Dockerfile*` to establish there is no sixth artefact: the only hits outside the change directory and
+the README are archived DEVLOGs and `openspec/specs/content-store/spec.md`, which already discriminates
+on history (`:25`, "whether adopted from elsewhere or created by a previous start"). Each surviving
+"initializes"/"adopted" is an instance of the rule, not a restatement of it.
+
+**Blind spot — and it is the one that matters.** All three sweeps of this class (the worker's, the
+reviewer's, mine) are *lexical*: they read prose and compare it against a discriminator I derived by
+reading `EnsureInitialCommitAsync` myself. Three lexical audits agreeing is not three independent
+audits. If the code's effective discriminator were something other than `repositoryHasNoCommitsYet` —
+if, say, a caller gated the call site differently — every sweep would agree and every sweep would be
+wrong. What partly closes it is that 2.4 and 2.7 drive the two branches for real, and I traced
+`:110-136 → :213 → :706` rather than trusting the tests' framing. What does not close it is a claim
+phrased without any of the vocabulary above; I mitigated by reading `proposal.md` and the change spec
+whole rather than by grep alone.
+
+### `design.md:34` — the rejection's meaning is intact
+
+"a repository it did not create" → "whose history it did not start", inside D1's *rejected*
+alternative. The rejected thing is ensure-on-every-start, and both of the reasons given survive the
+swap: it would mutate repositories ZeroWiki adopted (now stated in the discriminator the rest of the
+change uses), and it would produce a startup commit or a dirty tree for every operator who did not want
+one — a clause that never depended on the phrase at all. If anything the rejection is now stronger,
+because "did not create" was ambiguous about a repository a *previous start* created, and "did not
+start its history" is not. Under the new phrase D1 still rejects exactly what it rejected.
+
+### Nothing else in the range was disturbed
+
+- `b434b2d` touches `proposal.md` (8 lines), `design.md` (1 line) and the DEVLOG. No `src`, no `tests`,
+  no `tasks.md`.
+- `git diff -- src` is empty and `git status --short` is clean at `b434b2d` — no mutation residue.
+- **The record is complete for all three commits.** Every block in the range carries a reviewer verdict
+  with a fingerprint, and the amendment's `1a8744a9b72d` is the newest, so no code in this section is
+  uncertified. No dangling `→ @reviewer`.
+- **The two gate observations are honestly recorded.** The build-daemon correction supersedes §3's
+  account without rewriting it, which is the append-only rule working as intended, and it names the
+  evidence that forced the correction (a *different* project's sourcelink file failing *after* a
+  preemptive shutdown). The `RepositoryBusy` flake is recorded with the reason it is not this change's
+  — §1 touches bootstrap seeding only, not the save path or the lock — and carried rather than closed.
+  I would have flagged either one if it had been dismissed; neither was.
+- **Archive-merge coherence**, which no block review's range covers: this change's `## ADDED
+  Requirement` does not contradict the committed `content-store` spec it will merge into. That spec's
+  "Empty volume is initialized" scenario (`openspec/specs/content-store/spec.md:18-21`) is an instance,
+  not an exhaustive discriminator, and its refusal scenario at `:23-25` is already history-based.
+
+### For `## NEXT` — notes, not findings
+
+1. **`README.md:159-162` says a pre-existing `.gitignore`'s "rules survive".** True of the file's text;
+   for the one shape `design.md:106-129` records as a live accepted risk — an operator's
+   `!docs/.obsidian/` re-inclusion — the rule survives as text and stops taking effect. Explicitly
+   **not** a blocker: D5 accepts that consequence knowingly, and the README's standing rule is to state
+   what happens without git's internals. Recorded because it is the same shape as the finding this
+   section spent two rounds on, and a future editor should know the sentence has a known edge, not
+   because it should be changed now. Product Owner's call whether it is worth a clause.
+2. `design.md:68-71` still files the negation override under "every divergence found failed in the same
+   direction" — carried from my last post, still open, still corrected three lines below.
+3. `design.md:34` now runs ~113 characters against the file's ~100 wrap. Cosmetic; no gate sees it.
+4. The **append** branch is evidenced by `check-ignore` and by file bytes; only the fresh-write branch
+   is driven through the real reconciliation path. Residual risk low, named because it is this
+   project's characteristic shape.
+5. Reproducing a `Reviewed-state:` from a commit range needs `tasks.md` excluded as well as
+   `DEVLOG.md`, for the step-6-then-step-7 reason.
+6. `existingContent.Length > 0` stays unexercised — behaviourally equivalent, understood, not owed.
+
+### What this review could not see
+
+- I ran no gates and no mutants. `GATES_EXIT:0`, all four `_EXIT:0`, 905 passed and fingerprint
+  `1a8744a9b72d` are taken from the architect's post, not re-derived. I did re-derive the clean
+  `git diff -- src` and `git status --short`.
+- **Nothing in this change has been run against a real Obsidian vault**, and by D2 the Product Owner's
+  own wiki will never receive the rule — confirming it needs a fresh volume. This is the only claim in
+  the change that no automated gate reaches, and it is unowned.
+- Whether the README's two paragraphs land for a reader who has never seen this change is a Product
+  Owner judgement, not one I can make from the spec.
+
+→ @architect
+
 ## NEXT
 
-**Resume point:** §2 open, block 2.1–2.7 briefed. §1 is **closed** — supervisor `Approve` on
-`96a7adf..HEAD` after the pivot.
+**The change is complete.** All three sections carry a supervisor `Approve`; every task is ticked.
+Nothing is in flight. The remaining work is the Product Owner's decision to archive.
 
-- Branch `change/ignore-obsidian-config-in-content-repo`, base `96a7adf`. Two commits: `92fb126` (§1),
-  plus the simplification fix.
-- **§1 supervisor blockers, current status:**
-  - *Blocker 1 (committed block had no reviewer Approve)* — repaired. The lost verdict was re-posted by
-    its author from transcript, dated, at `## 1.`; the Approve for the simplification block follows it.
-  - *Blocker 2 (the D5 branch has no executing evidence)* — **OPEN.** Carried into §2's brief; it is
-    what §2 exists to close.
-  - *Blocker 3 (`git add` refusal-to-start)* — ruled by the Product Owner: fail fast is intended.
-    Recorded in `design.md` Risks and the spec; **2.7** tests it.
-  - *The `❓` on `core.excludesFile`* — dissolved with the `check-ignore` instrument.
-- **§2 is the weight of this change** (2.1–2.7) — briefed under `## 2.`, aimed at the supervisor's
-  coverage gaps rather than the task text.
-- **Owed to §3, two items:** 3.1's wording predates D5, so the README must also cover the
-  pre-existing-`.gitignore` case; and the §1 supervisor's non-blocking finding that
-  `specs/content-store/spec.md:20-23` lacks its "no commits yet" qualifier, so the prose reads as a
-  contradiction with the adopted-repository SHALL NOT above it. Both are wording, both land in §3.
-- Live decisions: D2 ignore-only, never untrack. D5 whole trimmed line, never a substring, root
-  `.gitignore` only — a redundant duplicate is the accepted failure direction.
-- The record: a reviewer verdict was lost today when an architect pin-rewrite discarded everything below
-  the pin marker. Append above the pin, and verify placement with `grep -n '^## '` after writing.
+Recompute rather than trust: `git log --oneline 96a7adf..HEAD`, `grep -c '^- \[ \]' tasks.md`,
+`make gates`.
+
+### If you are picking this up cold
+
+Read **D5 in `design.md`** first. It carries why the rule is a whole-trimmed-line text check and not
+the `check-ignore` probe that was built, reviewed four times and withdrawn — including the argument
+that decided it: the precise instrument fails by shipping a repository with no rule, silently, to an
+operator who believes they are protected; the blunt one fails by writing a redundant line. **Do not
+"improve" it back.** The three `check-ignore` calls remaining in the tests are D4's assertion
+instrument, not residue.
+
+### Open, in the Product Owner's hands
+
+- **Fresh-volume Obsidian verification — unowned, and the only claim no gate reaches.** By D2 the
+  Product Owner's own wiki will never receive the rule, so this needs a new volume.
+- Whether the README's two paragraphs land for a cold reader.
+- Whether `README.md:159-162`'s "its rules survive" earns an edge clause: for the `!docs/.obsidian/`
+  shape the operator's rule survives as *text* and stops taking effect. Accepted under D5; the README
+  states what, not why, so this is a judgement call, not a defect.
+
+### Known gaps, none blocking
+
+- `design.md:68-71` files the negation override among the divergences that sank `check-ignore`. It is
+  the property that **survived** the pivot and fails in the opposite direction. The paragraph below
+  corrects the implication, so only a reader who stops at the bullets is misled.
+- The **append** branch is evidenced by `check-ignore` and file bytes; only the fresh-write branch is
+  driven through real reconciliation.
+- `existingContent.Length > 0` is unexercised — **understood, not owed**: dropping it yields a leading
+  blank line that git's ignore grammar discards, so the mutant is behaviourally equivalent.
+- `design.md:34` runs ~113 chars against the file's ~100 wrap. Cosmetic.
+
+### Hazards for the next session
+
+- **Gate builds fail on `obj/` permission denials** (`CS2012`, or `GenerateMvcTestManifestTask`). The
+  fix needs **both** `dotnet build-server shutdown` **and** removal of the stale artefact the daemon
+  left — either alone has appeared to work once and then failed, which is how it was twice
+  misdiagnosed here. `dotnet`'s persistent daemons perform the writes, so one started under an agent's
+  sandbox poisons later builds whatever flags the caller uses. Never `make clean`; that is the Product
+  Owner's.
+- **`GitSmartHttpRealClientTests.PageSavedThroughTheApp_IsWhatARealClientClones` flaked once** —
+  `Expected: Saved / Actual: RepositoryBusy`, write-lock contention. Green on re-run and in the final
+  gate run, and unrelated to this change. **Unowned and belonging to no section here** — if it recurs,
+  it is a real intermittent, not noise.
+- **Reproducing a `Reviewed-state:` fingerprint** from a commit range needs `tasks.md` excluded as well
+  as `DEVLOG.md`: step 6 verifies before step 7 ticks, so every tick-carrying block has that offset by
+  construction.
+- **Editing this file:** append **above** the pin and verify with `grep -n '^## '` afterwards. A
+  reviewer verdict was destroyed here by a pin rewrite that split on the last `## NEXT` — the pin's own
+  prose contained the marker.
+
+### The lesson this change actually produced
+
+Five findings shared one shape: **a check answering a narrower question than the thing it was taken to
+establish.** `File.Exists` for "is it ignored"; a root-only probe for "wherever it appears"; a
+hostile-config run for "the pinning is complete"; and twice, an artefact correction fixing the reported
+sentence while its siblings stood. For artefact edits the rule is: **a correction is done when every
+sentence sharing the claim is fixed — the reported location is a sample, never the extent.** The block
+reviews caught the diff-local instances; only the supervisor caught the ones needing a wider range or a
+different instrument.
