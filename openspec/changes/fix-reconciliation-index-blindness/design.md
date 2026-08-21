@@ -120,6 +120,49 @@ project has now hit three times. The test sets the bit with a real `git update-i
 file on disk, and asserts the refusal. The mutation that must kill it: swap the content comparison back
 to `status --porcelain` and confirm the test dies.
 
+### Decision 7 — Section 1 observes; section 2 judges (Product Owner decision, 2026-08-21)
+
+Added after section 1 failed two supervisor reviews with the *same defect class*: round one refused
+startup on a harmless symlink, round two on a harmless gitlink. The cause was not carelessness — it is
+structural. Section 1 was required to render a **verdict** ("is this a fault?") while every policy that
+verdict must agree with lives in section 2: `FindStagedGitlinksAsync`'s deliberately narrow contract
+(an adopted submodule advancing is *not* a fault — "exactly the bricking this check exists to
+prevent"), 2.1's ordering against the existing stderr refusals, and 2.2's refusal message. A section
+cannot be held to policies it cannot see.
+
+**Section 1's output is therefore an observation, not a verdict.** Per suppressed entry it reports the
+path, the index mode, the `HEAD` mode, and the comparison outcome. It decides nothing.
+`FindSuppressedEntryFaultsAsync` becomes `FindSuppressedIndexObservationsAsync`. **Section 2 owns every
+fault decision**, which is where the policies already are.
+
+This is why the gitlink question is not answered a third time here: section 1 reports that a path is a
+`160000` entry whose `HEAD` mode is or is not `160000`, and section 2 decides what that means. The
+index-independent equivalent of the existing `newMode == 160000 && oldMode != 160000` test is one
+subprocess and needs no exit-code parsing — measured:
+
+| `git ls-tree <tree> -- <path>` | meaning |
+|---|---|
+| `160000 commit <sha>\t<path>` | already an adopted gitlink |
+| `100644 blob <sha>\t<path>` | a tracked file replaced by a gitlink — a typechange |
+| *(empty output, exit 0)* | not in `HEAD` at all — a new gitlink |
+
+### Decision 8 — The Linux/glibc claims are observed once in the container, not inferred (Product Owner decision, 2026-08-21)
+
+Everything this change measured — symlinks, permission bits, index modes, and the `LC_ALL=C` pin on the
+EACCES/ENOENT discriminator — was measured on git 2.55.0 / macOS APFS, by the worker, the reviewer and
+the supervisor alike. Five parties, one host. Two of those claims are *specifically* about a platform
+none of them can see: `strerror` translation is a **glibc** behaviour, so on macOS the bug the locale
+pin fixes is unreproducible **and** the pin's efficacy is unobservable. Section 3's tests run on that
+same host, so they are the wrong home for it — they would inherit the gap, not close it.
+
+The branch is reachable in production: the container runs as **non-root** (`USER $APP_UID`,
+`Dockerfile:56`), so an unreadable file is a real state, not one only root's exemption could hide.
+
+The change therefore carries one **human-in-the-loop** task: build the image and exercise the
+suppressed-entry paths (symlink, gitlink, EACCES, non-ASCII) once inside the Linux/glibc container. It
+is verification, not new behaviour, and per the workflow's §4 it is **not ticked without the Product
+Owner's confirmation** — the Architect hands over exact commands and what to expect, and waits.
+
 ## Risks / Trade-offs
 
 - **One more subprocess per start.** `git ls-files -v` on every startup, whose output is normally empty.

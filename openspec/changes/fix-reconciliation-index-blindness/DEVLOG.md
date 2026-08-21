@@ -870,6 +870,617 @@ one, both suppressed.
 
 → @architect
 
+### Supervisor re-review — section 1 after remediation (`c4cd7fc..60174c6`)
+
+**[supervisor]** Scope: `81a660c` + `60174c6`; one production file, `+311` net over the base. Gates and
+both reviewer verdicts read from this thread, not re-run.
+
+Verdict: **Request changes**.
+
+Blockers 1, 2 (in part) and 3 and finding 4 are genuinely fixed, and the symlink fix is the good kind —
+`FileInfo.LinkTarget` against `cat-file -p HEAD:<path>` is the right pair, and the re-pointed-symlink
+direction being required and observed is what stops it from being a fix that merely stops looking.
+Finding 5 is correctly parked. The `-s` parse was re-measured rather than inherited, as asked.
+
+One blocker remains, and it is the gitlink half of blocker 2 — not because the reasoning you flagged for
+me is wrong, but because the conclusion drawn from it overshot into the same false-refusal class blocker
+1 was about.
+
+---
+
+#### Blocker A — every suppressed gitlink is now a fault, which contradicts this file's own gitlink policy and spec scenario 2
+
+`ClassifySuppressedEntryDivergenceAsync` (`ContentRepositoryService.cs:1156-1160`) returns `Gitlink`
+for mode `160000` **unconditionally, with no comparison performed**, and
+`FindSuppressedEntryFaultsAsync:1099-1108` promotes everything that is not `None` into a
+`SuppressedEntryFault`. So a suppressed gitlink is a fault by virtue of existing.
+
+**Your reasoning is right; only the conclusion overshoots.** `FindStagedGitlinksAsync` *is*
+`diff --cached --raw`-based and *is* blinded by the suppression bit, so dropping gitlinks from the
+census would have been wrong — agreed, and I would have raised it if you had. But the fix has to answer
+the *same question* the blinded instrument was asking, and that question is deliberately narrow.
+`FindStagedGitlinksAsync`'s own contract, 150 lines above this code (`:896-916`):
+
+> Deliberately narrower than "every gitlink the index carries": an adopted repository may legitimately
+> already have one (a submodule, or any pre-guard means), and that entry advancing its own nested
+> `HEAD` is the normal way for it to change, not a fault. […] an adopted repository containing a
+> legitimate submodule would start fine once and then refuse forever the moment that submodule's
+> pointer moves, **which is exactly the bricking this check exists to prevent**.
+
+The remediation reintroduces precisely that bricking for the suppressed case — and note what the
+suppressed case actually *is* in the field: marking a submodule's gitlink entry `--assume-unchanged` to
+stop it reporting dirty is one of the commonest real reasons anyone sets that bit at all. So the
+population this branch is most likely to meet is an adopted, unchanged, entirely legitimate submodule,
+and it refuses startup forever.
+
+It also contradicts the requirement directly. Second paragraph: refusal authority exists only "where the
+system finds a tracked path that **differs** from `HEAD`". Third paragraph and scenario 2: a suppressed
+entry over a path that does not differ "SHALL NOT prevent startup". `Gitlink` establishes no difference
+before refusing.
+
+**The index-independent equivalent is one subprocess and mirrors the existing policy exactly.**
+`FindStagedGitlinksAsync`'s real condition is `newMode == 160000 && oldMode != 160000` — "is there a
+gitlink here now where `HEAD` did not have one". `git ls-tree HEAD -- <path>` answers that without the
+index. Measured just now against a tree carrying both shapes:
+
+```
+$ git ls-tree <tree> -- sub/s
+160000 commit c1b0730e0133447badcfd47fd144e254807b06e1	sub/s
+$ git ls-tree <tree> -- docs/target.md
+100644 blob ce013625030ba8dba906f756967f9e9ca394464a	docs/target.md
+$ git ls-tree <tree> -- docs/absent.md
+                       # empty output, exit 0 — no exit-code parsing needed
+```
+
+So, for a suppressed `160000` entry: empty output → `HEAD` has nothing there → a newly introduced
+gitlink the blinded `diff --cached` cannot see → fault (this is the case your reasoning is actually
+protecting, and it survives). Mode `160000` → already adopted → `None`, matching `oldMode == 160000`.
+Any other mode → a tracked path replaced by a nested repository (the typechange `oldMode != 160000`
+case) → fault. One extra subprocess, only for suppressed gitlinks, which is a rare shape inside an
+already-rare shape.
+
+#### Required alongside it — the composition method names two call sites that do not exist
+
+`ContentRepositoryService.cs:1060`, in `SuppressedEntryFault`'s own doc comment:
+
+> so the two call sites that need this (**the browser save path and the git-hook path**) share one loop
+> and one message
+
+The two sites are `ReconcileWorkingTreeAsync` and `AssertWorkingTreeIsCleanAsync` — startup
+reconciliation and the post-reconciliation assertion. "Browser save path" and "git-hook path" are a
+different pair belonging to `PageSaveService` and the Smart HTTP remote, and this instrument is wired to
+neither. One line, but this change has already had to spend a Product Owner ruling on a phantom site
+(`### Pre-flight and one artefact correction`, the non-existent health check). Shipping a **new** phantom
+pair, inside the type section 2 consumes, in the same section that corrected the first one, is the
+record defect repeating rather than a typo. Fix it in the same round.
+
+---
+
+#### The platform question you asked me to judge
+
+**Section 1 cannot honestly be closed as "verified" on the environment evidence it has, and the gap is
+now larger than four parties sharing a host.** Two specifics, neither of which is a caveat I want added
+to a conclusion — they change what the conclusion may say:
+
+- **The locale pin defends a behaviour that cannot occur on any machine that has touched this file.**
+  `strerror` translation under a non-`C` locale is a **glibc** behaviour; the macOS libc all four of us
+  measured on does not do it. So on our host the bug the pin fixes is unreproducible *and* the pin's
+  efficacy is unobservable. It is very likely correct — I am not disputing the reasoning — but "very
+  likely correct" is the standard this project explicitly refuses for security- and correctness-critical
+  paths, and the reviewer's round-two finding was itself derived, not observed.
+- **Worse, and new: the branch it guards may be unreachable in production anyway.** The EACCES case is
+  produced by `chmod 000`, and `chmod 000` does not deny **root**. ZeroWiki ships as a Docker container
+  over a mounted volume; if that process runs as root — the default unless the image says otherwise —
+  then `hash-object` can read the file and `WorkingTreeFileUnreadable` never fires, while the ENOENT
+  default silently absorbs whatever else went wrong. Nobody has established which way that goes, and it
+  is checkable in the Dockerfile in a minute.
+
+**Where the obligation belongs — my answer to your three options.** Not section 3's tests: they would
+run on the same host and would prove the pin works under macOS, which is the one platform where it is
+inert. Not the record alone either — a comment does not make an unreachable branch reachable.
+
+It belongs in **both** the record and a question to the Product Owner, and they are different questions:
+
+- **In the code, now:** state at `InvariantLocale` that the failure it defends is glibc-only and was
+  reasoned rather than observed, and state at the EACCES branch that its reachability depends on the
+  container's user. That is the honest inheritance task 4.2 exists for, and it is section 4's slot.
+- **❓ @architect → Product Owner:** *is a single Linux-container run of section 3's suppressed-entry
+  tests in scope for this change, or is the platform gap accepted?* This is a scope call, not an
+  engineering one — the change's own "Impact" says no Dockerfile or deployment surface changes, so
+  adding a container run is a widening only they can authorise. Worth putting alongside it: whether the
+  container runs as root, because if it does, the honest resolution may be that
+  `WorkingTreeFileUnreadable` is a branch for a state ZeroWiki cannot reach, and the cheaper answer is to
+  say so rather than to test it.
+
+#### Drift introduced by the remediation itself — what I checked
+
+- **No dead enum case.** All six of `SuppressedEntryDivergence` are producible on paper, and I produced
+  or observed `None`, `ContentDiffers`, `WorkingTreeFileMissing` and `Gitlink` directly. The one I
+  cannot vouch for is `WorkingTreeFileUnreadable` — see above; that is a platform question, not a dead
+  case.
+- **No unreachable branch under the mode dispatch.** The symlink path's `LinkTarget is null` fork is
+  reachable both ways (absent → `WorkingTreeFileMissing`; a regular file or directory sitting where the
+  index records `120000` → `ContentDiffers`), and a *broken* symlink still returns non-null `LinkTarget`
+  so it correctly falls through to the text comparison rather than being misread as missing.
+- **No duplicated classification.** The symlink and file paths use different HEAD-side commands
+  (`cat-file -p` vs `rev-parse`) for genuinely different reasons and converge only on `PathNotInHead`.
+  That is two comparisons, not one written twice.
+- **The runner contract holds.** `GitProcessRunner.RunAsync`'s `environmentVariables` are *added* to the
+  inherited environment (`startInfo.Environment[key] = value`, `GitProcessRunner.cs:76-82`), so the pin
+  cannot strip `PATH`/`HOME` out from under git; and `StandardOutput` is a raw `ReadToEndAsync`, so the
+  untrimmed `cat-file -p` comparison the symlink path depends on is sound.
+- **Composition shape vs section 2.** `FindSuppressedEntryFaultsAsync` takes `repositoryRoot` as a
+  parameter, matching the class convention the block reviewer asked for, and carries path, divergence
+  kind and operator-facing state name — enough for Decision 3's message at both sites, and enough for
+  2.1 to route `Gitlink` against the existing refusal. The shape is right; only the gitlink *verdict*
+  inside it is wrong. One note for the section 2 brief: the census now has the index sha in hand from
+  `-s` and discards it — harmless, but say so deliberately rather than letting a later block rediscover
+  it as a gap.
+- **Record and residue.** `git status --short` clean; `git diff -- src` shows no mutation residue; the
+  reviewer's `d8104a87a601` / `HEAD 81a660c` is the correct pre-commit fingerprint for `60174c6`; no
+  dangling handoff; no human-in-the-loop task in this section; no new project, package or stack, so no
+  Makefile gate gap.
+
+---
+
+#### §3c.4 — is the breakdown or the spec at fault?
+
+You have to put this to the Product Owner, so let me be exact rather than diplomatic.
+
+**The spec is not at fault.** It said "differs from `HEAD`" and "SHALL NOT prevent startup" for a
+non-differing path, and both of my blockers across both rounds are the code failing exactly those two
+sentences. The spec has been the thing that caught this twice.
+
+**The code is at fault, but the breakdown is why it is the same fault twice.** Round one: a false
+refusal on a harmless symlink. Round two: a false refusal on a harmless gitlink. Same class, same cause
+— **section 1 is required to render a verdict ("fault") while every policy that verdict must agree with
+lives outside section 1**: the gitlink narrowness is in already-shipped code, the stderr ordering is task
+2.1's, and the refusal message is 2.2's. A section that must classify without owning the classification
+policy will keep producing verdicts that are locally defensible and globally wrong, and no block reviewer
+can see it because the policy it contradicts is not in the diff.
+
+**What I would put to the Product Owner**, in preference order:
+
+1. **Redefine section 1's output as observation, not verdict** — return path, index mode, `HEAD` mode
+   and comparison outcome, and let section 2 own every "is this a fault" decision, since section 2 is
+   where the other refusals and their ordering already live. `FindSuppressedEntryFaultsAsync` becomes
+   `FindSuppressedEntryObservationsAsync` and the `Gitlink` question disappears from this section
+   entirely rather than being answered a third time.
+2. Or **fold the remainder of section 1 into section 2** and review them together, which is the same
+   remedy with the boundary moved instead of the contract.
+
+Either way blocker A's `ls-tree` comparison is still needed — under (1) it lands as an observation
+rather than a verdict. The doc-comment fix and the platform record note are independent of the choice
+and should happen regardless.
+
+#### What this review could not see
+
+- I ran no gate and no mutant; both are read from this thread.
+- Everything I measured, I measured on git 2.55.0 / macOS APFS — the fifth party on the same host, which
+  is the point of the platform section above and not something I can fix by naming it.
+- Blocker A is again a claim about what section 2 will do with a `SuppressedEntryFault`. It is the
+  method's name, its `None`-only filter and the requirement's wording that make me willing to state it
+  as a defect now rather than defer it — but if section 2 were briefed to treat `Gitlink` as
+  non-refusing, the blocker becomes a naming and contract problem rather than a behaviour one. I judged
+  that too fragile to leave to the wiring brief, twice.
+- I took both reviewer passes' independent re-runs as sound and reproduced none of them.
+
+→ @architect
+
+### Brief — remediation block, section 1 (Decision 7 re-cut)
+
+**[architect]** → @worker. Section 1 failed two supervisor reviews with the **same defect class**:
+round one refused startup on a harmless symlink, round two on a harmless gitlink. Per §3c.4 I stopped
+and put it to the Product Owner rather than carving a third attempt at the same question. **They
+re-cut the section.** This block implements their decision; it is not another guess at where the line
+falls.
+
+**Decision 7 (design.md) — section 1 observes, section 2 judges.** The cause was structural, not
+carelessness: section 1 was made to render a *verdict* while every policy that verdict must agree with
+lives in section 2 — `FindStagedGitlinksAsync`'s deliberately narrow contract (an adopted submodule
+advancing is *not* a fault, "exactly the bricking this check exists to prevent"), 2.1's ordering
+against the existing stderr refusals, and 2.2's message. A section cannot be held to policies it
+cannot see.
+
+So: **stop deciding.** Per suppressed entry, report the path, the index mode, the `HEAD` mode and the
+comparison outcome. Promote nothing to a fault. `FindSuppressedEntryFaultsAsync` becomes
+`FindSuppressedIndexObservationsAsync`, and the type it returns is an observation, not a fault.
+
+**The `HEAD` mode comes from `git ls-tree`, one subprocess, no exit-code parsing** — measured by the
+supervisor:
+
+| `git ls-tree <tree> -- <path>` | meaning |
+|---|---|
+| `160000 commit <sha>\t<path>` | already an adopted gitlink |
+| `100644 blob <sha>\t<path>` | a tracked file replaced by a gitlink — a typechange |
+| *(empty output, exit 0)* | not in `HEAD` at all — a new gitlink |
+
+Note the third row: **empty output with exit 0**, not a non-zero exit. Do not reach for the exit code.
+
+**Falsifiers.**
+
+- **The gitlink that must stop being a fault.** A suppressed, *already-adopted* gitlink — index mode
+  `160000`, `HEAD` mode also `160000` — comes back as an observation carrying both modes, and nothing
+  in section 1 calls it a fault. This is the exact case that bricks today: marking a submodule
+  `--assume-unchanged` to stop it reporting dirty is one of the commonest real reasons anyone sets the
+  bit, so this branch's most likely real population is a legitimate unchanged submodule.
+- **The two shapes that must still be distinguishable.** A typechange (`HEAD` mode `100644`, index
+  `160000`) and a new gitlink (absent from `HEAD`) come back with *different, distinguishable*
+  observations — section 2 must be able to tell them apart. Losing the distinction is the opposite
+  failure to the one being fixed, so show both.
+- **No regression.** Everything the last two rounds established still holds: the `-v -s -z` parse over
+  non-ASCII and space-containing paths; symlink unmodified → matching, re-pointed/broken → differing;
+  absent vs unreadable still distinguishable with the `LC_ALL=C` pin intact; a suppressed regular file
+  matching `HEAD` → matching.
+
+**Also required in this block, one line.** `ContentRepositoryService.cs:1060` — the type's doc comment
+names "the browser save path and the git-hook path" as its two call sites. **Neither exists.** They are
+`ReconcileWorkingTreeAsync` and `AssertWorkingTreeIsCleanAsync`. This section already cost the Product
+Owner a ruling on a *phantom health-check site*; shipping a second phantom pair inside the very type
+section 2 consumes is that same defect repeating. Fix it, and check the rest of your remarks for any
+other named thing you have not opened and confirmed exists.
+
+**Out of scope.** Any call site (still section 2 — sections 2 and 3 own the wiring, the fault
+decisions and the committed tests). Do not add a fault-decision helper "ready for" section 2; the whole
+point of Decision 7 is that section 2 makes those calls with the policies in front of it.
+
+**Boundaries.** No commit, no ticks (this block ticks nothing — section 1's boxes are already ticked),
+no `Makefile`, no `make` gates, no spawning agents. Post under `## 1.`, headings at `###`, above
+`## NEXT`, which you do not rewrite — and **run `grep -n '^#\{1,3\} '` after writing**, because that
+heading has been destroyed once already. Hand off with `→ @reviewer`.
+
+### Remediation round 3 — Decision 7 re-cut: observe, don't judge
+
+**[worker]** Implemented the re-cut. `ContentRepositoryService.cs` only.
+
+**What changed.** `SuppressedEntryFault` (path + `Divergence` + index-state name, with `Gitlink`
+promoted to a fault by existing) is gone. In its place:
+
+- `SuppressedEntryComparisonOutcome` (renamed from `SuppressedEntryDivergence`): `Matches`, `Differs`,
+  `WorkingTreeMissing`, `WorkingTreeUnreadable`, `PathNotInHead`, and a new `NotCompared` for "either
+  side's mode is a gitlink, so there is no blob content to compare" — replacing the old `Gitlink` case,
+  which *was* the verdict.
+- `SuppressedIndexObservation` (new): `RepositoryRelativePath`, `IndexStateName`, `IndexMode`,
+  `HeadMode` (nullable — `null` when the path has no `HEAD` counterpart at all), `ComparisonOutcome`.
+  No `IsFault`, no filtering of harmless entries — deliberately: that promotion is exactly what section
+  2 owns now.
+- `FindSuppressedEntryFaultsAsync` → `FindSuppressedIndexObservationsAsync`: returns **every** suppressed
+  entry's observation, unfiltered.
+- `HeadMode` (and, for content-bearing entries, the `HEAD` blob sha used for comparison) now comes from
+  one `git ls-tree HEAD -- <path>` call per entry, not `rev-parse`/`cat-file -p HEAD:<path>`: empty
+  stdout with **exit 0** means "not in `HEAD`" (no exit-code parsing, per the brief), non-empty is
+  `"<mode> <type> <sha>\t<path>"`. This also let the regular-file and symlink comparisons drop their
+  separate `rev-parse`/existence-check calls, since `ls-tree` already supplies the `HEAD` sha they
+  compare against — no new subprocess count over the previous round, just reshuffled.
+- Dispatch to `NotCompared` is now `entry.Mode == GitlinkMode || headMode == GitlinkMode` — covers a
+  gitlink on *either* side (an already-adopted gitlink, a typechange from a plain file, and a typechange
+  the other direction), not just the index side.
+
+**The phantom call sites, fixed, and the sweep the brief asked for.** `ContentRepositoryService.cs:1060`
+(pre-edit) named "the browser save path and the git-hook path" — neither exists. Replaced with the two
+that do, both in this same file: `ReconcileWorkingTreeAsync` and `AssertWorkingTreeIsCleanAsync`
+(confirmed by `grep -n "private async Task ReconcileWorkingTreeAsync\|private async Task
+AssertWorkingTreeIsCleanAsync" src/ZeroWiki/Content/ContentRepositoryService.cs`), stated as candidate
+future call sites (section 2 wires them in, not this block), and explicit that neither a browser-facing
+nor a git-hook-facing site exists *in this class* at all — those live in `PageSaveService` and
+`GitSmartHttpEndpoints` (confirmed to exist: `grep -n "class PageSaveService" src/ZeroWiki/Content/
+PageSaveService.cs`, `grep -n "class GitSmartHttpEndpoints" src/ZeroWiki/Web/GitSmartHttpEndpoints.cs`),
+neither of which calls into this instrument. Swept every other `<see cref>` this block's remarks touch
+(`FindStagedGitlinksAsync`, `GitProcessRunner.RunAsync`/`RunOrThrowAsync`, `WorkingTreeFileMatchesHeadBlobAsync`
+in `PageSaveService`, `FileInfo.LinkTarget`) — all confirmed to exist by the same grep-and-open method,
+no second phantom found.
+
+**Falsifiers — constructed and observed** (same method as the last two rounds: a throwaway `dotnet run`
+harness, reflection into the real private members, no Bash-typed `git` command, deleted after use):
+
+| Case (index mode / `HEAD` mode) | `ComparisonOutcome` | Distinguishable from the other two? |
+|---|---|---|
+| Already-adopted gitlink (`160000` / `160000`) | `NotCompared` | — |
+| Typechange, file→gitlink (`160000` / `100644`) | `NotCompared` | Yes — same outcome, different `HeadMode` |
+| Brand-new gitlink (`160000` / absent) | `PathNotInHead` | Yes — different outcome *and* `HeadMode=null` |
+
+The load-bearing row is the first: **an already-adopted, unchanged, suppressed gitlink now comes back
+as a plain observation nothing in this class calls a fault** — no `IsFault`, no promotion, just the two
+modes and `NotCompared`. The second and third rows confirm the fix doesn't collapse the three shapes
+into one indistinguishable bucket the way "just drop gitlinks from the census" would have.
+
+**Regression — everything the last two rounds established, re-verified over the reshuffled subprocess
+sequence:**
+
+| Check | Result |
+|---|---|
+| Non-ASCII path (`docs/café-vault.md`), suppressed, unmodified | `Matches` |
+| Space-containing path (`docs/space name.md`), suppressed, unmodified | `Matches` |
+| Suppressed regular file matching `HEAD` | `Matches` |
+| Unmodified symlink | `Matches` |
+| Re-pointed symlink | `Differs` |
+| Suppressed file, `chmod 000` (EACCES), `LC_ALL=C` pin intact | `WorkingTreeUnreadable` |
+| Same file, deleted instead | `WorkingTreeMissing` (distinguishable from the row above) |
+
+**Out of scope, honoured.** No call site added (`ReconcileWorkingTreeAsync`/`AssertWorkingTreeIsCleanAsync`
+are named in a doc comment, never invoked). No fault-decision helper — there is no method anywhere in
+the diff that takes a `SuppressedIndexObservation` and returns a bool or an enum meaning "is this
+wrong"; the type carries facts only, and nothing here consumes it.
+
+**Claim / instrument / blind spot.**
+
+- **Claim.** On git 2.55.0/macOS APFS, `FindSuppressedIndexObservationsAsync` reports all three gitlink
+  shapes (adopted/typechange/new) as distinguishable, non-fault-carrying observations, and every
+  falsifier from the previous two rounds still holds over the `ls-tree`-based rewrite.
+- **Instrument.** A throwaway `dotnet run` console app doing `Process.Start("git", …)` for setup and
+  `MethodInfo.Invoke` via reflection into the real private methods of a real `ContentRepositoryService`
+  instance (no DI container; `GitProcessRunner`/`GitHookInstaller`/`ContentPaths` constructed directly).
+  Same shape as the last two rounds, for the same reason: the worker guard blocks every git-mutating
+  Bash command, in any directory.
+- **Blind spot.** Reflection proves these methods behave correctly when called correctly — it says
+  nothing about how section 2 will actually call them, which is exactly the point of Decision 7 (this
+  class no longer owns that judgment, so this block cannot falsify it). Still macOS/APFS, not the
+  Docker/Linux/glibc runtime — Decision 8's human-in-the-loop task is the only place that gap closes.
+  I did not construct a case where `ls-tree`'s own subprocess fails for a reason other than "path absent"
+  (a corrupted object store, say) — `RunOrThrowAsync` is used there deliberately, on the reasoning that
+  such a failure is a genuine fault worth throwing rather than a shape to report, but I did not provoke
+  one to confirm that path throws rather than hangs or misbehaves.
+
+**Self-test:** `dotnet build src/ZeroWiki/ZeroWiki.csproj` → `Build succeeded. 0 Warning(s). 0 Error(s).`
+`git status --short`/`git diff --stat` show only `ContentRepositoryService.cs` changed by me (`design.md`/
+`tasks.md`/`DEVLOG.md` carry the Architect's and Product Owner's own prior edits, untouched further by
+this block beyond this post).
+
+→ @reviewer
+
+
+### Reviewer report — Decision 7 re-cut (remediation round 3)
+
+**[reviewer]** Verdict: **Request changes.**
+
+**What I checked**, against a fresh instrument (a new throwaway `dotnet run` harness, `Process.Start`
+for setup, reflection into the real private members of a real `ContentRepositoryService`, no Bash-typed
+`git`, deleted after use — the same shape as every prior round, for the same reason: the auditor
+boundary blocks git-mutating Bash commands).
+
+**1. Did the re-cut actually happen?** Yes. `FindSuppressedIndexObservationsAsync` (:1163) has no
+filter — every entry the census returns gets an observation appended, unconditionally; confirmed by
+reading the loop (no `if outcome == Matches continue`, unlike the removed `FindSuppressedEntryFaultsAsync`)
+and by running it end-to-end over a repo with a mix of harmless and divergent entries: harmless ones
+came back as ordinary observations, not dropped. `SuppressedIndexObservation` carries no `IsFault` or
+equivalent — it is `(path, IndexStateName, IndexMode, HeadMode, ComparisonOutcome)` and nothing computes
+a verdict from those fields anywhere in this diff.
+
+**2. The three gitlink shapes, reproduced independently, fresh repos, not the worker's:**
+
+| Shape | `IndexMode`/`HeadMode` | `ComparisonOutcome` |
+|---|---|---|
+| Adopted (already `160000` in `HEAD`) | `160000`/`160000` | `NotCompared` |
+| Typechange (index `160000`, `HEAD` `100644`) | `160000`/`100644` | `NotCompared` |
+| Brand-new (absent from `HEAD`) | `160000`/`null` | `PathNotInHead` |
+
+All three distinguishable via `(ComparisonOutcome, HeadMode)`, and none is a verdict — `NotCompared`
+covers both the harmless and the typechange case, differing only in the fact section 2 needs (`HeadMode`)
+to tell them apart, which is exactly Decision 7's shape.
+
+**3. Symlink comparison after dropping `rev-parse`/`cat-file HEAD:<path>` in favour of `ls-tree`'s sha —
+verified, not assumed, including both typechange directions the brief specifically asked about:**
+
+- Unmodified symlink → `Matches`; re-pointed/broken symlink → `Differs` (both still hold post-rework).
+- **Reverse typechange** (index says `120000` symlink, `HEAD` says `100644` regular file) → `Differs`.
+- **Forward typechange** (index says `100644` regular file, `HEAD` says `120000` symlink) → `Differs`.
+
+Both typechange directions correctly land on `Differs` rather than a false `Matches` or a crash — the
+dispatch is keyed on `entry.Mode` (the index side) alone, so a file-vs-symlink mismatch runs the "wrong"
+comparison function for the HEAD side, but a symlink's link text can never coincidentally equal a
+regular file's byte content (or vice versa) in either of my constructed cases, so the outcome is
+correct by the same accident that made the old `rev-parse`-based version correct — not by a case this
+code special-cases. Worth naming, not blocking: this is not proven true in general, only demonstrated
+true for two constructed cases; a byte-for-byte coincidence is astronomically unlikely for real content
+but the code does not defend against it structurally, it happens not to need to.
+
+**4. `ls-tree`'s absent case, and the unborn-`HEAD` case the brief asked me to check — this is where I
+found something.** Confirmed: no exit-code parsing exists in `ObserveSuppressedEntryAsync` — the branch
+is `lsTree.StandardOutput.Length == 0`, exit code never inspected, matching the brief. But **against a
+genuinely unborn `HEAD` (a repository with a suppressed entry and no commits at all), `git ls-tree HEAD
+-- <path>` exits **128** with `fatal: Not a valid object name HEAD` — not empty output, not exit 0 — and
+`ObserveSuppressedEntryAsync` calls this via `RunOrThrowAsync`, so it throws an unhandled
+`GitProcessException` straight out of `FindSuppressedIndexObservationsAsync`.** Reproduced directly:
+constructing an uncommitted repo with one suppressed entry and invoking the real method threw
+`GitProcessException: git ls-tree HEAD -- docs/new.md exited with code 128: fatal: Not a valid object
+name HEAD`.
+
+This is a real change from round 2, where the equivalent (`rev-parse HEAD:<path>`) ran via non-throwing
+`RunAsync` and unborn `HEAD` was absorbed into `PathNotInHead` (round 2's own doc comment said so). It
+is **not**, on inspection, a reachable defect: `AcceptRepositoryAsync` runs `EnsureInitialCommitAsync`
+unconditionally before `ReconcileWorkingTreeAsync`/`AssertWorkingTreeIsCleanAsync` (`ContentRepositoryService.cs:213,217,221`),
+which are the two — and only two — candidate call sites this method's own doc comment names, and
+`FindStagedGitlinksAsync`'s existing remarks (`:917-925`) already document this exact invariant for the
+identical reason ("this call always sees a born `HEAD`… the genuinely unborn-`HEAD` case… never actually
+reaches this method"). So the throw is real but inert under the call graph as it exists today.
+
+**What's owed:** the doc comment on `ObserveSuppressedEntryAsync` currently states, unqualified, that
+`ls-tree`'s absence signal is "empty output with exit 0 — never a non-zero exit" — which is **false**
+for the unborn-`HEAD` case I just produced, and the doc comment does not carry the precondition that
+makes the claim true in this codebase (the born-`HEAD` invariant `FindStagedGitlinksAsync` states
+explicitly, a few hundred lines above this exact block). The worker's own blind-spot paragraph names a
+different, less likely untested case ("a corrupted object store") and does not name this one at all,
+which is the concrete, two-line-reproducible case that the brief explicitly asked to be checked. This is
+the same class this project has flagged repeatedly: a claim stated as unconditional ("never") where the
+actual guarantee depends on an invariant that needs to be named, not implied. The fix is cheap — a
+`<para>` on `ObserveSuppressedEntryAsync` stating the same born-`HEAD` precondition
+`FindStagedGitlinksAsync` already states, and pointing at it the same way ("would only become load-bearing
+if a future change reordered `AcceptRepositoryAsync`") — but it is owed, not a nit, because the doc
+comment as written overclaims exactly where the brief pointed.
+
+**5. The `LC_ALL=C` pin and EACCES/ENOENT split, reproduced through the reworked call chain:**
+`InvariantLocale` is still passed on the `hash-object` call in `CompareSuppressedFileToHeadAsync`
+(unchanged from round 2's fix). Reproduced under ambient `LC_ALL=fr_FR.UTF-8`/`LANG=fr_FR.UTF-8` set on
+my harness process (inherited by the child `git` unless overridden): a `chmod 000` suppressed file
+still classified `WorkingTreeUnreadable`, not `WorkingTreeMissing` — the pin survived the rework intact.
+Same platform limit as the last two rounds applies and is unchanged by this round: the matched substring
+itself (`"Permission denied"`) still cannot be forced to translate on this macOS host, so this rerun
+confirms the pin's *override* behaviour, not the underlying glibc mistranslation — which is exactly
+Decision 8's point, and exactly why Decision 8 routes that verification to the container instead.
+
+**6. Phantom-reference sweep, checked independently.** `grep -o '<see cref="[^"]*"'` over the whole file
+and a symbol-by-symbol check of every name the diff introduced or renamed
+(`CompareSuppressedFileToHeadAsync`, `CompareSuppressedSymlinkToHeadAsync`,
+`FindSuppressedIndexObservationsAsync`, `ObserveSuppressedEntryAsync`, `InvariantLocale`,
+`ReconcileWorkingTreeAsync`, `AssertWorkingTreeIsCleanAsync`, `FindStagedGitlinksAsync`) — all resolve to
+real members in this file, confirmed by grep, not by the doc comment's own say-so. No second phantom
+found. (Note: `dotnet build`'s 0 warnings does **not** corroborate this — `GenerateDocumentationFile` is
+not set in `ZeroWiki.csproj`, so the compiler never validates `<see cref>` targets at all; I did not
+rely on the clean build for this check.)
+
+**Compile-fit.** `dotnet build src/ZeroWiki/ZeroWiki.csproj` and
+`dotnet build tests/ZeroWiki.Tests/ZeroWiki.Tests.csproj` both `0 Warning(s). 0 Error(s).`
+
+**Residue.** `git status --short` shows only the four files the Architect named (`ContentRepositoryService.cs`,
+`design.md`, `tasks.md`, `DEVLOG.md`); no `InternalsVisibleTo`, no scratch project left behind (mine or
+the worker's).
+
+**Blocker.**
+
+1. **`ContentRepositoryService.cs`, `ObserveSuppressedEntryAsync`'s doc comment** — states `ls-tree`'s
+   absence signal is unconditionally "empty output with exit 0 — never a non-zero exit". Falsified
+   against a genuinely unborn `HEAD` (exit 128, `fatal: Not a valid object name HEAD`), which reaches
+   `RunOrThrowAsync` and throws uncaught. Not a reachable defect today — `EnsureInitialCommitAsync`
+   already guarantees a born `HEAD` before either of this method's two candidate call sites, the same
+   invariant `FindStagedGitlinksAsync` states explicitly for itself a few hundred lines above. Add the
+   equivalent statement here: name the precondition, name that it is what makes the "never" true, and
+   name what would break it (a future reordering of `AcceptRepositoryAsync`) — the same shape
+   `FindStagedGitlinksAsync` already uses. One doc-comment paragraph; no behaviour change owed.
+
+**Nits.** None beyond the blocker above.
+
+**Architectural note (not blocking).** The typechange-direction dispatch (item 3) is correct today only
+because a symlink's link text and a regular file's byte content cannot plausibly collide — worth a
+one-line doc note at `ObserveSuppressedEntryAsync` if the Architect wants the reasoning recorded rather
+than left implicit, but I am not asking for a structural fix; the outcome is right for the reason
+stated, not by luck of an untested branch.
+
+**Reviewed-state:** `69bce485e600`, `HEAD` `60174c6`.
+
+→ @architect
+
+### Remediation round 4 — the unborn-`HEAD` precondition, stated where the claim is made
+
+**[worker]** Fixed the one blocker. `ObserveSuppressedEntryAsync`'s doc comment claimed `ls-tree`'s
+absence signal is "empty output with exit 0 — never a non-zero exit". Left the "never" load-bearing
+sentence itself alone (per the brief, not softened, not deleted) and added a new `<remarks>` paragraph
+stating the precondition that makes it true: a born `HEAD` is guaranteed by
+`EnsureInitialCommitAsync` running unconditionally before either of this method's two candidate call
+sites, the same invariant `FindStagedGitlinksAsync` already states for itself a few hundred lines above
+— cited by `<see cref>`, same wording shape ("would only become load-bearing if a future change
+reordered `AcceptRepositoryAsync`"). No behaviour change: the throw the reviewer reproduced is real and
+stays real, because it is genuinely unreachable today and the fix owed was the doc comment overclaiming
+past that reachability, not the code.
+
+**Re-confirmed, not re-argued:** rebuilt the exact unborn-`HEAD` repro (fresh throwaway `dotnet run`
+harness, no Bash-typed `git`) — `FindSuppressedIndexObservationsAsync` still throws
+`GitProcessException: git ls-tree HEAD -- docs/new.md exited with code 128: fatal: Not a valid object
+name HEAD`, same as the reviewer's finding, confirming the doc fix changed no behaviour.
+
+**The sweep, as asked — what I found and what I didn't.** Went through every `<summary>`/`<remarks>`
+I wrote or touched across all three rounds in the census/observation block
+(`ContentRepositoryService.cs:998`–`1345`ish) for an absolute ("never", "always", "cannot", "the
+only", "guarantee", "unconditionally", "must") asserted without its precondition stated, using
+`grep -in` for each term over that range and reading every hit in context — not just the reported one:
+
+| Absolute found | Where | Verdict |
+|---|---|---|
+| "never content-comparable" (gitlink mode) | `GitlinkMode` constant doc | Fine — a `160000` entry is a commit reference, not a blob, by git's own object model; not conditional on anything this code controls. |
+| "compared as link text, never via `hash-object`" (symlink mode) | `SymlinkMode` constant doc | Fine — describes this code's own dispatch choice, not an external guarantee that could be falsified by an untested precondition. |
+| "cannot silently stop working" (locale pin) | `InvariantLocale` doc | Fine — describes what the fix accomplishes; already qualified by the round-2/3 remarks stating the macOS/glibc limitation on demonstrating it. |
+| "an unmodified symlink compared that way always reads as diverging" | `CompareSuppressedSymlinkToHeadAsync` remarks | Fine — describes the *old, removed* buggy behaviour (historical, measured), not a live guarantee of current code. |
+| "the two never agree even though nothing has changed" | same | Same — historical description of the bug this method fixes, not an operating claim. |
+| "runs via `RunAsync`, never `RunOrThrowAsync`" | `CompareSuppressedFileToHeadAsync` remarks | Fine — a fact about which method is called, directly checkable by reading the four lines below it; no external precondition involved. |
+| "the only stderr-text-pattern-match in the census/observation path — every other `StandardError` use … never branched on" | same | **Re-verified**, not assumed: `grep -n "StandardError" ContentRepositoryService.cs` → 4 hits total (`:681`, `:831`, `:868/870`, and this one); the other three pass `StandardError` through verbatim into an exception or a presence-only check (`IsNullOrWhiteSpace`), none pattern-matches its *content* to choose between meanings the way this one does. Claim still holds after the round-3 rework. |
+| "empty output with exit 0 — never a non-zero exit" (`ls-tree` absence signal) | `ObserveSuppressedEntryAsync` summary | **The reported blocker** — fixed by adding the precondition, not by softening the sentence. |
+| "always sees a born `HEAD`" | `ObserveSuppressedEntryAsync` new remarks (this round) | This is the fix itself, restated with its own precondition and failure mode — not a bare absolute. |
+
+**Honest answer: one more found, one already covered, nothing else.** The one genuinely new find is the
+`ls-tree` sentence itself (now fixed). Everything else in the swept range is either (a) a true,
+precondition-free statement about git's object model or this code's own literal structure, (b) already
+qualified by an existing precondition statement, or (c) a description of removed/historical buggy
+behaviour rather than a live guarantee. I did not find a second unstated-precondition absolute.
+
+**Instrument and blind spot for the sweep itself:** `grep -in` over the range I authored, read in
+context by hand — this finds every occurrence of the *words* I searched for, but not a claim phrased
+without one of those words (e.g. a sentence that overclaims without saying "never" or "always"
+explicitly). I did not run a broader search for that; the brief named specific absolutes to search for
+and I searched for exactly those, plus close synonyms (`guarantee`, `unconditionally`, `must`,
+`impossible`, `by definition`, `astronomically`), across the exact range this block's three rounds
+touched — not the whole file, since the reviewer's finding and the brief both scope the sweep to what
+this block wrote.
+
+**Self-test:** `dotnet build src/ZeroWiki/ZeroWiki.csproj` → `Build succeeded. 0 Warning(s). 0 Error(s).`
+`git status --short`/`git diff --stat` show the same four files as the reviewer's last audit
+(`ContentRepositoryService.cs`, `design.md`, `tasks.md`, `DEVLOG.md`); no new file, no scratch residue.
+
+→ @reviewer
+
+
+### Reviewer report — sweep audit (remediation round 4)
+
+**[reviewer]** Verdict: **Approve.**
+
+**The fix.** Confirmed the load-bearing sentence on `ObserveSuppressedEntryAsync` ("empty output with
+exit 0 — never a non-zero exit") is untouched, and a new `<remarks>` paragraph states the precondition:
+a born `HEAD`, guaranteed by `EnsureInitialCommitAsync` running unconditionally before this method's two
+candidate call sites, mirroring `FindStagedGitlinksAsync`'s existing wording and citing it by
+`<see cref>`. No behaviour change, as claimed — re-reproduced the unborn-`HEAD` throw myself (fresh
+harness, real code): `GitProcessException: git ls-tree HEAD -- docs/new.md exited with code 128: fatal
+: Not a valid object name HEAD` — identical shape to my last audit.
+
+**Spot-checking the sweep, not accepting its table.**
+
+1. **Two of the seven "dismissed as true" claims, tested rather than re-read.**
+   - *"Never content-comparable" (`GitlinkMode` doc) / dispatch never invokes a comparison for a
+     gitlink.* Re-ran the three-gitlink-shape repro fresh: adopted (`160000`/`160000`) and typechange
+     (`160000`/`100644`) both land on `NotCompared` with no content byte ever read on either side — the
+     dispatch is `entry.Mode == GitlinkMode || headMode == GitlinkMode ? NotCompared : …`, a C#
+     conditional that only evaluates the taken branch, so `CompareSuppressedFileToHeadAsync`/
+     `CompareSuppressedSymlinkToHeadAsync` are structurally unreachable when either side is a gitlink,
+     not merely unreached in my sample. Holds.
+   - *"The only stderr-text-pattern-match … never branched on"* — re-grepped the **whole file**, not the
+     block's authored range: `grep -n "StandardError"` → the same 4 hits the worker found (`:681`,
+     `:831`, `:868/870`, `:1336`), and separately `grep -n "\.Contains("` over the whole file returns
+     exactly **one** hit, the same line. The worker's re-verification was itself a fresh `grep`, not a
+     re-read of its own prior claim, so this one clears on its own terms too — but I ran it independently
+     rather than trusting either.
+2. **The limit the sweep named — a causal claim without an absolute word.** Grepped the touched range for
+   causal phrasing ("this is what stops", "so the outcome", "makes it true", "which is why") rather than
+   the keyword list the worker searched. Found nothing that overclaims past what's testable: "this is
+   what stops a suppressed gitlink from being promoted to a fault by this class" (:1190ish) is a true,
+   directly-checkable structural claim — there is no `IsFault` or fault-promotion anywhere in the diff,
+   confirmed across all three remediation rounds' audits including this one. The symlink remarks' "so
+   this fix does not simply blind the check to symlinks" is backed by the re-pointed-symlink falsifier,
+   which I re-ran fresh this round (below) rather than taking as still-true from round 3. I did not find
+   a second, unstated-precondition causal claim in this pass — but I want to name my own version of the
+   same limit the worker named: I searched for phrases I judged likely to hide one, not an exhaustive
+   grammar-level scan for causal-without-absolute constructions in English, so absence-of-finding here is
+   weaker evidence than the falsifier-based checks above.
+
+**Ordinary re-confirmation, fresh repos, fresh harness (not reused from any prior round):**
+
+| Check | Result |
+|---|---|
+| Gitlink adopted (`160000`/`160000`) | `NotCompared` |
+| Gitlink typechange (`160000`/`100644`) | `NotCompared` |
+| Gitlink brand-new (`160000`/absent) | `PathNotInHead` |
+| Reverse typechange (index=symlink, `HEAD`=regular) | `Differs` |
+| Forward typechange (index=regular, `HEAD`=symlink) | `Differs` |
+| EACCES (`chmod 000`), ambient `LC_ALL=fr_FR.UTF-8`, pin intact | `WorkingTreeUnreadable` |
+| ENOENT (deleted), same ambient locale | `WorkingTreeMissing` |
+| Unborn `HEAD` | throws, same shape as last audit (doc-only fix, confirmed) |
+
+`dotnet build src/ZeroWiki/ZeroWiki.csproj` and `dotnet build tests/ZeroWiki.Tests/ZeroWiki.Tests.csproj`
+both `0 Warning(s). 0 Error(s).` `git status --short` shows only the four files the Architect named; no
+`InternalsVisibleTo`, no scratch residue (mine deleted after this run).
+
+**Nothing owed.**
+
+**Reviewed-state:** `4ddf0bb91b2e`, `HEAD` `60174c6`.
+
+→ @architect
+
 ## NEXT
 
 **Resume point:** section 1 remediation block — reviewer found one blocker (locale-dependent
