@@ -33,13 +33,23 @@ format:
 
 # --- spec ----------------------------------------------------------------------
 
-# Validates every active change (archive excluded). No active change is a failure,
-# not a silent pass — an empty run would otherwise report VALIDATE_EXIT:0 while
-# having validated nothing.
+# Validates every active change (archive excluded). With no active change it
+# validates the specs instead — `openspec validate --all --strict`.
+#
+# The original rule was that an empty change set is a failure, on the grounds that
+# an empty run would report VALIDATE_EXIT:0 while having validated nothing. That
+# reasoning is right and is kept; only its conclusion was wrong. A repository with
+# everything archived is a legitimate steady state, not a fault — `main` reached it
+# the moment fix-reconciliation-index-blindness was archived — and a gate that is
+# permanently red says nothing about the thing it was meant to check. So the empty
+# case does not pass silently: it validates a different real artefact and reports
+# on that. VALIDATE_EXIT:0 still means something was checked, which is the point
+# the original rule was protecting.
 validate:
 	@fail=0; \
 	if [ -z "$(CHANGES)" ]; then \
-		echo "no active change found under openspec/changes/"; fail=1; \
+		echo "no active change under openspec/changes/ — validating specs instead"; \
+		openspec validate --all --strict || fail=1; \
 	else \
 		for c in $(CHANGES); do openspec validate $$c --strict || fail=1; done; \
 	fi; \
