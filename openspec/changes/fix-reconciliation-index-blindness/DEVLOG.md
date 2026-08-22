@@ -3798,6 +3798,372 @@ src` shows only the one modified file; no untracked files.
 
 → @architect
 
+### Supervisor review — section 4 (`82c35fb..e54ea99`)
+
+**[supervisor]** Verdict: **Request changes.**
+
+Two sentences, one paragraph, one comment-only fix block. Everything else in this section is the best
+record work in the change, and I want that on the page before the finding: the per-claim ledger, the
+explicit evidence classes, and 4.4's refusal to assert the untested half are exactly what this section
+was for.
+
+**But this section exists to end false claims in the code, and it shipped a new one.** That is not a
+thing I can approve past, however small, because the next reader inherits it with the section's own
+authority behind it.
+
+#### The finding — the census-parse paragraph claims an observation the record does not support
+
+`ContentRepositoryService.cs`, `FindSuppressedIndexEntriesAsync`'s new `<para>` (the fifth edit in
+`e54ea99`):
+
+> the space-containing-path and non-ASCII-path parsing above, **and Decision 2's non-suppressing tags
+> (`M`, `R`, `C`, `K`, `?`) falling through this census untouched**, were both re-observed on
+> Linux/glibc 2.39/git 2.43.0 in the shipped `mcr.microsoft.com/dotnet/aspnet:10.0` container (task
+> 3.7; design.md Decision 8)
+
+**F1 — the platform is misattributed.** Both authoritative records place that observation in a
+different image. `### 3.7 — the Linux/glibc container run` says "Throwaway clone at `82c35fb`, mounted
+into `mcr.microsoft.com/dotnet/sdk:10.0` … glibc 2.39, git 2.43.0", and `design.md` Decision 8 repeats
+it verbatim. Both reserve `aspnet:10.0` for the *locale* observation alone, which is its own separate
+bullet in each. So `glibc 2.39 / git 2.43.0` are the **sdk** image's figures, and the comment attaches
+them to the runtime image. The runtime image does not inherit them by default either: `Dockerfile:43`
+is `FROM mcr.microsoft.com/dotnet/aspnet:10.0` and `Dockerfile:45-46` installs git with
+`apt-get install -y --no-install-recommends git`, so the shipping image's git version is whatever that
+apt resolves — a figure **no record in this change establishes**. (This file separately carries a
+*third* account of the shipped platform, in `ReconcileWorkingTreeAsync`'s D17 remark: "2.43.0 (Ubuntu
+24.04, the shipped image)". I am not adjudicating that; I am noting that the change now contains three
+descriptions of one platform and 4.3's own standard is that a measurement names the platform it was
+made on.)
+
+Either the comment is wrong or 3.7's post and Decision 8 are. Two authoritative accounts of the same
+run disagree, and this is the one section whose job was to make that impossible.
+
+**F2 — a shape is claimed observed that no record says was observed.** Decision 2's non-suppressing
+tags (`M`/`R`/`C`/`K`/`?`) appear **nowhere** in 3.7's post or Decision 8. Both record exactly three
+results: the 19 tests passing plus EACCES; the parse (non-ASCII `core.quotePath`/`-z`, space-containing
+path round-tripping); and the locale inversion. Constructing an unmerged index or an `R`/`K` tag is not
+something either record says happened, and it is not something the other two results imply.
+
+**The propagation path is visible, and naming it is more useful than blaming the worker.** It entered
+in the `### Brief — block 4.1–4.4`: *"3.7 observed **both** at the git level on Linux"* — written about
+a three-item list. The worker carried the brief's assertion faithfully; the reviewer's item 3 checked
+the paragraph's *tested* half rigorously (confirmed by grep that no fixture exists) and did not check
+the *observed* half, because the brief had already settled it. **This is the same pattern this change
+has already recorded once** — a hand-written claim of the Architect's that propagated through two
+further parties before anyone re-derived it — and it is the fourth time in this change that a count has
+disagreed with the list it governs ("both" over three items). The standing fix applies unchanged: name
+the items, or name the command; never the count.
+
+**Fault: the code — two sentences in one `<para>`.** Not the breakdown (section 4's four tasks are cut
+correctly and three of them landed cleanly) and not the spec (untouched by this section). A single
+comment-only fix block closes it.
+
+#### Suggested remediation shape — one block, no behaviour, no ticks
+
+1. **Split the platform attribution to match the record:** the parse observation was made in
+   `mcr.microsoft.com/dotnet/sdk:10.0` (glibc 2.39, git 2.43.0); the locale observation was made in
+   `mcr.microsoft.com/dotnet/aspnet:10.0`. Say each where it belongs, and either state the shipping
+   image's git version or say it is not established — do not carry the sdk figure across.
+2. **Resolve the tags claim one of two ways, not by softening it.** If the tag fall-through *was*
+   observed in-container, the fix is in the **record** — add it to `### 3.7` and Decision 8, where it is
+   currently absent, and then the comment's citation becomes true. If it was **not** observed, remove it
+   from the observed list and leave it where my round-two post put it: a shape with neither a test nor
+   an observation. Only the Architect knows which; that is a question, not a rewrite.
+3. **Drop the "both".** A three-item list does not take a count.
+
+While there, one cosmetic item that is genuinely not worth its own block: the 4.3 remark mixes
+`**Measured in-container …:**` (markdown) with `<b>Limits of that measurement:</b>` (XML) inside the
+same `///` paragraph, where asterisks render literally. Fold it in or leave it to `## NEXT`.
+
+#### Everything else — checked against the code, not the thread
+
+- **4.1 is true and correctly cited.** `git diff --quiet HEAD` is on `design.md`'s Context table at
+  line 16 (`exit 1` / `exit 0`), so the comment points at a real measured row rather than restating it.
+  The framing — "it reads as the index-free reflex and is not; reaching for it would produce a patch
+  that passes review and changes nothing" — is the single most useful sentence added in this section.
+- **4.3 does not overstate, and I looked hard at exactly the step you flagged.** "This pin guards a
+  condition that cannot occur" is scoped in the same clause to "in the container ZeroWiki actually runs
+  in", and the limits follow immediately. The limit that does the real work is the last one: *on a
+  non-Docker deployment the pin is load-bearing rather than defensive*. That sentence is what stops the
+  paragraph collapsing into "this cannot happen", and it is present.
+- **4.4 is correct in both directions.** It states the ordering plainly, cites task 3.9's test as the
+  falsifier for the half that has one, and says the reverse direction "is not covered by that test or
+  any other and is not asserted here either way" — which is precisely the trap I warned about in round
+  one, avoided rather than papered over.
+- **The B2 paragraph states what I actually established**, correctly classed as analytic, and does not
+  inflate it into a detection claim. The Decision 5 note ("a fact about the code — one method, two
+  callers — not a tested one") is exactly the sentence I asked for.
+- **4.2's third option is the right call.** Pointing 4.1's comment at `design.md`'s existing Context
+  table rather than duplicating it removes a drift site instead of creating one, and `design.md`
+  archives with the change.
+- **Diff really is comment-only.** I confirmed independently: `git diff 82c35fb..HEAD -- src` is five
+  comment/`<para>` hunks and nothing else.
+
+#### Does the record match what I watched being built?
+
+Yes — and unusually so. I checked the four places a tidier story would show:
+
+- **Section 1's three rounds** are not smoothed over: F3's new paragraph says `WorkingTreeUnreadable`
+  "was introduced in section 1 and promoted to a fault in section 2 **without its own stated
+  reasoning**, unlike every sibling arm", which is an admission, not a summary. Decision 7 records the
+  re-cut and its structural cause.
+- **Decision 9** still carries the withdrawn performance task, the 18m13s figure that never reproduced,
+  and the sentence naming whose error it was. Nothing was quietly deleted.
+- **B1 and B2** both appear at their sites, with B1's cited to its test and B2's marked analytic.
+- **The filtered-evidence correction** lives in the DEVLOG thread rather than the code, which is right —
+  it is a fact about how the evidence was produced, not about the instrument.
+
+The one place the code reads tidier than the truth is the paragraph above. That is the whole of it.
+
+#### Do the deferrals still look right, now the change is complete?
+
+Three of the four, yes — and each is now recorded at the site rather than only in a thread, which is
+the standard I asked for and did not expect to get:
+
+- `LinkTarget is null && File.Exists` — defer. Recorded, and its fault verdict is identical to the
+  sibling shape that *is* pinned; the untested part is which branch reaches it.
+- Decision 5's same-policy property — defer. Recorded precisely.
+- The filtered-evidence remainder — closed as far as it can be; the record now states its own
+  instrument.
+
+**One has shifted, and it is the one to name first in `## NEXT`.** Before 3.7 I said the non-ASCII half
+had an owner and the space and tag halves did not. 3.7 changed that for two of the three: non-ASCII and
+space now have a real in-container observation. **Decision 2's tag selection now stands alone as the
+only deferred item in this change with neither a test nor an observation** — which is exactly what F2
+obscures by listing it alongside two shapes that do. I do not think that reopens a completed change: the
+failure mode is a startup refusal with the cause misattributed to this census instead of the merge
+conflict it actually is — a wrong diagnosis, not data loss, and fail-fast either way. But it should be
+the first line of the deferred list, not the third.
+
+#### The change as a whole
+
+**It satisfies `content-store`'s new requirement at both sites, for the shapes that occur.** A clean
+report now means a clean tree for content: divergence, suppressed deletion, suppressed-but-uncommitted,
+a re-pointed symlink and a gitlink typechange all refuse and name the path and the index state;
+reconciliation refuses before staging, and the self-check re-derives the same census independently
+rather than inheriting its answer. The harmless side — the part that decides whether this change bricks
+a working wiki — carries the strongest evidence in the change: three constructions and two full-suite
+mutants whose collateral was traced by mechanism rather than counted.
+
+The honest qualification, and F2's paragraph already states it, is **mode**: a suppressed entry whose
+content matches `HEAD` but whose exec bit changed starts normally, so the tree is not byte-for-byte
+`HEAD` while the system reports clean. The reasoning for leaving it — statting the on-disk mode ignores
+`core.fileMode` and would reintroduce the false-refusal class that cost section 1 three rounds — is
+sound, and `updateInstead` is blinded by the same bit so no push was going to bounce. Recorded at the
+site, correctly classed as a boundary rather than a gap. I raise it only so the requirement is not read
+as holding without exception; it holds for content, deliberately not for mode.
+
+#### For `## NEXT`, for the archive — yours to place, not mine
+
+1. **Decision 2's tag selection**: no test, no observation, the only deferred item with neither.
+2. `LinkTarget is null && File.Exists`; Decision 5's same-policy property; the space/non-ASCII fixtures
+   (observed in-container, never tested) — all recorded at their sites in `ContentRepositoryService.cs`,
+   so a reader who opens the code finds them without the DEVLOG.
+3. **The lesson that owns no section, and the one I would most want the next reader to have:** these
+   gaps were reachable because three separate audits enumerated the evidence by walking the same list of
+   committed tests, and a branch with no test cannot appear in a list of tests. That is recorded only in
+   this thread. The thread archives with the change, so it is preserved — but it is the transferable
+   part, and it deserves a pointer rather than burial at depth.
+4. The flaky `RepositoryWriteLockTests.HeldByAnotherProcess_BoundedWaitGivesUp…` still predates this
+   change and is still out of scope.
+
+#### What this review could not see
+
+- **I ran no mutants** this pass — the diff is comment-only, so there is no behaviour to falsify. That
+  also means I contributed no independent corroboration of the 924-test suite this round.
+- **F1 and F2 are findings about the record's internal consistency**, which is the strongest thing I can
+  establish from here: I cannot re-run 3.7. I am not claiming the tag fall-through is broken, or even
+  that it was not observed — only that **nothing written down says it was**, and this section's own
+  standard is that a claim names the thing that would let a reader check it.
+- **Still one host, plus one container run I did not perform.** 3.7 is the Product Owner's confirmed
+  observation and I take it as given.
+- **My sweep of the new remarks was claim-by-claim, not exhaustive over the file.** I read every
+  sentence `e54ea99` added. I did not re-audit remarks this section left untouched, so an older
+  unfalsified claim elsewhere in `ContentRepositoryService.cs` would have survived this pass — the D17
+  "Ubuntu 24.04, the shipped image" line above is one I noticed only because F1 led me to it.
+
+**Reviewed-state:** `git diff HEAD -- ':/' ':(top,exclude,glob)**/DEVLOG.md'` is empty with no untracked
+files outside the DEVLOG — this section's tree is exactly `e54ea99`.
+
+→ @architect
+
+### Brief — remediation block, section 4 (supervisor F1/F2)
+
+**[architect]** → @worker. Comment-only, ticks nothing. **Both findings originate with me, not with you** —
+F2's wording came out of my brief verbatim, and you carried it faithfully. Say so is not the point;
+fixing the record is.
+
+**F1 — the platform attribution is wrong, and the section written to prevent exactly this is where it
+happened.** `FindSuppressedIndexEntriesAsync`'s new `<para>` says the parse shapes were re-observed in
+the shipped `mcr.microsoft.com/dotnet/aspnet:10.0`. They were not. **Correct attribution:**
+
+- **`mcr.microsoft.com/dotnet/sdk:10.0`** — glibc 2.39, git 2.43.0, non-root uid 501: the 19 tests, the
+  EACCES exercise, and the parse observations (non-ASCII, space-in-path).
+- **`mcr.microsoft.com/dotnet/aspnet:10.0`** — the **locale** observation only (`C`, `C.utf8`, `POSIX`).
+
+**And one thing the supervisor said was established nowhere now is.** It flagged a third account in the
+file — D17's "2.43.0 (Ubuntu 24.04, the shipped image)" — and declined to adjudicate. I measured it:
+`aspnet:10.0` is `ID=ubuntu`, `VERSION_ID="24.04"`, and its apt git candidate is
+`1:2.43.0-1ubuntu7.3` — so the shipping image's git **is** 2.43.0, and D17's line is correct.
+Record that as measured rather than leaving three accounts a reader must reconcile. Note precisely what
+it means: the runtime image has **no git preinstalled** and `Dockerfile:45-46` installs it via apt, so
+the version follows Ubuntu 24.04's package, not the base image.
+
+**F2 — a shape claimed as observed that was not.** Decision 2's non-suppressing tags appear in neither
+`### 3.7` nor Decision 8; that run produced exactly three results. **It is now observed**, and here is
+the measurement to record — same `sdk:10.0`, non-root, git 2.43.0. A genuinely unmerged index (stages
+1/2/3 via `update-index --index-info`) yields:
+
+```
+M 100644 8681f8b8… 1	f.txt
+M 100644 424860ee… 2	f.txt
+M 100644 228068db… 3	f.txt
+tags present: M
+```
+
+Uppercase `M` — neither lowercase nor `S` — so Decision 2's rule correctly declines to select it, which
+is the specific claim Decision 2 makes. **Record it as observed-not-tested**, exactly as the parse
+shapes are: there is still no test fixture for a non-suppressing tag.
+
+**Also drop the word "both"** from that paragraph. It described a three-item list, which is how the
+error propagated in the first place — the fourth time in this change a count has disagreed with its own
+list. Prefer naming the items to counting them.
+
+**Cosmetic, while you are there:** 4.3's remark mixes `**markdown**` and `<b>` in one `///` paragraph.
+Pick the file's prevailing convention.
+
+**The deferred list now has one item that stands alone** — Decision 2's tag selection was the only
+deferral with neither a test nor an observation, and this measurement changes that. So after your fix,
+the genuinely-deferred set is: the `LinkTarget is null && File.Exists` shape (no test), the census-parse
+fixtures (observed, not tested), Decision 5's same-policy property (structural, not tested). Make sure
+the record reflects that ordering rather than the old one.
+
+**Out of scope:** any behaviour change; anything outside the remarks `e54ea99` touched, except the D17
+line if and only if recording the measured git version requires it. If a truthful sentence needs a code
+change, **stop and tell me**.
+
+**Boundaries.** No commit, no ticks, no `Makefile`, no `make` gates, no spawning agents. Post under
+`## 4.`, `###` headings, above `## NEXT`; `grep -n '^#\{1,3\} '` after writing. Hand off with
+`→ @reviewer`.
+
+### Worker report — remediation block, section 4 (F1/F2)
+
+**[worker]** Comment-only, ticks nothing. Both findings acknowledged as originating in the brief, not
+invented by me — fixed the record anyway rather than arguing provenance.
+
+**F1 — platform misattribution, `FindSuppressedIndexEntriesAsync`'s observed-vs-tested paragraph:**
+corrected. The space-in-path and non-ASCII-path parse observations are now attributed to
+`mcr.microsoft.com/dotnet/sdk:10.0` (glibc 2.39, git 2.43.0, non-root uid 501 — the same run that
+produced the 19 suppressed-entry tests and the EACCES exercise), not `aspnet:10.0`. `aspnet:10.0`
+appears nowhere in that paragraph any more — it is not where the parse shapes were observed.
+
+**D17's third git-version account, resolved:** added a note directly under the `add -A` D17 comment
+block (`:857-863`) recording that `2.43.0 (Ubuntu 24.04, the shipped image)` is now measured, not
+merely carried forward: `aspnet:10.0` reports `ID=ubuntu`, `VERSION_ID="24.04"`, apt candidate for
+`git` is `1:2.43.0-1ubuntu7.3` — matching the existing line exactly — and named the mechanism: the
+runtime image ships no git of its own, `Dockerfile:45-46` installs it via apt at build time, so the
+version follows Ubuntu 24.04's package rather than anything bundled with the base image. Three accounts
+in the file now agree and say why.
+
+**F2 — Decision 2's non-suppressing tags, now genuinely observed:** folded into the same paragraph
+rather than a separate one — same image (`sdk:10.0`, non-root, git 2.43.0), a genuinely unmerged index
+(three stages via `update-index --index-info`) yields uppercase `M`, neither lowercase nor `S`, so this
+census's tag selection correctly declines it — the specific claim Decision 2 makes. Classed
+**observed-not-tested**, exactly like the two parse shapes: no fixture asserts on it either. Dropped the
+word "both" — the paragraph now names all three observed shapes (space-in-path, non-ASCII-path,
+non-suppressing tag) rather than counting them.
+
+**Genuinely-deferred set, reflecting the new ordering:** with the tag now observed, what remains
+deferred with *no* observation and *no* test is the `LinkTarget is null && File.Exists` shape
+(`CompareSuppressedSymlinkToHeadAsync`'s remarks); what remains *observed but untested* is the
+census-parse fixtures paragraph just corrected above (all three shapes: space-in-path, non-ASCII-path,
+non-suppressing tag); and what remains a *structural, untested* fact is Decision 5's same-policy
+property (`IsSuppressedEntryFault`'s summary). B2 is not part of this set — the supervisor's re-review
+already classed it correctly as established analytically, not deferred, and this block did not touch it.
+
+**Cosmetic:** the one `**markdown**` bold in `CompareSuppressedFileToHeadAsync`'s remarks (4.3) is now
+`<b>…</b>`, matching the file's prevailing convention — no other `**` remains (`grep -n '\*\*' src/ZeroWiki/Content/ContentRepositoryService.cs` is empty).
+
+**Per-claim ledger for this block:**
+- Parse shapes (space-in-path, non-ASCII-path) on `sdk:10.0` — **measurement**, task 3.7/Decision 8,
+  corrected platform.
+- Decision 2's non-suppressing-tag decline on `sdk:10.0` — **measurement**, same run, newly recorded
+  in the code (was previously an unfalsified/uncited claim inherited from the brief).
+- D17's "2.43.0 (Ubuntu 24.04, the shipped image)" — **measurement**, `aspnet:10.0`'s `/etc/os-release`
+  and apt candidate, resolving what the supervisor flagged as unadjudicated.
+- The locale claim in 4.3 (`aspnet:10.0` only) — unchanged, already checked clean by the supervisor.
+
+**Build:** `dotnet build src/ZeroWiki/ZeroWiki.csproj` → `Build succeeded`, `0 Warning(s)`, `0 Error(s)`
+(direct sanity build, no `make` gate — no behaviour changed). `git status --short -- src` shows the one
+modified file, no untracked files; `git diff -- src` is comment/doc-comment lines only.
+
+→ @reviewer
+
+
+### Reviewer report — section 4 remediation block (supervisor F1/F2)
+
+**[reviewer]** Verdict: **Approve.**
+
+**Method.** Read the diff's three hunks as claims, checked each against the code, `design.md`, and the
+`Dockerfile` — not against the DEVLOG's account of them. Confirmed independently that the diff is
+comment-only: `git diff HEAD -- src/... | grep -E '^[+-]' | ... | grep -vE '^\s*(///|//|\*|$)'` returns
+nothing.
+
+**1. Platform attributions, checked by grepping the whole file for both image names.** `grep -n
+"aspnet:10.0\|sdk:10.0" src/ZeroWiki/Content/ContentRepositoryService.cs` returns exactly three hits:
+the D17 note (`:860`, `aspnet:10.0`, about its own OS-release/apt-candidate — correct, that measurement
+genuinely was made on the runtime image), the parse/tag paragraph (`:1279`, `sdk:10.0` — corrected),
+and the locale remark (`:1508`, `aspnet:10.0`, unchanged, already correct). No figure crosses images:
+the D17 note never mentions glibc 2.39 (the sdk-image figure), and the parse paragraph never mentions
+locale counts or `C`/`C.utf8`/`POSIX`. `Dockerfile:45-46` is exactly `apt-get install -y
+--no-install-recommends git` — confirmed the D17 mechanism claim ("no git of its own... installs it via
+apt") against the real file, not the comment's say-so.
+
+**2. The tag claim's evidence class and content.** "None of this is a test: no committed fixture
+constructs a space-containing path, a non-ASCII path, or a non-suppressing tag and asserts this
+census's behaviour on it, on either platform" — the tag shape is classed identically to its two
+neighbours. And it states the actual claim Decision 2 makes, not a weaker one: "so this census's tag
+selection **correctly declines it**, the specific claim Decision 2 makes" — not merely "`M` appeared."
+
+**3. The D17 note.** Mechanism confirmed against the real `Dockerfile` (lines 45-46, exact match). It
+resolves into one account, not a fourth: the pre-existing D17 line (`:853`) is six lines above the new
+note that verifies it, and the note does not introduce any new, independent figure — it measures the
+same image the line already named.
+
+**4. "Both" is gone** (grepped the touched region — no stray count). One thing worth naming since I was
+told to treat any surviving number as suspect: the paragraph's own heading still reads "recorded so
+**the two** are not conflated" even though the body now lists three shapes. Checked whether this is a
+fifth count-mismatch — it is not: that heading text is unchanged context (outside this diff's hunks),
+and "the two" refers to the two **evidence classes** (observed vs. tested) being conflated, not a count
+of shapes. Grammatically correct as written; not a new defect, and not touched by this remediation.
+
+**5. The deferred set.** Confirmed unchanged in the code (this diff doesn't touch the `LinkTarget is
+null && File.Exists` remark or the Decision-5 summary — both were already reviewed and approved last
+round). The worker's DEVLOG account of the new ordering (tag moved from "neither" into "observed, not
+tested," alongside the two parse shapes; `LinkTarget`/`File.Exists` remains the sole "neither" item;
+Decision 5 remains structural) matches what each site's own text says, and B2 is correctly not part of
+this set — untouched by this block, already classed analytic in the prior round.
+
+**6. Swept the three changed hunks for new unfalsified claims.** Found none beyond the "the two" phrase
+addressed above, which resolved as pre-existing and correct on inspection rather than a new defect.
+
+**Build sanity.** `dotnet build src/ZeroWiki/ZeroWiki.csproj` → `0 Warning(s). 0 Error(s).`
+
+**State:** `git diff -- src` is exactly the D17 note, the corrected observed-vs-tested paragraph, and
+the markdown→`<b>` fix; `git status --short -- src` shows only the one file; no untracked files.
+
+**What I could not independently verify:** the container measurements themselves (`aspnet:10.0`'s
+`/etc/os-release` and apt candidate; the unmerged-index tag observation) — I have no Docker access in
+this environment, and 3.7/this remediation's measurement are the Product Owner's/Architect's confirmed
+observations, not something I re-ran. My audit is of the record's internal consistency, the same limit
+the supervisor named for itself.
+
+**Nothing owed.**
+
+**Reviewed-state:** `74b0ec37f8e7`, `HEAD` `e54ea99`.
+
+→ @architect
+
 ## NEXT
 
 **Resume point:** section 4, block 4.1–4.4 — briefed under `## 4.`. Sections 1, 2 and 3 are **closed**

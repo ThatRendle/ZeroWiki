@@ -855,6 +855,13 @@ public sealed class ContentRepositoryService
         // denied` on stderr for an unreadable directory, and both produce empty stderr for `add -A` on a
         // healthy tree — `ApplyContentSafetyConfigurationAsync`'s own remarks cover the CRLF case, which
         // this app now removes at the source rather than trying to also recognise here.
+        //
+        // "2.43.0 (Ubuntu 24.04, the shipped image)" above is measured, not carried forward unverified
+        // (task 4's remediation): `mcr.microsoft.com/dotnet/aspnet:10.0` reports `ID=ubuntu`,
+        // `VERSION_ID="24.04"`, and its apt candidate for `git` is `1:2.43.0-1ubuntu7.3`, matching this
+        // line exactly. Mechanism: the runtime image ships no git of its own — `Dockerfile:45-46`
+        // installs it via apt at build time — so the version in production follows Ubuntu 24.04's
+        // package, not anything bundled with the base image.
         var addArguments = new[] { "add", "-A" };
         var addResult = await _git.RunAsync(repositoryRoot, addArguments, cancellationToken: cancellationToken);
         if (!addResult.Succeeded)
@@ -1268,14 +1275,16 @@ public sealed class ContentRepositoryService
     /// </para>
     /// <para>
     /// <b>Observed, but not test-fixture-covered (recorded so the two are not conflated):</b> the
-    /// space-containing-path and non-ASCII-path parsing above, and Decision 2's non-suppressing tags
-    /// (<c>M</c>, <c>R</c>, <c>C</c>, <c>K</c>, <c>?</c>) falling through this census untouched, were both
-    /// re-observed on Linux/glibc 2.39/git 2.43.0 in the shipped <c>mcr.microsoft.com/dotnet/aspnet:10.0</c>
-    /// container (task 3.7; design.md Decision 8) and produced identical parsing to the macOS/git 2.55.0
-    /// measurement above. That is an observation, not a test: no committed fixture constructs a
-    /// space-containing path or one of Decision 2's non-suppressing tags and asserts this census's
-    /// behaviour on it, on either platform. A regression in either shape would not currently fail
-    /// <c>make test</c>.
+    /// space-containing-path and non-ASCII-path parsing above were re-observed on Linux/glibc 2.39/git
+    /// 2.43.0 in <c>mcr.microsoft.com/dotnet/sdk:10.0</c> (non-root uid 501; task 3.7, design.md
+    /// Decision 8 — the same run that exercised the 19 suppressed-entry tests and the EACCES branch) and
+    /// produced identical parsing to the macOS/git 2.55.0 measurement above. Decision 2's non-suppressing
+    /// tags are observed the same way, on the same image: a genuinely unmerged index (three stages via
+    /// <c>update-index --index-info</c>) yields an uppercase <c>M</c> — neither lowercase nor <c>S</c> —
+    /// so this census's tag selection correctly declines it, the specific claim Decision 2 makes. None of
+    /// this is a test: no committed fixture constructs a space-containing path, a non-ASCII path, or a
+    /// non-suppressing tag and asserts this census's behaviour on it, on either platform. A regression in
+    /// any of those shapes would not currently fail <c>make test</c>.
     /// </para>
     /// </remarks>
     private async Task<IReadOnlyList<SuppressedIndexEntry>> FindSuppressedIndexEntriesAsync(
@@ -1495,7 +1504,7 @@ public sealed class ContentRepositoryService
     /// absent-file and unreadable-file cases, so <c>stderr</c> text is the only signal separating them —
     /// and that text's failure-reason tail (<c>"No such file or directory"</c> / <c>"Permission denied"</c>)
     /// comes from the OS's own <c>strerror()</c>, which glibc can translate under a non-<c>C</c> locale in
-    /// general. **Measured in-container (task 3.7; design.md Decision 8), not assumed:** on
+    /// general. <b>Measured in-container (task 3.7; design.md Decision 8), not assumed:</b> on
     /// <c>mcr.microsoft.com/dotnet/aspnet:10.0</c> — the image this application ships on
     /// (<c>Dockerfile:56</c>) — the only locales present are <c>C</c>, <c>C.utf8</c> and <c>POSIX</c>;
     /// there is no translated locale data to translate into, and
