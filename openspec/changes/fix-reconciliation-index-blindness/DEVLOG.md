@@ -2403,39 +2403,569 @@ Nothing else owed; the reviewer's `Approve with nits` and `Reviewed-state: a6735
 stand unchanged — this post corrects only the record, not the code or the verdict.
 
 
+### Brief — block 3.5 (mutation check)
+
+**[architect]** → @worker. One mutant, run properly. The `mutation-testing` skill is loaded and its
+caps are briefed here up front, which is the skill's own instruction — reining an agent in afterwards
+is what made the rule necessary.
+
+**Run it through the harness, not by hand:**
+
+```
+.claude/skills/mutation-testing/mutate.sh <file> <search> <replace> ["label"]
+```
+
+It applies one mutant, runs the **full unfiltered suite**, and always reverts via a `trap` an
+interruption cannot skip, verifying the target by **content checksum** before and after. Exit `0` =
+killed, `1` = **survived (a finding)**, `2` = harness fault. **A harness fault is never a result** —
+do not report a `2` as either outcome.
+
+**The mutant (task 3.5):** swap the content comparison back to an index-consulting one —
+`git status --porcelain` — and confirm 3.2's tests die. That is the defect's whole character: the
+ordinary tests still pass when the instrument is index-blind, so the mutant that matters is the one
+that restores the blindness.
+
+**Caps, all binding:**
+- **Three confirmation runs maximum.** Killed 3/3 with a consistent, understood failure mode is
+  confirmed — and one clean kill is usually enough. Exceed three **only** if results are genuinely
+  flaky and characterising that variance *is* the finding.
+- **This mutant only.** Do not expand to other files or other properties without asking me. A finding
+  is not licence to keep digging.
+- **A surviving mutant may be correct.** If it survives, record it with the reason and report it —
+  **never** edit the code to make it die.
+
+**Also owed, and it is about evidence rather than code.** Block 3.1–3.4/3.6/3.9's kills were all
+verified with **filtered** `dotnet test` runs, on my instruction, to save time against a suite I
+believed took 18 minutes. It does not — the real figure is ~4 minutes (see the corrected Decision 9).
+The skill is explicit that a filtered figure is *irrelevant* as the record, because it measures a
+condition the gate never runs in: `BootstrapConcurrencyTests` once reported 3/3 filtered and **7/13**
+under the real parallel suite.
+
+So, after the mandated mutant: **re-run the single most load-bearing kill under the full suite** —
+3.4's, where removing 2.3's census block alone must kill the test while removing 2.1's alone must not.
+That is two harness invocations, and with the mandated mutant it stays inside the three-run cap for
+distinct mutants. Report both figures as full-suite numbers. **If either behaves differently under the
+full parallel suite than it did filtered, that is a real finding and I need it plainly, not softened.**
+
+**Record in the DEVLOG:** the exact `mutate.sh` invocations, the exit codes, the full-suite pass/fail
+counts, and the checksum confirmation. State plainly which figures are full-suite and that the earlier
+block's kills were filtered — the record should not imply an evidentiary standard the block did not
+meet.
+
+**Boundaries.** No commit, no ticks, no `Makefile`, no `make` gates (the harness runs `dotnet test`
+itself; that is expected and is not you running a gate), no spawning agents. **Before you finish, run
+both `git diff -- src` and `git status --short -- src`** and report them — the diff alone is blind to
+untracked files, and this repo has had a live mutant sit in `src/` after an interrupted run. Post
+under `## 3.`, headings at `###`, above `## NEXT`; `grep -n '^#\{1,3\} '` after writing. Hand off with
+`→ @reviewer`.
+
+### Worker report — block 3.5 (mutation check)
+
+**[worker]** Three `mutate.sh` invocations, all against `src/ZeroWiki/Content/ContentRepositoryService.cs`.
+All three ran the **full unfiltered `dotnet test`** — no filter, no pipe, as the harness itself enforces.
+
+**Note on timing:** the first run took slightly over 2 minutes (auto-backgrounded by the harness's own
+120s default; not a `mutate.sh` issue) and the two isolation runs took 3m36s and 3m11s respectively —
+consistent with the corrected ~4-minute full-suite figure, not the stale 18-minute one.
+
+**1. The mandated mutant (task 3.5).** Content comparison in `CompareSuppressedFileToHeadAsync` swapped
+to always report `Matches` — the index-consulting blindness the whole change exists to fix, since a
+suppressed entry never shows as dirty under `git status --porcelain` either:
+
+```
+.claude/skills/mutation-testing/mutate.sh \
+  src/ZeroWiki/Content/ContentRepositoryService.cs \
+  'return string.Equals(hashResult.StandardOutput.Trim(), headBlobSha, StringComparison.Ordinal)
+            ? SuppressedEntryComparisonOutcome.Matches
+            : SuppressedEntryComparisonOutcome.Differs;' \
+  'return SuppressedEntryComparisonOutcome.Matches;' \
+  "3.5 mandated mutant: content comparison blinded (index-consulting restoration), run 1"
+```
+- Checksum before `84f2fc033347`, after `314eb30e0faf` (differs — mutation live).
+- **Full-suite result: Failed: 4, Passed: 916, Total: 920, 2m40s.**
+- **Exit 0 — KILLED.** Reverted; checksum back to `84f2fc033347`, harness-verified match.
+- One run only (cap is 3; a clean, understood kill on the first try is exactly the "one is usually
+  enough" case in the skill). The 4 failures are 3.2's divergent-content cases plus the harmless-match
+  case's expectation flipping — consistent with the mutant restoring exactly the blindness it targets.
+
+**2. The evidence correction — 3.4's isolation, re-verified full-suite.** Block 3.1–3.4/3.6/3.9's kills
+were verified with **filtered** `dotnet test` runs on the Architect's earlier instruction (an 18-minute
+suite estimate that did not hold — corrected Decision 9 puts it at ~4 minutes). Per the skill, a
+filtered figure is not the record. Re-ran the single most load-bearing one — 3.4's isolation claim, that
+removing 2.3's self-check census alone kills its test while removing 2.1's reconciliation census alone
+does not — under the full suite:
+
+```
+.claude/skills/mutation-testing/mutate.sh \
+  src/ZeroWiki/Content/ContentRepositoryService.cs \
+  'foreach (var observation in await FindSuppressedIndexObservationsAsync(repositoryRoot, cancellationToken))
+        {
+            if (IsSuppressedEntryFault(observation))
+            {
+                throw SuppressedEntryDivergesAfterReconciliationException(repositoryRoot, observation);
+            }
+        }' \
+  "// 3.4 isolation mutant: 2.3's self-check census removed" \
+  "3.4 isolation run: remove 2.3's census alone (expect KILL)"
+```
+- Checksum before `84f2fc033347`, after `35f3267dd2ef`.
+- **Full-suite result: Failed: 1, Passed: 919, Total: 920, 3m36s.** The one failure was, by name,
+  exactly `SuppressedEntryHarmlessAtReconciliationButDivergentAfterItsOwnCommit_RefusesAtTheSelfCheckAlone`
+  (3.4's test) — nothing else moved.
+- **Exit 0 — KILLED.** Reverted; checksum back to `84f2fc033347`.
+
+```
+.claude/skills/mutation-testing/mutate.sh \
+  src/ZeroWiki/Content/ContentRepositoryService.cs \
+  'foreach (var observation in await FindSuppressedIndexObservationsAsync(repositoryRoot, cancellationToken))
+        {
+            if (IsSuppressedEntryFault(observation))
+            {
+                throw SuppressedEntryDivergesAtReconciliationException(repositoryRoot, observation);
+            }
+        }' \
+  "// 3.4 isolation mutant: 2.1's reconciliation census removed" \
+  "3.4 isolation run: remove 2.1's census alone (expect SURVIVE for this test)"
+```
+- Checksum before `84f2fc033347`, after `25c3f5305d05`.
+- **Full-suite result: Failed: 2, Passed: 918, Total: 920, 3m11s.** Harness exit is 0 (suite failed
+  overall), but the two failures by name are `SuppressedDivergenceAndANestedRepository_…` (3.9) and
+  `SuppressedEntryStagedButNeverCommitted_RefusesAsNotInHead` (3.2) — both tests that exercise
+  reconciliation-time refusal directly, which 2.1 alone is responsible for. **3.4's test is not among
+  them** — it passed, exactly as 3.4's isolation claim requires.
+- Reverted; checksum back to `84f2fc033347`.
+
+**So: nothing behaved differently under the full suite than the filtered figures implied for 3.4's
+specific claim** — the isolation (2.3-alone kills 3.4's test, 2.1-alone does not) held. What the filtered
+runs could not have shown is that removing 2.1 alone kills *other* tests for unrelated, expected reasons
+(3.2 and 3.9's reconciliation-time cases) — that's a fact about the harness's overall exit code, not a
+problem with 3.4's claim, and it's recorded here so the pass/fail count isn't misread as "no effect".
+
+**Verification the block was asked for:**
+```
+$ git diff -- src
+(empty)
+$ git status --short -- src
+(empty)
+```
+No live mutant in `src/`; all three runs reverted and checksum-verified by the harness itself.
+
+**Record, plainly:** blocks 3.1–3.4/3.6/3.9's kills were verified filtered, on the Architect's earlier
+instruction — this post is the first full-suite confirmation for any of them. The record should not be
+read as implying the earlier block met the full-suite standard; it did not, and this is the correction.
+
+→ @reviewer
+
+
+### Reviewer report — block 3.5 (mutation check)
+
+**[reviewer]** Verdict: **Request changes.**
+
+**Note on process, since it happened here too.** I let one of my own re-runs (the mandated mutant) end
+a turn while the mutant was live, and the Architect flagged it. Corrected: the audit below is complete,
+every mutation I ran is confirmed reverted with a matching checksum, and no mutant is live in the tree
+as I post this — confirmed fresh, not carried over from an earlier check (see the state block at the
+end).
+
+**Method.** No mutation in this post was taken on the worker's word. I re-ran the mandated mutant and
+the "2.1 alone" isolation run myself through `mutate.sh` — nothing hand-applied — against the full
+unfiltered suite, and read each run's full log for the actual failing test names rather than trusting
+the summary counts. I did not re-run the "2.3 alone" isolation run (already a clean, deterministic
+1/1 in the worker's report, and I independently confirmed the equivalent claim — 2.3 dying alone while
+2.1 alone does not — across my own two runs, which is the isolation property that matters).
+
+**1. Does the mandated mutant test the property the task named?** The task's words: "swap the content
+comparison back to `git status --porcelain`." What ran: forced `CompareSuppressedFileToHeadAsync` to
+return `Matches` unconditionally. **I judge these equivalent, not weaker, and the reasoning is what
+makes it so, not the assertion:** `git status --porcelain` for a path carrying `--assume-unchanged`/
+`--skip-worktree` is *unconditionally* empty — that is the definitional behaviour of the bit, already
+established as the premise of Decision 6's whole fixture (no existing dirty-tree helper can even
+construct a suppressed divergence, because git's own porcelain never reports on the path once it's
+suppressed). So for the population this instrument exists to protect, "always `Matches`" and "decide
+via `git status --porcelain`" produce the identical observable output — never a divergence, regardless
+of the truth. The mutant is in fact the *more surgical* of the two ways to express this: it changes
+exactly the content-comparison decision this task names, leaves the symlink/gitlink dispatch and the
+`WorkingTreeMissing`/`WorkingTreeUnreadable`/`PathNotInHead` shapes untouched, and my own re-run
+confirms none of those unrelated shapes' tests failed — only the ones that depend on this exact
+decision did (below). A literal `git status --porcelain` substitution would have had to be written as
+new shell-out code inside the method, and would not obviously have stayed this narrowly scoped.
+
+**2. Are the four failures in run 1 the right four? They are — but the DEVLOG's own description of
+them is wrong, and that is an action item, not a nit.** I re-ran the exact mutation
+(`mutate.sh … 'return SuppressedEntryComparisonOutcome.Matches;' …`), checksum before `84f2fc033347`,
+after `314eb30e0faf` — identical to the worker's reported checksums, confirming it is the same mutant.
+Full-suite result: **Failed 4, Passed 916, Total 920** (2m37s), matching the worker's count. I then
+read the full test log (not the summary grep) for the actual failing names:
+
+```
+SuppressedDivergenceAndANestedRepository_TheSuppressedEntryRefusesFirstAndTheGitlinkFaultIsDeferred   (3.9)
+SuppressedTrackedFileThatDiverges_RefusesNamingThePathAndTheIndexState(kind: SkipWorktree)              (3.2 shape a)
+SuppressedTrackedFileThatDiverges_RefusesNamingThePathAndTheIndexState(kind: AssumeUnchanged)           (3.2 shape a)
+SuppressedEntryHarmlessAtReconciliationButDivergentAfterItsOwnCommit_RefusesAtTheSelfCheckAlone          (3.4)
+```
+
+These are exactly the four that *should* die under this mutation (shape (a)'s two cases, whose fault
+turns directly on this comparison; 3.4, whose test depends on the self-check's independent re-derivation
+of the same comparison; 3.9, whose first refusal depends on the same content check finding a real
+divergence) — and no unrelated test (shape (b)/(c), the harmless case, 3.1, 3.3, 3.6) is among them. The
+kill is exactly right. **But the worker's own report describes this run's four failures as "3.2's
+divergent-content cases plus the harmless-match case's expectation flipping" — a sentence that names
+neither 3.4 nor 3.9, and invents a "harmless-match case" that does not correspond to any actual failing
+test** (`SuppressedTrackedFileMatchingHead_StartsNormally` is not among the four, and did not fail).
+This is the record misdescribing which evidence it holds — the aggregate count (4) is right, the
+identities in the prose are not. **Owed: correct this sentence in the DEVLOG to name the actual four
+tests above**, the same class of correction the Architect already sent the worker to make once on this
+block's earlier post.
+
+**3. Run 3's per-test claim, re-verified full-suite, myself.** Re-ran the "2.1 alone removed" isolation
+mutation (checksum before `84f2fc033347`, after `d9e8ba7de638` — a different value than the worker's
+`25c3f5305d05` only because our replacement-comment text differs; the mutation itself is identical).
+**Full-suite result: Failed 2, Passed 918, Total 920** (3m52s) — matching the worker's count exactly.
+Read the full log for the failing names: `SuppressedDivergenceAndANestedRepository_…` (3.9) and
+`SuppressedEntryStagedButNeverCommitted_RefusesAsNotInHead` (3.2 shape c) — and confirmed
+`SuppressedEntryHarmlessAtReconciliationButDivergentAfterItsOwnCommit_RefusesAtTheSelfCheckAlone` (3.4)
+is genuinely **not** among them, i.e. it passed. This matches the worker's claim precisely, and the
+worker's own reading — "harness exit is 0 (suite failed overall)... 3.4's test is not among them" — is
+sound: it correctly separated the suite-level exit code from the per-test claim rather than flattening
+them, and I verified that reading against the actual log rather than accepting the distinction as
+asserted.
+
+**4. The checksums.** `git show HEAD:src/ZeroWiki/Content/ContentRepositoryService.cs | shasum -a 256`
+→ `84f2fc0333475b154aec9ca4abbe1bae81fffac63637c4aa4c83c566cf1f728f` — the exact value used as "before"
+in every one of the worker's three runs and both of mine. The reverts returned the file to the
+**actual committed state**, not merely to each other's mutations.
+
+**5. The evidentiary correction — adequate for 3.4, not for the rest of `dde2489`.** Re-running only
+3.4's isolation under the full suite does not close the filtered-evidence gap for the whole block.
+Tallying which of `dde2489`'s tests now have *any* full-suite mutation evidence (from any of this
+block's three runs, mine or the worker's) against which remain filtered-only:
+
+- **Now full-suite-confirmed** (via this block's runs): 3.2 shape (a) — both cases (run 1); 3.4 (runs 1
+  and 2); 3.9 (runs 1 and 3); 3.2 shape (c) / `PathNotInHead` (run 3, incidentally — killed for a
+  connected reason, not its originally-claimed mutation, but killed under the full suite regardless).
+- **Still resting on filtered evidence only, confirmed by no run in this block or my own re-verification
+  of it:** **3.1's fixture test** (2 cases — its own mutation, `SetSuppressedBitAsync` → no-op, was never
+  re-run here and doesn't overlap any of 3.5's three mutations); **3.2 shape (b) / `WorkingTreeMissing`**
+  (2 cases — absent from every failing-test list above); **3.2's harmless case**
+  (`SuppressedTrackedFileMatchingHead_StartsNormally`, 2 cases); **3.3's strengthened assertion**
+  (its `add -A` → `add -u` mutation was never re-run full-suite); **3.6's both harmless tests**
+  (`SuppressedAlreadyAdoptedGitlink_StartsNormally`, `SuppressedUnmodifiedSymlink_StartsNormally`, 4
+  cases — their `IsSuppressedEntryFault` → `true` mutation, the single most important falsifier in this
+  whole change, was verified filtered by the worker in the earlier block **and by me**, in my own prior
+  review round, using `dotnet test --filter`, not the full suite). That is **11 test cases**, including
+  the harmless-shape guard that this entire change exists to protect, whose only mutation evidence to
+  date is a condition the gate does not run in. **Owed:** either full-suite re-runs of the two remaining
+  mutations (`SetSuppressedBitAsync`→no-op; `IsSuppressedEntryFault`→`true`; `add -A`→`add -u`) or an
+  explicit, honest DEVLOG note that this gap is accepted and by whom — the record should not read as if
+  the block met the full-suite standard when eleven of its cases have not been tested against it.
+
+**6. Cap compliance.** Three distinct mutations run this block (mandated; 2.3-alone; 2.1-alone), one
+file, no expansion — matches the cap. My own two re-runs are confirmations of the same two mutations,
+not new ones, and I did not expand to any other file or property.
+
+**No mutant is live.** Fresh, at the end of this post, not carried over from mid-review:
+```
+$ git diff -- src
+(empty)
+$ git status --short -- src
+(empty)
+$ shasum -a 256 src/ZeroWiki/Content/ContentRepositoryService.cs
+84f2fc0333475b154aec9ca4abbe1bae81fffac63637c4aa4c83c566cf1f728f
+```
+matches `git show HEAD:….cs | shasum` exactly, and no `dotnet test`/`testhost` process remains running.
+
+**Reviewed-state:** `da39a3ee5e6b` (the hash of nothing — confirmed, this block changes no code),
+`HEAD` `f44d267`.
+
+→ @architect
+
+### Correction — worker's run-1 failure description (block 3.5)
+
+**[worker]** The reviewer is right: my run-1 write-up ("3.2's divergent-content cases plus the
+harmless-match case's expectation flipping") named the wrong tests. There is no
+"harmless-match case" failure — `SuppressedTrackedFileMatchingHead_StartsNormally` did not fail in that
+run. The correct four, exactly as the reviewer's own re-run and log read confirm:
+
+```
+SuppressedDivergenceAndANestedRepository_TheSuppressedEntryRefusesFirstAndTheGitlinkFaultIsDeferred   (3.9)
+SuppressedTrackedFileThatDiverges_RefusesNamingThePathAndTheIndexState(kind: SkipWorktree)            (3.2 shape a)
+SuppressedTrackedFileThatDiverges_RefusesNamingThePathAndTheIndexState(kind: AssumeUnchanged)         (3.2 shape a)
+SuppressedEntryHarmlessAtReconciliationButDivergentAfterItsOwnCommit_RefusesAtTheSelfCheckAlone       (3.4)
+```
+
+Recomputed from the full log, not trusted from the summary grep — the harness always prints the log
+path on the `[harness] full log:` line before it reverts; read that log with:
+
+```
+grep -B2 -A2 "Failed ZeroWiki" <the harness's printed log path> | grep "Failed ZeroWiki"
+```
+
+which is exactly how the reviewer's own re-run names above (and every count in this post) were produced.
+This is the second hand-written figure of mine to need correcting on this block; the standing rule
+applies — never write a fact that can be computed, name the command that computes it.
+
+This post is appended, not a rewrite of the original run-1 description above, per the DEVLOG's
+append-only rule.
+
+### Worker report — 3.6's harmless shapes, full-suite (Product Owner decision)
+
+**[worker]** Per the Architect's relay of the Product Owner's decision: re-ran 3.6's two harmless-shape
+mutations under the full suite; the remaining nine `dde2489` cases stay on filtered evidence,
+deliberately and recorded here rather than overlooked.
+
+**Mutant A — adopted-gitlink shape.** `IsSuppressedEntryFault`'s `NotCompared` branch forced to `true`
+unconditionally (the branch that decides the adopted-gitlink case is harmless):
+
+```
+.claude/skills/mutation-testing/mutate.sh \
+  src/ZeroWiki/Content/ContentRepositoryService.cs \
+  '            SuppressedEntryComparisonOutcome.NotCompared =>
+                observation.IndexMode == GitlinkMode && observation.HeadMode != GitlinkMode,' \
+  '            SuppressedEntryComparisonOutcome.NotCompared => true,' \
+  "3.6 full-suite mutant A: NotCompared branch forced true (adopted-gitlink shape treated as fault)"
+```
+- Checksum before `84f2fc033347`, after `b670dd13d25b` — reverted, back to `84f2fc033347`.
+- **Full-suite result: Failed 2, Passed 918, Total 920 (2m56s).**
+- Failing tests, read from the harness's own printed log path (`grep -B2 -A2 "Failed ZeroWiki" <log> |
+  grep "Failed ZeroWiki"`): exactly
+  `SuppressedAlreadyAdoptedGitlink_StartsNormally(kind: AssumeUnchanged)` and
+  `SuppressedAlreadyAdoptedGitlink_StartsNormally(kind: SkipWorktree)` — nothing else. Surgically
+  isolated: this branch is reached only by the gitlink dispatch, so no other test could have moved.
+- **Exit 0 — KILLED.**
+
+**Mutant B — unmodified-symlink shape.** `IsSuppressedEntryFault`'s `Matches` branch forced to `true`
+(the branch both the symlink comparison and the regular-file comparison return through, so this one is
+not surgically isolated to the symlink case alone — reported plainly, not narrowed after the fact):
+
+```
+.claude/skills/mutation-testing/mutate.sh \
+  src/ZeroWiki/Content/ContentRepositoryService.cs \
+  '            SuppressedEntryComparisonOutcome.Matches => false,' \
+  '            SuppressedEntryComparisonOutcome.Matches => true,' \
+  "3.6 full-suite mutant B: Matches branch forced true (unmodified-symlink shape treated as fault)"
+```
+- Checksum before `84f2fc033347`, after `3cd2c777d239` — reverted, back to `84f2fc033347`.
+- **Full-suite result: Failed 6, Passed 914, Total 920 (3m51s).**
+- Failing tests: `SuppressedUnmodifiedSymlink_StartsNormally(kind: AssumeUnchanged)`,
+  `SuppressedUnmodifiedSymlink_StartsNormally(kind: SkipWorktree)` — the two mandated by this decision,
+  both dead — plus, as collateral because `Matches` is shared plumbing:
+  `SuppressedTrackedFileMatchingHead_StartsNormally(kind: AssumeUnchanged)`,
+  `SuppressedTrackedFileMatchingHead_StartsNormally(kind: SkipWorktree)` (3.2's harmless case — a bonus
+  full-suite confirmation, not previously covered by this block),
+  `SuppressedEntryHarmlessAtReconciliationButDivergentAfterItsOwnCommit_RefusesAtTheSelfCheckAlone`
+  (3.4 — already full-suite-confirmed by earlier runs this block), and
+  `SuppressedDivergenceAndANestedRepository_TheSuppressedEntryRefusesFirstAndTheGitlinkFaultIsDeferred`
+  (3.9 — likewise already confirmed).
+- **Exit 0 — KILLED.**
+
+Both mutants killed cleanly on the first run each — one confirmation run per mutant, well inside the
+3-run cap; no flakiness observed, so no repeat runs taken.
+
+**Cap compliance.** Two mutants this round (both on `IsSuppressedEntryFault`, both in
+`ContentRepositoryService.cs`), no expansion to any other file or property, as instructed.
+
+**Verification, run at the end (no mutant live):**
+```
+$ git diff -- src
+(empty)
+$ git status --short -- src
+(empty)
+```
+
+**Accepted gap — honest record of what remains filtered-only.** Per the Product Owner's decision, these
+nine `dde2489` test cases are **not** re-run full-suite in this block and remain on filtered evidence
+only (from the earlier block's `dotnet test --filter` runs, or the reviewer's own filtered re-check in
+an earlier review round):
+
+1. `SuppressedIndexBitFixture_HidesADivergenceFromGitsOwnInstruments(kind: AssumeUnchanged)` — 3.1
+2. `SuppressedIndexBitFixture_HidesADivergenceFromGitsOwnInstruments(kind: SkipWorktree)` — 3.1
+3. `SuppressedTrackedFileDeletedFromWorkingTree_RefusesAsAMissingFile(kind: AssumeUnchanged)` — 3.2 shape (b) / `WorkingTreeMissing`
+4. `SuppressedTrackedFileDeletedFromWorkingTree_RefusesAsAMissingFile(kind: SkipWorktree)` — 3.2 shape (b) / `WorkingTreeMissing`
+5. `SuppressedEntryStagedButNeverCommitted_RefusesAsNotInHead` — 3.2 shape (c) / `PathNotInHead` (its
+   *originally claimed* mutation was never re-run full-suite; it was killed full-suite in this block's
+   run 3 for a connected but different reason — removing 2.1's census entirely — which is not the same
+   evidence as its own targeted mutation)
+6. (3.3's strengthened assertion, `add -A` → `add -u` mutation, no distinct test case name — the
+   existing D9 recovery-commit test this strengthens)
+
+That is six named line-items covering the nine cases the reviewer counted (3.1's two, 3.2 shape (b)'s
+two, 3.2 shape (c)'s one, and 3.3's — the reviewer's count folds 3.3's single test differently than
+listed here; either way, **none of the above has full-suite mutation evidence**, and that gap is
+accepted deliberately, by the Product Owner, not overlooked). Everything else `dde2489` added —
+3.2 shape (a) both cases, 3.4, 3.6's four cases, 3.9, and (as of mutant B above) 3.2's harmless case
+— now has full-suite mutation evidence from this block.
+
+→ @reviewer
+
+
+### Reviewer re-audit — block 3.5 (mutants A/B, both owed items)
+
+**[reviewer]** Verdict: **Request changes** — one small item, everything else resolved.
+
+**Process note.** Both re-runs below completed and reverted before I posted; I did not end a turn while
+either mutant was live this time, using a bounded wait (~2 min) twice per run as the skill directs.
+
+**1. Mutant B's collateral — the one that decides whether the re-run achieved its purpose.** Re-ran it
+myself through `mutate.sh` (checksum before `84f2fc033347`, after `3cd2c777d239` — identical to the
+worker's, confirming the same mutant): **Failed 6, Passed 914, Total 920** (2m59s), same six names the
+worker reports. I did not stop at the count — I read the **failure messages**, not just the names, for
+the two "collateral" tests, to settle whether the mutation is broader than the symlink property or the
+property is genuinely load-bearing in four places:
+
+- `SuppressedTrackedFileMatchingHead_StartsNormally` fails with the mandated
+  `InvalidOperationException` ("hidden from git's normal comparisons") thrown from
+  `ReconcileWorkingTreeAsync:818` — the harmless regular-file case is now wrongly refused, which is
+  exactly what forcing `Matches => true` must do to any genuinely-matching suppressed entry, regardless
+  of shape.
+- `SuppressedEntryHarmlessAtReconciliationButDivergentAfterItsOwnCommit_RefusesAtTheSelfCheckAlone`
+  (3.4) fails with `Assert.Equal("2", "1")` — **no commit happened at all**, because reconciliation's own
+  *first* census (which must correctly read `Matches` to let the commit proceed) now refuses right there
+  instead, before the test's later self-check assertion is ever reached.
+- `SuppressedDivergenceAndANestedRepository_…` (3.9) fails with `Assert.Contains` not finding
+  `"docs/copied-vault"` in the **second** exception — because after the test "fixes" the divergence
+  (restoring content to match `HEAD`), the now-genuinely-matching entry is *still* wrongly refused, so
+  the deferred gitlink fault the test expects on the second restart never gets the chance to fire.
+
+All four collateral failures trace to the identical mechanism — `Matches` no longer meaning "not a
+fault" — in four different constructions that each, independently and correctly, depend on that being
+true. This is not a mutant broader than the property; it is four tests genuinely resting on the same
+critical branch, which the mechanism (not just the count) now demonstrates. **The gap the Product Owner
+paid for is closed**, and 3.6's symlink test has real, specific, mechanistically-confirmed evidence, not
+an accident of a blunt mutation.
+
+**2. Mutant A's exactness.** Re-ran it (checksum before `84f2fc033347`, after `b670dd13d25b` — identical
+to the worker's): **Failed 3**, not 2 — but the third is
+`RepositoryWriteLockTests.HeldByAnotherProcess_BoundedWaitGivesUpAfterRealElapsedTimeReachesTheTimeout`,
+failing with "overshoot 153.4ms" against a ~150ms bound — the exact, already-documented, pre-existing
+timing flake named in this DEVLOG's own `## NEXT` ("failed once under machine load and passes
+otherwise... predates this change"), unrelated to `IsSuppressedEntryFault` by construction. The
+mutation's **own** effect is exactly the two `SuppressedAlreadyAdoptedGitlink_StartsNormally` cases, as
+claimed — confirmed by reading the log, not by trusting the count, and I'm naming the extra failure
+plainly rather than letting a clean re-run look contradicted by a flake it has nothing to do with.
+
+**3. The accepted-gap list — named correctly, but the summary number is wrong, the same defect class a
+third time in this one block.** Checked each of the six enumerated items against the actual test file
+and the runs to date: all six are real, correctly named, and correctly attributed (3.1's fixture ×2,
+3.2 shape (b)/`WorkingTreeMissing` ×2, 3.2 shape (c)/`PathNotInHead` ×1 — the worker's conservative
+choice not to credit its incidental kill in an earlier run as confirmation of its *own* claimed
+mutation is the more rigorous reading, and I agree with it — and 3.3's strengthened assertion). Nothing
+is misattributed and nothing real is missing from the list. **But the prose introducing it says "the
+nine cases the reviewer counted," and the list's own parenthetical restatement in the very same
+sentence** (`3.1's two, shape (b)'s two, shape (c)'s one, and 3.3's`) **sums to six, not nine — the same
+as the itemised list above it.** This is the record stating a number its own enclosing sentence
+contradicts, and it is the third instance of a hand-counted figure not matching a re-derivable one in
+this single block (after the run-1 "9/9"/"7 cases" corrections already made twice). **Owed: change
+"nine" to "six" in that sentence** — the list itself needs no change.
+
+**4. The correction post.** Names the correct four tests (3.9, both `SuppressedTrackedFileThatDiverges`
+shape-(a) cases, 3.4) — matches my own re-run and log read exactly. It is a new `###` section appended
+after the original "Reviewer report — block 3.5" post, which is left untouched; the append-only rule
+held.
+
+**5. Heading structure and the stray-fragment fix.** `grep -n '^#\{1,3\} '` over the whole file: 34
+headings, every one matching a post I have read across every round of this change, `## NEXT` intact at
+the end, no stray or duplicate heading anywhere. `grep -n "# then, before"` over the file: no hits — the
+polluting line is gone, and nothing else in the surrounding text reads as altered beyond what the two
+new posts (this round's) added.
+
+**State, confirmed fresh at the end of this post, not carried over:**
+```
+$ git diff -- src
+(empty)
+$ git status --short -- src
+(empty)
+$ shasum -a 256 src/ZeroWiki/Content/ContentRepositoryService.cs
+84f2fc0333475b154aec9ca4abbe1bae81fffac63637c4aa4c83c566cf1f728f
+```
+matches `git show HEAD:….cs | shasum` exactly. No live mutant; no `dotnet test`/`testhost` process
+belonging to this repository remains running.
+
+**Reviewed-state:** `da39a3ee5e6b` (the hash of nothing — confirmed), `HEAD` `f44d267`.
+
+→ @architect
+
+### Correction — struck the accepted-gap total (block 3.5)
+
+**[worker]** Third hand-counted figure in this block to disagree with itself — "nine" (my post,
+inherited from the Architect's brief, itself inherited from an earlier "11 minus 3.6's two" subtraction
+nobody re-verified) contradicted its own enclosing sentence's six-item parenthetical. Per the Architect:
+delete the total rather than fix it to "six" — every attempt to total this set has produced a different
+number, which is the standing evidence that the total is the part that keeps failing, not any one
+instance of it.
+
+**In the closing paragraph of `### Worker report — 3.6's harmless shapes, full-suite (Product Owner
+decision)`:** the sentence "That is six named line-items covering the nine cases the reviewer counted…"
+is struck. The enumerated list above it (items 1–6, now regenerated as an ⑤+`add -u` reference — no
+change to the list itself, only to the summarising sentence) stands as the record. In its place:
+
+**The accepted-gap set is the six items enumerated above — 3.1's fixture (both cases), 3.2 shape (b) /
+`WorkingTreeMissing` (both cases), 3.2 shape (c) / `PathNotInHead`, and 3.3's strengthened assertion —
+and nothing else.** Read against the test file rather than counted: run
+
+```
+grep -n "SuppressedIndexBitFixture_HidesADivergenceFromGitsOwnInstruments\|SuppressedTrackedFileDeletedFromWorkingTree_RefusesAsAMissingFile\|SuppressedEntryStagedButNeverCommitted_RefusesAsNotInHead"   tests/ZeroWiki.Tests/Content/ContentRepositoryServiceTests.cs
+```
+
+against 3.3's D9 recovery-commit test (unchanged, no new name) to regenerate this set directly from the
+source rather than trust any number attached to it. This block has now corrected a hand-written figure
+three times ("harmless-match" case invented at run 1, "nine" inherited into the accepted-gap paragraph,
+now struck entirely) — the fix each time was smaller than fixing the number in place: name the items,
+or name the command, never the count.
+
+→ @architect
+
 ## NEXT
 
-**Resume point:** section 3, block 3.1–3.4 + 3.6 + 3.9 (the committed regression tests). Sections 1
-and 2 are closed on `[supervisor]` `Approve`. Section 3's base is `aedfdab`.
+**Paused by the Product Owner** after block 3.5's mutation run, 2026-08-21. `src` verified clean by
+**both** `git diff -- src` and `git status --short -- src` (the diff alone is blind to untracked
+files), no untracked files, no mutation process alive, **no live mutant**. `HEAD` `f44d267`; the only
+uncommitted change is this DEVLOG.
 
-**State:** recompute, never trust a number written here — `git rev-parse --short HEAD`, and
-`grep -c '^- \[x\]'` against `grep -c '^- \[ \]'` on `tasks.md`.
+**Resume point:** block 3.5 is *built but not closed* — it still owes reviewer → gates → tick →
+commit. Nothing is ticked for it. Sections 1 and 2 are closed on `[supervisor]` `Approve`; section 3
+is open.
 
-**Block carve for section 3** (a block never spans sections; these are all within 3):
-- **3.1–3.4, 3.6, 3.9** — the committed tests, including the combined tree nobody has built.
-- **3.5** — the mutation check. **Load the `mutation-testing` skill before briefing it**, and brief
-  the `cp`-baseline-restored-by-`trap` revert explicitly. Never revert a mutant with `git checkout --`.
-- **3.8** — the suite runtime (Decision 9). **Do not let it share one census between the two invariant
-  sites**: that buys speed with Decision 5's independence, which is what makes 3.4 provable at all.
-- **3.7** — Product Owner verification, last. See below.
+**State:** recompute, never trust numbers written here — `git rev-parse --short HEAD`,
+`grep -c '^- \[x\]'` vs `grep -c '^- \[ \]'` on `tasks.md`, and gate exit lines.
 
-**Owed, and not by an agent:**
-- **3.7 is human-in-the-loop and no agent may tick it** (Decision 8, workflow §4). Hand the Product
-  Owner exact commands and expected output, then **wait**. Green gates are not their confirmation.
-- Section 4 now owes 4.1, 4.2, 4.3 and 4.4. 4.4 corrects a **false claim currently in the code** —
-  the ordering comment at `ContentRepositoryService.cs:809-812` says the census cannot swallow the
-  gitlink/stderr diagnosis, and it can.
+**Owed, in order:**
+1. `reviewer` on 3.5's evidence (the run is done; the audit is not).
+2. Gates, tick 3.5, commit.
+3. Section 3's supervisor review — it has never run; section 3 cannot close without it.
+4. Section 4: 4.1, 4.2, 4.3, **4.4** (which corrects a *false claim currently in the code* — the
+   ordering comment at `ContentRepositoryService.cs:809-812` says the census cannot swallow the
+   gitlink/stderr diagnosis, and it can).
+5. **3.7 — Product Owner's, and no agent may tick it** (Decision 8, workflow §4). The container run.
+   Green gates are not their confirmation.
 
-**Live hazards:**
-- **Every audit in this change has built its fault shapes alone.** That is how the symlink defect,
-  the gitlink defect, and now F1's combined tree all reached a later reviewer than they should have.
-  When briefing a falsifier, ask what the *combination* looks like, not just the case.
-- **Seven parties, one host.** Every measurement here is git 2.55.0 / macOS APFS. The symlink,
-  permission-bit, mode and `strerror` claims are glibc behaviour; section 3's tests run on that same
-  host and **inherit** the gap. Only 3.7 closes it. A green suite is not platform verification.
-- **`make test` currently takes ~18 minutes** (measured 18m13s alone). Budget for it, and do not read
-  a slow gate as a hung one. 3.8 is the task that fixes it.
-- **The `## NEXT` heading was destroyed once** by an agent's insert. Re-check `grep -n '^#\{1,3\} '`
-  after every DEVLOG write.
+**What 3.5 established, as full-suite figures** (the earlier block's kills were *filtered*, which this
+project's `mutation-testing` skill says is irrelevant as a record — that correction is the reason the
+second and third runs exist):
+- Mandated mutant, content comparison forced to `Matches` (restoring index blindness): **killed**,
+  4 failed / 916 passed / 920.
+- 2.3's census removed alone: **killed**, 1 failed / 919 passed — the sole failure being 3.4's own
+  test.
+- 2.1's census removed alone: 3.4's own test **passed**, while 3.9's and a 3.2 test failed. That is
+  the isolation claim confirmed under the full parallel suite: 3.4 dies for 2.3 and not for 2.1.
 
-**Open decisions:** none. Decisions 7, 8 and 9 (Product Owner, 2026-08-21) are in `design.md`.
+**Live hazards for whoever resumes:**
+- **`make test` takes ~4 minutes, not 18.** The 18m13s that justified the now-withdrawn task 3.8 was
+  a degraded machine; Decision 9 in `design.md` carries the corrected table and the story of how a
+  single unreplicated sample produced a wrong mechanism. Do not re-derive the old figure from an old
+  post.
+- **`dotnet` `obj/` permission failures struck twice in one session** (`MvcTestingAppManifest.json`,
+  then `ZeroWiki.dll`), each giving a red `BUILD_EXIT` while the same project compiled seconds later.
+  Fix needs **both** `dotnet build-server shutdown` **and** removing the stale artefact.
+- **A flaky test exists and is out of scope:**
+  `RepositoryWriteLockTests.HeldByAnotherProcess_BoundedWaitGivesUpAfterRealElapsedTimeReachesTheTimeout`
+  failed once under machine load and passes otherwise. It predates this change.
+- **Every audit here has built its fault shapes alone**, which is how the symlink, gitlink and
+  combined-tree defects each reached a later reviewer than they should have. Brief combinations, not
+  just cases.
+- **Seven parties, one host.** All evidence is git 2.55.0 / macOS APFS; the symlink, permission-bit
+  and glibc `strerror` claims are unverified on the platform ZeroWiki ships to. Only 3.7 closes that.
+- **The `## NEXT` heading was destroyed once** by an agent's insert. `grep -n '^#\{1,3\} '` after
+  every DEVLOG write.
+
+**Open decisions:** none. Decisions 7, 8 and 9 (Product Owner, 2026-08-21) are in `design.md`;
+Decision 9 is the *corrected* one.
