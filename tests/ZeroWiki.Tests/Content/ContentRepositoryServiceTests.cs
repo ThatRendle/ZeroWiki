@@ -1690,6 +1690,100 @@ public sealed class ContentRepositoryServiceTests : IDisposable
         await AssertPorcelainIsEmptyAsync(repositoryRoot);
     }
 
+    [Theory]
+    [InlineData(SuppressionKind.AssumeUnchanged, "--assume-unchanged")]
+    [InlineData(SuppressionKind.SkipWorktree, "--skip-worktree")]
+    public async Task SuppressedSymlinkThatIsRepointed_RefusesNamingThePathAndTheIndexState(
+        SuppressionKind kind, string expectedIndexStateName)
+    {
+        // Supervisor finding B1 (section 3 remediation): 3.6 pinned only the harmless direction of the
+        // symlink dispatch (SuppressedUnmodifiedSymlink_StartsNormally, above) — this is the divergent
+        // direction the spec's "SHALL refuse" actually names, and CompareSuppressedSymlinkToHeadAsync's
+        // own remarks claimed it "confirmed" without a committed falsifier. Falsifier: blinding that
+        // method to always return Matches must kill this test.
+        if (OperatingSystem.IsWindows())
+        {
+            return;
+        }
+
+        var service = CreateService();
+        await service.EnsureRepositoryAsync();
+        var repositoryRoot = RepositoryRoot;
+        var linkPath = Path.Combine(repositoryRoot, "docs", "link.md");
+
+        File.CreateSymbolicLink(linkPath, "target.md");
+        await _git.RunOrThrowAsync(repositoryRoot, ["add", "docs/link.md"]);
+        await _git.RunOrThrowAsync(
+            repositoryRoot,
+            ["commit", "-m", "add a symlink before suppression"],
+            GitAuthor.System.ToEnvironmentVariables());
+
+        await SetSuppressedBitAsync(repositoryRoot, "docs/link.md", kind);
+
+        // Re-point the symlink's own link text after suppression — the working tree no longer agrees
+        // with what HEAD recorded, and git's own instruments cannot see it because the bit hides them.
+        File.Delete(linkPath);
+        File.CreateSymbolicLink(linkPath, "elsewhere.md");
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() => service.EnsureRepositoryAsync());
+        Assert.Contains("docs/link.md", exception.Message, StringComparison.Ordinal);
+        Assert.Contains(expectedIndexStateName, exception.Message, StringComparison.Ordinal);
+
+        // Nothing was committed past the divergence, and the bit is untouched (Decision 3).
+        Assert.Equal("2", (await _git.RunOrThrowAsync(repositoryRoot, ["rev-list", "--count", "HEAD"])).StandardOutput.Trim());
+        var expectedTag = kind == SuppressionKind.AssumeUnchanged ? "h" : "S";
+        var lsFiles = await _git.RunOrThrowAsync(repositoryRoot, ["ls-files", "-v", "docs/link.md"]);
+        Assert.Equal($"{expectedTag} docs/link.md", lsFiles.StandardOutput.Trim());
+    }
+
+    [Theory]
+    [InlineData(SuppressionKind.AssumeUnchanged, "--assume-unchanged")]
+    [InlineData(SuppressionKind.SkipWorktree, "--skip-worktree")]
+    public async Task SuppressedTrackedFileReplacedByAGitlink_Refuses(
+        SuppressionKind kind, string expectedIndexStateName)
+    {
+        // Supervisor finding B2 (section 3 remediation): 3.6 pinned only the harmless half of the
+        // NotCompared arm (an already-adopted gitlink whose nested HEAD merely advanced) — this is
+        // Decision 7's "a tracked file replaced by a gitlink" typechange, the fault half of the same
+        // condition. Falsifier: forcing IsSuppressedEntryFault's NotCompared arm to false must kill
+        // this test.
+        var service = CreateService();
+        await service.EnsureRepositoryAsync();
+        var repositoryRoot = RepositoryRoot;
+        var placeholderPath = Path.Combine(repositoryRoot, "docs", "vault-placeholder.md");
+
+        // HEAD holds this path as an ordinary blob, committed directly (bypassing the service).
+        await File.WriteAllTextAsync(placeholderPath, "# Placeholder\n");
+        await _git.RunOrThrowAsync(repositoryRoot, ["add", "docs/vault-placeholder.md"]);
+        await _git.RunOrThrowAsync(
+            repositoryRoot,
+            ["commit", "-m", "a tracked file, before it is replaced by a gitlink"],
+            GitAuthor.System.ToEnvironmentVariables());
+
+        // Replace the tracked file with a nested git repository of the same name, and stage it —
+        // bypassing ReconcileWorkingTreeAsync's own `add -A`/gitlink guard, which the census (running
+        // before that guard, Decision 6) must catch on its own. Never committed: HEAD keeps the blob,
+        // so the index's 160000 mode disagrees with HEAD's, which is the shape under test.
+        File.Delete(placeholderPath);
+        await CreateNestedGitRepositoryDirectoryAsync(placeholderPath);
+        await _git.RunOrThrowAsync(repositoryRoot, ["add", "docs/vault-placeholder.md"]);
+
+        var lsFilesStage = await _git.RunOrThrowAsync(repositoryRoot, ["ls-files", "--stage", "docs/vault-placeholder.md"]);
+        Assert.StartsWith("160000 ", lsFilesStage.StandardOutput);
+
+        await SetSuppressedBitAsync(repositoryRoot, "docs/vault-placeholder.md", kind);
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() => service.EnsureRepositoryAsync());
+        Assert.Contains("docs/vault-placeholder.md", exception.Message, StringComparison.Ordinal);
+        Assert.Contains(expectedIndexStateName, exception.Message, StringComparison.Ordinal);
+
+        // Nothing was committed past the fault — the census refuses before `add -A` even runs
+        // (Decision 6), so the gitlink never reaches HEAD.
+        Assert.Equal("2", (await _git.RunOrThrowAsync(repositoryRoot, ["rev-list", "--count", "HEAD"])).StandardOutput.Trim());
+        var lsFilesAfter = await _git.RunOrThrowAsync(repositoryRoot, ["ls-files", "--stage", "docs/vault-placeholder.md"]);
+        Assert.StartsWith("160000 ", lsFilesAfter.StandardOutput);
+    }
+
     [Fact]
     public async Task SuppressedDivergenceAndANestedRepository_TheSuppressedEntryRefusesFirstAndTheGitlinkFaultIsDeferred()
     {

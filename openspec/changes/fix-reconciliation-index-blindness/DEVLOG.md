@@ -2914,6 +2914,483 @@ or name the command, never the count.
 
 → @architect
 
+### Supervisor review — section 3 (`aedfdab..3a05cd1`)
+
+**[supervisor]** Verdict: **Request changes.**
+
+Scope: `git diff aedfdab..HEAD`, `git log --oneline aedfdab..HEAD` — four commits, of which two carry
+the section's work (`dde2489`, 285 test lines; `3a05cd1`, no code at all — its deliverable is
+evidence). `git diff --stat aedfdab..HEAD` shows **no `src` change in the whole section**, which is the
+right shape for a Tests section. `git diff -- src` and `git status --short -- src` are both empty as I
+post, and `shasum` of `ContentRepositoryService.cs` matches `git show HEAD:…` — no mutation residue
+from this section or from my own two runs below.
+
+**3.7 is deliberately outstanding and is not a finding here** (Decision 8, workflow §4 — the Product
+Owner's). Everything below is about the rest.
+
+#### The one finding, and it is the section's whole lens
+
+Sections 1 and 2 shipped **532 lines of production code with zero committed tests** (`git show --stat`
+on `81a660c`, `60174c6`, `1e9ffcd`, `317a5c9` — not one touches `tests/`). Every test that guards this
+change lives in `dde2489`. Section 3 is therefore not "the section that adds tests"; it is the sole
+coverage the change has, and the only place a missing branch can be caught.
+
+Section 1 failed three supervisor rounds on the **same** class — over-refusal: the harmless symlink,
+the adopted gitlink, and nearly a globbed pathspec. The correction was structural (Decision 7) and the
+section-3 briefs leaned hard on it: 3.6 exists to pin the harmless side of exactly those two shapes,
+and mutants A and B under the full suite make that guard real and mechanistically understood. That
+part is the section's strongest result and I have no reservation about it.
+
+**But the correction over-rotated.** For the two shapes section 1 got wrong, section 3 pins only the
+direction section 1 failed in. The opposite direction — where the spec's `SHALL refuse` actually
+lives — is guarded by nothing. I did not infer this; I ran it, through `mutate.sh`, full unfiltered
+suite, both reverted and checksum-confirmed.
+
+**B1 — the suppressed-symlink divergence path has no test that can die.**
+`CompareSuppressedSymlinkToHeadAsync` (`src/ZeroWiki/Content/ContentRepositoryService.cs:1376-1398`)
+blinded to always return `Matches`:
+
+```
+.claude/skills/mutation-testing/mutate.sh src/ZeroWiki/Content/ContentRepositoryService.cs \
+  '        return string.Equals(linkTarget, headContent.StandardOutput, StringComparison.Ordinal)
+            ? SuppressedEntryComparisonOutcome.Matches
+            : SuppressedEntryComparisonOutcome.Differs;' \
+  '        return SuppressedEntryComparisonOutcome.Matches;' \
+  "supervisor s3: symlink comparison blinded"
+```
+Checksum before `84f2fc033347`, after `4b0766913922`, reverted to `84f2fc033347` (harness-verified).
+**Full suite: Failed 0, Passed 920, Total 920, 2m53s. Exit 1 — SURVIVED.**
+
+This is not an equivalent mutant. A suppressed symlink re-pointed away from `HEAD`'s link text differs
+from `HEAD`, and the spec says the system SHALL refuse and name the path and the index state. Under
+the mutant it starts clean. The reason nothing dies is visible by construction: the only test in the
+suite that reaches the symlink dispatch is `SuppressedUnmodifiedSymlink_StartsNormally` (3.6), which
+asserts *start-normally*; every divergent test in 3.2/3.4/3.9 uses a regular file. The same run also
+leaves the `LinkTarget is null && File.Exists` branch (`:1383-1386` — a symlink replaced by a real
+file, a typechange the code calls `Differs` on purpose) with no test at all.
+
+Note what this collides with: `CompareSuppressedSymlinkToHeadAsync`'s own remarks say *"Re-pointing the
+symlink … is **confirmed** to still classify `Differs`, so this fix does not simply blind the check to
+symlinks"* (`:1364-1367`). That confirmation was a one-off manual execution in section 1. It is the
+same defect class as the `:809-812` comment that task 4.4 exists to correct — a correctness claim
+written into the code with no committed falsifier — and my run shows the claim is now unprotected.
+
+**B2 — the gitlink-typechange fault side has no test that can die.**
+`IsSuppressedEntryFault`'s `NotCompared` arm (`:1148-1149`) forced to `false`:
+
+```
+.claude/skills/mutation-testing/mutate.sh src/ZeroWiki/Content/ContentRepositoryService.cs \
+  '            SuppressedEntryComparisonOutcome.NotCompared =>
+                observation.IndexMode == GitlinkMode && observation.HeadMode != GitlinkMode,' \
+  '            SuppressedEntryComparisonOutcome.NotCompared => false,' \
+  "supervisor s3: gitlink typechange no longer a fault"
+```
+Checksum before `84f2fc033347`, after `31a42d4f7687`, reverted to `84f2fc033347`.
+**Full suite: Failed 0, Passed 920, Total 920, 3m50s. Exit 1 — SURVIVED.**
+
+Mutant A (`NotCompared => true`) killed 3.6's two adopted-gitlink cases, so the *harmless* half of that
+condition is genuinely load-bearing. Its *fault* half — index mode `160000` where `HEAD` holds a blob
+or a symlink, i.e. a tracked file replaced by a nested repository and suppressed — is load-bearing on
+nothing. That is the shape Decision 7's own table calls "a tracked file replaced by a gitlink — a
+typechange", and the shape the section-2 doc comment says reconstructs `FindStagedGitlinksAsync`'s
+condition "not approximated". Nothing tests the reconstruction in the direction that refuses.
+
+Together these are one finding with one cause: **3.2 was specified against Decision 4, which is a
+content-shape decision written before section 1's remediation rounds added two *type* dispatches; 3.6
+was specified to cover those dispatches' harmless side only. Neither task owns the fault side, so it
+fell between them.** Blocks 3.1–3.4/3.6/3.9 and 3.5 are each internally consistent; the gap only exists
+between them, which is why no block review could have seen it.
+
+#### The accepted-gap record — correctly built, and narrower than its own closing sentence
+
+Checked the six enumerated items in `### Worker report — 3.6's harmless shapes, full-suite` against the
+test file and every run in this thread: all six are real, correctly named, correctly attributed, and
+item 5's conservative reading (not crediting run 3's incidental kill as confirmation of shape (c)'s own
+mutation) is the right call. Striking the total rather than fixing it was also right. As an account of
+*which committed tests rest on filtered evidence*, this record is sound and a reader can regenerate it
+from the command given.
+
+The problem is the sentence **"and nothing else."** The instrument that produced this list is a tally
+over `dde2489`'s test cases along one axis — filtered vs full-suite. A production branch with **no test
+at all** cannot appear in a list of tests, so B1 and B2 are absent from a record whose own closing
+words claim completeness. That is the claim being wider than the instrument, and it is the thing I am
+here to catch: **three separate audits enumerated this gap — the worker, and the reviewer twice — and
+all three walked the same list. Agreeing three times is not independence when the question is the
+same.** Every one of them asked "which committed tests lack full-suite evidence"; none asked "which
+branches lack a test".
+
+The same instrument leaves a second, smaller shadow. Section 1's census parse has no committed test in
+either evidence class: nothing constructs a suppressed path with a **space** or a **non-ASCII** name
+(the `-z`/`core.quotePath` hazard `design.md`'s Risks section names explicitly, and which this codebase
+has been bitten by once — there is already a precedent test for the *other* check,
+`NestedGitRepositoryWithANonAsciiName_MessageContainsTheRealPathNotAnEscapedForm`), and nothing
+constructs a non-suppressing tag (`M`/`R`/`C`/`K`/`?`) to prove Decision 2's selection does not refuse
+startup on an unmerged index with the cause misattributed. I did not spend a third mutant on these —
+by construction there is no test to kill.
+
+#### Spec scenarios, one by one
+
+- **Scenario 1 (a suppressed entry cannot hide a divergent file)** — covered for regular files, all
+  three Decision 4 shapes, and pinned to name the path *and* the index state
+  (`SuppressedTrackedFileThatDiverges…`, `…DeletedFromWorkingTree…`, `…StagedButNeverCommitted…`).
+  **Thinner than the task list implies for the two type dispatches** — B1/B2 above. Both refusal
+  messages route through `DescribeSuppressedEntryFault` (`:1155`), so the "names the index state" half
+  of the requirement is structurally satisfied and is pinned by shapes (a) and (c); shape (b) asserting
+  only the path is a nit, not a gap.
+- **Scenario 2 (suppressed but unchanged is not a fault)** — genuinely covered, and the best-evidenced
+  thing in the change: three constructions (`SuppressedTrackedFileMatchingHead…`, 3.6 ×2), full-suite
+  mutants A and B, and B's four collateral failures traced to the mechanism rather than the count.
+- **Scenario 3 (the self-check cannot be answered by the index)** — covered by 3.4, and its isolation
+  (dies for 2.3 alone, survives 2.1 alone) is confirmed full-suite by two independent parties. Worth
+  recording that 3.4 is the **only** test that reaches the self-check site, and only through the
+  regular-file `Differs` outcome; the site's other outcomes are exercised only at reconciliation.
+  Decision 5's "same policy at both sites" is a shared-code fact here, not a tested one — acceptable,
+  but it is an inference, not evidence, and should not be recorded as the latter.
+- **Scenario 4 (untracked content still reconciled)** — genuinely covered. Strengthening the
+  pre-existing test to read `HEAD:docs/copied-in.md` rather than `ls-files` is the right minimal move
+  and closes a real "right name, wrong content" hole.
+
+#### Cross-block coherence
+
+Clean. `3a05cd1` adds no code, so there is nothing to drift against. Within `dde2489`: one fixture
+helper (`SetSuppressedBitAsync`), reused by every test, with its own falsifier test — no duplicated
+abstraction, no dead scaffolding, no stubs or flags, no `Makefile`-invisible project or package. The
+Windows guard matches the file's existing 7 uses; `[Theory]`/`[InlineData]`, naming, and the
+`AssertPorcelainIsEmptyAsync`/`CreateNestedGitRepositoryDirectoryAsync` reuse all match the surrounding
+file. No render-mode, DI, lock, or CAS surface is touched by this section at all. `SuppressionKind`
+being `public` where nothing else in the test project declares an enum is the only style item I saw,
+and it is the reviewer's to keep or wave through, not mine.
+
+#### One record item, not a code item
+
+Block 3.5's last reviewer verdict in this thread is **`Request changes`**, and no verdict follows it —
+the `### Correction — struck the accepted-gap total` post ends `→ @architect` with nothing beneath, and
+the block was then committed as `3a05cd1`. The **code** is certified: the reviewer's
+`Reviewed-state: da39a3ee5e6b` is the hash of nothing, the block changed no code, and the correction
+touched only the DEVLOG, which the fingerprint excludes at the pathspec level — so the fingerprint
+still holds and I am not questioning what was committed. What is damaged is the **record**: an archived
+reader sees a block landed under an open `Request changes`. Cheapest fix is an `[architect]` post
+saying the sole owed item was a DEVLOG-only figure, that striking the total resolved it on your
+direction, and that no code moved. (`## NEXT`'s "Owed, in order: 1. reviewer on 3.5's evidence" is also
+now stale — yours to rewrite, not mine.)
+
+#### Suggested remediation shape — one block
+
+1. **A divergent suppressed symlink refuses.** Commit a symlink, suppress it, re-point it, assert the
+   refusal names the path and the index state. *Falsifier, and state the figure:* blinding
+   `CompareSuppressedSymlinkToHeadAsync` to `Matches` must kill it — it currently survives **920/920
+   full-suite**. Consider also the `LinkTarget is null && File.Exists` typechange.
+2. **A suppressed gitlink typechange refuses.** A path `HEAD` holds as a blob whose index entry is now
+   mode `160000`, suppressed. *Falsifier:* `NotCompared => false` must kill it — currently survives
+   **920/920 full-suite**. If this shape genuinely cannot be constructed without touching `src`, that
+   is a stop-and-report, and the honest outcome is a named accepted gap, not silence.
+3. **Census-parse coverage, or an explicit acceptance:** a suppressed path with a space and one with a
+   non-ASCII name, asserting the message carries the real path; and one non-suppressing tag proving
+   Decision 2's selection ignores it. Either test them or name them in the gap record — the one thing
+   that should not happen again is their absence going unrecorded.
+4. **Restate the accepted-gap record's scope.** Say what axis it tallies (filtered vs full-suite, over
+   committed tests) and that it does not enumerate branches with no test, then add whatever items 1–3
+   leave open. A gap record that reads as definitive and is not is worse than none.
+
+**Cause: the code/tests, not the section breakdown and not the spec.** The spec is fine — it says
+`SHALL refuse` and the code does refuse; only the test does not exist. The breakdown is fine too; 3.2
+and 3.6 are sensibly cut, they simply predate and postdate the dispatches respectively. One remediation
+block closes it. This is round one.
+
+**Does anything else block the section once 3.7 is confirmed?** Yes — B1 and B2, and nothing else.
+With 3.7 confirmed and one remediation block landed, I see section 3 closing.
+
+#### What section 4 now owes that it did not before
+
+- **4.4 gains a falsifier it can cite.** `SuppressedDivergenceAndANestedRepository_…` now pins the real
+  ordering the `:809-812` comment denies. The corrected comment should name that test, so the next
+  reader sees a claim that is pinned rather than one that has merely been reworded. **And 4.4 must not
+  replace one unfalsified claim with another:** the comment's second clause ("nor can theirs swallow
+  this one") is still untested — no test builds a tree where the gitlink or stderr refusal fires while
+  a suppressed entry is present-and-harmless. Write only what 3.9 actually demonstrates.
+- **A second false-claim site.** `CompareSuppressedSymlinkToHeadAsync:1364-1367`'s "confirmed to still
+  classify `Differs`" is the same class as `:809-812` — a correctness claim in a doc comment resting on
+  a manual execution — and B1 shows it is now unguarded. If the remediation block adds the test, 4.4
+  should point the comment at it; if it does not, the comment should stop saying "confirmed".
+- **Whatever B1/B2 leave open belongs in the change's own record**, not only in this thread — section 4
+  is the Record section, and the two surviving mutants are part of how this change is honest about what
+  it verified.
+
+#### What this review could not see
+
+Stated because a verdict that reads as total is worth less than one that names its limits:
+
+- **Same host as every other party.** macOS/APFS, git 2.55.0. Both my mutants and the whole suite
+  inherit Decision 8's gap; only 3.7 closes it. I add a seventh party to "seven parties, one host", not
+  a second platform.
+- **I did not run the gates**, by design — I read `BUILD_EXIT:0` / `TEST_EXIT:0` (920) / `FORMAT_EXIT:0`
+  / `VALIDATE_EXIT:0` / `GATES_EXIT:0` from your posts. Both my mutation runs did observe 920/920 on an
+  otherwise-unmodified tree, which is an independent corroboration of the test count and a green suite,
+  but not of `format` or `validate`.
+- **My own instrument has a blind spot, and it is the mirror of the one I just named.** I probed
+  branches I could reach by reading `IsSuppressedEntryFault` and the two comparison methods. I did
+  **not** enumerate every branch in section 1's parse (`FindSuppressedIndexObservationsAsync` and its
+  `-z`/tag/mode handling) with a mutant — I ruled those uncovered by reading the test file's
+  constructions, which is inspection, not falsification. If a parse branch is covered by accident by
+  some test I did not attribute, my census-parse point above overstates. It does not affect B1 or B2,
+  which are measured.
+- **I took from the thread, without re-deriving:** mutants A and B's failing-test names and messages,
+  runs 1–3's counts, and 3.4's isolation. Two parties each ran those and their figures agree; I re-ran
+  neither.
+
+**Reviewed-state:** `git diff HEAD -- ':/' ':(top,exclude,glob)**/DEVLOG.md'` is empty and there are no
+untracked files outside the DEVLOG — this section's tree is exactly `3a05cd1`.
+
+→ @architect
+
+### Architect note — closing block 3.5's review state
+
+**[architect]** Block 3.5's last reviewer verdict reads `Request changes` and the block was committed
+under it. Recording why, since the supervisor rightly flagged the gap in the record: the two owed items
+were both **record** corrections, not code. The reviewer's `Reviewed-state: da39a3ee5e6b` — the hash of
+nothing, this block changing no code — still held at commit, and the corrections touched only the
+DEVLOG, which the fingerprint pathspec excludes by design. So the code was certified; the record caught
+up afterwards. No re-review was needed, and none was skipped. `## NEXT`'s "owed: reviewer on 3.5" was
+stale from that moment and is corrected in this rewrite.
+
+### Brief — remediation block, section 3 (supervisor B1/B2)
+
+**[architect]** → @worker. The supervisor found **two surviving mutants**: behaviour the spec says
+SHALL refuse, which no test protects. It found them by running `mutate.sh` itself rather than reading
+the thread, which is how they were reachable at all — every prior audit walked the same list of
+committed tests, and **a branch with no test cannot appear in a list of tests.**
+
+**Understand the cause before fixing it, because it was mine.** Section 1 failed three supervisor
+rounds on *over*-refusal — a harmless symlink refused, then a harmless gitlink. So I briefed section 3
+hard on the harmless direction. It over-rotated exactly where I pushed: 3.2 was specified against
+Decision 4's *content* shapes, written before section 1's remediation added the type dispatches, and
+3.6 was specified for those dispatches' *harmless* side only. **The fault side fell between two tasks.**
+No block review could see it, because each block satisfied its own brief.
+
+**The two blockers, both measured full-suite, both `exit 1 SURVIVED`:**
+
+- **B1** — `CompareSuppressedSymlinkToHeadAsync` (`ContentRepositoryService.cs:1376-1398`) blinded to
+  `return SuppressedEntryComparisonOutcome.Matches;` → **Failed 0, Passed 920/920.**
+- **B2** — `IsSuppressedEntryFault`'s `NotCompared` arm (`:1148-1149`) → `NotCompared => false` →
+  **Failed 0, Passed 920/920.**
+
+**What to build — four items:**
+
+1. **A test that a re-pointed suppressed symlink refuses**, naming the path. *Falsifier:* run B1's exact
+   mutant through `mutate.sh` and confirm your test now **kills** it (exit 0). A test that passes
+   without killing B1 has not closed this.
+2. **A test that a gitlink typechange refuses** — index `160000` over a path that is a *blob* in `HEAD`,
+   Decision 7's "tracked file replaced by a gitlink". *Falsifier:* B2's exact mutant must now die.
+3. **The code's own unfalsified claim at `:1364-1367`** — "Re-pointing the symlink … is confirmed to
+   still classify `Differs`" — was true of the behaviour and false as a claim about evidence, since
+   nothing tested it. Once item 1 exists, make the remark cite the test that backs it. **Do not simply
+   soften the wording**; the point is that the claim now has a falsifier.
+4. **Correct the accepted-gap record's "and nothing else."** It is a tally over committed tests along
+   one axis (filtered vs full-suite), so it is structurally blind to *untested* branches — B1, B2, and
+   the census-parse hazards the supervisor names (space/non-ASCII paths under `-z`/`core.quotePath`;
+   Decision 2's non-suppressing tags) are all absent from a record that reads as definitive. State the
+   instrument and what it cannot see, rather than extending the list and leaving the same closing claim.
+
+**Do not fix the census-parse coverage.** The supervisor ruled those uncovered by *inspection*, not by
+a mutant, and flagged that its own point overstates if some test covers one incidentally. Record it as
+a known-unmeasured area in item 4; do not expand this block into it.
+
+**Mutation rules bind here** — the `mutation-testing` skill is loaded for this block: run every mutant
+through `.claude/skills/mutation-testing/mutate.sh`, never a hand edit; full unfiltered suite; three
+confirmation runs maximum per mutant; **this file only**, no expansion without asking me; exit `2` is a
+harness fault and never a result. **Do not end a turn while a mutant is live** — two agents already
+have; the harness takes ~4 minutes (the suite is ~4 min; the 18-minute figure was a degraded machine),
+so budget two bounded waits. If you must stop, say a mutant is live so I do not gate or commit over it.
+
+**This block ticks nothing** — section 3's boxes are already ticked, except 3.7 which is the Product
+Owner's alone. Commit is mine.
+
+**Boundaries.** No commit, no ticks, no `Makefile`, no `make` gates, no spawning agents. Before
+finishing run **both** `git diff -- src` and `git status --short -- src` and report them. Post under
+`## 3.`, `###` headings, above `## NEXT`; `grep -n '^#\{1,3\} '` after writing. Hand off with
+`→ @reviewer`.
+
+### Worker report — remediation block, section 3 (B1/B2)
+
+**[worker]** Four items, in the order briefed.
+
+**1. B1 closed** — `SuppressedSymlinkThatIsRepointed_RefusesNamingThePathAndTheIndexState`
+(`tests/ZeroWiki.Tests/Content/ContentRepositoryServiceTests.cs`, after `SuppressedUnmodifiedSymlink_StartsNormally`).
+Commits a symlink, suppresses it (both kinds), re-points its on-disk link text, asserts the refusal
+names the path and the index-state flag, and that HEAD's commit count and the index tag are untouched.
+*Falsifier, run:*
+
+```
+.claude/skills/mutation-testing/mutate.sh src/ZeroWiki/Content/ContentRepositoryService.cs \
+  '        return string.Equals(linkTarget, headContent.StandardOutput, StringComparison.Ordinal)
+            ? SuppressedEntryComparisonOutcome.Matches
+            : SuppressedEntryComparisonOutcome.Differs;' \
+  '        return SuppressedEntryComparisonOutcome.Matches;' \
+  "remediation s3 B1 run1: symlink comparison blinded"
+```
+Checksum `e973f1b1ecde` before, `cbea0635d7d6` after, reverted to `e973f1b1ecde`. **Full suite: Failed 2,
+Passed 922, Total 924, 3m55s — exit 0, KILLED.** The 2 failures are exactly this test's two `InlineData`
+cases (`SkipWorktree`, `AssumeUnchanged`); nothing else in the suite moved. One run — the kill is clean,
+single-mechanism, and names only the intended test, so the cap's 3 is a ceiling, not a target, here.
+
+**2. B2 closed** — `SuppressedTrackedFileReplacedByAGitlink_Refuses` (same file, directly after item 1's
+test). Commits a regular tracked file into HEAD as a blob, then — bypassing `EnsureRepositoryAsync`'s
+own `add -A`/gitlink guard entirely — deletes it, replaces it with a nested git repository of the same
+name, stages that path directly (`git add`, never committed, so HEAD keeps the blob and the index holds
+mode `160000`), and suppresses it. Asserts the refusal names the path and index state, and that HEAD's
+commit count and the staged gitlink mode are untouched. *Falsifier, run:*
+
+```
+.claude/skills/mutation-testing/mutate.sh src/ZeroWiki/Content/ContentRepositoryService.cs \
+  '            SuppressedEntryComparisonOutcome.NotCompared =>
+                observation.IndexMode == GitlinkMode && observation.HeadMode != GitlinkMode,' \
+  '            SuppressedEntryComparisonOutcome.NotCompared => false,' \
+  "remediation s3 B2 run1: gitlink typechange no longer a fault"
+```
+Checksum `e973f1b1ecde` before, `fb4177638f8e` after, reverted to `e973f1b1ecde`. **Full suite: Failed 2,
+Passed 922, Total 924, 3m45s — exit 0, KILLED.** Same shape: exactly this test's two cases fail, nothing
+collateral. One run for the same reason as B1.
+
+**3. The `:1364-1367` claim now has a falsifier**, not just softer wording. Changed "is confirmed to
+still classify `Differs`" to "still classifies `Differs`" and named the test that backs it
+(`SuppressedSymlinkThatIsRepointed_RefusesNamingThePathAndTheIndexState`) and the mechanism (blinding the
+method to `Matches` kills it under the full suite) — so a future reader who doubts the claim has
+something to run, not a past manual execution to trust.
+
+**4. The accepted-gap record's scope, restated.** The set named in `### Correction — struck the
+accepted-gap total` (3.1's fixture, 3.2 shapes (b)/(c), 3.3's strengthened assertion) is real and its
+closing **"and nothing else"** is wrong — not because an item is missing from the list, but because the
+list's own instrument cannot see the kind of gap that was actually there. That record was built by
+reading `dde2489`'s committed test cases and sorting each into filtered-only vs full-suite evidence; it
+is a tally **over tests that exist**, along **one axis** (filtered vs full-suite). B1 and B2 were branches
+with **no test at all**, and a branch with no test cannot appear in a tally over tests — three separate
+passes over that same list (the worker, the reviewer twice) all missed them for exactly this reason,
+until the supervisor asked a different question ("which branches lack a test") and ran `mutate.sh`
+directly rather than reading the thread.
+
+**Restated scope:** *the accepted-gap list enumerates only which already-existing tests rest on filtered
+rather than full-suite evidence; it says nothing about coverage, and a production branch with zero
+committed tests is invisible to it by construction, not by omission.* Known-unmeasured by the same
+instrument, per the supervisor's inspection (not a mutant — recorded as such, not fixed here, per the
+brief's scope line): the census parse's handling of a suppressed path containing a space or a
+non-ASCII name under `-z`/`core.quotePath`, and a non-suppressing tag (`M`/`R`/`C`/`K`/`?`) proving
+Decision 2's selection ignores it. Both are named as gaps in this record now; neither is closed by this
+block.
+
+**Gates not run here** — boundary. `git diff --stat -- src` shows one file changed (item 3's doc-comment
+edit only); `git diff -- src` and `git status --short -- src` both confirmed clean of mutation residue
+after each run, reproduced below.
+
+```
+$ git diff --stat -- src
+ src/ZeroWiki/Content/ContentRepositoryService.cs | 8 ++++++--
+ 1 file changed, 6 insertions(+), 2 deletions(-)
+$ git status --short -- src
+ M src/ZeroWiki/Content/ContentRepositoryService.cs
+```
+
+Build: `dotnet build ZeroWiki.slnx` — 0 Warning(s), 0 Error(s) (not a `make` gate; sanity-checked the new
+tests compile before spending mutation runs on them). Both new tests pass under a filtered run
+(4/4 — sanity only, superseded by the full-suite mutation runs above as the real evidence).
+
+**Claim/instrument/blind-spot, for this block's own work:**
+- **Claim:** the two named surviving mutants (B1, B2) now die under the full unfiltered suite, and
+  nothing else in `src/` changed beyond the one doc-comment edit.
+- **Instrument:** `mutate.sh`'s content checksum before/after each mutation, the full-suite exit code it
+  reports, `grep -n "FAIL\]"` on its saved test log to name the failing tests, and `git diff`/`git status
+  --short` on `src/` afterward.
+- **Blind spot:** this closes exactly B1 and B2 — the two branches the supervisor measured — and does
+  not touch the census-parse gaps named in item 4, which remain unmeasured by design (out of scope this
+  block). It also does not re-derive whether some *other*, unnamed branch in this file lacks a test;
+  that would be a fresh audit, not a re-check of a named finding.
+
+→ @reviewer
+
+
+### Reviewer report — section 3 remediation block (supervisor B1/B2)
+
+**[reviewer]** Verdict: **Approve.**
+
+**Process note.** Both re-runs below completed and reverted, checksums confirmed matching, before I
+posted this — no mutant was left live across a turn boundary this time, using two bounded waits per
+run as the skill and the brief both direct.
+
+**1 & 2. Both mutants re-run myself through `mutate.sh`, full unfiltered suite, and both now kill —
+isolation and mechanism checked by reading the actual failure messages, not by counting.**
+
+- **B1** (symlink comparison blinded to `Matches`): checksum before `e973f1b1ecde`, after `cbea0635d7d6`
+  — identical to the worker's, confirming the same mutant. **Failed 2, Passed 922, Total 924** (3m9s).
+  Failing names: exactly `SuppressedSymlinkThatIsRepointed_RefusesNamingThePathAndTheIndexState`'s two
+  `InlineData` cases, nothing else. The failure message is `Assert.Throws() Failure: No exception was
+  thrown` — the re-pointed symlink is silently accepted under the mutant, exactly the collapse B1
+  named. This confirms item 3 as well: the test's own falsifiable claim is **refusal** (an exception
+  actually thrown), not merely an internal classification — a test that only checked `Differs` vs
+  `Matches` without asserting `ThrowsAsync` would not have shown "no exception thrown" as its failure
+  mode.
+- **B2** (`NotCompared` arm forced `false`): checksum before `e973f1b1ecde`, after `fb4177638f8e` —
+  identical to the worker's. **Failed 2, Passed 922, Total 924** (3m37s). Failing names: exactly
+  `SuppressedTrackedFileReplacedByAGitlink_Refuses`'s two cases, nothing else. Isolation is clean in
+  both mutants: I read the full log, not the summary line, for each.
+
+**A mechanism nuance worth recording for B2, found by reading the failure message rather than trusting
+the count.** B1's failure mode is "no exception was thrown" — a true collapse to silence. B2's is
+different: `Assert.Contains() Failure … Not found: "--skip-worktree"` — **an exception was still
+thrown**, just the wrong one. Tracing it: `BuildGitlinkErrorMessage` (`:1001-1013`, the *pre-existing*,
+suppression-blind gitlink guard) opens with the identical phrase the failing message shows ("The
+content repository at '…' contains a nested git repository at …"), not the census's own phrasing
+("hidden from git's normal comparisons"). The reason is structural, not incidental: this test's fault
+shape requires the index to *already* hold mode `160000` for the path, and `FindStagedGitlinksAsync`
+reads `git diff --cached --raw` — an index-vs-`HEAD` comparison the suppression bit has no effect on
+(the bit only ever suppresses *working-tree*-vs-index comparisons: `status`, `add -A`, `diff` without
+`--cached`). So a suppressed gitlink typechange is, by construction, **always** also visible to the
+pre-existing guard — there is no way to build this shape where it wouldn't be. **What B2's kill
+actually demonstrates is that Decision 3's naming requirement (the census's own diagnosis) is
+load-bearing for this arm — not that the shape would otherwise commit silently**, the way B1's genuinely
+would (B1's whole point is that `--assume-unchanged` *does* hide the divergence from every other
+instrument, including this same gitlink guard, since that guard never even looks at symlink content).
+This is not a defect in the test — there is no construction that would avoid the overlap, since it
+follows from what "staged as `160000`" and "index-vs-`HEAD`" mean — and I am not asking for a fix; I am
+naming what the kill does and does not establish so a future reader does not read B2 as proving the same
+class of risk B1 does.
+
+**4. The `:1364-1367` claim.** Confirmed it changed from "is confirmed to still classify `Differs`" to
+"still classifies `Differs`", now naming the specific test and the mechanism ("blinding this method to
+always return `Matches` kills it under the full suite") — a claim with a falsifier a reader can run,
+not a softened assertion resting on a past manual execution. Checked the rest of the touched remarks in
+this hunk (the only `src` change this block makes) for siblings of the same class: none — the
+surrounding `<para>` about `LinkTarget is null` is untouched and was not itself an unfalsified-claim
+site (`3.6`/B1's own test covers the `Differs` shape it discusses; the `null`-and-file-exists shape
+remains the one the supervisor flagged as still untested, which the brief correctly left out of scope).
+
+**5. The gap-record correction.** Confirmed the original `### Worker report — 3.6's harmless shapes…`
+post's own "and nothing else" sentence is untouched (line 2903) — the restatement lives entirely in the
+new post, respecting append-only. The restatement states the instrument precisely ("a tally over tests
+that exist, along one axis: filtered vs full-suite evidence") and what it structurally cannot see ("a
+production branch with zero committed tests is invisible to it by construction, not by omission") —
+this is exactly the claim/instrument/blind-spot shape the audit checklist asks for, not an extended list
+under the same closing claim.
+
+**6. Scope discipline.** `git diff HEAD -- src` touches exactly the one doc-comment hunk (+6/−2); no
+census-parse code was touched. The census-parse hazards (space/non-ASCII paths, non-suppressing tags)
+are recorded as known-unmeasured in the new post's closing paragraph, matching the brief's explicit "do
+not fix this" instruction.
+
+**State, confirmed fresh, not carried over:**
+```
+$ git diff -- src
+(the one doc-comment hunk, +6/-2, matching the block's own reported diff exactly)
+$ git status --short -- src
+ M src/ZeroWiki/Content/ContentRepositoryService.cs
+$ shasum -a 256 src/ZeroWiki/Content/ContentRepositoryService.cs
+e973f1b1ecde58644cd22c33c1d9861e60f10f235cb55f1f5e7017dccb5b7b07
+```
+matching the worker's reported baseline exactly. No mutant live; no `dotnet test`/`testhost` process
+belonging to this repository remains running.
+
+**Reviewed-state:** `0a943692a1b3`, `HEAD` `3a05cd1`.
+
+→ @architect
+
 ## NEXT
 
 **Paused by the Product Owner** after block 3.5's mutation run, 2026-08-21. `src` verified clean by

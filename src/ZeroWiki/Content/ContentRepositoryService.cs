@@ -1362,9 +1362,13 @@ public sealed class ContentRepositoryService
     /// resolve to the *target file's* blob sha while <c>HEAD</c>'s own recorded sha for that path is the
     /// symlink's own blob — the two never agree even though nothing has changed, which is exactly the
     /// false divergence this method exists to avoid. Re-pointing the symlink (so its on-disk link text no
-    /// longer matches the link text <c>HEAD</c> holds) is confirmed to still classify
+    /// longer matches the link text <c>HEAD</c> holds) still classifies
     /// <see cref="SuppressedEntryComparisonOutcome.Differs"/>, so this fix does not simply blind the check
-    /// to symlinks.
+    /// to symlinks — pinned by
+    /// <c>ContentRepositoryServiceTests.SuppressedSymlinkThatIsRepointed_RefusesNamingThePathAndTheIndexState</c>,
+    /// which blinding this method to always return <c>Matches</c> kills under the full suite (section 3
+    /// remediation, supervisor finding B1); before that test existed this was a one-off manual execution
+    /// with no committed falsifier.
     /// <para>
     /// <see cref="FileInfo.LinkTarget"/> returns <c>null</c> both when nothing exists at the path and when
     /// something exists but is no longer a symlink at all (confirmed by execution). The former is
