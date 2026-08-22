@@ -164,6 +164,16 @@ git 2.43.0**:
   `core.quotePath` octal-escapes a non-ASCII path (`"docs/caf\303\251-vault.md"`); `-z` emits raw
   UTF-8 (`303 251` = `c3 a9`), path after a **TAB**, records NUL-delimited; a space-containing path
   round-trips intact. Identical to the macOS/git 2.55 measurement.
+- **Decision 2's rule also holds for the one non-suppressing tag that needed a real index to produce**
+  (run separately, during section 4's remediation, not part of the sweep above — same
+  `mcr.microsoft.com/dotnet/sdk:10.0`, non-root uid 501, glibc 2.39, git 2.43.0). A genuinely unmerged
+  index, built with `git update-index --index-info` staging three versions of one path at stages 1/2/3,
+  yields an uppercase `M` in `git ls-files -v -s` — neither lowercase nor exactly `S` — so the census's
+  tag rule correctly declines to select it, matching the one member of Decision 2's five-tag set
+  (`M`, `R`, `C`, `K`, `?`) whose real-world occurrence Decision 2's own rationale names (an unmerged
+  index misattributing a refusal). The other four are declined by the rule's shape on inspection, not by
+  a run: any tag other than lowercase or `S` is rejected by construction, so no separate observation is
+  needed for `R`, `C`, `K`, or `?`.
 - **The locale claim inverted.** ZeroWiki ships on `mcr.microsoft.com/dotnet/aspnet:10.0`, which
   contains exactly **three** locales — `C`, `C.utf8`, `POSIX`. There is no translated locale data in
   the image, so glibc's `strerror` **cannot** translate "Permission denied" there whatever `LC_ALL` an

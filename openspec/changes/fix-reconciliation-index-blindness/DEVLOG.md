@@ -4164,6 +4164,313 @@ the supervisor named for itself.
 
 → @architect
 
+### Supervisor re-review — section 4 after remediation (`82c35fb..9f35378`)
+
+**[supervisor]** Verdict: **Request changes.** One clause and one citation, in the neighbourhood of a
+single sentence. This is the smallest of the three findings this section has produced, and I want to say
+plainly up front that I considered `Approve` with it parked in `## NEXT` — I explain below why I did
+not, because the reasoning matters more than the item.
+
+#### 1. Are F1 and F2 closed?
+
+**F1: closed, verified myself rather than read.** `grep -n "aspnet:10.0\|sdk:10.0"` over
+`ContentRepositoryService.cs` returns exactly three hits and each is now attached to the measurement
+actually made there — `:860` the D17 note (`aspnet:10.0`'s own `/etc/os-release` and apt candidate,
+which genuinely is a runtime-image measurement), `:1279` the parse/tag paragraph (`sdk:10.0`), `:1508`
+the locale remark (`aspnet:10.0`). No figure crosses images: `glibc 2.39` appears only against the sdk
+run, the locale set only against the runtime image. The third account I flagged and declined to
+adjudicate is genuinely resolved rather than smoothed — D17's line was **correct**, and the note now
+says how that was established and by what mechanism (`Dockerfile:45-46` installs git via apt, so the
+version tracks Ubuntu's package rather than the base image). Three accounts collapsed into one measured
+fact is the right outcome and better than the fix I asked for. `grep -c '\*\*'` over the file is `0`,
+so the markdown/XML mix is gone too. The diff is comment-only — I re-derived that independently rather
+than accepting it.
+
+**F2: the observation was run, which is more than I asked for, and the sentence recording it is
+narrower in evidence than in scope.** That is finding 3.
+
+#### 2. Finding 3 — the tag sentence claims a set and observed a member
+
+`FindSuppressedIndexEntriesAsync`'s paragraph (`:1279-1288`) now reads:
+
+> **Decision 2's non-suppressing tags are observed** the same way, on the same image: a genuinely
+> unmerged index (three stages via `update-index --index-info`) yields an uppercase `M` — neither
+> lowercase nor `S` — so this census's tag selection correctly declines it…
+
+**3a — the plural.** Decision 2's set is five: `M` (unmerged), `R` (removed), `C` (modified/created),
+`K` (to be killed), `?` (other) — `design.md:64`. One was observed. Nothing in the sentence is *untrue*,
+which is what makes it different from F1 and F2; what is wrong is that it lets a reader credit five
+observations where there is one. **And the honest version is stronger than the current one, not weaker**
+— the reason the other four need no run is that the selection rule keeps only a lowercase tag or `S`,
+so any uppercase tag is declined *by reading the code*, and `M` is the one member whose real-world
+occurrence had to be checked because it is the case Decision 2's own rationale names ("a census written
+as `tag != "H"` would therefore refuse to start on an unmerged index"). Say that, and the paragraph
+records a measurement **and** an argument, each labelled. One clause.
+
+**3b — the citation lands where the evidence is not.** The sentence before it cites "task 3.7,
+design.md Decision 8" for the parse shapes, correctly. The tag sentence continues "observed the same
+way, on the same image" and inherits that citation by adjacency — but the tag run happened *during this
+remediation*, not during 3.7, and **neither `design.md` Decision 8 nor the `### 3.7` post carries it**.
+I checked both: `grep -n "unmerged\|index-info\|non-suppressing\|uppercase"` over `design.md` returns
+only Decision 2's own prose, nothing in Decision 8's results; the `### 3.7` post has no hit at all. So a
+reader who follows the code's citation to the change's durable decision record finds three results and
+no tag observation — **structurally the same defect F1 was**, a citation pointing somewhere the evidence
+isn't. The observation is currently recorded only in this remediation's brief and worker post, at depth
+in the thread.
+
+**Fix, both parts small:** scope the plural to `M` and name the rule-reading argument that covers the
+other four; and put the tag observation into Decision 8's results list (an appended, dated line is
+enough) so the code's citation resolves. If you would rather cite the DEVLOG post directly instead of
+amending Decision 8, that also closes it — what cannot stand is a claim whose named source does not
+contain it.
+
+**Fault: the code — one sentence — plus one line missing from `design.md`.** Not the breakdown, not the
+spec.
+
+#### Why I did not simply park this in `## NEXT`
+
+Twice in this section I have blocked on a claim whose scope exceeded its evidence: a platform a
+measurement was not made on, and a plural ("both") covering an item nothing had observed. This is the
+same shape a third time, one notch weaker because the generalisation is sound and merely unstated.
+Waving it through would mean the standard I enforced twice stopped applying at the point where applying
+it became inconvenient — and this is the section whose entire purpose is that the next reader inherits
+evidence rather than assertion. The rule in my own remit is explicit about a completeness claim whose
+instrument is narrower than the claim, and I would rather be predictable than lenient at the last gate.
+
+**On your "that is a rate, not bad luck" — I agree, and I think the cause is nameable.** Three rounds,
+three defects, and every one of them was in a sentence *about evidence*: where it was measured, how many
+things it covered, what it proves. Nothing in this workflow gates that class of prose. `make build`,
+`make test`, `make format` and `make validate` cannot read a comment; the reviewer audits the diff and
+did so well here — grepping both image names, checking `Dockerfile:45-46` against the claim, catching
+and correctly dismissing "the two"; and the supervisor pass is the only one that habitually asks "is the
+source of this sentence really where it says it is". **Prose about evidence is the least-gated artefact
+in the change, and it is the one this change is entirely made of.** That belongs in `## NEXT` whatever
+you decide about the finding.
+
+#### 3. The deferred set
+
+The reordering is right in direction and, once 3a lands, right in substance. As it stands the tag has
+been promoted out of "neither test nor observation" on a sentence that over-credits its evidence, so the
+promotion is sound for `M` and unstated for the other four. After the fix:
+
+- **Neither test nor observation:** the `LinkTarget is null && File.Exists` shape (a suppressed symlink
+  replaced on disk by a regular file) — now the only member, which is what I said would be true once the
+  tag moved.
+- **Observed, not tested:** space-in-path, non-ASCII path, and the non-suppressing tag — all three
+  recorded at the site, none with a fixture, and the paragraph says so in its own closing sentence.
+- **Structural, not tested:** Decision 5's same-policy property.
+- B2 is correctly *not* in this set — established analytically, recorded as such, not deferred.
+
+#### 4. The change as a whole
+
+Unchanged from my last pass, and I have now watched every round of it. **`content-store`'s new
+requirement holds at both sites for the shapes that occur**: content divergence, suppressed deletion,
+suppressed-but-uncommitted, a re-pointed symlink and a gitlink typechange all refuse and name the path
+and the index state; reconciliation refuses before staging; the self-check re-derives the same census
+independently rather than inheriting an answer. The harmless side — the half that decides whether this
+change bricks a working wiki — carries the strongest evidence here: three constructions and two
+full-suite mutants whose collateral was traced by mechanism rather than counted. The deliberate
+exception is **mode**: a suppressed entry whose content matches `HEAD` but whose exec bit changed starts
+normally, so a clean report is a clean *content* tree, not a byte-identical one. That is recorded at the
+site with its reason, and the reason is good — statting the on-disk mode ignores `core.fileMode` and
+would reintroduce the false-refusal class that cost section 1 three rounds.
+
+**Can a stranger act on the record without re-deriving it?** For the code, yes — and this is the part I
+would defend to someone who never saw the thread. Every claim in `ContentRepositoryService.cs`'s census
+path now names a test, a measurement with its platform, or says in the sentence that it is an inference,
+with two exceptions, both of which are finding 3. That is a genuinely unusual standard and it survived
+me attacking it three times. For the *process* record, also yes, with one caveat I put under NEXT below:
+the reasoning lives in the DEVLOG thread, which archives, but the transferable lesson is at depth.
+
+#### 5. `## NEXT` — confirmed, with one revision
+
+1. **Revised.** Decision 2's tag selection is no longer the item standing alone; after finding 3 lands,
+   the sole "neither test nor observation" item is the **`LinkTarget is null && File.Exists`** shape.
+   The tag joins space-in-path and non-ASCII as observed-but-untested.
+2. Unchanged: the site-recorded deferrals — that `LinkTarget` shape, the three observed-not-tested
+   census-parse shapes, and Decision 5's same-policy property. All are recorded in
+   `ContentRepositoryService.cs` itself, so a reader who opens the code finds them without the DEVLOG,
+   which is the durable half.
+3. Unchanged and still the one I would most want carried: **three audits enumerating evidence from the
+   same list of committed tests could not reveal an untested branch.** Add the sibling lesson this round
+   produced — **prose about evidence is the least-gated artefact in the workflow**, which is why this
+   section produced a defect in each of its three rounds while every gate stayed green.
+4. Unchanged: `RepositoryWriteLockTests.HeldByAnotherProcess_BoundedWaitGivesUp…` is still flaky, still
+   predates this change, still out of scope.
+
+#### What this review could not see
+
+- **No mutants**; the diff is comment-only, so there is nothing to falsify, and I again contributed no
+  independent corroboration of the 924-test suite.
+- **I cannot re-run any container measurement.** F1's resolution, the D17 Ubuntu/apt figures and the
+  unmerged-index observation are all yours and the Product Owner's, taken as given. My audit is of the
+  record's internal consistency — which is exactly why finding 3b is phrased as "the citation does not
+  resolve", not "the observation did not happen".
+- **My sweep covered the three hunks `9f35378` added**, plus the paragraph they edited. Remarks
+  untouched by this section have not been re-audited by me at any point; the D17 line surfaced last
+  round only because F1 led me to it, and I have no basis for saying it is the only one of its kind.
+
+**Reviewed-state:** `git diff HEAD -- ':/' ':(top,exclude,glob)**/DEVLOG.md'` is empty with no untracked
+files outside the DEVLOG — this section's tree is exactly `9f35378`.
+
+→ @architect
+
+### Brief — remediation block, section 4 round two (supervisor finding 3)
+
+**[architect]** → @worker. **Product Owner authorised this third round** — §3c.4 says stop and ask
+rather than carve a third block, so I stopped and asked, and they said proceed. Comment and
+design-doc only; ticks nothing.
+
+**The finding is smaller than the last two and is not a falsehood.** That is precisely why it is worth
+fixing carefully.
+
+**3a — the clause claims a set and the evidence covers a member.** `ContentRepositoryService.cs:1279-1288`
+reads "Decision 2's non-suppressing tags are observed…" and then substantiates `M`. Decision 2's set is
+five — `M`, `R`, `C`, `K`, `?` (`design.md:64`). Nothing there is untrue, but a reader may credit five
+observations where one was made.
+
+**The honest version is stronger than the current one, and that is the point.** The other four need no
+run: the census rule keeps an entry only when its tag is **lowercase or exactly `S`**, so *any*
+uppercase tag is declined by reading the code. `M` is the single member whose real-world occurrence had
+to be checked — it is the case Decision 2's own rationale names, an unmerged index being the state that
+would misattribute a refusal.
+
+So write the paragraph to carry **two** things, each labelled for what it is:
+- a **measurement** — `M`, observed in `sdk:10.0`, non-root, git 2.43.0, an unmerged index via
+  `update-index --index-info` (stages 1/2/3) yielding uppercase `M`, which the rule declines;
+- an **argument** — the remaining four are declined by the rule's own shape, established by reading it
+  rather than by running anything.
+
+Do not simply delete the plural and leave the measurement looking narrower than the guarantee. The
+guarantee genuinely covers all five; only one of the five needed observing.
+
+**3b — the citation resolves to a record that does not hold the evidence.** The tag run happened during
+the **previous remediation block**, not during 3.7 — and neither `design.md` Decision 8 nor the
+`### 3.7` DEVLOG post carries it. A reader following the code's citation to the durable record finds
+three results and no tag observation. That is structurally the same defect F1 was: a pointer aimed
+where the thing is not.
+
+**Fix it at the destination, not by weakening the pointer.** Add the tag observation to **Decision 8's
+results** in `design.md`, as its own bullet alongside the three already there, with the same
+attribution discipline the others carry (image, glibc/git versions, uid, what was built, what was
+seen). Then the code's citation resolves. You may additionally cite the DEVLOG post, but `design.md` is
+the durable record and is where a reader will look first.
+
+**Why this is being fixed rather than parked** — worth understanding, since it shapes how carefully you
+write it. The supervisor blocked twice on claims whose scope exceeded their evidence; waving the third
+through would mean the standard stopped applying exactly where applying it became inconvenient, in the
+one section whose entire purpose is that the reader inherits evidence rather than assertion.
+
+**Out of scope:** any behaviour change; any other remark. Two edits: one paragraph in
+`ContentRepositoryService.cs`, one bullet in `design.md` Decision 8. **If a truthful sentence needs a
+code change, stop and tell me.**
+
+**Boundaries.** No commit, no ticks, no `Makefile`, no `make` gates, no spawning agents. `design.md` is
+a change artefact and yours to edit for this task — `tasks.md` is not. Post under `## 4.`, `###`
+headings, above `## NEXT`; `grep -n '^#\{1,3\} '` after writing. Hand off with `→ @reviewer`.
+
+### Worker report — remediation block, section 4 round two (finding 3)
+
+**[worker]** Comment and design-doc only, ticks nothing. Two edits, as briefed.
+
+**3a — `ContentRepositoryService.cs`'s observed-vs-tested paragraph split in two:** the parse-shapes
+paragraph (space-in-path, non-ASCII-path) is unchanged in substance, now closed on its own before the
+tag claim starts. A new paragraph states Decision 2's non-suppressing set is five (`M`, `R`, `C`, `K`,
+`?`) and classes the evidence for each explicitly rather than as one undifferentiated "observed":
+- **measurement** — `M`, in `sdk:10.0` (non-root, git 2.43.0), a genuinely unmerged index built with
+  `update-index --index-info` yielding uppercase `M`, which the census declines;
+- **argument** — the other four (`R`, `C`, `K`, `?`) declined by the rule's own shape (lowercase-or-`S`
+  only) on inspection, no run needed or made.
+
+No plural was deleted to narrow the claim — the guarantee still covers all five; the paragraph now says
+which one was run and why the other four didn't need to be.
+
+**3b — the citation now resolves.** Added a fourth bullet to `design.md`'s Decision 8 results, alongside
+the three already there, same attribution discipline (image, uid, glibc/git versions, what was built,
+what was seen) — and noted explicitly that this measurement was **run separately during section 4's
+remediation**, not part of the original 3.7 sweep, so the bullet doesn't imply a single docker session
+produced all four results. The code's citation (`design.md Decision 8`) now points at a bullet that
+actually holds the tag observation.
+
+**Per-claim ledger for this round:**
+- `M` declined by the census — **measurement**, `sdk:10.0`, non-root, git 2.43.0, run during this
+  section's remediation (not 3.7); now recorded in both the code and `design.md` Decision 8.
+- `R`/`C`/`K`/`?` declined by the census — **argument**, from the rule's own lowercase-or-`S` shape, no
+  run performed or claimed.
+- Space-in-path / non-ASCII-path parsing — unchanged, still **measurement**, `sdk:10.0`, task 3.7.
+
+**Build:** `dotnet build src/ZeroWiki/ZeroWiki.csproj` → `Build succeeded`, `0 Warning(s)`, `0 Error(s)`
+(direct sanity build, no `make` gate — no behaviour changed). `git status --short` shows exactly the two
+files named in the brief (`ContentRepositoryService.cs`, `design.md`); `git diff` on each is the single
+paragraph/bullet described above, nothing else touched.
+
+→ @reviewer
+
+
+### Reviewer report — section 4 round-two remediation (supervisor finding 3)
+
+**[reviewer]** Verdict: **Approve.**
+
+**Method.** Read the two edits as claims, checked each against the code and `design.md` directly, and
+verified the one claim that's a statement about code behaviour by execution rather than by reading it.
+
+**1. The argument's soundness — checked by execution, not assumed.** The brief flagged `char.IsLower`
+on a non-letter (`?`) as the specific thing worth checking. Wrote a throwaway `dotnet run` probe against
+`char.IsLower` and the exact predicate at `ContentRepositoryService.cs:1327`
+(`char.IsLower(tag) || tag == 'S'`) over `M`, `R`, `C`, `K`, `?`, plus `H`/`h`/`S`/`s` as controls:
+
+```
+M: IsLower=False, ==S: False, selected=False
+R: IsLower=False, ==S: False, selected=False
+C: IsLower=False, ==S: False, selected=False
+K: IsLower=False, ==S: False, selected=False
+?: IsLower=False, ==S: False, selected=False
+h: IsLower=True,  selected=True
+S: IsLower=False, ==S: True, selected=True
+```
+
+All five of Decision 2's non-suppressing tags are excluded by the predicate, including `?` — `IsLower`
+on a non-letter returns `false`, not an exception or an unexpected `true`, confirming the argument holds
+for the case that actually needed checking rather than assuming. Deleted the scratch project after.
+
+**2. The measurement/argument split.** Re-read `:1281-1291`: `<b>` labels each half explicitly — "That
+is a **measurement**: `M`, observed in the same `sdk:10.0` container..." and "The other four are an
+**argument**, not a run: ... no separate observation was needed or made for them." A reader cannot
+credit five observations from this text; it says one was run and names why the rest weren't.
+
+**3. The citation now resolves.** Re-ran the supervisor's own check:
+`grep -n "unmerged\|index-info\|non-suppressing\|uppercase" design.md` now returns real hits under
+Decision 8 (`:167-173`), not only Decision 2's original prose. The new bullet carries the same
+attribution discipline as its three siblings — image (`sdk:10.0`), uid (non-root 501), glibc/git
+versions (2.39/2.43.0), what was built (`update-index --index-info`, three stages), what was seen
+(uppercase `M`, declined) — and explicitly states it was "run separately, during section 4's
+remediation, not part of the sweep above," so it doesn't imply a single docker session produced all
+four bullets. The code's citation now points at a place that holds the evidence.
+
+**4. The parse-shapes claim.** Confirmed by diff inspection: the space-in-path/non-ASCII-path sentence
+is retained verbatim, just closed into its own `<para>` before the tag paragraph begins — not touched in
+substance.
+
+**5. Swept for a fourth.** Checked every new sentence in both files against Decision 2's actual text
+(`design.md:60-70`) and the actual predicate: "the census rule keeps an entry only when its tag is
+lowercase or exactly `S`" (accurate), "an unmerged index is the state that would misattribute a
+refusal" (matches Decision 2's own rationale, "the refusal would be attributed to the wrong cause,"
+almost verbatim), "None of the five... has a committed test fixture" (confirmed by grep — no test
+constructs an unmerged index or any non-suppressing tag). Found no new claim whose scope exceeds its
+evidence.
+
+**Build sanity.** `dotnet build src/ZeroWiki/ZeroWiki.csproj` → `0 Warning(s). 0 Error(s).`
+Independently confirmed comment-only: the non-comment-line filter over the diff returns nothing.
+
+**State:** `git status --short` shows exactly the two files named in the brief plus the DEVLOG; `git
+diff` on each is the single paragraph/bullet described.
+
+**Nothing owed.**
+
+**Reviewed-state:** `5d45b5a20872`, `HEAD` `9f35378`.
+
+→ @architect
+
 ## NEXT
 
 **Resume point:** section 4, block 4.1–4.4 — briefed under `## 4.`. Sections 1, 2 and 3 are **closed**

@@ -1278,13 +1278,22 @@ public sealed class ContentRepositoryService
     /// space-containing-path and non-ASCII-path parsing above were re-observed on Linux/glibc 2.39/git
     /// 2.43.0 in <c>mcr.microsoft.com/dotnet/sdk:10.0</c> (non-root uid 501; task 3.7, design.md
     /// Decision 8 — the same run that exercised the 19 suppressed-entry tests and the EACCES branch) and
-    /// produced identical parsing to the macOS/git 2.55.0 measurement above. Decision 2's non-suppressing
-    /// tags are observed the same way, on the same image: a genuinely unmerged index (three stages via
-    /// <c>update-index --index-info</c>) yields an uppercase <c>M</c> — neither lowercase nor <c>S</c> —
-    /// so this census's tag selection correctly declines it, the specific claim Decision 2 makes. None of
-    /// this is a test: no committed fixture constructs a space-containing path, a non-ASCII path, or a
-    /// non-suppressing tag and asserts this census's behaviour on it, on either platform. A regression in
-    /// any of those shapes would not currently fail <c>make test</c>.
+    /// produced identical parsing to the macOS/git 2.55.0 measurement above.
+    /// </para>
+    /// <para>
+    /// <b>Decision 2's non-suppressing-tag set is five (<c>M</c>, <c>R</c>, <c>C</c>, <c>K</c>, <c>?</c>,
+    /// design.md Decision 2) and this census's guarantee covers all five, but only one needed running to
+    /// check.</b> That is a <b>measurement</b>: <c>M</c>, observed in the same <c>sdk:10.0</c> container
+    /// (non-root, git 2.43.0, run separately during this section's remediation, design.md Decision 8) — a
+    /// genuinely unmerged index built with <c>update-index --index-info</c> (three stages) yields
+    /// uppercase <c>M</c> in <c>git ls-files -v -s</c>, which this census correctly declines. It is the one
+    /// member Decision 2's own rationale names by real-world consequence: an unmerged index is the state
+    /// that would misattribute a refusal if this rule mishandled it. The other four are an
+    /// <b>argument</b>, not a run: the rule below keeps an entry only when its tag is lowercase or exactly
+    /// <c>S</c>, so <c>R</c>, <c>C</c>, <c>K</c>, and <c>?</c> are declined by that shape on inspection —
+    /// no separate observation was needed or made for them. None of the five, nor the space-containing or
+    /// non-ASCII path parsing above, has a committed test fixture: a regression in any of those shapes
+    /// would not currently fail <c>make test</c>.
     /// </para>
     /// </remarks>
     private async Task<IReadOnlyList<SuppressedIndexEntry>> FindSuppressedIndexEntriesAsync(
