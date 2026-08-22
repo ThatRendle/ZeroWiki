@@ -146,22 +146,38 @@ subprocess and needs no exit-code parsing — measured:
 | `100644 blob <sha>\t<path>` | a tracked file replaced by a gitlink — a typechange |
 | *(empty output, exit 0)* | not in `HEAD` at all — a new gitlink |
 
-### Decision 8 — The Linux/glibc claims are observed once in the container, not inferred (Product Owner decision, 2026-08-21)
+### Decision 8 — The Linux/glibc claims are observed in the container, and one of them inverted (Product Owner decision, 2026-08-21; **result recorded same day**)
 
 Everything this change measured — symlinks, permission bits, index modes, and the `LC_ALL=C` pin on the
-EACCES/ENOENT discriminator — was measured on git 2.55.0 / macOS APFS, by the worker, the reviewer and
-the supervisor alike. Five parties, one host. Two of those claims are *specifically* about a platform
-none of them can see: `strerror` translation is a **glibc** behaviour, so on macOS the bug the locale
-pin fixes is unreproducible **and** the pin's efficacy is unobservable. Section 3's tests run on that
-same host, so they are the wrong home for it — they would inherit the gap, not close it.
+EACCES/ENOENT discriminator — was measured on git 2.55.0 / macOS APFS by worker, reviewer and
+supervisor alike. Seven parties, one host. Two of those claims were *specifically* about a platform
+none of them could see, so the change carried one task (3.7) to observe them where ZeroWiki actually
+ships.
 
-The branch is reachable in production: the container runs as **non-root** (`USER $APP_UID`,
-`Dockerfile:56`), so an unreadable file is a real state, not one only root's exemption could hide.
+**Run, not reasoned.** A throwaway clone mounted into `mcr.microsoft.com/dotnet/sdk:10.0` as
+**non-root uid 501** (matching production's `USER $APP_UID`, `Dockerfile:56`), on **glibc 2.39,
+git 2.43.0**:
 
-The change therefore carries one **human-in-the-loop** task: build the image and exercise the
-suppressed-entry paths (symlink, gitlink, EACCES, non-ASCII) once inside the Linux/glibc container. It
-is verification, not new behaviour, and per the workflow's §4 it is **not ticked without the Product
-Owner's confirmation** — the Architect hands over exact commands and what to expect, and waits.
+- **The behaviour holds.** All **19** suppressed-entry tests pass on Linux. The EACCES branch genuinely
+  exercises there, a non-root process really being denied by `chmod 000`.
+- **The census parse holds, including the two shapes that have no test fixture.** Default
+  `core.quotePath` octal-escapes a non-ASCII path (`"docs/caf\303\251-vault.md"`); `-z` emits raw
+  UTF-8 (`303 251` = `c3 a9`), path after a **TAB**, records NUL-delimited; a space-containing path
+  round-trips intact. Identical to the macOS/git 2.55 measurement.
+- **The locale claim inverted.** ZeroWiki ships on `mcr.microsoft.com/dotnet/aspnet:10.0`, which
+  contains exactly **three** locales — `C`, `C.utf8`, `POSIX`. There is no translated locale data in
+  the image, so glibc's `strerror` **cannot** translate "Permission denied" there whatever `LC_ALL` an
+  operator sets. Verified both ways in-container: `LC_ALL=fr_FR.UTF-8 git hash-object` on an unreadable
+  file returns English, identically to `LC_ALL=C`.
+
+**So the `LC_ALL=C` pin guards a condition that is unreachable in the shipped container.** It is kept —
+an operator may derive an image with locales installed, and the code should not silently depend on
+their absence — but it is **defence in depth against an unreachable state**, not a fix for a live
+locale-dependence bug, and task 4.3 records it that way in the code.
+
+**Limits of this measurement**, stated because the whole point of 3.7 was to stop inferring: it
+describes the base image *as published today*, a future base could add locales, and it says nothing
+about a non-Docker deployment.
 
 ### Decision 9 — The census wiring costs ~41%, and that is not worth a task (Product Owner decision, 2026-08-21; **corrected same day**)
 

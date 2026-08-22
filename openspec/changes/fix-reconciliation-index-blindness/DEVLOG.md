@@ -3391,58 +3391,288 @@ belonging to this repository remains running.
 
 → @architect
 
+### Supervisor re-review — section 3 after remediation (`aedfdab..82c35fb`)
+
+**[supervisor]** Verdict: **Approve.**
+
+Round two on the same range. `git diff 3a05cd1..82c35fb` is +94 test lines, +6/−2 of doc comment in
+`src`, and the DEVLOG. **No production behaviour changed in the remediation** — the only `src` hunk is
+`CompareSuppressedSymlinkToHeadAsync`'s remarks. `git status --short` is clean and `git diff -- src` is
+empty as I post; I ran no mutants this round, and say below why not.
+
+**3.7 remains the Product Owner's and is not a finding.** With it confirmed, I see nothing else holding
+section 3 open.
+
+#### 1. Are B1 and B2 genuinely closed?
+
+**B1: closed in substance.** `SuppressedSymlinkThatIsRepointed_RefusesNamingThePathAndTheIndexState`
+(`tests/…/ContentRepositoryServiceTests.cs:1693-1734`) asserts the four things the spec's SHALL
+actually requires — an exception is thrown, it names the path, it names the index state, and nothing was
+committed past the divergence with the operator's bit intact (Decision 3). The reviewer's reading of the
+failure mode is the part that matters and I agree with it: under B1's mutant the failure is
+`Assert.Throws() Failure: No exception was thrown`. That is a **collapse to silence**, which is the only
+failure mode that distinguishes "the test asserts refusal" from "the test asserts a classification". A
+test that kills a mutant by tripping a message assertion would not have proved that.
+
+**B2: closed in the letter for detection, in substance for attribution — and the reviewer's advisory is
+right.** I agree, and I would put it more strongly than "no construction avoids the overlap": **the
+overlap is analytic, not incidental.** The `NotCompared` fault arm's condition is
+`IndexMode == 160000 && HeadMode != 160000` (`ContentRepositoryService.cs:1148-1149`), which the code's
+own remarks say is `FindStagedGitlinksAsync`'s `newMode == 160000 && oldMode != 160000`
+"reconstructed, not approximated". `FindStagedGitlinksAsync` reads `diff --cached` — index-vs-`HEAD` —
+and the suppression bit only ever hides *working-tree*-vs-index comparisons. **A faithful
+reconstruction of an index-visible condition cannot itself be index-blind.** So there is no tree in
+which this arm detects a gitlink typechange that the pre-existing guard would have missed, and the
+reviewer's `Assert.Contains() Failure … Not found: "--skip-worktree"` is the measurement of exactly
+that: an exception still thrown, from `BuildGitlinkErrorMessage`, just the wrong one.
+
+So B1 and B2 were never the same class, and the section's evidence is genuinely less symmetric than the
+remediation's shape suggests. **This does not change closure**, for three reasons:
+
+- The new test is correct, discriminating, and worth keeping. It is the only thing pinning that the
+  census — not the later guard — is what answers this shape, which is Decision 3's naming requirement
+  and Decision 6's "refuse before `add -A`, so there is no `git reset` to unwind."
+- My round-one B2 finding still stands as stated: the arm had **no test**, and a branch with no test is
+  a hole regardless of what shadows it. What I got wrong was the implied severity, not the fact.
+- Asking the question of the arm the way my own remit puts it — *what fails if I delete its usage?* —
+  the honest answer is **the message and the ordering, not the detection**. That is a real answer and a
+  defensible reason to keep the arm; it is also a thing a future change could delete and see one test
+  fail, so it belongs in the record rather than being left for someone to rediscover.
+
+**Recorded, so it is not read as symmetric later:** B1 guarded a divergence that *nothing else in the
+system can see* (`--assume-unchanged` hides a re-pointed symlink from every other instrument, the
+gitlink guard included, since that guard never looks at symlink content). B2 guarded the *diagnosis* of
+a divergence a pre-existing guard already catches. Both were untested; only one was a silent-acceptance
+risk.
+
+#### 2. Drift from the remediation
+
+None that blocks. 94 lines, two tests, both in the file's existing idiom: `[Theory]` over both
+suppression kinds with an `expectedIndexStateName` argument (the shape `SuppressedTrackedFileThatDiverges…`
+already uses), the same Windows guard, the same `SetSuppressedBitAsync`/`CreateNestedGitRepositoryDirectoryAsync`
+helpers, no new abstraction, no scaffolding, no `Makefile`-invisible surface. The commit-count and
+`ls-files -v` tail assertions mirror shape (a)'s. Test count 920 → 924 is exactly the two new
+`[Theory]` pairs.
+
+Two nits for the reviewer's ledger, not for a block: `SuppressedTrackedFileReplacedByAGitlink_Refuses`
+asserts the index state but its name stops at `_Refuses`, where every sibling that makes that assertion
+says `_RefusesNamingThePathAndTheIndexState`; and B1's test repeats
+`SuppressedUnmodifiedSymlink_StartsNormally`'s four-line symlink-and-commit preamble verbatim rather
+than sharing it, which matches how the rest of the file builds trees inline and is fine either way.
+
+#### 3. Converting my own inference into measurement — done, and it did not overstate
+
+Last round I said I had ruled the census-parse branches uncovered **by inspection**, and that the point
+would overstate if some test covered one incidentally. That was the weakest claim in my post, so I
+closed it mechanically rather than leaving it as a caveat:
+
+```
+grep -n "SetSuppressedBitAsync(" tests/ZeroWiki.Tests/Content/ContentRepositoryServiceTests.cs
+grep -n '"update-index"' tests/ZeroWiki.Tests/Content/ContentRepositoryServiceTests.cs
+```
+
+All **11** call sites pass a plain-ASCII, space-free path (`docs/.gitkeep`, `docs/uncommitted.md`,
+`docs/adopted-vault`, `docs/link.md`, `docs/vault-placeholder.md`), and `update-index` appears exactly
+**once** in the file — inside the helper, which only ever passes `--assume-unchanged` or
+`--skip-worktree`. No test manufactures any other index tag, and the file contains no
+merge/`MERGE_HEAD`/`cacheinfo` construction at all. So the claim holds as measured, not inferred: the
+`-z`/`core.quotePath` path handling and Decision 2's tag selection have **zero** committed coverage.
+
+**And recording, not measuring, is the right call here — for a stronger reason than budget.** A mutant
+cannot answer this question at all. Removing `-z` breaks parsing for *every* path, so it would be
+killed by the ordinary-path tests and prove nothing about `core.quotePath`; targeting the quoting
+behaviour requires a non-ASCII fixture, which is precisely the test that does not exist. **This gap is
+unmeasurable by mutation until the fixture is written**, so "record it" is not a deferral of
+measurement — it is the only correct statement available. That is worth having in the record, because
+the next person to look will otherwise assume a mutation run was simply not spent.
+
+One refinement that sharpens ownership: **3.7's own task text already names non-ASCII** among the four
+things the container run exercises, so the non-ASCII half has an owner (manual, in-container, not a
+committed test). The **space-in-path** half and the **tag-selection** half have no owner anywhere in
+this change.
+
+#### 4. Anything else blocking closure
+
+No. Everything still open is named, attributed and deliberately deferred, which is the standard I asked
+of the gap record and it is now met:
+
+- **The `LinkTarget is null && File.Exists` shape** (`:1383-1386` — a suppressed symlink replaced on
+  disk by a regular file, which the code calls `Differs` on purpose) still has no test. I raised it in
+  round one as a rider on B1, the brief scoped it out explicitly, and the reviewer recorded it as
+  deferred. A deliberately recorded gap is a legitimate outcome; a silent one is not. It should reach
+  `## NEXT` and section 4's record, not stay only in these two posts.
+- The census-parse items above, with the ownership split noted.
+- Decision 5's "same policy at both sites" remains a shared-code fact rather than a tested one, and
+  3.4 is still the only test reaching the self-check site.
+
+**Record integrity, checked rather than accepted.** The reviewer's `Reviewed-state: 0a943692a1b3` was
+taken at `HEAD 3a05cd1`; I recomputed it against what actually landed —
+`git diff 3a05cd1 82c35fb -- ':/' ':(top,exclude,glob)**/DEVLOG.md' | shasum | cut -c1-12` →
+**`0a943692a1b3`**. The Approve certifies exactly the committed tree, with no untracked files to close
+the usual blind spot over. Block 3.5's dangling verdict is also closed by
+`### Architect note — closing block 3.5's review state`, which states what was verified and how.
+
+#### What this pass could not see
+
+- **No mutants run this round**, deliberately. B1's and B2's kills were each run twice — worker and
+  reviewer independently, matching checksums both times — and re-running them a third time would
+  measure agreement I already have. I took those two kills, their failing-test identities and B2's
+  failure message from the thread; I verified B2's *mechanism* against the source myself, which is the
+  part the conclusion turns on, but I did not re-observe the runs.
+- **Still one host** — macOS/APFS, git 2.55.0, for every party including me. Only 3.7 changes that.
+- **I did not run the gates**; `BUILD_EXIT:0` / `TEST_EXIT:0` (924) / `FORMAT_EXIT:0` / `VALIDATE_EXIT:0`
+  are read from your post, and unlike last round I have no incidental corroboration of the suite count
+  from a mutation run of my own.
+- **My own audit remains a targeted one.** I probed the branches I could name from reading
+  `IsSuppressedEntryFault` and the two comparison methods, and I have now enumerated the test fixtures
+  mechanically — but I have not enumerated every branch of `FindSuppressedIndexObservationsAsync`'s
+  parse against a test. If a fourth uncovered branch exists in this file, it is in that parse, and my
+  instrument this round was grep over fixtures, which can only show what the tests *build* — not what
+  the parse *does* with what they build.
+
+**Reviewed-state:** `git diff HEAD -- ':/' ':(top,exclude,glob)**/DEVLOG.md'` is empty with no untracked
+files outside the DEVLOG — this section's tree is exactly `82c35fb`.
+
+→ @architect
+
+### 3.7 — the Linux/glibc container run (Product Owner confirmed)
+
+**[architect]** Run by the Architect and **confirmed by the Product Owner**, who then ticked it — the
+task is human-in-the-loop by Decision 8 and workflow §4, and green output is not confirmation.
+
+Throwaway clone at `82c35fb`, mounted into `mcr.microsoft.com/dotnet/sdk:10.0` as **non-root uid 501**
+(matching production's `USER $APP_UID`, `Dockerfile:56`), **glibc 2.39, git 2.43.0** — note the git
+version differs from the 2.55.0 every prior measurement used.
+
+1. **Behaviour holds.** All **19** suppressed-entry tests pass on Linux. EACCES genuinely exercises: a
+   non-root process really is denied by `chmod 000`.
+2. **The census parse holds — including the two shapes with no test fixture.** Default `core.quotePath`
+   octal-escapes non-ASCII (`"docs/caf\303\251-vault.md"`); `-z` emits raw UTF-8 (`303 251` = `c3 a9`),
+   path after a **TAB**, NUL-delimited; the space-containing path round-trips intact. Identical to the
+   macOS/git 2.55 result. This closes at the git level the space-in-path and non-ASCII gaps the
+   supervisor flagged as unowned — by direct observation on the shipping platform rather than by a
+   fixture.
+3. **The locale claim inverted.** `mcr.microsoft.com/dotnet/aspnet:10.0` — what ZeroWiki actually ships
+   on — holds exactly **three** locales: `C`, `C.utf8`, `POSIX`. No translated locale data exists in the
+   image, so glibc's `strerror` cannot translate "Permission denied" there whatever `LC_ALL` is set.
+   Verified both ways in-container: `LC_ALL=fr_FR.UTF-8 git hash-object` on an unreadable file returns
+   English, identically to `LC_ALL=C`.
+
+**Consequence:** the `LC_ALL=C` pin guards a condition **unreachable in the shipped container**. Kept —
+a derived image could install locales and the code should not silently depend on their absence — but it
+is defence in depth, not a fix for a live bug. Decision 8 and task 4.3 are rewritten to say so.
+
+**Limits, stated because the point of 3.7 was to stop inferring:** this is the base image *as published
+today*; a future base could add locales; and it says nothing about a non-Docker deployment.
+
+## 4. Record
+
+**[architect]** Base: `82c35fb` — the change's claims made inheritable: what the next reader is told,
+where they will actually look, and with the measurement rather than the assertion behind it.
+
+### Brief — block 4.1–4.4
+
+**[architect]** → @worker. Four record tasks. This section is short but it is not clerical: **this
+change has produced three separate false or unfalsified claims in its own code**, and two of the four
+tasks exist to correct them. Treat every sentence you write as something a future reader will act on
+without re-deriving.
+
+**4.1 — at the census, state that `git diff --quiet HEAD` is *also* blinded.** This is the reflex fix:
+it reads as index-free and is not. Anyone repairing this defect by reaching for it would write a patch
+that passes review and changes nothing. The Context table in `design.md` has the measured row.
+
+**4.2 — carry the measured table into the record** so the next reader inherits the *measurement*, not
+the claim. Both `git-backed-content-core`'s archived reference and this DEVLOG are acceptable homes;
+say which you chose and why.
+
+**4.3 — rewrite the `InvariantLocale` remark against what 3.7 measured.** It currently states the glibc
+`strerror` translation as settled fact. 3.7 established the opposite: the shipping image
+(`mcr.microsoft.com/dotnet/aspnet:10.0`) holds only `C`, `C.utf8` and `POSIX`, so that translation
+**cannot occur there**. Keep the pin, describe it as defence in depth against an unreachable state, and
+name the measurement *and its limits* (base image as published today; silent on non-Docker deployment).
+
+**4.4 — correct the ordering comment's false non-overlap claim** at `ContentRepositoryService.cs:809-812`.
+It says the census cannot swallow the gitlink/stderr diagnosis. It can: a tree holding both faults
+refuses at the census and defers the gitlink diagnosis to the next restart. **That behaviour is correct**
+— it matches the precedent sixty lines below — and `SuppressedDivergenceAndANestedRepository_…` is now
+its falsifier, so cite it. **But do not replace one unfalsified claim with another:** the supervisor
+noted the comment's second clause is still untested, so say which half has a test behind it and which
+does not. While there, record F2's boundary (a suppressed **mode-only** change — exec bit, or
+`100644`↔`120000` — is deliberately not decided by content comparison: statting the on-disk mode ignores
+`core.fileMode` and would reintroduce the false-refusal class this change ends; no product impact, since
+`updateInstead` is blinded by the same bit) and give `WorkingTreeUnreadable` the reasoning every other
+switch arm has — it is the arm most likely to fire in production on a harmless file.
+
+**Also record, without fixing** (all named by the supervisor, all deliberately deferred):
+- The `LinkTarget is null && File.Exists` shape (`:1383-1386`) — a suppressed symlink replaced by a
+  regular file — has no test.
+- The census-parse branches: space-in-path and Decision 2's non-suppressing tags have no test fixture.
+  **3.7 observed both at the git level on Linux**, so record what is observed versus what is *tested* —
+  they are not the same claim.
+- Decision 5's "same policy at both sites" is a shared-code fact, not a tested one.
+- **B2's arm detects nothing the pre-existing gitlink guard misses.** The supervisor established this
+  analytically: the arm reconstructs `FindStagedGitlinksAsync`'s condition, and that guard reads
+  `diff --cached` (index-vs-`HEAD`), which the suppression bit never hides. What the arm buys is the
+  **message and the ordering**, not detection. Record it so nobody rediscovers it as a defect.
+
+**The standard:** every claim you write must be one a reader can check. If it has a test, name the test.
+If it was measured, name the measurement and the platform. If it is an inference, say so in the
+sentence. This section's whole purpose is that the next reader inherits evidence rather than assertion.
+
+**Out of scope:** any behaviour change. This section writes remarks and records; it does not alter what
+the code does. If you believe a record task cannot be written truthfully without a code change, **stop
+and tell me** rather than adjusting the code to fit a sentence.
+
+**Boundaries.** No commit, no ticks, no `Makefile`, no `make` gates, no spawning agents. Post under
+`## 4.`, headings at `###`, above `## NEXT`; `grep -n '^#\{1,3\} '` after writing. Hand off with
+`→ @reviewer`.
+
 ## NEXT
 
-**Paused by the Product Owner** after block 3.5's mutation run, 2026-08-21. `src` verified clean by
-**both** `git diff -- src` and `git status --short -- src` (the diff alone is blind to untracked
-files), no untracked files, no mutation process alive, **no live mutant**. `HEAD` `f44d267`; the only
-uncommitted change is this DEVLOG.
+**Resume point:** section 4, block 4.1–4.4 — briefed under `## 4.`. Sections 1, 2 and 3 are **closed**
+on `[supervisor]` `Approve`. Section 4's base is `82c35fb`. This is the change's last section.
 
-**Resume point:** block 3.5 is *built but not closed* — it still owes reviewer → gates → tick →
-commit. Nothing is ticked for it. Sections 1 and 2 are closed on `[supervisor]` `Approve`; section 3
-is open.
+**State:** recompute, never trust a number here — `git rev-parse --short HEAD`, `grep -c '^- \[x\]'`
+against `grep -c '^- \[ \]'` on `tasks.md`, and gate exit lines.
 
-**State:** recompute, never trust numbers written here — `git rev-parse --short HEAD`,
-`grep -c '^- \[x\]'` vs `grep -c '^- \[ \]'` on `tasks.md`, and gate exit lines.
+**Owed after 4.1–4.4:** reviewer → gates → tick → commit → **section 4's supervisor review** → then
+report to the Product Owner and *offer* to archive (`/opsx:archive`), waiting for their confirmation.
+Do not archive automatically.
 
-**Owed, in order:**
-1. `reviewer` on 3.5's evidence (the run is done; the audit is not).
-2. Gates, tick 3.5, commit.
-3. Section 3's supervisor review — it has never run; section 3 cannot close without it.
-4. Section 4: 4.1, 4.2, 4.3, **4.4** (which corrects a *false claim currently in the code* — the
-   ordering comment at `ContentRepositoryService.cs:809-812` says the census cannot swallow the
-   gitlink/stderr diagnosis, and it can).
-5. **3.7 — Product Owner's, and no agent may tick it** (Decision 8, workflow §4). The container run.
-   Green gates are not their confirmation.
+**Known-open, all deliberate, all belonging in section 4's record rather than a block:**
+- The `LinkTarget is null && File.Exists` shape (`:1383-1386`) — suppressed symlink replaced by a
+  regular file — has no test.
+- Census-parse: space-in-path and Decision 2's non-suppressing tags have no test **fixture**, though
+  3.7 observed both at the git level on Linux. *Observed* and *tested* are different claims; the
+  record must not blur them.
+- Decision 5's "same policy at both sites" is a shared-code fact, not a tested one.
+- B2's `NotCompared` arm detects nothing the pre-existing gitlink guard misses — it buys the **message
+  and the ordering**. Established analytically by the supervisor; recorded so nobody rediscovers it as
+  a defect.
+- Some `dde2489` kills rest on **filtered** mutation evidence, accepted by the Product Owner and
+  enumerated in the DEVLOG with the instrument's blind spot stated.
 
-**What 3.5 established, as full-suite figures** (the earlier block's kills were *filtered*, which this
-project's `mutation-testing` skill says is irrelevant as a record — that correction is the reason the
-second and third runs exist):
-- Mandated mutant, content comparison forced to `Matches` (restoring index blindness): **killed**,
-  4 failed / 916 passed / 920.
-- 2.3's census removed alone: **killed**, 1 failed / 919 passed — the sole failure being 3.4's own
-  test.
-- 2.1's census removed alone: 3.4's own test **passed**, while 3.9's and a 3.2 test failed. That is
-  the isolation claim confirmed under the full parallel suite: 3.4 dies for 2.3 and not for 2.1.
-
-**Live hazards for whoever resumes:**
-- **`make test` takes ~4 minutes, not 18.** The 18m13s that justified the now-withdrawn task 3.8 was
-  a degraded machine; Decision 9 in `design.md` carries the corrected table and the story of how a
-  single unreplicated sample produced a wrong mechanism. Do not re-derive the old figure from an old
-  post.
-- **`dotnet` `obj/` permission failures struck twice in one session** (`MvcTestingAppManifest.json`,
-  then `ZeroWiki.dll`), each giving a red `BUILD_EXIT` while the same project compiled seconds later.
-  Fix needs **both** `dotnet build-server shutdown` **and** removing the stale artefact.
-- **A flaky test exists and is out of scope:**
-  `RepositoryWriteLockTests.HeldByAnotherProcess_BoundedWaitGivesUpAfterRealElapsedTimeReachesTheTimeout`
-  failed once under machine load and passes otherwise. It predates this change.
-- **Every audit here has built its fault shapes alone**, which is how the symlink, gitlink and
-  combined-tree defects each reached a later reviewer than they should have. Brief combinations, not
-  just cases.
-- **Seven parties, one host.** All evidence is git 2.55.0 / macOS APFS; the symlink, permission-bit
-  and glibc `strerror` claims are unverified on the platform ZeroWiki ships to. Only 3.7 closes that.
-- **The `## NEXT` heading was destroyed once** by an agent's insert. `grep -n '^#\{1,3\} '` after
-  every DEVLOG write.
+**Live hazards:**
+- **`make test` takes ~3–4 minutes, not 18.** The 18m13s that briefly justified a since-withdrawn task
+  was a degraded machine. Decision 9 carries the corrected table and how one unreplicated sample
+  produced a confident wrong mechanism.
+- **`dotnet` `obj/` permission failures** struck twice in one session on different artefacts, each
+  giving a red `BUILD_EXIT` while the same project compiled seconds later. Fix needs **both**
+  `dotnet build-server shutdown` **and** removing the stale artefact.
+- **A flaky test, out of scope:** `RepositoryWriteLockTests.HeldByAnotherProcess_BoundedWaitGivesUp…`
+  fails under machine load, passes otherwise. Predates this change.
+- **Over-correcting a defect class creates its mirror, and the mirror is invisible to the process that
+  caught the original.** Section 1 failed three rounds on *over*-refusal; section 3 was briefed hard on
+  the harmless direction and left the *fault* direction of both type dispatches untested (supervisor
+  B1/B2). Neither block review could see it: each block satisfied its own brief, and the gap was
+  between briefs.
+- **A list of tests cannot reveal an untested branch.** Three audits walked the same list and agreed,
+  which bought no independence. Mutants found what the list could not.
+- **Two agents ended a turn with a live mutant.** The harness reverts in a `trap`, but budget **two**
+  bounded waits (~4 min per run) and say so explicitly if you must stop while one is live.
+- **The `## NEXT` heading was destroyed once** by an agent's insert. `grep -n '^#\{1,3\} '` after every
+  DEVLOG write.
 
 **Open decisions:** none. Decisions 7, 8 and 9 (Product Owner, 2026-08-21) are in `design.md`;
-Decision 9 is the *corrected* one.
+**8 and 9 are both the corrected versions** — 8 because 3.7's container run inverted its locale claim,
+9 because the regression that prompted it was a degraded machine.
