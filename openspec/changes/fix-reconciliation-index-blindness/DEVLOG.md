@@ -4471,52 +4471,207 @@ diff` on each is the single paragraph/bullet described.
 
 → @architect
 
+### Supervisor re-review — section 4, round three (`82c35fb..8cd95b1`) — final
+
+**[supervisor]** Verdict: **Approve.** Section 4 is closed, and with sections 1–3 already closed on
+`Approve`, so is the change.
+
+#### 1. Is finding 3 closed in substance?
+
+**Yes — it removes the ambiguity rather than reorganising it, which is the distinction I drew.** The
+paragraph no longer makes one claim of uncertain reach; it makes two claims and assigns each its
+members: a **measurement** (`M`, `sdk:10.0`, non-root, git 2.43.0, unmerged index via
+`update-index --index-info`, declined by the rule) and an **argument** (`R`/`C`/`K`/`?`, declined by the
+rule's shape). A reader can now tell which is which without re-deriving anything.
+
+The part that makes it *closed* rather than *better worded* is that the argument half is checkable in
+one line, and I checked it rather than reading the sentence: the predicate at
+`ContentRepositoryService.cs:1327` is `if (char.IsLower(tag) || tag == 'S')`. That is exactly what the
+remark describes, and it decides all four remaining tags on inspection — including `?`, the non-letter
+case where a reader might reasonably doubt, and which the reviewer probed by execution rather than
+assuming. **An argument that resolves to one visible line is not a weaker evidence class than a
+measurement; it is a different one, and labelling it as such is the whole point.** Writing it as the
+stronger version — the guarantee covers five, one needed running — is also the more honest shape,
+because the narrower version would have understated what the code actually promises.
+
+**3b is fixed at the destination.** `design.md` Decision 8 now carries the tag observation as a fourth
+bullet with the same attribution discipline as its three siblings, and — the detail that matters — it
+says the run was *separate from 3.7's sweep* rather than letting adjacency imply otherwise. The code's
+citation resolves to a record that holds the evidence. That is the fix I asked for, done at the end I
+asked for it.
+
+I also recomputed the reviewer's fingerprint against what landed:
+`git diff 9f35378 8cd95b1 -- ':/' ':(top,exclude,glob)**/DEVLOG.md' | shasum | cut -c1-12` →
+**`5d45b5a20872`**, matching. The `src` diff is comment-only; I re-derived that independently rather
+than accepting it.
+
+#### 2. Is there a fourth?
+
+**I did not find one, and here is what I checked so the claim has an instrument attached.** I read every
+sentence `8cd95b1` added — the rewritten `<para>` and the ten `design.md` lines — as a claim, and
+checked each against its source rather than against the thread:
+
+- "the same run that exercised the 19 suppressed-entry tests and the EACCES branch" (parse shapes) —
+  matches the `### 3.7` post and Decision 8's first two bullets.
+- "run separately during this section's remediation" — matches Decision 8's new bullet, which now says
+  so itself.
+- "the one member Decision 2's own rationale names by real-world consequence" — Decision 2's text does
+  name exactly the unmerged index ("would therefore refuse to start on an unmerged index … attributed to
+  the wrong cause"). Scoped to Decision 2's rationale, not to reality, and accurate as scoped.
+- "None of the five, nor the space-containing or non-ASCII path parsing above, has a committed test
+  fixture" — consistent with my own earlier enumeration of all 11 `SetSuppressedBitAsync` call sites and
+  the single `update-index` call site in the test file.
+
+**One corner I probed rather than assumed, and it is clean.** Decision 2 says assume-unchanged
+*lowercases whatever tag the entry would otherwise carry*, so a lowercase `m` is reachable in principle
+and the predicate would select it. That is not a hole in the new claim: by Decision 2's own logic a
+lowercase `m` **is** a suppression, and selecting it is correct. The guarantee is about the uppercase
+forms, which is what the sentence says. I mention it because a stranger will wonder, and the record
+should not make them re-derive it.
+
+**On the rate.** Three rounds, three defects, and this round none — but I would not read that as the
+process having converged, because what changed was that someone asked the question, not that the class
+became harder to write. The transferable finding stands: prose about evidence is the least-gated
+artefact here, and no `make` target can read a comment.
+
+#### 3. The deferred set
+
+**Confirmed, exactly as predicted.** With the tag now measured and recorded:
+
+- **Neither test nor observation — one item:** the `LinkTarget is null && File.Exists` shape (a
+  suppressed symlink replaced on disk by an ordinary file), recorded at
+  `CompareSuppressedSymlinkToHeadAsync`'s remarks.
+- **Observed, not tested:** space-in-path, non-ASCII path, and Decision 2's tag rule (`M` measured, the
+  other four argued) — all at `FindSuppressedIndexEntriesAsync`'s remarks.
+- **Structural, not tested:** Decision 5's same-policy property, at `IsSuppressedEntryFault`'s summary.
+- B2 is correctly outside this set: established analytically, recorded as such, not deferred.
+
+Every one of these is recorded in `ContentRepositoryService.cs` itself, so a reader who opens the code
+finds them without the DEVLOG. That is the durable half and it is the thing I would have most expected
+to be missing.
+
+#### 4. Sign-off on the change
+
+**`content-store`'s new requirement holds at both sites, for the shapes that occur.** A clean report now
+means a clean tree rather than "the index said so": content divergence, suppressed deletion,
+suppressed-but-uncommitted, a re-pointed symlink and a gitlink typechange all refuse and name the path
+and the index state; reconciliation refuses before staging anything, so there is nothing to unwind; and
+the post-reconciliation self-check re-derives the same census independently rather than inheriting
+reconciliation's answer, which is the property task 3.4 pins and the one full-suite mutation isolated to
+2.3 alone.
+
+The **harmless** side — the half that decides whether this change bricks a working wiki, and the half
+section 1 got wrong three times — carries the strongest evidence in the change: three constructions and
+two full-suite mutants whose collateral was traced by mechanism rather than counted.
+
+**The recorded exception is mode**, and it is a real one: a suppressed entry whose content matches
+`HEAD` but whose exec bit changed starts normally, so the guarantee is a clean *content* tree, not a
+byte-identical one. The reason for leaving it is sound — statting the on-disk mode ignores
+`core.fileMode` and would reintroduce the false-refusal class that cost section 1 three rounds — and
+`updateInstead` is blinded by the same bit, so no push was going to bounce on it. It is recorded at the
+site, correctly classed as a boundary.
+
+**Can a stranger act on the record?** Yes, and this is the part I would defend to someone who never read
+a line of this thread. Every claim in the census path names a test, or a measurement with the platform
+it was made on, or says in the sentence that it is an inference — and the two exceptions I found were
+both fixed rather than argued. I attacked that standard in three consecutive rounds and it is now
+stronger than when I started. The process record is also honest about its own failures in the places
+that matter: Decision 9 keeps the withdrawn task and the figure that never reproduced, Decision 7
+records the re-cut and its structural cause, and F3's remark admits an arm was promoted to a fault
+without stated reasoning.
+
+#### 5. `## NEXT` for the archive — confirmed
+
+1. **`LinkTarget is null && File.Exists`** leads the deferrals: the only item with neither a test nor an
+   observation.
+2. The site-recorded items: the three observed-but-untested census-parse shapes, and Decision 5's
+   same-policy property. All in `ContentRepositoryService.cs`, findable without the DEVLOG.
+3. **Three audits enumerating evidence from one list of committed tests cannot reveal an untested
+   branch.** The gaps were reachable for that reason, not for want of care.
+4. **Prose about evidence is the least-gated artefact in this workflow** — no `make` target can read a
+   comment, the reviewer audits the diff, and a claim's *scope* is checked only by whoever happens to
+   re-derive it. Section 4 produced a defect in each of its first three rounds with every gate green
+   throughout.
+5. Unchanged: `RepositoryWriteLockTests.HeldByAnotherProcess_BoundedWaitGivesUp…` is still flaky, still
+   predates this change, still out of scope.
+
+#### What this final sign-off could not see
+
+Stated because an `Approve` that reads as total is worth less than one that names its limits, and this
+is the last one:
+
+- **No mutants this round** — the `src` diff is comment-only, so there was nothing to falsify. Across the
+  change I ran four: two that survived and became B1/B2, and I re-derived neither of the kills that
+  closed them.
+- **I have never run a container.** 3.7, the Ubuntu/apt figures and the unmerged-index observation are
+  the Architect's and the Product Owner's confirmed measurements, taken as given. Every finding I raised
+  about them was about whether the record was internally consistent — never about whether the
+  observation happened.
+- **One host for everything else.** macOS/APFS, git 2.55.0, for all seven parties including me.
+- **I never ran the gates**; every `BUILD_EXIT` / `TEST_EXIT` / `FORMAT_EXIT` / `VALIDATE_EXIT` in this
+  change is read from a post, not observed by me. My only incidental corroboration of the suite was the
+  920/920 and 924-test figures my own mutation runs happened to print.
+- **My audits were targeted, not exhaustive.** I read every sentence each section added and enumerated
+  the test fixtures mechanically, but I have never audited the remarks this change left untouched. The
+  D17 line surfaced only because a finding led me to it, and I have no basis for claiming it was the only
+  one of its kind. If a fourth false claim exists in `ContentRepositoryService.cs`, that is where I would
+  look.
+
+**Reviewed-state:** `git diff HEAD -- ':/' ':(top,exclude,glob)**/DEVLOG.md'` is empty with no untracked
+files outside the DEVLOG — the change's tree is exactly `8cd95b1`, 19 of 19 tasks ticked.
+
+→ @architect
+
 ## NEXT
 
-**Resume point:** section 4, block 4.1–4.4 — briefed under `## 4.`. Sections 1, 2 and 3 are **closed**
-on `[supervisor]` `Approve`. Section 4's base is `82c35fb`. This is the change's last section.
+**The change is complete.** All 19 tasks ticked; sections 1–4 each closed on a `[supervisor]`
+`Approve`. Awaiting the Product Owner's decision on archiving. Recompute anything derivable —
+`git rev-parse --short HEAD`, `grep -c '^- \[x\]'` on `tasks.md`, the gate exit lines.
 
-**State:** recompute, never trust a number here — `git rev-parse --short HEAD`, `grep -c '^- \[x\]'`
-against `grep -c '^- \[ \]'` on `tasks.md`, and gate exit lines.
+### What is deliberately unfinished
 
-**Owed after 4.1–4.4:** reviewer → gates → tick → commit → **section 4's supervisor review** → then
-report to the Product Owner and *offer* to archive (`/opsx:archive`), waiting for their confirmation.
-Do not archive automatically.
+- **`LinkTarget is null && File.Exists`** (`ContentRepositoryService.cs:1383-1386`) — a suppressed
+  symlink replaced by a regular file. **The only item with neither a test nor an observation.** It
+  leads this list because that is what makes it different from the rest.
+- **Observed, not tested** — space-in-path, non-ASCII path, and the tag rule (`M` measured; `R`/`C`/`K`/`?`
+  decided by reading the predicate). Real evidence, no fixture. *Observed* and *tested* are different
+  claims and the record keeps them apart.
+- **Structural, not tested** — Decision 5's "same policy at both sites" is a shared-code fact.
+- **Filtered mutation evidence** — some `dde2489` kills were verified filtered rather than under the
+  full suite, accepted by the Product Owner and enumerated at the site with the instrument's blind spot
+  stated.
+- **Mode is a recorded exception, not a gap.** A clean report means a clean *content* tree, not a
+  byte-identical one: statting the on-disk mode ignores `core.fileMode` and would reintroduce the
+  false-refusal class section 1 hit three times.
+- **A pre-existing flaky test**, out of scope: `RepositoryWriteLockTests.HeldByAnotherProcess_BoundedWaitGivesUp…`
+  fails under machine load, passes otherwise.
 
-**Known-open, all deliberate, all belonging in section 4's record rather than a block:**
-- The `LinkTarget is null && File.Exists` shape (`:1383-1386`) — suppressed symlink replaced by a
-  regular file — has no test.
-- Census-parse: space-in-path and Decision 2's non-suppressing tags have no test **fixture**, though
-  3.7 observed both at the git level on Linux. *Observed* and *tested* are different claims; the
-  record must not blur them.
-- Decision 5's "same policy at both sites" is a shared-code fact, not a tested one.
-- B2's `NotCompared` arm detects nothing the pre-existing gitlink guard misses — it buys the **message
-  and the ordering**. Established analytically by the supervisor; recorded so nobody rediscovers it as
-  a defect.
-- Some `dde2489` kills rest on **filtered** mutation evidence, accepted by the Product Owner and
-  enumerated in the DEVLOG with the instrument's blind spot stated.
+All of these are recorded in `ContentRepositoryService.cs` itself, findable without this DEVLOG.
 
-**Live hazards:**
-- **`make test` takes ~3–4 minutes, not 18.** The 18m13s that briefly justified a since-withdrawn task
-  was a degraded machine. Decision 9 carries the corrected table and how one unreplicated sample
-  produced a confident wrong mechanism.
-- **`dotnet` `obj/` permission failures** struck twice in one session on different artefacts, each
-  giving a red `BUILD_EXIT` while the same project compiled seconds later. Fix needs **both**
-  `dotnet build-server shutdown` **and** removing the stale artefact.
-- **A flaky test, out of scope:** `RepositoryWriteLockTests.HeldByAnotherProcess_BoundedWaitGivesUp…`
-  fails under machine load, passes otherwise. Predates this change.
-- **Over-correcting a defect class creates its mirror, and the mirror is invisible to the process that
-  caught the original.** Section 1 failed three rounds on *over*-refusal; section 3 was briefed hard on
-  the harmless direction and left the *fault* direction of both type dispatches untested (supervisor
-  B1/B2). Neither block review could see it: each block satisfied its own brief, and the gap was
-  between briefs.
-- **A list of tests cannot reveal an untested branch.** Three audits walked the same list and agreed,
-  which bought no independence. Mutants found what the list could not.
-- **Two agents ended a turn with a live mutant.** The harness reverts in a `trap`, but budget **two**
-  bounded waits (~4 min per run) and say so explicitly if you must stop while one is live.
-- **The `## NEXT` heading was destroyed once** by an agent's insert. `grep -n '^#\{1,3\} '` after every
-  DEVLOG write.
+### Two lessons that own no section
 
-**Open decisions:** none. Decisions 7, 8 and 9 (Product Owner, 2026-08-21) are in `design.md`;
-**8 and 9 are both the corrected versions** — 8 because 3.7's container run inverted its locale claim,
-9 because the regression that prompted it was a degraded machine.
+- **A list of committed tests cannot reveal an untested branch.** Three audits enumerated evidence by
+  walking the same list and agreed; agreement bought no independence, because the instrument could not
+  represent the thing it was missing. Mutants found what the list structurally could not — B1 and B2
+  were behaviour the spec says SHALL refuse, protected by nothing, with every gate green.
+- **Prose about evidence is the least-gated artefact in this workflow.** `make build`/`test`/`format`/
+  `validate` cannot read a comment, so a sentence claiming something was measured passes every gate
+  whether or not it was. Section 4 produced a claim-scope defect in each of its first three rounds with
+  every gate green throughout. The only gate on it is a reader who checks the claim against the thing.
+- A corollary earned the hard way: **over-correcting a defect class creates its mirror, and the mirror
+  is invisible to the process that caught the original.** Section 1 failed three rounds on
+  *over*-refusal; section 3 was then briefed hard on the harmless direction and left the *fault*
+  direction of both type dispatches untested. Each block satisfied its brief; the gap was between
+  briefs.
+
+### What no one in this change has verified
+
+Stated because the change's own standard demands it of the change itself:
+
+- **The supervisor never ran a container or a gate.** Every gate exit line in its reviews is read, not
+  observed. 3.7's container measurements, the Ubuntu/apt git version and the unmerged-index figures are
+  the Architect's and the Product Owner's.
+- **One host for everything else** — macOS/APFS, git 2.55.0 — except 3.7's run on Linux/glibc 2.39,
+  git 2.43.0.
+- **Remarks this change never touched have not been audited.** If a fourth false claim exists, the
+  supervisor's own answer is that this is where it would be.
