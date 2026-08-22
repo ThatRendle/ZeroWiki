@@ -4,9 +4,11 @@
 
 The system SHALL determine whether the working tree diverges from `HEAD` by comparing content through an
 instrument that does not consult the git index, so that an index entry marked `--assume-unchanged` or
-`--skip-worktree` cannot cause a divergent tree to be reported as clean. This applies wherever the
-working-tree-clean invariant is established or asserted — startup reconciliation, the assertion that
-follows it, and the health/self-check that reports the invariant.
+`--skip-worktree` cannot cause a divergent tree to be reported as clean. This applies at **both** sites
+where the working-tree-clean invariant is established and asserted: startup reconciliation, and the
+post-reconciliation assertion that is this system's working-tree-clean self-check. There is no separate
+health-check surface — the assertion is startup-only and has no HTTP endpoint by Product Owner decision
+— so "both sites" is the whole of it.
 
 Where the system finds a tracked path that differs from `HEAD` and whose index entry suppresses that
 difference, it SHALL refuse to start, naming the path and the index state responsible. It SHALL NOT
@@ -29,12 +31,13 @@ prevent startup.
   tree content matches `HEAD`
 - **THEN** the system starts normally, because the invariant it protects is not violated
 
-#### Scenario: The health check cannot be answered by the index
+#### Scenario: The post-reconciliation assertion cannot be answered by the index
 
-- **WHEN** the working-tree-clean self-check runs over a tree containing a divergent file whose index
-  entry suppresses the difference
-- **THEN** the check reports the invariant as violated rather than healthy, on the same content-level
-  comparison reconciliation uses
+- **WHEN** the working-tree-clean self-check — the assertion that runs after reconciliation — is
+  reached over a tree containing a divergent file whose index entry suppresses the difference
+- **THEN** it reports the invariant as violated rather than clean, on the same content-level comparison
+  reconciliation uses, so that the assertion is not left trusting the index after reconciliation has
+  stopped doing so
 
 #### Scenario: Untracked content is still reconciled, not refused
 

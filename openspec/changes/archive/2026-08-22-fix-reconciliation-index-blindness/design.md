@@ -120,6 +120,116 @@ project has now hit three times. The test sets the bit with a real `git update-i
 file on disk, and asserts the refusal. The mutation that must kill it: swap the content comparison back
 to `status --porcelain` and confirm the test dies.
 
+### Decision 7 — Section 1 observes; section 2 judges (Product Owner decision, 2026-08-21)
+
+Added after section 1 failed two supervisor reviews with the *same defect class*: round one refused
+startup on a harmless symlink, round two on a harmless gitlink. The cause was not carelessness — it is
+structural. Section 1 was required to render a **verdict** ("is this a fault?") while every policy that
+verdict must agree with lives in section 2: `FindStagedGitlinksAsync`'s deliberately narrow contract
+(an adopted submodule advancing is *not* a fault — "exactly the bricking this check exists to
+prevent"), 2.1's ordering against the existing stderr refusals, and 2.2's refusal message. A section
+cannot be held to policies it cannot see.
+
+**Section 1's output is therefore an observation, not a verdict.** Per suppressed entry it reports the
+path, the index mode, the `HEAD` mode, and the comparison outcome. It decides nothing.
+`FindSuppressedEntryFaultsAsync` becomes `FindSuppressedIndexObservationsAsync`. **Section 2 owns every
+fault decision**, which is where the policies already are.
+
+This is why the gitlink question is not answered a third time here: section 1 reports that a path is a
+`160000` entry whose `HEAD` mode is or is not `160000`, and section 2 decides what that means. The
+index-independent equivalent of the existing `newMode == 160000 && oldMode != 160000` test is one
+subprocess and needs no exit-code parsing — measured:
+
+| `git ls-tree <tree> -- <path>` | meaning |
+|---|---|
+| `160000 commit <sha>\t<path>` | already an adopted gitlink |
+| `100644 blob <sha>\t<path>` | a tracked file replaced by a gitlink — a typechange |
+| *(empty output, exit 0)* | not in `HEAD` at all — a new gitlink |
+
+### Decision 8 — The Linux/glibc claims are observed in the container, and one of them inverted (Product Owner decision, 2026-08-21; **result recorded same day**)
+
+Everything this change measured — symlinks, permission bits, index modes, and the `LC_ALL=C` pin on the
+EACCES/ENOENT discriminator — was measured on git 2.55.0 / macOS APFS by worker, reviewer and
+supervisor alike. Seven parties, one host. Two of those claims were *specifically* about a platform
+none of them could see, so the change carried one task (3.7) to observe them where ZeroWiki actually
+ships.
+
+**Run, not reasoned.** A throwaway clone mounted into `mcr.microsoft.com/dotnet/sdk:10.0` as
+**non-root uid 501** (matching production's `USER $APP_UID`, `Dockerfile:56`), on **glibc 2.39,
+git 2.43.0**:
+
+- **The behaviour holds.** All **19** suppressed-entry tests pass on Linux. The EACCES branch genuinely
+  exercises there, a non-root process really being denied by `chmod 000`.
+- **The census parse holds, including the two shapes that have no test fixture.** Default
+  `core.quotePath` octal-escapes a non-ASCII path (`"docs/caf\303\251-vault.md"`); `-z` emits raw
+  UTF-8 (`303 251` = `c3 a9`), path after a **TAB**, records NUL-delimited; a space-containing path
+  round-trips intact. Identical to the macOS/git 2.55 measurement.
+- **Decision 2's rule also holds for the one non-suppressing tag that needed a real index to produce**
+  (run separately, during section 4's remediation, not part of the sweep above — same
+  `mcr.microsoft.com/dotnet/sdk:10.0`, non-root uid 501, glibc 2.39, git 2.43.0). A genuinely unmerged
+  index, built with `git update-index --index-info` staging three versions of one path at stages 1/2/3,
+  yields an uppercase `M` in `git ls-files -v -s` — neither lowercase nor exactly `S` — so the census's
+  tag rule correctly declines to select it, matching the one member of Decision 2's five-tag set
+  (`M`, `R`, `C`, `K`, `?`) whose real-world occurrence Decision 2's own rationale names (an unmerged
+  index misattributing a refusal). The other four are declined by the rule's shape on inspection, not by
+  a run: any tag other than lowercase or `S` is rejected by construction, so no separate observation is
+  needed for `R`, `C`, `K`, or `?`.
+- **The locale claim inverted.** ZeroWiki ships on `mcr.microsoft.com/dotnet/aspnet:10.0`, which
+  contains exactly **three** locales — `C`, `C.utf8`, `POSIX`. There is no translated locale data in
+  the image, so glibc's `strerror` **cannot** translate "Permission denied" there whatever `LC_ALL` an
+  operator sets. Verified both ways in-container: `LC_ALL=fr_FR.UTF-8 git hash-object` on an unreadable
+  file returns English, identically to `LC_ALL=C`.
+
+**So the `LC_ALL=C` pin guards a condition that is unreachable in the shipped container.** It is kept —
+an operator may derive an image with locales installed, and the code should not silently depend on
+their absence — but it is **defence in depth against an unreachable state**, not a fix for a live
+locale-dependence bug, and task 4.3 records it that way in the code.
+
+**Limits of this measurement**, stated because the whole point of 3.7 was to stop inferring: it
+describes the base image *as published today*, a future base could add locales, and it says nothing
+about a non-Docker deployment.
+
+### Decision 9 — The census wiring costs ~41%, and that is not worth a task (Product Owner decision, 2026-08-21; **corrected same day**)
+
+**This decision was first taken on a measurement that did not reproduce, and the correction is the
+useful part of it.** Recorded in full rather than tidied away, because the failure was mine as
+Architect and the pattern is one this change has met repeatedly: a single sample, a plausible
+mechanism reasoned on top of it, and no one asking what *else* would produce that number.
+
+**What was originally reported:** `make test` went from ~2m34s–3m10s to **18m13s** after block 2.1–2.3
+— a 7× regression — diagnosed as two extra git spawns per start being amplified non-linearly by the
+suite's ~14-way parallelism (p50 153ms per spawn against ~16–30ms in isolation, 52% of an instrumented
+subset's runtime). Task 3.8 was scoped on that basis.
+
+**What the like-for-like measurement actually shows**, taken in an isolated worktree so the branch
+never moved, and re-measuring the *same* 905 tests either side of the wiring:
+
+| commit | tests | duration | isolates |
+|---|---|---|---|
+| `1e9ffcd` | 905 | **2m55s** | before the census is wired in |
+| `317a5c9` | 905 | **4m6s** | census wired into both sites, same tests |
+| `dde2489` | 920 | 3m43s / 3m56s / 4m9s | current, +15 new tests |
+| `317a5c9` (first attempt) | 905 | 10m, then 18m13s | **never reproduced** |
+
+**The real cost is +71s, about +41%** — not 7×. The 18-minute figure was a degraded machine, and two
+independent corroborations say so: `dotnet`'s `obj/` permission failures struck twice in the same
+window on different artefacts (`MvcTestingAppManifest.json`, then `ZeroWiki.dll`), and a
+timing-sensitive lock test (`RepositoryWriteLockTests.HeldByAnotherProcess_BoundedWaitGivesUp…`)
+failed once under the same conditions and passes otherwise. A filesystem fighting the build inflates
+every file operation without changing how many subprocesses the code spawns — which is exactly what
+the per-spawn figures were measuring.
+
+**What survives:** the cost is real and reproducible, Decision 1's "one subprocess per start" still
+holds for production, and the census is genuinely empty (`entries.Count == 0` in all 641 instrumented
+calls). **What does not:** the magnitude, and the concurrency-amplification mechanism.
+
+**Decision: correct the record, drop task 3.8.** A 71-second cost on a 3-minute suite does not justify
+test-infrastructure work inside a change about index blindness. Sharing one census between the two
+invariant sites would still be the wrong fix if anyone revisits this — it buys speed with Decision 5's
+independence, which is what makes task 3.4 provable at all.
+
+**Left unfixed and deliberately out of scope:** the flaky lock test above. It predates this change.
+
 ## Risks / Trade-offs
 
 - **One more subprocess per start.** `git ls-files -v` on every startup, whose output is normally empty.

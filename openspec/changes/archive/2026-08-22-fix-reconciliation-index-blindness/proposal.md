@@ -43,8 +43,9 @@ robustness and honest diagnosis rather than a live incident.
 
 - Reconciliation and the working-tree-clean assertion verify tree-versus-`HEAD` divergence with an
   instrument the index cannot suppress, rather than trusting `add`/`status`/`diff --cached` alone.
-- The health/self-check that asserts the invariant reports on the same footing, so "healthy" cannot mean
-  "the index told me so".
+- The post-reconciliation assertion — which *is* this system's working-tree-clean self-check, there
+  being no separate health-check surface — reports on the same footing, so "clean" cannot mean "the
+  index told me so".
 - When a blinded path is found, the system says so specifically — naming the path and the index bit
   responsible — instead of reporting a clean tree or emitting a generic refusal. An operator meeting the
   bouncing-push symptom gets the cause from ZeroWiki rather than from a git error they must decode.
@@ -52,6 +53,10 @@ robustness and honest diagnosis rather than a live incident.
   policy switch. This change replaces an *instrument*, not a decision.
 - Regression coverage that fails if the index-independent instrument is swapped back for an
   index-consulting one — the defect's whole character is that the ordinary tests still pass.
+- **Considered mid-apply and dropped (Decision 9, 2026-08-21):** test-suite work to recover the ~41%
+  (+71s) the census wiring costs `make test`. Scoped on a reported 7× regression, then withdrawn when
+  the like-for-like measurement showed the 18-minute run was a degraded machine rather than the code.
+  The corrected numbers and how the first measurement misled are recorded in `design.md` Decision 9.
 
 Not in scope: the save path's own guard (already fixed), the rest of the inherited-git-config class
 (`core.safecrlf`, `core.fileMode`, `core.symlinks`, and their siblings — separately owned), and any

@@ -801,6 +801,37 @@ public sealed class ContentRepositoryService
     /// </remarks>
     private async Task ReconcileWorkingTreeAsync(string repositoryRoot, CancellationToken cancellationToken)
     {
+        // Section 2 (Decision 7): a suppressed index entry (--assume-unchanged/--skip-worktree) is
+        // invisible to `add -A`, `diff --cached`, and `status --porcelain` alike — that is the whole
+        // point of the bit — so it is checked here first, against the index as it stands, before any of
+        // those instruments run. `git diff --quiet HEAD` is blinded the same way (measured on git 2.55.0,
+        // design.md's Context table): it reads as the index-free "just compare the tree to HEAD" reflex,
+        // and it is not one — reaching for it to fix this defect would produce a patch that passes review
+        // and changes nothing, because it consults the index exactly like the three above. It does not
+        // depend on what `add -A` is about to stage (a suppressed path is, by definition, one `add -A`
+        // will not touch), so ordering it before that call costs nothing and means a fault here refuses
+        // before anything is staged — no `git reset` to unwind, unlike the gitlink refusal below, which
+        // only knows what it is refusing after staging.
+        // Constructed separately, a nested-repository or an unreadable-directory tree carries no
+        // suppressed entry at all, so this census reports nothing and execution falls through to those
+        // checks unchanged on that path. But when a tree holds both faults at once, this census's
+        // refusal *does* win over the gitlink diagnosis below on a single restart — not a non-overlap,
+        // an ordering: the gitlink check never runs because this loop throws first, so its diagnosis is
+        // deferred to the next restart rather than lost (matching the precedent at
+        // FindStagedGitlinksAsync's own refusal, decided independently). Falsified and confirmed by
+        // ContentRepositoryServiceTests.SuppressedDivergenceAndANestedRepository_TheSuppressedEntryRefusesFirstAndTheGitlinkFaultIsDeferred
+        // (task 3.9), which builds both faults in one tree and checks the gitlink fault still fires on the
+        // very next restart once the suppressed divergence alone is fixed. The reverse direction — whether
+        // the gitlink/unreadable-directory checks below could ever swallow *this* census's fault — is not
+        // covered by that test or any other and is not asserted here either way.
+        foreach (var observation in await FindSuppressedIndexObservationsAsync(repositoryRoot, cancellationToken))
+        {
+            if (IsSuppressedEntryFault(observation))
+            {
+                throw SuppressedEntryDivergesAtReconciliationException(repositoryRoot, observation);
+            }
+        }
+
         // `add -A` stages tracked modifications and deletions *and* untracked files. Untracked files
         // are the load-bearing case: copying a folder of Markdown onto the volume is the ordinary way
         // to populate a new ZeroWiki, and it arrives untracked. Staging only tracked changes (e.g.
@@ -824,6 +855,13 @@ public sealed class ContentRepositoryService
         // denied` on stderr for an unreadable directory, and both produce empty stderr for `add -A` on a
         // healthy tree — `ApplyContentSafetyConfigurationAsync`'s own remarks cover the CRLF case, which
         // this app now removes at the source rather than trying to also recognise here.
+        //
+        // "2.43.0 (Ubuntu 24.04, the shipped image)" above is measured, not carried forward unverified
+        // (task 4's remediation): `mcr.microsoft.com/dotnet/aspnet:10.0` reports `ID=ubuntu`,
+        // `VERSION_ID="24.04"`, and its apt candidate for `git` is `1:2.43.0-1ubuntu7.3`, matching this
+        // line exactly. Mechanism: the runtime image ships no git of its own — `Dockerfile:45-46`
+        // installs it via apt at build time — so the version in production follows Ubuntu 24.04's
+        // package, not anything bundled with the base image.
         var addArguments = new[] { "add", "-A" };
         var addResult = await _git.RunAsync(repositoryRoot, addArguments, cancellationToken: cancellationToken);
         if (!addResult.Succeeded)
@@ -995,6 +1033,522 @@ public sealed class ContentRepositoryService
             "application; refusing to start rather than commit a broken reference.";
     }
 
+    /// <summary>Index mode for a submodule/gitlink entry — never content-comparable (Blocker 2/Decision 2).</summary>
+    private const string GitlinkMode = "160000";
+
+    /// <summary>Index mode for a symbolic link — compared as link text, never via <c>hash-object</c> (Blocker 1).</summary>
+    private const string SymlinkMode = "120000";
+
+    /// <summary>
+    /// Environment override for the one git subprocess in this class whose behaviour is picked apart by
+    /// <c>stderr</c> text (<see cref="CompareSuppressedFileToHeadAsync"/>'s <c>hash-object</c> call —
+    /// reviewer finding, section 1 remediation): pins the subprocess's own locale to <c>C</c> so the
+    /// EACCES/ENOENT discrimination cannot silently stop working under an operator's non-<c>C</c>
+    /// <c>LC_ALL</c>/<c>LANG</c>, regardless of what this process itself inherited.
+    /// </summary>
+    private static readonly IReadOnlyDictionary<string, string> InvariantLocale =
+        new Dictionary<string, string> { ["LC_ALL"] = "C", ["LANG"] = "C" };
+
+    /// <summary>
+    /// An index entry whose tag (<see cref="FindSuppressedIndexEntriesAsync"/>'s <c>git ls-files -v -s</c>
+    /// census) tells git to stop trusting the working tree for <see cref="RepositoryRelativePath"/> —
+    /// either <c>--assume-unchanged</c> (a lowercase tag) or <c>--skip-worktree</c> (<c>S</c>). Carries
+    /// the index <see cref="Mode"/> (<c>100644</c>, <c>120000</c> symlink, <c>160000</c> gitlink, …) so
+    /// <see cref="FindSuppressedIndexObservationsAsync"/> can pick the right comparison for the shape on
+    /// disk before ever comparing bytes (Blocker 3: the mode was available in the same subprocess and was
+    /// the missing discriminator).
+    /// </summary>
+    private readonly record struct SuppressedIndexEntry(char Tag, string Mode, string RepositoryRelativePath);
+
+    /// <summary>
+    /// What comparing a suppressed entry's working-tree state against <c>HEAD</c> found — a fact, not a
+    /// verdict (Decision 7). Whether any of these counts as a fault is <b>not decided here</b>: that
+    /// judgment needs policies this class does not have (an adopted gitlink advancing is not a fault;
+    /// a typechange is a different question again), and those policies live where section 2 puts them.
+    /// </summary>
+    private enum SuppressedEntryComparisonOutcome
+    {
+        /// <summary>Content (or, for a symlink, link text) matches what <c>HEAD</c> holds for this path.</summary>
+        Matches,
+
+        /// <summary>The working tree's content (or link text) resolves against <c>HEAD</c>, and differs.</summary>
+        Differs,
+
+        /// <summary>The working-tree file is gone.</summary>
+        WorkingTreeMissing,
+
+        /// <summary>The working-tree file exists but could not be read (e.g. permission denied) — distinct
+        /// from <see cref="WorkingTreeMissing"/> because nothing was actually deleted.</summary>
+        WorkingTreeUnreadable,
+
+        /// <summary>The path is in the index but has no counterpart in <c>HEAD</c> at all.</summary>
+        PathNotInHead,
+
+        /// <summary>
+        /// Either the index mode or the <c>HEAD</c> mode is <c>160000</c> (gitlink) — a commit reference,
+        /// not a blob, so there is no byte content on either side to compare. This is the case Decision 7
+        /// exists for: whether an index mode of <c>160000</c> matching (or not matching) a <c>HEAD</c> mode
+        /// of <c>160000</c> is a fault is a policy question — an adopted submodule advancing is not a
+        /// fault, a typechange or a brand-new gitlink might be — and this class reports the two modes
+        /// rather than answering it.
+        /// </summary>
+        NotCompared,
+    }
+
+    /// <summary>
+    /// Everything section 2 needs to judge one suppressed index entry, and nothing that judges it
+    /// (Decision 7): the path, the operator-facing name of the index state responsible (<c>h</c> →
+    /// <c>--assume-unchanged</c>, <c>S</c> → <c>--skip-worktree</c>), the index mode, the mode <c>HEAD</c>
+    /// records for the same path (<c>null</c> if the path is not in <c>HEAD</c> at all), and the
+    /// comparison outcome. There is no <c>IsFault</c> here, deliberately — that was the exact defect
+    /// section 1 shipped twice (a harmless symlink, then a harmless gitlink, each promoted to a fault by
+    /// this class instead of by the policy that actually knows the answer).
+    /// </summary>
+    private readonly record struct SuppressedIndexObservation(
+        string RepositoryRelativePath,
+        string IndexStateName,
+        string IndexMode,
+        string? HeadMode,
+        SuppressedEntryComparisonOutcome ComparisonOutcome);
+
+    /// <summary>
+    /// The fault decision section 1 was not allowed to make (Decision 7). Both call sites —
+    /// <see cref="ReconcileWorkingTreeAsync"/> and <see cref="AssertWorkingTreeIsCleanAsync"/> — share
+    /// this one policy so the invariant means the same thing at both of its sites (Decision 5). That
+    /// "same policy at both sites" property is a fact about the code — one method, two callers — not a
+    /// tested one: there is no assertion anywhere that would fail if a future edit gave one call site its
+    /// own copy of this switch instead of calling this method.
+    /// </summary>
+    /// <remarks>
+    /// <see cref="SuppressedEntryComparisonOutcome.PathNotInHead"/> is a fault unconditionally (Decision
+    /// 4, case 3) — a suppressed path with no counterpart in <c>HEAD</c> can never be staged or committed
+    /// while suppressed, regardless of the index mode involved, so this already generalizes Decision 7's
+    /// "not in <c>HEAD</c> at all — a new gitlink" row without needing to test the mode.
+    /// <para>
+    /// <see cref="SuppressedEntryComparisonOutcome.NotCompared"/> is where <see
+    /// cref="FindStagedGitlinksAsync"/>'s condition (<c>newMode == 160000 &amp;&amp; oldMode != 160000</c>)
+    /// is reconstructed, not approximated, against the mode pair section 1 reported: fault iff
+    /// <see cref="SuppressedIndexObservation.IndexMode"/> is <see cref="GitlinkMode"/> and <see
+    /// cref="SuppressedIndexObservation.HeadMode"/> is not. This is symmetric with the gitlink check's own
+    /// narrowness by construction, not by a second policy call: an already-adopted gitlink whose nested
+    /// <c>HEAD</c> merely advanced (both sides <c>160000</c>) is not a fault — the commonest real reason
+    /// anyone sets these bits at all — while a tracked file replaced by a gitlink, or a gitlink newly
+    /// introduced, is. The reverse shape (the index now holds real content — a blob or a symlink — where
+    /// <c>HEAD</c> still records a gitlink) is also <c>NotCompared</c> but falls on the "not a fault" side
+    /// of the same test: <see cref="FindStagedGitlinksAsync"/> only ever guards against a gitlink being
+    /// introduced, never against one being replaced by real content, and there is no separate policy call
+    /// here either — reconstructing its exact condition already resolves this shape the same way.
+    /// </para>
+    /// <para>
+    /// <b>Decided on purpose (asymmetry 1 of section 1's close):</b> a symlink typechange (index mode
+    /// <c>120000</c>, working tree now a regular file or directory) reaches this policy as
+    /// <see cref="SuppressedEntryComparisonOutcome.Differs"/>, a direct fault — decided consistently with
+    /// the gitlink typechange above (both are treated as a fault), just reached by a different mechanism:
+    /// a symlink typechange still has bytes to compare (<see cref="CompareSuppressedSymlinkToHeadAsync"/>
+    /// answers it directly), while a gitlink typechange never has a blob on at least one side and can only
+    /// be answered by the mode pair.
+    /// </para>
+    /// <para>
+    /// <b>Decided on purpose (asymmetry 2 of section 1's close):</b> <see
+    /// cref="SuppressedEntryComparisonOutcome.PathNotInHead"/> does not recover whether the working-tree
+    /// path is present or absent on disk. It does not change here: Decision 4 case 3 makes "not in
+    /// <c>HEAD</c>" a fault regardless of on-disk state — an uncommitted, suppressed index entry can never
+    /// be staged either way — so the distinction has no effect on the verdict, only on the refusal
+    /// message's wording. Recovering it would mean a second, mode-dependent existence probe (a symlink's
+    /// absence test differs from a regular file's) purely for message polish on a diagnosis that already
+    /// names the path and the index state per Decision 3. Left unrecovered; revisit only if an operator
+    /// report says the message is not actionable as written.
+    /// </para>
+    /// <para>
+    /// <b>Boundary, recorded without fixing (F2): this policy decides content divergence, and mode only
+    /// for gitlinks — it does not decide a mode-only change on an ordinary file.</b> Two shapes this
+    /// switch never asks about: a suppressed entry whose content matches <c>HEAD</c> but whose executable
+    /// bit changed on disk (starts normally; the working tree silently ≠ <c>HEAD</c> on that bit alone),
+    /// and a suppressed <c>100644</c>↔<c>120000</c> typechange decided purely by content/link-text
+    /// comparison rather than by the mode pair. Not treated as a defect to close: the obvious fix (stat
+    /// the on-disk mode and compare it to the index) ignores <c>core.fileMode</c> and would refuse startup
+    /// on a filesystem where the exec bit is not meaningful — reintroducing the false-refusal class this
+    /// section exists to end. No product impact follows from leaving it open either: git's own
+    /// <c>updateInstead</c> receive path is blinded by the identical suppression bit, so a mode-only
+    /// divergence was never going to bounce a push in the first place.
+    /// </para>
+    /// <para>
+    /// <b><see cref="SuppressedEntryComparisonOutcome.WorkingTreeUnreadable"/> is a fault by inference,
+    /// not by a named Decision (F3).</b> Decision 4 enumerates three divergent shapes and this is not one
+    /// of them — it was introduced in section 1 and promoted to a fault in section 2 without its own
+    /// stated reasoning, unlike every sibling arm above. The reasoning: it is consistent with the existing
+    /// stderr-based refusal for an unreadable <i>directory</i> (<see cref="ReconcileWorkingTreeAsync"/>'s
+    /// D17 handling), and it is the arm most likely to fire in production on an otherwise-healthy file —
+    /// Decision 8 measured the shipped container running as non-root, where a permission change on a
+    /// tracked file is the ordinary way this arm gets exercised, not an edge case. That is reasoning
+    /// recorded here for the first time, not a decision this class previously made explicit.
+    /// </para>
+    /// <para>
+    /// <b><see cref="SuppressedEntryComparisonOutcome.NotCompared"/>'s fault side detects nothing the
+    /// pre-existing <see cref="FindStagedGitlinksAsync"/> guard misses (established analytically, not by a
+    /// test that could show otherwise).</b> The condition above is <see cref="FindStagedGitlinksAsync"/>'s
+    /// own <c>newMode == 160000 &amp;&amp; oldMode != 160000</c> reconstructed against the mode pair this
+    /// class already has — and that guard reads <c>git diff --cached</c> (index vs. <c>HEAD</c>), an
+    /// instrument the suppression bit never hides gitlink introduction from. What this arm buys over the
+    /// pre-existing guard is the message (naming the suppressed path and its index state, Decision 3) and
+    /// the ordering (refusing before <c>add -A</c> stages anything, see <see
+    /// cref="ReconcileWorkingTreeAsync"/>'s remarks) — not a case the pre-existing guard would otherwise
+    /// miss.
+    /// </para>
+    /// </remarks>
+    private static bool IsSuppressedEntryFault(SuppressedIndexObservation observation) =>
+        observation.ComparisonOutcome switch
+        {
+            SuppressedEntryComparisonOutcome.Matches => false,
+            SuppressedEntryComparisonOutcome.Differs => true,
+            SuppressedEntryComparisonOutcome.WorkingTreeMissing => true,
+            SuppressedEntryComparisonOutcome.WorkingTreeUnreadable => true,
+            SuppressedEntryComparisonOutcome.PathNotInHead => true,
+            SuppressedEntryComparisonOutcome.NotCompared =>
+                observation.IndexMode == GitlinkMode && observation.HeadMode != GitlinkMode,
+            _ => throw new ArgumentOutOfRangeException(
+                nameof(observation), observation.ComparisonOutcome, "Unhandled comparison outcome."),
+        };
+
+    private static string DescribeSuppressedEntryFault(SuppressedIndexObservation observation) =>
+        $"'{observation.RepositoryRelativePath}' (marked {observation.IndexStateName})";
+
+    /// <summary>
+    /// Decision 3: never silently clear the operator's bit. Naming the path and the operator-facing
+    /// index state (Decision 3/2.2) so the operator who set it is the one asked what it should protect,
+    /// and pointing at the exact command that would clear it — the fix this class deliberately does not
+    /// apply on the operator's behalf.
+    /// </summary>
+    private static InvalidOperationException SuppressedEntryDivergesAtReconciliationException(
+        string repositoryRoot, SuppressedIndexObservation observation) =>
+        new InvalidOperationException(
+            $"The content repository at '{repositoryRoot}' has a tracked path that differs from HEAD " +
+            $"but is hidden from git's normal comparisons: {DescribeSuppressedEntryFault(observation)}. " +
+            "Startup reconciliation cannot safely commit past this without either discarding the " +
+            "divergence or silently clearing an index bit the operator set deliberately, so it refuses " +
+            "to start rather than report a clean tree. Clear the index bit yourself if the divergence is " +
+            $"expected (`git update-index --no-assume-unchanged -- '{observation.RepositoryRelativePath}'` " +
+            "or `--no-skip-worktree` for `--skip-worktree`), or restore the tracked content to match " +
+            "HEAD, then restart.");
+
+    /// <summary>Decision 5: the same check, the same message shape, for the post-reconciliation self-check.</summary>
+    private static InvalidOperationException SuppressedEntryDivergesAfterReconciliationException(
+        string repositoryRoot, SuppressedIndexObservation observation) =>
+        new InvalidOperationException(
+            $"The content repository at '{repositoryRoot}' is not clean after startup reconciliation: " +
+            $"{DescribeSuppressedEntryFault(observation)} differs from HEAD, but git's normal " +
+            "comparisons cannot see it because the index entry suppresses them. Reconciliation should " +
+            "have committed every change; refusing to start rather than accept pushes against a tree it " +
+            "cannot verify is clean.");
+
+    /// <summary>
+    /// Census of every index entry whose tag suppresses git's normal working-tree comparison for that
+    /// path (D9 remediation, Decision 1/2): <c>git ls-files -v -s</c> tags and mode-tags each entry, and
+    /// this keeps only the ones whose tag is <b>lowercase</b> (assume-unchanged lowercases whatever tag
+    /// the entry would otherwise carry — the ordinary case reads <c>h</c>) or exactly <c>S</c>
+    /// (skip-worktree). Every other non-<c>H</c> tag (<c>M</c> unmerged, <c>R</c> removed, <c>C</c>
+    /// modified/created, <c>K</c> to be killed, <c>?</c> other) describes a state the existing
+    /// reconciliation instruments already see and handle; selecting them here would refuse startup on,
+    /// say, an unmerged index with the cause misattributed to this check instead of the merge conflict it
+    /// actually is (Decision 2). On a repository with no suppressed entry at all — the overwhelmingly
+    /// normal case — this returns an empty list at the cost of exactly one subprocess.
+    /// </summary>
+    /// <remarks>
+    /// Run with <c>-s -z</c>: without <c>-z</c>, <c>core.quotePath</c> (on by default) renders a
+    /// non-ASCII path as a quoted C-style octal escape (confirmed by execution: with a tracked
+    /// <c>docs/café-vault.md</c>, plain <c>git ls-files -v</c> prints
+    /// <c>H "docs/caf\303\251-vault.md"</c>, the literal quote marks and escape included), which is not
+    /// the path this application would resolve on disk. <c>-z</c> disables that quoting and NUL-delimits
+    /// each record instead of newline-delimiting them.
+    /// <para>
+    /// <b><c>-s</c> changes the record format, and this was re-measured, not inherited</b> (supervisor
+    /// finding, section 1 remediation): with <c>-s</c> a record reads
+    /// <c>"&lt;tag&gt; &lt;mode&gt; &lt;sha&gt; &lt;stage&gt;\t&lt;path&gt;"</c> — the path follows the
+    /// first <b>TAB</b>, not the first space. Measured by execution against a scratch repository with
+    /// both a space-containing and a non-ASCII tracked path, both suppressed:
+    /// <c>h 100644 9fb211415c6451a78535c54837c14428baa7b11b 0\tdocs/café-vault.md</c> and
+    /// <c>h 100644 2d00bd505971a8bc7318d98e003aee708a367c85 0\tdocs/space name.md</c> (NUL-terminated,
+    /// path unescaped). Splitting the header on space for tag/mode and taking everything after the tab
+    /// for the path is therefore correct and never mangles a legitimate space-containing path
+    /// (<see cref="FindStagedGitlinksAsync"/> hit the identical <c>core.quotePath</c> hazard first, for
+    /// <c>git diff --cached --raw</c>, and this reuses its fix).
+    /// </para>
+    /// <para>
+    /// <b>Observed, but not test-fixture-covered (recorded so the two are not conflated):</b> the
+    /// space-containing-path and non-ASCII-path parsing above were re-observed on Linux/glibc 2.39/git
+    /// 2.43.0 in <c>mcr.microsoft.com/dotnet/sdk:10.0</c> (non-root uid 501; task 3.7, design.md
+    /// Decision 8 — the same run that exercised the 19 suppressed-entry tests and the EACCES branch) and
+    /// produced identical parsing to the macOS/git 2.55.0 measurement above.
+    /// </para>
+    /// <para>
+    /// <b>Decision 2's non-suppressing-tag set is five (<c>M</c>, <c>R</c>, <c>C</c>, <c>K</c>, <c>?</c>,
+    /// design.md Decision 2) and this census's guarantee covers all five, but only one needed running to
+    /// check.</b> That is a <b>measurement</b>: <c>M</c>, observed in the same <c>sdk:10.0</c> container
+    /// (non-root, git 2.43.0, run separately during this section's remediation, design.md Decision 8) — a
+    /// genuinely unmerged index built with <c>update-index --index-info</c> (three stages) yields
+    /// uppercase <c>M</c> in <c>git ls-files -v -s</c>, which this census correctly declines. It is the one
+    /// member Decision 2's own rationale names by real-world consequence: an unmerged index is the state
+    /// that would misattribute a refusal if this rule mishandled it. The other four are an
+    /// <b>argument</b>, not a run: the rule below keeps an entry only when its tag is lowercase or exactly
+    /// <c>S</c>, so <c>R</c>, <c>C</c>, <c>K</c>, and <c>?</c> are declined by that shape on inspection —
+    /// no separate observation was needed or made for them. None of the five, nor the space-containing or
+    /// non-ASCII path parsing above, has a committed test fixture: a regression in any of those shapes
+    /// would not currently fail <c>make test</c>.
+    /// </para>
+    /// </remarks>
+    private async Task<IReadOnlyList<SuppressedIndexEntry>> FindSuppressedIndexEntriesAsync(
+        string repositoryRoot, CancellationToken cancellationToken)
+    {
+        var lsFiles = await _git.RunOrThrowAsync(
+            repositoryRoot,
+            ["ls-files", "-v", "-s", "-z"],
+            cancellationToken: cancellationToken);
+
+        var entries = new List<SuppressedIndexEntry>();
+
+        foreach (var record in lsFiles.StandardOutput.Split('\0', StringSplitOptions.RemoveEmptyEntries))
+        {
+            var tabIndex = record.IndexOf('\t');
+            if (tabIndex < 1)
+            {
+                continue;
+            }
+
+            var header = record[..tabIndex].Split(' ');
+            if (header.Length < 2 || header[0].Length == 0)
+            {
+                continue;
+            }
+
+            var tag = header[0][0];
+            var mode = header[1];
+            var path = record[(tabIndex + 1)..];
+
+            if (char.IsLower(tag) || tag == 'S')
+            {
+                entries.Add(new SuppressedIndexEntry(tag, mode, path));
+            }
+        }
+
+        return entries;
+    }
+
+    /// <summary>
+    /// An observation for every suppressed index entry, with nothing filtered out and nothing promoted
+    /// to a fault (Decision 7 — the re-cut of what this class was doing before: section 1 failed two
+    /// supervisor reviews for deciding faults itself, on a harmless symlink and then a harmless gitlink,
+    /// because that decision needs policies — <see cref="FindStagedGitlinksAsync"/>'s deliberately narrow
+    /// gitlink contract chief among them — that live in section 2, not here). A caller judges each
+    /// observation using whatever policy applies to it; this method only reports what is true.
+    /// </summary>
+    /// <remarks>
+    /// Not yet called from either candidate site — section 2 wires this in. The two are
+    /// <see cref="ReconcileWorkingTreeAsync"/> (before its commit, ordered against §6's existing stderr
+    /// refusals) and <see cref="AssertWorkingTreeIsCleanAsync"/> (the post-reconciliation self-check,
+    /// Decision 5). Naming them here as concrete methods, not as a "browser save path"/"git-hook path"
+    /// pairing that names nothing in this codebase, is itself a section 1 remediation (this class has no
+    /// browser-facing or git-hook-facing call site at all — those live in <c>PageSaveService</c> and
+    /// <c>GitSmartHttpEndpoints</c> respectively, and neither calls into this instrument).
+    /// </remarks>
+    private async Task<IReadOnlyList<SuppressedIndexObservation>> FindSuppressedIndexObservationsAsync(
+        string repositoryRoot, CancellationToken cancellationToken)
+    {
+        var entries = await FindSuppressedIndexEntriesAsync(repositoryRoot, cancellationToken);
+
+        var observations = new List<SuppressedIndexObservation>();
+        foreach (var entry in entries)
+        {
+            observations.Add(await ObserveSuppressedEntryAsync(repositoryRoot, entry, cancellationToken));
+        }
+
+        return observations;
+    }
+
+    private static string DescribeIndexState(char tag) => tag == 'S' ? "--skip-worktree" : "--assume-unchanged";
+
+    /// <summary>
+    /// Builds one entry's observation. The <c>HEAD</c> mode comes from <c>git ls-tree HEAD -- &lt;path&gt;</c>
+    /// — one subprocess, no exit-code parsing (Decision 7): the format is
+    /// <c>"&lt;mode&gt; &lt;type&gt; &lt;sha&gt;\t&lt;path&gt;"</c>, or <b>empty output with exit 0</b>
+    /// when the path is not in <c>HEAD</c> at all (measured; this is why the old
+    /// <c>rev-parse HEAD:&lt;path&gt;</c>, whose absence signal <i>was</i> a non-zero exit, is no longer
+    /// used for this check). When either the index mode or the <c>HEAD</c> mode is a gitlink, there is no
+    /// blob content on either side to compare, so the outcome is <see cref="SuppressedEntryComparisonOutcome.NotCompared"/>
+    /// and section 2 judges the mode pair directly — this is what stops a suppressed gitlink from being
+    /// promoted to a fault by this class the way it was in the previous remediation round.
+    /// </summary>
+    /// <remarks>
+    /// <b>"Empty output, exit 0" is the absence signal only because a born <c>HEAD</c> is guaranteed by
+    /// the time this runs (reviewer finding, section 1 remediation round 3).</b> Against a genuinely
+    /// unborn <c>HEAD</c> — a repository with no commits at all — <c>git ls-tree HEAD -- &lt;path&gt;</c>
+    /// instead exits <b>128</b> with <c>fatal: Not a valid object name HEAD</c> (reproduced by
+    /// execution), which reaches <see cref="GitProcessRunner.RunOrThrowAsync"/> above and throws. This
+    /// call always sees a <em>born</em> <c>HEAD</c> for the same reason
+    /// <see cref="FindStagedGitlinksAsync"/> does, a few hundred lines above this one:
+    /// <see cref="EnsureInitialCommitAsync"/> runs unconditionally before reconciliation in
+    /// <see cref="AcceptRepositoryAsync"/> and either creates the initial commit or refuses to start, so
+    /// the genuinely unborn-<c>HEAD</c> case never actually reaches this method's two candidate call
+    /// sites (<see cref="ReconcileWorkingTreeAsync"/>, <see cref="AssertWorkingTreeIsCleanAsync"/>). That
+    /// is what makes the summary's "empty output, exit 0" claim true here — it is not a property of
+    /// <c>ls-tree</c> in general, and would stop being true, with an unhandled exception where a clean
+    /// <see cref="SuppressedEntryComparisonOutcome.PathNotInHead"/> observation was expected, if a future
+    /// change ever reordered <see cref="AcceptRepositoryAsync"/> to run reconciliation before the initial
+    /// commit.
+    /// </remarks>
+    private async Task<SuppressedIndexObservation> ObserveSuppressedEntryAsync(
+        string repositoryRoot, SuppressedIndexEntry entry, CancellationToken cancellationToken)
+    {
+        var lsTree = await _git.RunOrThrowAsync(
+            repositoryRoot,
+            ["ls-tree", "HEAD", "--", entry.RepositoryRelativePath],
+            cancellationToken: cancellationToken);
+
+        if (lsTree.StandardOutput.Length == 0)
+        {
+            return new SuppressedIndexObservation(
+                entry.RepositoryRelativePath,
+                DescribeIndexState(entry.Tag),
+                entry.Mode,
+                HeadMode: null,
+                SuppressedEntryComparisonOutcome.PathNotInHead);
+        }
+
+        var tabIndex = lsTree.StandardOutput.IndexOf('\t');
+        var header = lsTree.StandardOutput[..tabIndex].Split(' ');
+        var headMode = header[0];
+        var headBlobSha = header[2];
+
+        var outcome = entry.Mode == GitlinkMode || headMode == GitlinkMode
+            ? SuppressedEntryComparisonOutcome.NotCompared
+            : entry.Mode == SymlinkMode
+                ? await CompareSuppressedSymlinkToHeadAsync(repositoryRoot, entry.RepositoryRelativePath, headBlobSha, cancellationToken)
+                : await CompareSuppressedFileToHeadAsync(repositoryRoot, entry.RepositoryRelativePath, headBlobSha, cancellationToken);
+
+        return new SuppressedIndexObservation(
+            entry.RepositoryRelativePath, DescribeIndexState(entry.Tag), entry.Mode, headMode, outcome);
+    }
+
+    /// <summary>
+    /// Whether a suppressed <b>symlink</b> entry's link text actually differs from what <c>HEAD</c> holds
+    /// (Blocker 1). <c>git hash-object -- &lt;path&gt;</c> <i>follows</i> a symlink and hashes its
+    /// target's content, but git stores a symlink as a <c>120000</c> blob whose content is the link text
+    /// itself — so an unmodified symlink compared that way always reads as diverging. The correct
+    /// comparison is the link text the filesystem reports for the path (<see cref="FileInfo.LinkTarget"/>,
+    /// no subprocess, and never resolved further) against the blob <paramref name="headBlobSha"/> names
+    /// (<c>git cat-file -p &lt;sha&gt;</c>, which prints the blob's exact bytes with no added newline —
+    /// confirmed by execution: a 9-byte blob for a 9-character link target, no trailing <c>\n</c>).
+    /// </summary>
+    /// <remarks>
+    /// Measured, not reasoned: an unmodified suppressed symlink has <c>git hash-object -- docs/link.md</c>
+    /// resolve to the *target file's* blob sha while <c>HEAD</c>'s own recorded sha for that path is the
+    /// symlink's own blob — the two never agree even though nothing has changed, which is exactly the
+    /// false divergence this method exists to avoid. Re-pointing the symlink (so its on-disk link text no
+    /// longer matches the link text <c>HEAD</c> holds) still classifies
+    /// <see cref="SuppressedEntryComparisonOutcome.Differs"/>, so this fix does not simply blind the check
+    /// to symlinks — pinned by
+    /// <c>ContentRepositoryServiceTests.SuppressedSymlinkThatIsRepointed_RefusesNamingThePathAndTheIndexState</c>,
+    /// which blinding this method to always return <c>Matches</c> kills under the full suite (section 3
+    /// remediation, supervisor finding B1); before that test existed this was a one-off manual execution
+    /// with no committed falsifier.
+    /// <para>
+    /// <see cref="FileInfo.LinkTarget"/> returns <c>null</c> both when nothing exists at the path and when
+    /// something exists but is no longer a symlink at all (confirmed by execution). The former is
+    /// <see cref="SuppressedEntryComparisonOutcome.WorkingTreeMissing"/>; the latter — the mode the index
+    /// still records no longer matches what is on disk — is itself a divergence, reported as
+    /// <see cref="SuppressedEntryComparisonOutcome.Differs"/> rather than invented as a new shape.
+    /// <b>Recorded without a test:</b> the specific case of the <c>File.Exists</c> branch above — a
+    /// suppressed symlink replaced on disk by an ordinary regular file — has no fixture exercising it;
+    /// the reasoning that it must classify <see cref="SuppressedEntryComparisonOutcome.Differs"/> is
+    /// inferred from the <c>LinkTarget is null</c> contract above, not pinned by execution the way the
+    /// re-pointed-symlink case is.
+    /// </para>
+    /// </remarks>
+    private async Task<SuppressedEntryComparisonOutcome> CompareSuppressedSymlinkToHeadAsync(
+        string repositoryRoot, string repositoryRelativePath, string headBlobSha, CancellationToken cancellationToken)
+    {
+        var absolutePath = Path.Combine(repositoryRoot, repositoryRelativePath);
+        var linkTarget = new FileInfo(absolutePath).LinkTarget;
+
+        if (linkTarget is null)
+        {
+            return File.Exists(absolutePath) || Directory.Exists(absolutePath)
+                ? SuppressedEntryComparisonOutcome.Differs
+                : SuppressedEntryComparisonOutcome.WorkingTreeMissing;
+        }
+
+        var headContent = await _git.RunOrThrowAsync(
+            repositoryRoot,
+            ["cat-file", "-p", headBlobSha],
+            cancellationToken: cancellationToken);
+
+        return string.Equals(linkTarget, headContent.StandardOutput, StringComparison.Ordinal)
+            ? SuppressedEntryComparisonOutcome.Matches
+            : SuppressedEntryComparisonOutcome.Differs;
+    }
+
+    /// <summary>
+    /// Whether a suppressed <b>regular-file</b> index entry's content actually differs from <c>HEAD</c> —
+    /// the check that keeps a harmless suppression bit from refusing startup (Decision 4, spec scenario
+    /// "A suppressed index entry over an unchanged file is not a fault"). Compares
+    /// <c>git hash-object -- &lt;path&gt;</c> (the working tree's own blob sha, computed without ever
+    /// consulting the index — the same instrument <see cref="WorkingTreeFileMatchesHeadBlobAsync"/> in
+    /// <c>PageSaveService</c> already established for the save path) against
+    /// <paramref name="headBlobSha"/> (the blob <c>HEAD</c> holds for that path, from
+    /// <see cref="ObserveSuppressedEntryAsync"/>'s <c>ls-tree</c> call).
+    /// </summary>
+    /// <remarks>
+    /// The <c>hash-object</c> call runs via <see cref="GitProcessRunner.RunAsync"/>, never
+    /// <see cref="GitProcessRunner.RunOrThrowAsync"/>: a non-zero exit is not a fault in this method, it
+    /// *is* one of the shapes Decision 4 names. Verified by execution against a real repository (not
+    /// reasoned from git's docs) rather than assumed: it exits 128 with
+    /// <c>fatal: could not open '&lt;path&gt;' for reading: No such file or directory</c> when the
+    /// working-tree file is missing, and with <c>fatal: could not open '&lt;path&gt;' for reading:
+    /// Permission denied</c> when it exists but cannot be read (reproduced with <c>chmod 000</c>). These
+    /// two failure causes were previously collapsed into one (Blocker 2, section 1 remediation): they are
+    /// now told apart by <c>stderr</c>, since git's exit code is 128 for both.
+    /// <para>
+    /// <b>The <c>hash-object</c> call pins <see cref="InvariantLocale"/> (reviewer finding, section 1
+    /// remediation) as defence in depth against a state measured to be unreachable in the shipped
+    /// container, not a fix for a live locale-dependence bug.</b> Its exit code is 128 for both the
+    /// absent-file and unreadable-file cases, so <c>stderr</c> text is the only signal separating them —
+    /// and that text's failure-reason tail (<c>"No such file or directory"</c> / <c>"Permission denied"</c>)
+    /// comes from the OS's own <c>strerror()</c>, which glibc can translate under a non-<c>C</c> locale in
+    /// general. <b>Measured in-container (task 3.7; design.md Decision 8), not assumed:</b> on
+    /// <c>mcr.microsoft.com/dotnet/aspnet:10.0</c> — the image this application ships on
+    /// (<c>Dockerfile:56</c>) — the only locales present are <c>C</c>, <c>C.utf8</c> and <c>POSIX</c>;
+    /// there is no translated locale data to translate into, and
+    /// <c>LC_ALL=fr_FR.UTF-8 git hash-object</c> against an unreadable file returned the identical English
+    /// text as <c>LC_ALL=C</c>. So in the container ZeroWiki actually runs in, this pin guards a condition
+    /// that cannot occur. It is kept anyway: an operator may derive an image with locales installed, and
+    /// this method should not silently depend on their absence. <b>Limits of that measurement:</b> it
+    /// describes the base image as published as of 2026-08-21, a future revision of that image could add
+    /// locales, and it says nothing about a non-Docker deployment, where this reasoning does not apply and
+    /// the pin is load-bearing rather than defensive. This is the only stderr-text-pattern-match in the
+    /// census/observation path — every other <c>StandardError</c> use in this file is passed through
+    /// verbatim into an exception or a log, never branched on, so no sibling call needs the same pin.
+    /// </para>
+    /// </remarks>
+    private async Task<SuppressedEntryComparisonOutcome> CompareSuppressedFileToHeadAsync(
+        string repositoryRoot, string repositoryRelativePath, string headBlobSha, CancellationToken cancellationToken)
+    {
+        var hashResult = await _git.RunAsync(
+            repositoryRoot,
+            ["hash-object", "--", repositoryRelativePath],
+            environmentVariables: InvariantLocale,
+            cancellationToken: cancellationToken);
+
+        if (!hashResult.Succeeded)
+        {
+            return hashResult.StandardError.Contains("Permission denied", StringComparison.Ordinal)
+                ? SuppressedEntryComparisonOutcome.WorkingTreeUnreadable
+                : SuppressedEntryComparisonOutcome.WorkingTreeMissing;
+        }
+
+        return string.Equals(hashResult.StandardOutput.Trim(), headBlobSha, StringComparison.Ordinal)
+            ? SuppressedEntryComparisonOutcome.Matches
+            : SuppressedEntryComparisonOutcome.Differs;
+    }
+
     /// <summary>
     /// Asserts the working-tree-clean invariant holds after reconciliation. A startup-only check with
     /// no HTTP surface (Product Owner decision): an anonymous endpoint would leak repository state to
@@ -1017,6 +1571,22 @@ public sealed class ContentRepositoryService
                 $"reconciliation (git status --porcelain reported):\n{status.StandardOutput}" +
                 "Reconciliation should have committed every change; refusing to start rather than " +
                 "accept pushes against a dirty tree.");
+        }
+
+        // Decision 5: this is the working-tree-clean self-check, and there is no separate health-check
+        // surface — so it runs the same content-level census `ReconcileWorkingTreeAsync` runs, on its
+        // own, rather than trusting `status --porcelain` above (which cannot see a suppressed entry by
+        // construction). This does not depend on `ReconcileWorkingTreeAsync` having already refused: it
+        // re-derives the census and the fault verdict from the repository's current state every time
+        // this method runs, so calling it in isolation over a repository containing a divergent
+        // suppressed entry — reconciliation's own refusal neutralised or bypassed entirely — still
+        // refuses here.
+        foreach (var observation in await FindSuppressedIndexObservationsAsync(repositoryRoot, cancellationToken))
+        {
+            if (IsSuppressedEntryFault(observation))
+            {
+                throw SuppressedEntryDivergesAfterReconciliationException(repositoryRoot, observation);
+            }
         }
     }
 }
