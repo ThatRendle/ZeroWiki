@@ -3627,6 +3627,177 @@ and tell me** rather than adjusting the code to fit a sentence.
 `## 4.`, headings at `###`, above `## NEXT`; `grep -n '^#\{1,3\} '` after writing. Hand off with
 `→ @reviewer`.
 
+### Worker report — block 4.1–4.4
+
+**[worker]** Three-way call, one line each:
+
+- **4.1 (state `git diff --quiet HEAD` is also blinded at the census)** — **build**. No such statement
+  existed anywhere in code; `ReconcileWorkingTreeAsync`'s ordering comment named only `add -A`,
+  `diff --cached`, `status --porcelain`.
+- **4.2 (carry the measured table into the record)** — **build**, but nothing to add: the measured table
+  already lives in `design.md`'s `## Context` (added at propose time, task 4.1's own citation target). I
+  chose **`design.md` as the sole home** rather than duplicating it into the DEVLOG — it is already
+  committed, already the thing 4.1 cites, and a second copy would just be one more place a future edit to
+  the table could drift from. `git-backed-content-core`'s archived reference is a `git-backed-content-core`
+  artefact, not this change's; nothing in this section touches that capability.
+- **4.3 (rewrite `InvariantLocale` remark against 3.7's measurement)** — **finish**. The remark existed and
+  stated the glibc-translation claim as settled fact with no locale-of-the-shipped-image qualification;
+  the gap was exactly the inversion 3.7 measured.
+- **4.4 (correct the ordering comment; record F2/F3/B2/LinkTarget/census-observed-vs-tested/Decision-5)**
+  — **finish**. The false non-overlap sentence existed at `ContentRepositoryService.cs:811-813`
+  (post-4.1-edit line numbers shifted; original brief cited 809-812) and needed correcting, not writing
+  from scratch; the six "also record" items were genuinely absent from the code (nothing to finish, pure
+  **build**).
+
+No disagreement with the brief on any of the four — reported for the record, not because anything here
+was in question.
+
+**What changed, `src/ZeroWiki/Content/ContentRepositoryService.cs` only, no behaviour touched:**
+
+1. **`ReconcileWorkingTreeAsync`'s census-ordering comment** (`:804-824` post-edit) — added the
+   `git diff --quiet HEAD` blinding statement (4.1, cites design.md's Context table and its own git 2.55.0
+   measurement) and rewrote the false non-overlap claim: it now states plainly that the census's refusal
+   *does* win over the gitlink diagnosis on a single restart when a tree holds both faults, cites
+   `ContentRepositoryServiceTests.SuppressedDivergenceAndANestedRepository_TheSuppressedEntryRefusesFirstAndTheGitlinkFaultIsDeferred`
+   (task 3.9) as the falsifier for that direction, and says explicitly that the reverse direction (could
+   the gitlink/unreadable-directory checks ever swallow *this* census's fault) is untested and unasserted
+   either way — the second, still-unfalsified clause the brief called out.
+2. **`CompareSuppressedFileToHeadAsync`'s `InvariantLocale` remark** (4.3) — kept the pin, reframed it as
+   defence in depth against a state 3.7 measured to be unreachable on the shipped
+   `mcr.microsoft.com/dotnet/aspnet:10.0` image (only `C`/`C.utf8`/`POSIX` present, `LC_ALL=fr_FR.UTF-8`
+   produced identical English `stderr` text to `LC_ALL=C` in-container), and named the measurement's
+   limits verbatim from Decision 8 (image as published 2026-08-21; silent on non-Docker deployment, where
+   the pin would be load-bearing rather than defensive).
+3. **`IsSuppressedEntryFault`'s remarks** — three new `<para>` blocks: **F2** (mode-only boundary: content
+   is decided, mode only for gitlinks; the on-disk-mode-stat fix is deliberately not applied because it
+   ignores `core.fileMode` and reintroduces the false-refusal class this change ends; no product impact
+   since `updateInstead` is blinded by the same bit), **F3** (`WorkingTreeUnreadable`'s reasoning, given
+   for the first time: consistent with the existing unreadable-*directory* stderr refusal, and the arm
+   most likely to fire in production per Decision 8's non-root container), and **B2** (the `NotCompared`
+   fault arm reconstructs `FindStagedGitlinksAsync`'s own condition against an instrument
+   (`diff --cached`) the suppression bit never blinds — established analytically by the supervisor, not
+   by a test, and stated as such — so it buys the message and the ordering, not detection the pre-existing
+   guard lacked).
+4. **`CompareSuppressedSymlinkToHeadAsync`'s remarks** — recorded the `LinkTarget is null && File.Exists`
+   shape (symlink replaced by a regular file) as inferred from the `LinkTarget` contract, not pinned by
+   any fixture, unlike the re-pointed-symlink case two paragraphs above it which is.
+5. **`FindSuppressedIndexEntriesAsync`'s remarks** — added a paragraph distinguishing *observed*
+   (space-in-path, non-ASCII-path, Decision 2's non-suppressing tags — all re-observed on Linux/glibc
+   2.39/git 2.43.0 in the shipped container per 3.7/Decision 8, identical to the macOS/git 2.55.0
+   measurement above it) from *tested* (no fixture constructs either shape and asserts on it; a
+   regression in either would not currently fail `make test`).
+6. **`IsSuppressedEntryFault`'s summary** — one sentence noting Decision 5's "same policy at both call
+   sites" is a fact about the code (one method, two callers), not an assertion that would fail if a future
+   edit forked it.
+
+**Per-claim ledger** (test / measurement+platform / inference — the standard the brief set):
+
+- `git diff --quiet HEAD` is blinded identically to the other three instruments — **measurement**, git
+  2.55.0, design.md's Context table (this block did not re-measure it; it was already in the design doc
+  from propose time).
+- The census refusal can and does defer the gitlink diagnosis to the next restart — **test**,
+  `SuppressedDivergenceAndANestedRepository_TheSuppressedEntryRefusesFirstAndTheGitlinkFaultIsDeferred`.
+  The reverse direction is stated as **untested**, not claimed either way.
+- glibc cannot translate `strerror` on the shipped image — **measurement**, in-container,
+  `mcr.microsoft.com/dotnet/aspnet:10.0`, task 3.7/Decision 8, with its stated limits (image as published
+  2026-08-21; silent on non-Docker) carried forward verbatim.
+- F2 (mode-only shapes uncomparable by content) — **inference**: reasoned from what the switch's cases
+  cover, not executed against a live mode-only-changed fixture; said so.
+- F3 (`WorkingTreeUnreadable` reasoning) — **inference**, explicitly framed as reasoning offered for the
+  first time, consistent with a sibling check, not a Decision the code previously encoded.
+- B2 (no detection gain over the gitlink guard) — **inference**, an analytical reconstruction of two
+  conditions side by side, not a test; recorded as the supervisor's finding, attributed as such.
+- LinkTarget/File.Exists shape — **inference** from the documented `LinkTarget` contract; recorded as
+  having no test, in contrast with the sibling case that does.
+- Census-parse observed-vs-tested — **measurement** (3.7, in-container, both shapes) for what was
+  *observed*; explicitly **not** claimed as tested, and said why (no fixture).
+- Decision 5's shared-policy property — **inference**/structural fact (one method, two call sites), not
+  tested; said so.
+
+**Build:** `dotnet build src/ZeroWiki/ZeroWiki.csproj` → `Build succeeded`, `0 Warning(s)`, `0 Error(s)`
+(direct build for sanity, per boundaries — no `make` gate run, no code behaviour changed to gate).
+
+No behaviour changed anywhere in this block — only comments and XML doc remarks. `git diff -- src` is
+five `<para>`/comment edits inside `ContentRepositoryService.cs`, nothing else touched, no new/untracked
+files (`git status --short -- src` empty beyond the one modified file).
+
+→ @reviewer
+
+
+### Reviewer report — block 4.1–4.4
+
+**[reviewer]** Verdict: **Approve.**
+
+**Method.** Read every new sentence as a claim, checked each against the code, `design.md`, and the
+`Dockerfile` — not against the DEVLOG's account of them — per the brief's own standard. Confirmed
+independently (not taking the Architect's word) that the diff is comment-only:
+`git diff HEAD -- src/... | grep -E '^[+-]' | ... | grep -vE '^\s*(///|//|\*|$)'` returns nothing.
+
+**1. Every new claim checked true.** 4.4's rewrite: confirmed it states the census's refusal *does* win
+over the gitlink diagnosis on a combined tree, names
+`SuppressedDivergenceAndANestedRepository_TheSuppressedEntryRefusesFirstAndTheGitlinkFaultIsDeferred`
+(task 3.9) as the falsifier for that direction, and says plainly the reverse direction "is not covered
+by that test or any other and is not asserted here either way" — it does not quietly assert the
+untested half in either direction.
+
+**2. 4.3's evidence-class labelling.** The remark states, verbatim: measured in-container
+(`mcr.microsoft.com/dotnet/aspnet:10.0`, task 3.7/Decision 8), three locales present, `LC_ALL=fr_FR.UTF-8`
+produced identical English `stderr` to `LC_ALL=C` — then a dedicated "Limits of that measurement"
+sentence: base image as published 2026-08-21, a future revision could add locales, silent on non-Docker
+deployment where the pin is load-bearing rather than defensive. The phrase "this pin guards a condition
+that cannot occur" is scoped explicitly to "in the container ZeroWiki actually runs in" and immediately
+followed by the limits — not an overstatement past what 3.7 measured. Cross-checked the citations
+themselves rather than trusting them: `Dockerfile:56` is `USER $APP_UID` exactly, and the runtime stage
+(`Dockerfile:43`) is `FROM mcr.microsoft.com/dotnet/aspnet:10.0` exactly.
+
+**3. Observed versus tested.** `FindSuppressedIndexEntriesAsync`'s new paragraph: "That is an
+observation, not a test: no committed fixture constructs a space-containing path or one of Decision 2's
+non-suppressing tags and asserts this census's behaviour on it, on either platform. A regression in
+either shape would not currently fail `make test`." Confirmed by grep that no such fixture exists in
+`ContentRepositoryServiceTests.cs`. The two classes are not blurred.
+
+**4. The B2 paragraph.** Headed "established analytically, not by a test that could show otherwise,"
+and the reasoning is stated in a form a reader can verify without trusting it: `FindStagedGitlinksAsync`'s
+own `newMode == 160000 && oldMode != 160000` reconstructed against the mode pair, and that guard reads
+`git diff --cached` (index vs. `HEAD`), an instrument the suppression bit never hides gitlink
+introduction from. I am not taking this on the supervisor's or the worker's word here — I independently
+established this exact mechanism myself, by mutation, in the section 3 remediation review two blocks
+ago (reading B2's actual failure message and tracing it to `BuildGitlinkErrorMessage`, the pre-existing
+guard's own text). This paragraph states precisely what I confirmed by execution.
+
+**5. 4.2's choice.** The worker pointed 4.1's new comment at `design.md`'s Context table rather than
+duplicating the measured table into the DEVLOG or citing `git-backed-content-core`'s archived reference
+— neither of the two options the brief literally named. Judged sound: the table already lived in
+`design.md`'s Context (confirmed — added at propose time, five-row instrument table, exactly what 4.1's
+comment cites), a reader following the code's own citation lands on the real measurement, and a second
+copy would be one more place a future edit could drift from the original. `design.md` is committed and
+archives with the change alongside the DEVLOG, so a reader of the archived change has it either way.
+This satisfies the task's intent — the next reader inherits the measurement, not the claim — even though
+it is a third option the worker discovered rather than one of the two offered; the worker states which
+they chose and why, as the brief required.
+
+**6. Swept for new unfalsified claims.** Went through every added `<para>` treating each sentence as a
+claim: the Decision-5 "no assertion anywhere would fail if a future edit forked this switch" is a
+structural claim directly checkable by reading the two call sites (confirmed: both call the same static
+method, no meta-test on that fact, consistent with what earlier rounds already established); F2's
+`core.fileMode`/`updateInstead`-blindness reasoning is labelled inference and its logic holds (a
+mode-only divergence on a suppressed path is invisible to git's own push-safety checks for the identical
+reason content divergence would be, without the new instrument); F3's "arm most likely to fire in
+production" is labelled reasoning, not measurement; the `LinkTarget is null && File.Exists` note is
+confirmed true by grep — no test constructs "suppressed symlink replaced by a regular file." I found no
+new sentence asserting something checkable without saying how to check it.
+
+**Build sanity.** `dotnet build src/ZeroWiki/ZeroWiki.csproj` → `0 Warning(s). 0 Error(s).`
+
+**State:** `git diff -- src` is exactly the five `<para>`/comment edits reported; `git status --short --
+src` shows only the one modified file; no untracked files.
+
+**Nothing owed.**
+
+**Reviewed-state:** `705757400aa3`, `HEAD` `5ce8363`.
+
+→ @architect
+
 ## NEXT
 
 **Resume point:** section 4, block 4.1–4.4 — briefed under `## 4.`. Sections 1, 2 and 3 are **closed**

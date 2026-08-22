@@ -804,13 +804,26 @@ public sealed class ContentRepositoryService
         // Section 2 (Decision 7): a suppressed index entry (--assume-unchanged/--skip-worktree) is
         // invisible to `add -A`, `diff --cached`, and `status --porcelain` alike — that is the whole
         // point of the bit — so it is checked here first, against the index as it stands, before any of
-        // those instruments run. It does not depend on what `add -A` is about to stage (a suppressed
-        // path is, by definition, one `add -A` will not touch), so ordering it before that call costs
-        // nothing and means a fault here refuses before anything is staged — no `git reset` to unwind,
-        // unlike the gitlink refusal below, which only knows what it is refusing after staging.
+        // those instruments run. `git diff --quiet HEAD` is blinded the same way (measured on git 2.55.0,
+        // design.md's Context table): it reads as the index-free "just compare the tree to HEAD" reflex,
+        // and it is not one — reaching for it to fix this defect would produce a patch that passes review
+        // and changes nothing, because it consults the index exactly like the three above. It does not
+        // depend on what `add -A` is about to stage (a suppressed path is, by definition, one `add -A`
+        // will not touch), so ordering it before that call costs nothing and means a fault here refuses
+        // before anything is staged — no `git reset` to unwind, unlike the gitlink refusal below, which
+        // only knows what it is refusing after staging.
         // Constructed separately, a nested-repository or an unreadable-directory tree carries no
         // suppressed entry at all, so this census reports nothing and execution falls through to those
-        // checks unchanged — this refusal cannot swallow theirs, nor can theirs swallow this one.
+        // checks unchanged on that path. But when a tree holds both faults at once, this census's
+        // refusal *does* win over the gitlink diagnosis below on a single restart — not a non-overlap,
+        // an ordering: the gitlink check never runs because this loop throws first, so its diagnosis is
+        // deferred to the next restart rather than lost (matching the precedent at
+        // FindStagedGitlinksAsync's own refusal, decided independently). Falsified and confirmed by
+        // ContentRepositoryServiceTests.SuppressedDivergenceAndANestedRepository_TheSuppressedEntryRefusesFirstAndTheGitlinkFaultIsDeferred
+        // (task 3.9), which builds both faults in one tree and checks the gitlink fault still fires on the
+        // very next restart once the suppressed divergence alone is fixed. The reverse direction — whether
+        // the gitlink/unreadable-directory checks below could ever swallow *this* census's fault — is not
+        // covered by that test or any other and is not asserted here either way.
         foreach (var observation in await FindSuppressedIndexObservationsAsync(repositoryRoot, cancellationToken))
         {
             if (IsSuppressedEntryFault(observation))
@@ -1094,7 +1107,10 @@ public sealed class ContentRepositoryService
     /// <summary>
     /// The fault decision section 1 was not allowed to make (Decision 7). Both call sites —
     /// <see cref="ReconcileWorkingTreeAsync"/> and <see cref="AssertWorkingTreeIsCleanAsync"/> — share
-    /// this one policy so the invariant means the same thing at both of its sites (Decision 5).
+    /// this one policy so the invariant means the same thing at both of its sites (Decision 5). That
+    /// "same policy at both sites" property is a fact about the code — one method, two callers — not a
+    /// tested one: there is no assertion anywhere that would fail if a future edit gave one call site its
+    /// own copy of this switch instead of calling this method.
     /// </summary>
     /// <remarks>
     /// <see cref="SuppressedEntryComparisonOutcome.PathNotInHead"/> is a fault unconditionally (Decision
@@ -1135,6 +1151,42 @@ public sealed class ContentRepositoryService
     /// absence test differs from a regular file's) purely for message polish on a diagnosis that already
     /// names the path and the index state per Decision 3. Left unrecovered; revisit only if an operator
     /// report says the message is not actionable as written.
+    /// </para>
+    /// <para>
+    /// <b>Boundary, recorded without fixing (F2): this policy decides content divergence, and mode only
+    /// for gitlinks — it does not decide a mode-only change on an ordinary file.</b> Two shapes this
+    /// switch never asks about: a suppressed entry whose content matches <c>HEAD</c> but whose executable
+    /// bit changed on disk (starts normally; the working tree silently ≠ <c>HEAD</c> on that bit alone),
+    /// and a suppressed <c>100644</c>↔<c>120000</c> typechange decided purely by content/link-text
+    /// comparison rather than by the mode pair. Not treated as a defect to close: the obvious fix (stat
+    /// the on-disk mode and compare it to the index) ignores <c>core.fileMode</c> and would refuse startup
+    /// on a filesystem where the exec bit is not meaningful — reintroducing the false-refusal class this
+    /// section exists to end. No product impact follows from leaving it open either: git's own
+    /// <c>updateInstead</c> receive path is blinded by the identical suppression bit, so a mode-only
+    /// divergence was never going to bounce a push in the first place.
+    /// </para>
+    /// <para>
+    /// <b><see cref="SuppressedEntryComparisonOutcome.WorkingTreeUnreadable"/> is a fault by inference,
+    /// not by a named Decision (F3).</b> Decision 4 enumerates three divergent shapes and this is not one
+    /// of them — it was introduced in section 1 and promoted to a fault in section 2 without its own
+    /// stated reasoning, unlike every sibling arm above. The reasoning: it is consistent with the existing
+    /// stderr-based refusal for an unreadable <i>directory</i> (<see cref="ReconcileWorkingTreeAsync"/>'s
+    /// D17 handling), and it is the arm most likely to fire in production on an otherwise-healthy file —
+    /// Decision 8 measured the shipped container running as non-root, where a permission change on a
+    /// tracked file is the ordinary way this arm gets exercised, not an edge case. That is reasoning
+    /// recorded here for the first time, not a decision this class previously made explicit.
+    /// </para>
+    /// <para>
+    /// <b><see cref="SuppressedEntryComparisonOutcome.NotCompared"/>'s fault side detects nothing the
+    /// pre-existing <see cref="FindStagedGitlinksAsync"/> guard misses (established analytically, not by a
+    /// test that could show otherwise).</b> The condition above is <see cref="FindStagedGitlinksAsync"/>'s
+    /// own <c>newMode == 160000 &amp;&amp; oldMode != 160000</c> reconstructed against the mode pair this
+    /// class already has — and that guard reads <c>git diff --cached</c> (index vs. <c>HEAD</c>), an
+    /// instrument the suppression bit never hides gitlink introduction from. What this arm buys over the
+    /// pre-existing guard is the message (naming the suppressed path and its index state, Decision 3) and
+    /// the ordering (refusing before <c>add -A</c> stages anything, see <see
+    /// cref="ReconcileWorkingTreeAsync"/>'s remarks) — not a case the pre-existing guard would otherwise
+    /// miss.
     /// </para>
     /// </remarks>
     private static bool IsSuppressedEntryFault(SuppressedIndexObservation observation) =>
@@ -1213,6 +1265,17 @@ public sealed class ContentRepositoryService
     /// for the path is therefore correct and never mangles a legitimate space-containing path
     /// (<see cref="FindStagedGitlinksAsync"/> hit the identical <c>core.quotePath</c> hazard first, for
     /// <c>git diff --cached --raw</c>, and this reuses its fix).
+    /// </para>
+    /// <para>
+    /// <b>Observed, but not test-fixture-covered (recorded so the two are not conflated):</b> the
+    /// space-containing-path and non-ASCII-path parsing above, and Decision 2's non-suppressing tags
+    /// (<c>M</c>, <c>R</c>, <c>C</c>, <c>K</c>, <c>?</c>) falling through this census untouched, were both
+    /// re-observed on Linux/glibc 2.39/git 2.43.0 in the shipped <c>mcr.microsoft.com/dotnet/aspnet:10.0</c>
+    /// container (task 3.7; design.md Decision 8) and produced identical parsing to the macOS/git 2.55.0
+    /// measurement above. That is an observation, not a test: no committed fixture constructs a
+    /// space-containing path or one of Decision 2's non-suppressing tags and asserts this census's
+    /// behaviour on it, on either platform. A regression in either shape would not currently fail
+    /// <c>make test</c>.
     /// </para>
     /// </remarks>
     private async Task<IReadOnlyList<SuppressedIndexEntry>> FindSuppressedIndexEntriesAsync(
@@ -1375,6 +1438,11 @@ public sealed class ContentRepositoryService
     /// <see cref="SuppressedEntryComparisonOutcome.WorkingTreeMissing"/>; the latter — the mode the index
     /// still records no longer matches what is on disk — is itself a divergence, reported as
     /// <see cref="SuppressedEntryComparisonOutcome.Differs"/> rather than invented as a new shape.
+    /// <b>Recorded without a test:</b> the specific case of the <c>File.Exists</c> branch above — a
+    /// suppressed symlink replaced on disk by an ordinary regular file — has no fixture exercising it;
+    /// the reasoning that it must classify <see cref="SuppressedEntryComparisonOutcome.Differs"/> is
+    /// inferred from the <c>LinkTarget is null</c> contract above, not pinned by execution the way the
+    /// re-pointed-symlink case is.
     /// </para>
     /// </remarks>
     private async Task<SuppressedEntryComparisonOutcome> CompareSuppressedSymlinkToHeadAsync(
@@ -1422,17 +1490,24 @@ public sealed class ContentRepositoryService
     /// now told apart by <c>stderr</c>, since git's exit code is 128 for both.
     /// <para>
     /// <b>The <c>hash-object</c> call pins <see cref="InvariantLocale"/> (reviewer finding, section 1
-    /// remediation).</b> Its exit code is 128 for both the absent-file and unreadable-file cases, so
-    /// <c>stderr</c> text is the only signal separating them — but that text's failure-reason tail
-    /// (<c>"No such file or directory"</c> / <c>"Permission denied"</c>) comes from the OS's own
-    /// <c>strerror()</c>, not git's gettext catalog, and glibc translates <c>strerror</c> under a
-    /// non-<c>C</c> locale as standard, documented behaviour. Nothing upstream of this call constrains
-    /// the operator's locale, so an unpinned invocation would silently stop discriminating under, say,
-    /// <c>LC_ALL=fr_FR.UTF-8</c> in the container's environment. Pinning the subprocess's own locale
-    /// (independent of whatever the host process inherited) keeps the match meaningful regardless. This
-    /// is the only stderr-text-pattern-match in the census/observation path — every other
-    /// <c>StandardError</c> use in this file is passed through verbatim into an exception or a log, never
-    /// branched on, so no sibling call needs the same pin.
+    /// remediation) as defence in depth against a state measured to be unreachable in the shipped
+    /// container, not a fix for a live locale-dependence bug.</b> Its exit code is 128 for both the
+    /// absent-file and unreadable-file cases, so <c>stderr</c> text is the only signal separating them —
+    /// and that text's failure-reason tail (<c>"No such file or directory"</c> / <c>"Permission denied"</c>)
+    /// comes from the OS's own <c>strerror()</c>, which glibc can translate under a non-<c>C</c> locale in
+    /// general. **Measured in-container (task 3.7; design.md Decision 8), not assumed:** on
+    /// <c>mcr.microsoft.com/dotnet/aspnet:10.0</c> — the image this application ships on
+    /// (<c>Dockerfile:56</c>) — the only locales present are <c>C</c>, <c>C.utf8</c> and <c>POSIX</c>;
+    /// there is no translated locale data to translate into, and
+    /// <c>LC_ALL=fr_FR.UTF-8 git hash-object</c> against an unreadable file returned the identical English
+    /// text as <c>LC_ALL=C</c>. So in the container ZeroWiki actually runs in, this pin guards a condition
+    /// that cannot occur. It is kept anyway: an operator may derive an image with locales installed, and
+    /// this method should not silently depend on their absence. <b>Limits of that measurement:</b> it
+    /// describes the base image as published as of 2026-08-21, a future revision of that image could add
+    /// locales, and it says nothing about a non-Docker deployment, where this reasoning does not apply and
+    /// the pin is load-bearing rather than defensive. This is the only stderr-text-pattern-match in the
+    /// census/observation path — every other <c>StandardError</c> use in this file is passed through
+    /// verbatim into an exception or a log, never branched on, so no sibling call needs the same pin.
     /// </para>
     /// </remarks>
     private async Task<SuppressedEntryComparisonOutcome> CompareSuppressedFileToHeadAsync(
